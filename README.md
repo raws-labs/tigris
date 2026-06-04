@@ -76,6 +76,10 @@ Link the harness against [tigris-runtime](https://github.com/raws-labs/tigris-ru
 - [Introducing TiGrIS](https://tigris-ml.dev/blog/introducing-tigris): design, benchmarks, how tiling works
 - [CLI reference](https://tigris-ml.dev/docs/cli): every flag, every subcommand
 
+## Maintainer
+
+TiGrIS is maintained by RAWS Labs. For applied embedded-ML engineering or collaboration, see [raws.at](https://www.raws.at/).
+
 ## Development
 
 ```bash
