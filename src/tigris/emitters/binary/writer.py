@@ -41,6 +41,12 @@ from .defs import (
 )
 
 
+# Weight blobs are padded so every weight/bias starts on this byte boundary.
+# The optimized CMSIS-NN Cortex-M kernels read weights/bias with LDRD (8-byte)
+# and wide SIMD loads, which fault on unaligned data; 16 also covers Helium MVE.
+WEIGHT_ALIGN = 16
+
+
 # Helper: String Table
 
 
@@ -319,6 +325,10 @@ def _build_weights(
         else:
             raw = arr.astype(np.float32).tobytes()
         name_off = strings.add(name)
+        # Pad so this weight starts WEIGHT_ALIGN-aligned within the blob.
+        # Combined with a WEIGHT_ALIGN-aligned blob base (emit assembler aligns
+        # the section) every weight/bias pointer is aligned for the opt kernels.
+        blob_buf.extend(b"\x00" * ((-len(blob_buf)) % WEIGHT_ALIGN))
         blob_offset = len(blob_buf)
         entries_buf.extend(struct.pack(
             "<III",
@@ -418,6 +428,10 @@ def _build_weights_compressed(
         first_widx = widx_list[0]
         for widx in widx_list:
             raw, name_off = prepared[widx]
+            # Pad to WEIGHT_ALIGN so each weight is aligned after decompression
+            # into the (WEIGHT_ALIGN-aligned) fast arena - same requirement as
+            # the uncompressed path.
+            block_buf.extend(b"\x00" * ((-len(block_buf)) % WEIGHT_ALIGN))
             # Write entry with block-relative offset
             struct.pack_into(
                 "<III", entries_buf, widx * WEIGHT_ENTRY_SIZE,
@@ -552,6 +566,14 @@ def _resolve_weight_bias(op: OpNode, weight_idx: dict[str, int]) -> tuple[int, i
     return w_idx, b_idx
 
 
+def _round_half_away(x: float) -> int:
+    """Round half away from zero (TFLite TfLiteRound / C std::round), NOT Python's
+    banker's round-half-to-even. The compiler's quant params must round the same
+    way as tflite/gemmlowp/CMSIS-NN and the runtime, or a per-channel requant
+    multiplier (or a ReLU6 act_max) lands 1 off for any scale on a .5 boundary."""
+    return math.floor(x + 0.5) if x >= 0.0 else math.ceil(x - 0.5)
+
+
 def _compute_act_bounds(
     ag: AnalyzedGraph, op: OpNode, fused_act: int,
 ) -> tuple[int, int]:
@@ -581,7 +603,7 @@ def _compute_act_bounds(
         act_max = 127
     elif fused_act == ACT_RELU6:
         act_min = max(output_zp, -128)
-        act_max = min(round(6.0 / output_scale) + output_zp, 127)
+        act_max = min(_round_half_away(6.0 / output_scale) + output_zp, 127)
     else:
         act_min, act_max = -128, 127
 
@@ -742,12 +764,17 @@ def _compute_multiplier_shift(scale: float) -> tuple[int, int]:
 
     mantissa, exp = math.frexp(scale)  # 0.5 <= mantissa < 1.0, scale = mantissa * 2^exp
 
-    multiplier = int(round(mantissa * (1 << 31)))
+    multiplier = _round_half_away(mantissa * (1 << 31))
     if multiplier == (1 << 31):
         multiplier //= 2
         exp += 1
 
-    return multiplier, exp - 1
+    # Runtime computes (acc * multiplier) >> 31, then applies `shift`, i.e.
+    # acc * multiplier * 2^(shift - 31). With scale = multiplier * 2^(exp - 31)
+    # (frexp), the correct shift is exactly `exp` (matches TFLite
+    # QuantizeMultiplier). A `- 1` here halves every requant and collapses
+    # deep int8 graphs to the output zero-point.
+    return multiplier, exp
 
 
 def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
@@ -805,11 +832,16 @@ def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
             continue
         w_scale = w_info.quant.scale  # may be per-channel
 
-        # effective_scale[c] = in_scale * w_scale[c] / out_scale[c]
-        num_out_ch = len(out_scale)
+        # effective_scale[c] = in_scale * w_scale[c] / out_scale (per output
+        # channel). The output ACTIVATION scale is per-tensor (len 1), but
+        # per-channel weight quant has one scale per output channel, so the
+        # number of effective scales is the per-channel WEIGHT count - using
+        # len(out_scale) collapsed per-channel conv to per-tensor (reusing
+        # channel 0's multiplier for all channels, which diverges from TFLite).
         num_w_ch = len(w_scale)
-        eff = np.zeros(num_out_ch, dtype=np.float64)
-        for c in range(num_out_ch):
+        num_ch = max(len(out_scale), num_w_ch)
+        eff = np.zeros(num_ch, dtype=np.float64)
+        for c in range(num_ch):
             ws = float(w_scale[c]) if c < num_w_ch else float(w_scale[0])
             os = float(out_scale[c]) if c < len(out_scale) else float(out_scale[0])
             eff[c] = in_scale * ws / os if os != 0 else 0.0
@@ -852,10 +884,13 @@ def _build_quant_params(
         quant_idx_map[name] = idx
         idx += 1
 
-        num_channels = len(qp.scale)
-
         # Use effective scale for op outputs (requantization), raw scale otherwise
         eff = effective_scales.get(name)
+
+        # Per-channel count comes from the effective scales (per output channel
+        # for per-channel weight quant), not the per-tensor activation scale -
+        # otherwise per-channel conv requant is stored as per-tensor.
+        num_channels = len(eff) if eff is not None else len(qp.scale)
 
         # Store multiplier/shift for both per-tensor (1) and per-channel (>1)
         multiplier_off = data_offset
@@ -979,10 +1014,27 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     section_dir_size = (len(section_parts) + 1) * SECTION_ENTRY_SIZE  # +1 for sentinel
     body_start = HEADER_SIZE + section_dir_size
 
+    # Align every section start to WEIGHT_ALIGN. The loader reinterprets several
+    # sections zero-copy as int32 arrays (SEC_SHAPE_POOL, the SEC_QUANT_PARAMS
+    # multiplier/shift pool) and uint16 (SEC_INDEX_POOL); a section landing at a
+    # non-4-byte offset would make those casts unaligned -> UB, and a hard fault
+    # on strict-alignment cores (Cortex-M0/M33, -mno-unaligned-access). The file
+    # base is WEIGHT_ALIGN-aligned (bin2c / mmap), so aligning each section start
+    # to WEIGHT_ALIGN makes every section pointer aligned. SEC_WEIGHTS needs the
+    # weight BLOB aligned too: the loader computes
+    #   weight_blob = file_base + section_offset + num_weights*WEIGHT_ENTRY_SIZE
+    # so pad additionally past the entry table.
     sections = []
+    placed_parts = []
     current = body_start
     for sec_id, data in section_parts:
+        pad = (-current) % WEIGHT_ALIGN
+        if sec_id == SEC_WEIGHTS:
+            blob_pos = current + pad + num_weights * WEIGHT_ENTRY_SIZE
+            pad += (-blob_pos) % WEIGHT_ALIGN
+        current += pad
         sections.append((sec_id, current))
+        placed_parts.append(b"\x00" * pad + data)
         current += len(data)
     file_size = current
 
@@ -1031,7 +1083,7 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     out = bytearray()
     out.extend(header)
     out.extend(sec_dir)
-    for _, data in section_parts:
+    for data in placed_parts:
         out.extend(data)
 
     if len(out) != file_size:

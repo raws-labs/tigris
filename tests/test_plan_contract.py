@@ -70,13 +70,17 @@ CONTRACT = {
     },
     "conv_relu_chain": {
         "builder": build_conv_relu_chain,
-        "budget_str": "32K",
+        # 64K: the real working-set peak is 53,888 B (conv1 holds its [1,8,30,30]
+        # input co-resident with its [1,8,28,28] output - see test_memory). 32K
+        # would (correctly) force multi-stage slow-overflow; 64K keeps this a
+        # clean single-stage plan, which is what this format contract checks.
+        "budget_str": "64K",
         "version": 1,
         "num_tensors": 3,
         "num_ops": 2,        # Relu fused into first Conv
         "num_stages": 1,
         "num_tile_plans": 0,
-        "budget": 32768,
+        "budget": 65536,
         "num_model_inputs": 1,
         "num_model_outputs": 1,
         "num_weights": 4,
