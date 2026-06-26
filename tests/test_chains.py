@@ -121,6 +121,113 @@ def chain_with_fanout_path(tmp_path):
     return path
 
 
+@pytest.fixture
+def chain_with_pool_path(tmp_path):
+    """Conv -> Relu -> MaxPool(stride2) -> Conv. The strided pool sits where a
+    chain would otherwise form. exec_chain_tiled composes receptive fields for
+    Conv/DepthwiseConv only, so a pool inside a chain would get height-preserving
+    (pointwise) tile geometry -> wrong rows / OOB. The pool stage must stay out of
+    any chain."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 64, 64])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 32, 32])
+    w0 = helper.make_tensor("w0", TensorProto.FLOAT, [4, 3, 3, 3],
+                            np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
+    b0 = helper.make_tensor("b0", TensorProto.FLOAT, [4], np.zeros(4, dtype=np.float32).tolist())
+    w1 = helper.make_tensor("w1", TensorProto.FLOAT, [8, 4, 3, 3],
+                            np.zeros((8, 4, 3, 3), dtype=np.float32).flatten().tolist())
+    b1 = helper.make_tensor("b1", TensorProto.FLOAT, [8], np.zeros(8, dtype=np.float32).tolist())
+    conv0 = helper.make_node("Conv", ["input", "w0", "b0"], ["t0"], name="conv0",
+                             kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
+    relu = helper.make_node("Relu", ["t0"], ["t1"], name="relu0")
+    pool = helper.make_node("MaxPool", ["t1"], ["t2"], name="pool0",
+                            kernel_shape=[2, 2], strides=[2, 2])
+    conv1 = helper.make_node("Conv", ["t2", "w1", "b1"], ["output"], name="conv1",
+                             kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
+    graph = helper.make_graph([conv0, relu, pool, conv1], "chain_pool",
+                              [X], [Y], initializer=[w0, b0, w1, b1])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    path = tmp_path / "chain_pool.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+@pytest.fixture
+def chain_with_model_output_mid_path(tmp_path):
+    """3 convs where the middle conv's output (t2) is ALSO a model output. The
+    chain intermediate is streamed tile-by-tile and never materialized to slow
+    memory, so chaining across t2 would leave that model output unwritten. The
+    chain must break at t2."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 64, 64])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 64, 64])
+    Y2 = helper.make_tensor_value_info("t2", TensorProto.FLOAT, [1, 4, 64, 64])
+    w0 = helper.make_tensor("w0", TensorProto.FLOAT, [4, 3, 3, 3],
+                            np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
+    b0 = helper.make_tensor("b0", TensorProto.FLOAT, [4], np.zeros(4, dtype=np.float32).tolist())
+    w1 = helper.make_tensor("w1", TensorProto.FLOAT, [4, 4, 3, 3],
+                            np.zeros((4, 4, 3, 3), dtype=np.float32).flatten().tolist())
+    b1 = helper.make_tensor("b1", TensorProto.FLOAT, [4], np.zeros(4, dtype=np.float32).tolist())
+    w2 = helper.make_tensor("w2", TensorProto.FLOAT, [8, 4, 3, 3],
+                            np.zeros((8, 4, 3, 3), dtype=np.float32).flatten().tolist())
+    b2 = helper.make_tensor("b2", TensorProto.FLOAT, [8], np.zeros(8, dtype=np.float32).tolist())
+    conv0 = helper.make_node("Conv", ["input", "w0", "b0"], ["t0"], name="conv0",
+                             kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
+    relu = helper.make_node("Relu", ["t0"], ["t1"], name="relu0")
+    conv1 = helper.make_node("Conv", ["t1", "w1", "b1"], ["t2"], name="conv1",
+                             kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
+    conv2 = helper.make_node("Conv", ["t2", "w2", "b2"], ["output"], name="conv2",
+                             kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
+    graph = helper.make_graph([conv0, relu, conv1, conv2], "chain_mid_output",
+                              [X], [Y, Y2], initializer=[w0, b0, w1, b1, w2, b2])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    path = tmp_path / "chain_mid_output.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+_POOL_OP_TYPES = {"MaxPool", "AveragePool", "GlobalAveragePool", "GlobalMaxPool"}
+
+
+def _stages_then_chains(path, budget):
+    """Run the pipeline up to stage creation, then return (ag, raw chain groups)."""
+    ag = load_model(path)
+    ag = compute_lifetimes(ag)
+    ag = compute_memory_timeline(ag)
+    ag = partition_temporal(ag, budget)
+    ag = partition_spatial(ag)
+    return ag, detect_chains(ag)
+
+
+def _chain_boundary_tensors(ag, chains):
+    """Tensors streamed between consecutive chained stages (never materialized)."""
+    boundaries: set[str] = set()
+    for group in chains:
+        for a, b in zip(group, group[1:]):
+            boundaries |= set(ag.stages[a].output_tensors) & set(ag.stages[b].input_tensors)
+    return boundaries
+
+
+def test_pool_stage_not_chained(chain_with_pool_path):
+    """A pool op must never appear inside a chained stage (#5: exec_chain_tiled
+    handles only Conv/DepthwiseConv as spatial)."""
+    ag, chains = _stages_then_chains(chain_with_pool_path, budget=24000)
+    for group in chains:
+        for si in group:
+            optypes = {ag.ops[oi].op_type for oi in ag.stages[si].op_indices}
+            assert not (optypes & _POOL_OP_TYPES), (
+                f"pool op chained in stage {si}: {optypes}")
+
+
+def test_chain_does_not_span_model_output(chain_with_model_output_mid_path):
+    """A chain intermediate that is also a model output must not be absorbed into
+    a chain (#7), else it is never written."""
+    ag, chains = _stages_then_chains(chain_with_model_output_mid_path, budget=24000)
+    boundaries = _chain_boundary_tensors(ag, chains)
+    assert not (boundaries & set(ag.model_outputs)), (
+        f"model output streamed as chain intermediate: {boundaries & set(ag.model_outputs)}")
+
+
 # Chain detection tests
 
 

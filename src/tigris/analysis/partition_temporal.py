@@ -93,9 +93,10 @@ def _stage_peak_memory(
     for step in range(start, end + 1):
         live = 0
         for lt in ag.lifetimes.values():
-            # Tensor is alive at this step if birth_step < step <= death_step
-            # (using the same convention as memory.py: alive from birth+1 to death)
-            alive_from = lt.birth_step + 1
+            # Tensor is alive from its producing step (output co-resides with the
+            # inputs that die there - the runtime allocs the output before freeing
+            # inputs) through its last consumer. Same convention as memory.py.
+            alive_from = lt.birth_step
             freed_at = lt.death_step + 1
 
             # Within this stage, the tensor is live if:

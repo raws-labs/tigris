@@ -247,9 +247,21 @@ def _estimate_halo_bytes(ag: AnalyzedGraph, stage, halo: int, input_h: int) -> i
 
 
 def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
-    """Check if all ops in a stage are spatially tileable and I/O is 4D."""
+    """Check if a stage may be part of a streamable CHAIN (used only by
+    detect_chains): all ops spatially tileable, no POOL op, and 4D I/O.
+
+    POOL is excluded because the runtime chain executor (exec_chain_tiled)
+    composes/back-propagates receptive fields for Conv/DepthwiseConv only; a POOL
+    op in a chained stage would be treated as height-preserving (pointwise),
+    giving wrong tile row counts and OOB reads. Pool stages still tile standalone
+    via exec_stage_tiled. Remove the POOL exclusion once the chain executor
+    handles pool spatial ops.
+    """
     for op_i in stage.op_indices:
-        if classify_op(ag.ops[op_i].op_type) == TileCategory.UNTILEABLE:
+        cat = classify_op(ag.ops[op_i].op_type)
+        if cat == TileCategory.UNTILEABLE:
+            return False
+        if cat == TileCategory.POOL:
             return False
     # All inputs and outputs must be 4D
     for name in stage.input_tensors:
@@ -307,6 +319,10 @@ def detect_chains(ag: AnalyzedGraph) -> list[list[int]]:
             and len(stage.input_tensors) == 1
             and prev_stage.output_tensors[0] == stage.input_tensors[0]
             and consumer_counts.get(prev_stage.output_tensors[0], 0) == 1
+            # The chain intermediate is streamed tile-by-tile and never
+            # materialized to slow memory; if it is also a model output, chaining
+            # would leave that output unwritten. Keep it out of the chain.
+            and prev_stage.output_tensors[0] not in ag.model_outputs
         )
 
         if can_chain:

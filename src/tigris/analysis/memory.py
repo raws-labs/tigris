@@ -16,12 +16,16 @@ def compute_memory_timeline(ag: AnalyzedGraph) -> AnalyzedGraph:
         return ag
 
     # Build sorted event list: (step, +/- size, tensor_name)
-    # +size at birth_step+1 (tensor becomes available after producing op finishes,
-    #   but for model inputs born at step -1, they are live at step 0)
+    # +size at birth_step: the runtime (exec_stage_normal) ALLOCATES an op's
+    #   output before running the kernel and frees the consumed inputs only after
+    #   it returns, so the output is live AT its producing step, co-resident with
+    #   the inputs that die there. Counting it at birth_step+1 instead misses that
+    #   overlap (undercounts peak ~output-size) and drops the final op's output
+    #   entirely (its birth_step+1 falls past the end of the sweep).
     # -size at death_step+1 (tensor freed after its last consumer finishes)
     events: list[tuple[int, int, str]] = []
     for lt in ag.lifetimes.values():
-        alive_from = lt.birth_step + 1  # live starting at the step *after* birth
+        alive_from = lt.birth_step      # live starting AT the producing step
         freed_at = lt.death_step + 1    # freed *after* the last consumer
         # For model inputs (birth=-1): alive_from=0
         # For model outputs (death=num_ops): freed_at=num_ops+1 (never freed during exec)
