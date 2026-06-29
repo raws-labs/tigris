@@ -108,10 +108,10 @@ def read_binary_plan(data: bytes) -> dict:
         )
         spatial_pos = pos + 12  # after the first 12 bytes
         (kh, kw, sh, sw, pt, pb, pl, pr, dh, dw, group) = struct.unpack_from(
-            "<10BH", data, spatial_pos
+            "<4B7H", data, spatial_pos  # schema v2: 18-byte spatial (pad/dilation u16)
         )
-        weight_idx_val, bias_idx_val = struct.unpack_from("<HH", data, pos + 24)
-        fused_act, act_min, act_max = struct.unpack_from("<Bbbx", data, pos + 28)
+        weight_idx_val, bias_idx_val = struct.unpack_from("<HH", data, pos + 30)
+        fused_act, act_min, act_max = struct.unpack_from("<Bbbx", data, pos + 34)
         ops.append({
             "name": _read_string(name_off),
             "op_type": op_type,

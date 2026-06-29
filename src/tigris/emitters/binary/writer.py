@@ -123,13 +123,14 @@ class _ShapePool:
 
 
 def _pack_spatial_attrs(op: OpNode) -> bytes:
-    """Pack 12 bytes of spatial attributes.
+    """Pack 18 bytes of spatial attributes (schema v2).
 
     Layout:
         kernel_h(u8) kernel_w(u8) stride_h(u8) stride_w(u8)
-        pad_top(u8) pad_bottom(u8) pad_left(u8) pad_right(u8)
-        dilation_h(u8) dilation_w(u8) group(u16 LE)
-    Total: 12 bytes
+        pad_top(u16) pad_bottom(u16) pad_left(u16) pad_right(u16)
+        dilation_h(u16) dilation_w(u16) group(u16 LE)
+    Total: 18 bytes. pad/dilation are u16 (was u8) so deep dilated convs
+    (dilation/pad up to 65535, e.g. TCN/WaveNet) no longer overflow.
     """
     attrs = op.attrs
     ks = attrs.get("kernel_shape", [])
@@ -160,7 +161,7 @@ def _pack_spatial_attrs(op: OpNode) -> bytes:
         pad_right = int(pa[3]) if len(pa) >= 4 else 0
 
     return struct.pack(
-        "<10BH",
+        "<4B7H",
         kernel_h, kernel_w, stride_h, stride_w,
         pad_top, pad_bottom, pad_left, pad_right,
         dilation_h, dilation_w,
