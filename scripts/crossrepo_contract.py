@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""Prove a deterministic compiler -> runtime contract against ONNX Runtime.
+
+The gate intentionally uses only the float32 and s8 reference dispatchers.
+Accelerated backends retain their own target-specific parity tests; this checks
+that plans emitted by the compiler execute with the sibling runtime's public
+loader, arena, executor, and raw I/O contract.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import onnx
+import onnxruntime as ort
+from click import ClickException
+from numpy.typing import NDArray
+from onnx import TensorProto, helper, numpy_helper
+
+from tigris.cli import _run_pipeline
+from tigris.emitters.binary.reader import read_binary_plan
+from tigris.emitters.binary.writer import emit_binary
+
+
+Array = NDArray[np.generic]
+_DTYPE_BY_ONNX_CODE = {
+    TensorProto.FLOAT: np.dtype("<f4"),
+    TensorProto.INT8: np.dtype("i1"),
+}
+_INT8_LSB_TOLERANCE = 1
+
+
+@dataclass(frozen=True)
+class ContractCase:
+    """A compile model, independent ORT reference model, and model inputs."""
+
+    name: str
+    compile_model: onnx.ModelProto
+    reference_model: onnx.ModelProto
+    inputs: dict[str, Array]
+
+
+def _model(
+    name: str,
+    nodes: list[onnx.NodeProto],
+    inputs: list[onnx.ValueInfoProto],
+    outputs: list[onnx.ValueInfoProto],
+    initializers: list[onnx.TensorProto] = [],
+) -> onnx.ModelProto:
+    model = helper.make_model(
+        helper.make_graph(nodes, name, inputs, outputs, initializers),
+        opset_imports=[helper.make_opsetid("", 13)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    return model
+
+
+def _constant_add_case() -> ContractCase:
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4]
+    )
+    constant = numpy_helper.from_array(
+        np.array([[1.0, -2.0, 0.5, 3.0]], dtype=np.float32), "constant"
+    )
+    model = _model(
+        "constant_add",
+        [
+            helper.make_node("Add", ["input", "constant"], ["shifted"]),
+            helper.make_node("Relu", ["shifted"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        [constant],
+    )
+    return ContractCase(
+        "float_constant_add",
+        model,
+        model,
+        {
+            "input": np.array(
+                [[0.25, -1.0, 5.0, -4.0]], dtype=np.float32
+            )
+        },
+    )
+
+
+def _residual_case() -> ContractCase:
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4]
+    )
+    model = _model(
+        "residual",
+        [
+            helper.make_node("Relu", ["input"], ["left"]),
+            helper.make_node("Sigmoid", ["input"], ["right"]),
+            helper.make_node("Add", ["left", "right"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+    )
+    return ContractCase(
+        "float_residual",
+        model,
+        model,
+        {
+            "input": np.array(
+                [[-2.0, -0.5, 0.5, 2.0]], dtype=np.float32
+            )
+        },
+    )
+
+
+def _dilated_conv_case() -> ContractCase:
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 5, 5]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 1, 3, 3]
+    )
+    weights = numpy_helper.from_array(
+        np.array([[[[1.0, -0.5], [0.25, 2.0]]]], dtype=np.float32),
+        "weights",
+    )
+    model = _model(
+        "dilated_conv",
+        [
+            helper.make_node(
+                "Conv",
+                ["input", "weights"],
+                ["output"],
+                dilations=[2, 2],
+                kernel_shape=[2, 2],
+            )
+        ],
+        [model_input],
+        [model_output],
+        [weights],
+    )
+    return ContractCase(
+        "float_dilated_conv",
+        model,
+        model,
+        {
+            "input": np.array(
+                [
+                    [
+                        [
+                            [0.0, 1.0, 2.0, 3.0, 4.0],
+                            [5.0, 6.0, 7.0, 8.0, 9.0],
+                            [10.0, 11.0, 12.0, 13.0, 14.0],
+                            [15.0, 16.0, 17.0, 18.0, 19.0],
+                            [20.0, 21.0, 22.0, 23.0, 24.0],
+                        ]
+                    ]
+                ],
+                dtype=np.float32,
+            )
+        },
+    )
+
+
+def _qdq_case(operator: str) -> ContractCase:
+    """Build a QDQ Conv or AveragePool model with an int8 ORT reference."""
+    output_shape = [1, 1, 4, 4] if operator == "Conv" else [1, 1, 2, 2]
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, output_shape
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, output_shape
+    )
+
+    input_scale = numpy_helper.from_array(
+        np.array([0.25], dtype=np.float32), "input_scale"
+    )
+    input_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "input_zero_point"
+    )
+    output_scale = numpy_helper.from_array(
+        np.array([0.25], dtype=np.float32), "output_scale"
+    )
+    output_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "output_zero_point"
+    )
+    initializers = [
+        input_scale,
+        input_zero_point,
+        output_scale,
+        output_zero_point,
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear",
+            ["input", "input_scale", "input_zero_point"],
+            ["input_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["input_q", "input_scale", "input_zero_point"],
+            ["input_dq"],
+        ),
+    ]
+    if operator == "Conv":
+        weight = numpy_helper.from_array(
+            np.array([[[[0.5]]]], dtype=np.float32), "weight"
+        )
+        weight_scale = numpy_helper.from_array(
+            np.array([0.25], dtype=np.float32), "weight_scale"
+        )
+        weight_zero_point = numpy_helper.from_array(
+            np.array([0], dtype=np.int8), "weight_zero_point"
+        )
+        initializers.extend([weight, weight_scale, weight_zero_point])
+        nodes.extend(
+            [
+                helper.make_node(
+                    "QuantizeLinear",
+                    ["weight", "weight_scale", "weight_zero_point"],
+                    ["weight_q"],
+                ),
+                helper.make_node(
+                    "DequantizeLinear",
+                    ["weight_q", "weight_scale", "weight_zero_point"],
+                    ["weight_dq"],
+                ),
+                helper.make_node("Conv", ["input_dq", "weight_dq"], ["raw"]),
+            ]
+        )
+    else:
+        nodes.append(
+            helper.make_node(
+                "AveragePool",
+                ["input_dq"],
+                ["raw"],
+                kernel_shape=[2, 2],
+                strides=[2, 2],
+            )
+        )
+    nodes.extend(
+        [
+            helper.make_node(
+                "QuantizeLinear",
+                ["raw", "output_scale", "output_zero_point"],
+                ["output_q"],
+            ),
+            helper.make_node(
+                "DequantizeLinear",
+                ["output_q", "output_scale", "output_zero_point"],
+                ["output"],
+            ),
+        ]
+    )
+    compile_model = _model(
+        f"qdq_{operator.lower()}", nodes, [model_input], [model_output], initializers
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+    input_data = np.array(
+        [
+            [
+                [
+                    [-1.0, -0.75, -0.5, -0.25],
+                    [0.0, 0.25, 0.5, 0.75],
+                    [1.0, 1.25, 1.5, 1.75],
+                    [2.0, 2.25, 2.5, 2.75],
+                ]
+            ]
+        ],
+        dtype=np.float32,
+    )
+    return ContractCase(
+        f"int8_{operator.lower()}",
+        compile_model,
+        reference_model,
+        {"input": input_data},
+    )
+
+
+def _to_runtime_layout(value: Array) -> Array:
+    if value.ndim == 4:
+        return np.ascontiguousarray(value.transpose(0, 2, 3, 1))
+    if value.ndim == 3:
+        return np.ascontiguousarray(value.transpose(0, 2, 1))
+    return np.ascontiguousarray(value)
+
+
+def _from_runtime_layout(value: Array, original_ndim: int) -> Array:
+    if original_ndim == 4:
+        return np.ascontiguousarray(value.transpose(0, 3, 1, 2))
+    if original_ndim == 3:
+        return np.ascontiguousarray(value.transpose(0, 2, 1))
+    return value
+
+
+def _compile_plan(model_path: Path, plan_path: Path) -> dict:
+    graph, _ = _run_pipeline(str(model_path), ("4K",))
+    emit_binary(graph, plan_path)
+    return read_binary_plan(plan_path.read_bytes())
+
+
+def _quantize_input(value: Array, plan: dict, tensor: dict) -> Array:
+    quant_index = tensor["quant_param_idx"]
+    if quant_index == 0xFFFF:
+        raise AssertionError(f"int8 input {tensor['name']!r} has no quant params")
+    quant = plan["quant_params"][quant_index]
+    scale = float(quant["scale"])
+    if scale <= 0:
+        raise AssertionError(f"int8 input {tensor['name']!r} has invalid scale")
+    quantized = np.rint(value / scale) + int(quant["zero_point"])
+    return np.clip(quantized, -128, 127).astype(np.int8)
+
+
+def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
+    chunks: list[bytes] = []
+    for tensor_index in plan["model_inputs"]:
+        tensor = plan["tensors"][tensor_index]
+        source = inputs[tensor["name"]]
+        if tensor["dtype"] == TensorProto.FLOAT:
+            encoded = source.astype(np.float32, copy=False)
+        elif tensor["dtype"] == TensorProto.INT8:
+            encoded = _quantize_input(source, plan, tensor)
+        else:
+            raise AssertionError(
+                f"unsupported contract input dtype {tensor['dtype']}"
+            )
+        encoded = _to_runtime_layout(encoded)
+        if encoded.nbytes != tensor["size_bytes"]:
+            raise AssertionError(
+                f"input {tensor['name']!r} has {encoded.nbytes} bytes, "
+                f"plan expects {tensor['size_bytes']}"
+            )
+        chunks.append(encoded.tobytes())
+    return b"".join(chunks)
+
+
+def _decode_outputs(
+    plan: dict, raw: bytes, reference_outputs: list[Array]
+) -> list[Array]:
+    decoded: list[Array] = []
+    offset = 0
+    if len(plan["model_outputs"]) != len(reference_outputs):
+        raise AssertionError("plan and ONNX Runtime output counts differ")
+    for tensor_index, reference in zip(plan["model_outputs"], reference_outputs):
+        tensor = plan["tensors"][tensor_index]
+        dtype = _DTYPE_BY_ONNX_CODE.get(tensor["dtype"])
+        if dtype is None:
+            raise AssertionError(
+                f"unsupported contract output dtype {tensor['dtype']}"
+            )
+        end = offset + tensor["size_bytes"]
+        if end > len(raw):
+            raise AssertionError("runtime output file is truncated")
+        value = np.frombuffer(raw[offset:end], dtype=dtype).copy()
+        value = value.reshape(tensor["shape"])
+        decoded.append(_from_runtime_layout(value, reference.ndim))
+        offset = end
+    if offset != len(raw):
+        raise AssertionError("runtime output file has trailing bytes")
+    return decoded
+
+
+def _run(command: list[str], description: str) -> None:
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{description} failed (exit {completed.returncode}):\n"
+            f"{completed.stdout}{completed.stderr}"
+        )
+
+
+def _build_runner(runtime: Path, build_dir: Path) -> Path:
+    _run(
+        [
+            "cmake",
+            "-S",
+            str(runtime),
+            "-B",
+            str(build_dir),
+            "-DCMAKE_BUILD_TYPE=Release",
+        ],
+        "runtime configure",
+    )
+    _run(
+        [
+            "cmake",
+            "--build",
+            str(build_dir),
+            "--target",
+            "tigris_contract_runner",
+            "--parallel",
+        ],
+        "runtime contract-runner build",
+    )
+    return build_dir / "tigris_contract_runner"
+
+
+def _run_case(
+    case: ContractCase, runner: Path, work_dir: Path
+) -> Path:
+    case_dir = work_dir / case.name
+    case_dir.mkdir()
+    compile_path = case_dir / "compile.onnx"
+    reference_path = case_dir / "reference.onnx"
+    plan_path = case_dir / "model.tgrs"
+    inputs_path = case_dir / "inputs.bin"
+    outputs_path = case_dir / "outputs.bin"
+    onnx.save(case.compile_model, compile_path)
+    onnx.save(case.reference_model, reference_path)
+
+    plan = _compile_plan(compile_path, plan_path)
+    session = ort.InferenceSession(
+        str(reference_path), providers=["CPUExecutionProvider"]
+    )
+    reference_outputs = session.run(None, case.inputs)
+    inputs_path.write_bytes(_pack_inputs(plan, case.inputs))
+    _run(
+        [str(runner), str(plan_path), str(inputs_path), str(outputs_path)],
+        f"{case.name} runtime execution",
+    )
+    actual_outputs = _decode_outputs(
+        plan, outputs_path.read_bytes(), reference_outputs
+    )
+    for actual, expected in zip(actual_outputs, reference_outputs):
+        if np.issubdtype(expected.dtype, np.floating):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        else:
+            # The runtime uses integer half-away-from-zero quantization while
+            # this ONNX Runtime QDQ reference follows a different half-tie
+            # rule. Keep the same one-LSB acceptance bound used by benchmark
+            # validation, while rejecting any larger contract drift.
+            np.testing.assert_allclose(
+                actual, expected, rtol=0, atol=_INT8_LSB_TOLERANCE
+            )
+    print(f"PASS {case.name}")
+    return plan_path
+
+
+def _assert_compile_rejected(work_dir: Path) -> None:
+    cases = [
+        _model(
+            "unsupported_sin",
+            [helper.make_node("Sin", ["input"], ["output"])],
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
+        ),
+        _model(
+            "output_transpose",
+            [helper.make_node("Transpose", ["input"], ["output"], perm=[2, 0, 1])],
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2, 3])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [3, 1, 2])],
+        ),
+    ]
+    for index, model in enumerate(cases):
+        path = work_dir / f"rejected-{index}.onnx"
+        onnx.save(model, path)
+        try:
+            _compile_plan(path, work_dir / f"rejected-{index}.tgrs")
+        except (ClickException, ValueError):
+            continue
+        raise AssertionError(f"{model.graph.name} unexpectedly compiled")
+    print("PASS compiler_rejections")
+
+
+def _assert_runtime_rejects_incompatible_plan(
+    runner: Path, plan_path: Path, work_dir: Path
+) -> None:
+    data = bytearray(plan_path.read_bytes())
+    data[4:8] = (0xFFFFFFFF).to_bytes(4, "little")
+    incompatible = work_dir / "incompatible.tgrs"
+    input_path = work_dir / "empty-input.bin"
+    output_path = work_dir / "unexpected-output.bin"
+    incompatible.write_bytes(data)
+    input_path.write_bytes(b"")
+    completed = subprocess.run(
+        [str(runner), str(incompatible), str(input_path), str(output_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode == 0:
+        raise AssertionError("runtime accepted an incompatible plan version")
+    if output_path.exists():
+        raise AssertionError("runtime wrote output for an incompatible plan")
+    print("PASS incompatible_plan_rejection")
+
+
+def _run_gate(runtime: Path, work_dir: Path) -> None:
+    cases = [
+        _constant_add_case(),
+        _residual_case(),
+        _dilated_conv_case(),
+        _qdq_case("Conv"),
+        _qdq_case("AveragePool"),
+    ]
+    runner = _build_runner(runtime, work_dir / "runtime-build")
+    first_plan = _run_case(cases[0], runner, work_dir)
+    for case in cases[1:]:
+        _run_case(case, runner, work_dir)
+    _assert_compile_rejected(work_dir)
+    _assert_runtime_rejects_incompatible_plan(runner, first_plan, work_dir)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--runtime",
+        type=Path,
+        default=Path("../tigris-runtime"),
+        help="Path to the sibling tigris-runtime checkout",
+    )
+    parser.add_argument(
+        "--artifacts",
+        type=Path,
+        help="Retain generated ONNX, plan, input, and output files in this empty directory",
+    )
+    args = parser.parse_args()
+    runtime = args.runtime.resolve()
+    if not (runtime / "CMakeLists.txt").is_file():
+        raise SystemExit(f"runtime checkout not found: {runtime}")
+
+    if args.artifacts:
+        work_dir = args.artifacts.resolve()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        if any(work_dir.iterdir()):
+            raise SystemExit(f"artifact directory must be empty: {work_dir}")
+        _run_gate(runtime, work_dir)
+        print(f"Retained contract artifacts in {work_dir}")
+    else:
+        with tempfile.TemporaryDirectory(prefix="tigris-crossrepo-") as temp:
+            _run_gate(runtime, Path(temp))
+    print("Cross-repository compiler/runtime contract gate passed.")
+
+
+if __name__ == "__main__":
+    main()

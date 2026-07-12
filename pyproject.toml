@@ -36,8 +36,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2",
     "pytest>=7.0",
     "onnxruntime>=1.17",
+    "ruff>=0.6",
 ]
 
 [project.urls]
