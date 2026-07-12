@@ -31,12 +31,24 @@ def _run_pipeline(model: str, mem: tuple[str, ...]):
     model_path = Path(model)
     mem_pools = [_parse_size(m) for m in mem]
 
-    with console.status("Loading model..."):
-        ag = load_model(model_path)
-        ag = compute_lifetimes(ag)
-        ag = compute_memory_timeline(ag)
+    try:
+        with console.status("Loading model..."):
+            ag = load_model(model_path)
+            ag = compute_lifetimes(ag)
+            ag = compute_memory_timeline(ag)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not 0 <= ag.peak_memory_bytes <= 0xFFFFFFFF:
+        raise click.ClickException(
+            "Peak activation memory exceeds the uint32 plan-format limit"
+        )
 
     budget = mem_pools[0] if mem_pools else 0
+    if budget > 0xFFFFFFFF:
+        raise click.ClickException(
+            "Fast-memory budget exceeds the uint32 plan-format limit"
+        )
     if budget > 0:
         with console.status("Partitioning..."):
             ag = partition_temporal(ag, budget)

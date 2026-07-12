@@ -32,7 +32,10 @@ console = Console()
 
 _INLINE = [
     ("linear_3op",      build_linear_3op,      "4K",   False),
-    ("conv_relu_chain", build_conv_relu_chain,  "32K",  False),
+    # The stage's true co-resident input/output peak is 53,888 bytes.  Keep the
+    # binary contract fixture single-stage so it tests the wire format rather
+    # than temporal partitioning behavior.
+    ("conv_relu_chain", build_conv_relu_chain,  "64K",  False),
     ("ds_cnn",          build_ds_cnn,           "256K", True),
     ("fc_autoencoder",  build_fc_autoencoder,   "256K", True),
     ("tcn",             build_tcn,              "256K", True),

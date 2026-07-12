@@ -21,7 +21,6 @@ from .defs import (
     NO_QUANT_PARAM,
     NO_WEIGHT,
     OP_TYPE_MAP,
-    OP_TYPE_UNKNOWN,
     SEC_INDEX_POOL,
     SEC_OPS,
     SEC_QUANT_PARAMS,
@@ -122,7 +121,9 @@ class _ShapePool:
 # Spatial attribute helpers
 
 
-def _pack_spatial_attrs(op: OpNode) -> bytes:
+def _pack_spatial_attrs(
+    op: OpNode, weight_data: dict[str, np.ndarray] | None = None
+) -> bytes:
     """Pack 18 bytes of spatial attributes (schema v2).
 
     Layout:
@@ -140,13 +141,49 @@ def _pack_spatial_attrs(op: OpNode) -> bytes:
     gr = int(attrs.get("group", 1))
 
     is_1d = len(ks) == 1
+    is_spatial = op.op_type in {
+        "Conv",
+        "Conv1D",
+        "DepthwiseConv",
+        "ConvTranspose",
+        "MaxPool",
+        "AveragePool",
+    }
+    if not ks and op.op_type in {
+        "Conv",
+        "Conv1D",
+        "DepthwiseConv",
+        "ConvTranspose",
+    }:
+        # ONNX Conv kernel_shape is optional: infer it from the first constant
+        # weight operand rather than serializing a zero-sized kernel.
+        for input_name in op.inputs:
+            weights = (weight_data or {}).get(input_name)
+            if weights is None:
+                continue
+            if weights.ndim >= 4:
+                ks = [int(weights.shape[-2]), int(weights.shape[-1])]
+            elif weights.ndim == 3:
+                ks = [int(weights.shape[-1])]
+            break
+    if is_spatial and not ks:
+        raise ValueError(
+            f"Cannot emit spatial operator {op.name!r} ({op.op_type}) "
+            "without a concrete kernel_shape"
+        )
 
     kernel_h = int(ks[0]) if len(ks) >= 1 else 0
     kernel_w = int(ks[1]) if len(ks) >= 2 else (1 if is_1d else (kernel_h if ks else 0))
-    stride_h = int(st[0]) if len(st) >= 1 else 0
-    stride_w = int(st[1]) if len(st) >= 2 else (1 if is_1d else (stride_h if st else 0))
-    dilation_h = int(di[0]) if len(di) >= 1 else 0
-    dilation_w = int(di[1]) if len(di) >= 2 else (1 if is_1d else (dilation_h if di else 0))
+    # ONNX defaults both stride and dilation to 1 for spatial operators.
+    # Zero is reserved for non-spatial descriptors in the binary format.
+    stride_h = int(st[0]) if len(st) >= 1 else (1 if is_spatial else 0)
+    stride_w = int(st[1]) if len(st) >= 2 else (
+        1 if is_1d else (stride_h if st or is_spatial else 0)
+    )
+    dilation_h = int(di[0]) if len(di) >= 1 else (1 if is_spatial else 0)
+    dilation_w = int(di[1]) if len(di) >= 2 else (
+        1 if is_1d else (dilation_h if di or is_spatial else 0)
+    )
 
     if is_1d and len(pa) == 2:
         # ONNX Conv1D pads: [begin, end]
@@ -173,16 +210,26 @@ def _pack_spatial_attrs(op: OpNode) -> bytes:
 
 
 def _build_weight_op_map(ag: AnalyzedGraph) -> dict[str, str]:
-    """Map each weight name to its consumer op_type (the op where it appears as inputs[1])."""
+    """Map each serialized weight to the operator that determines its layout."""
     result: dict[str, str] = {}
     for op in ag.ops:
-        if len(op.inputs) >= 2 and op.inputs[1] in ag.weight_data:
+        if op.op_type in {"Add", "Mul"}:
+            for input_name in op.inputs:
+                if input_name in ag.weight_data:
+                    result[input_name] = op.op_type
+        elif len(op.inputs) >= 2 and op.inputs[1] in ag.weight_data:
             result[op.inputs[1]] = op.op_type
     return result
 
 
 def _transpose_weight_nhwc(arr: np.ndarray, op_type: str | None) -> np.ndarray:
     """Transpose weight from NCHW convention to NHWC convention at emission time."""
+    if op_type in {"Add", "Mul"}:
+        if arr.ndim == 4:
+            return arr.transpose(0, 2, 3, 1)
+        if arr.ndim == 3:
+            return arr.transpose(0, 2, 1)
+
     if arr.ndim == 4 and op_type == "DepthwiseConv":
         # ONNX depthwise: [C, 1, KH, KW] -> OHWI gives [C, KH, KW, 1]
         # Then reshape to [C, KH, KW] and transpose to [KH, KW, C] (HWC)
@@ -623,7 +670,7 @@ def _build_ops(
 
     for op in ag.ops:
         name_off = strings.add(op.name)
-        op_type = OP_TYPE_MAP.get(op.op_type, OP_TYPE_UNKNOWN)
+        op_type = OP_TYPE_MAP[op.op_type]
 
         # Map input/output tensor names to indices (skip constants)
         inp_indices = [tensor_idx[n] for n in op.inputs if n in tensor_idx]
@@ -632,7 +679,7 @@ def _build_ops(
         inp_off, inp_count = index_pool.add(inp_indices)
         out_off, out_count = index_pool.add(out_indices)
 
-        spatial = _pack_spatial_attrs(op)
+        spatial = _pack_spatial_attrs(op, ag.weight_data)
 
         # Resolve weight/bias indices from op's constant inputs
         w_idx, b_idx = _resolve_weight_bias(op, weight_idx)
@@ -642,10 +689,10 @@ def _build_ops(
         fused_act = {"Relu": ACT_RELU, "Relu6": ACT_RELU6}.get(fused_act_str, ACT_NONE)
         act_min, act_max = _compute_act_bounds(ag, op, fused_act)
 
-        # tigris_op_t: 32 bytes
+        # tigris_op_t: 38 bytes (schema v2)
         # name_str(u32) op_type(u8) num_inputs(u8) num_outputs(u8) stage(u8)
         # inputs_offset(u16) outputs_offset(u16)
-        # spatial_attrs(12 bytes)
+        # spatial_attrs(18 bytes)
         # weight_idx(u16) bias_idx(u16)
         # fused_act(u8) act_min(i8) act_max(i8) _pad(u8)
         buf.extend(struct.pack(
@@ -953,6 +1000,37 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
         compress: Weight compression method. ``None`` or ``"lz4"``.
         xip: If True, set FLAG_XIP in the header (weights read from flash).
     """
+    from tigris.analysis.validation import (
+        validate_execution_dtype,
+        validate_memory_plan,
+        validate_operator_support,
+    )
+
+    if not 0 <= ag.mem_budget <= 0xFFFFFFFF:
+        raise ValueError("Fast-memory budget exceeds the uint32 plan-format limit")
+    if not 0 <= ag.peak_memory_bytes <= 0xFFFFFFFF:
+        raise ValueError("Peak activation memory exceeds the uint32 plan-format limit")
+
+    dtype_validation = validate_execution_dtype(ag)
+    if not dtype_validation.supported:
+        raise ValueError(
+            "Cannot emit a plan with unsupported tensor dtypes: "
+            + dtype_validation.describe()
+        )
+
+    operator_validation = validate_operator_support(ag)
+    if not operator_validation.supported:
+        raise ValueError(
+            "Cannot emit a plan with unsupported operators: "
+            + operator_validation.describe()
+        )
+
+    if ag.mem_budget > 0:
+        validation = validate_memory_plan(ag)
+        if not validation.feasible:
+            details = "; ".join(issue.describe() for issue in validation.issues)
+            raise ValueError(f"Cannot emit an infeasible memory plan: {details}")
+
     strings = _StringTable()
     shapes = _ShapePool()
     index_pool = _IndexPool()

@@ -2,12 +2,15 @@
 
 import struct
 
+import pytest
+
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.analysis.partition_spatial import partition_spatial
 from tigris import SCHEMA_VERSION
 from tigris.emitters.binary.defs import (
+    HEADER_SIZE,
     MAGIC,
     OP_TYPE_MAP,
 )
@@ -34,7 +37,7 @@ def test_magic_and_version(linear_3op_path):
     data = emit_binary_bytes(ag)
 
     assert data[:4] == MAGIC
-    version = struct.unpack_from("<H", data, 4)[0]
+    version = struct.unpack_from("<I", data, 4)[0]
     assert version == SCHEMA_VERSION
 
 
@@ -65,18 +68,18 @@ def test_roundtrip_linear(linear_3op_path):
 
 
 def test_roundtrip_diamond(diamond_path):
-    ag = _full_pipeline(diamond_path, budget=512)
+    ag = _full_pipeline(diamond_path, budget=1536)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
     assert plan["model_name"] == "diamond"
     assert plan["num_ops"] == 3
-    assert plan["num_stages"] >= 2
-    assert plan["budget"] == 512
+    assert plan["num_stages"] >= 1
+    assert plan["budget"] == 1536
 
 
 def test_roundtrip_conv_chain(conv_relu_chain_path):
-    ag = _full_pipeline(conv_relu_chain_path, budget=4096)
+    ag = _full_pipeline(conv_relu_chain_path, budget=6144)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -169,31 +172,33 @@ def test_op_types(linear_3op_path):
     plan = read_binary_plan(data)
 
     for i, op in enumerate(plan["ops"]):
-        expected_type = OP_TYPE_MAP.get(ag.ops[i].op_type, 255)
+        expected_type = OP_TYPE_MAP[ag.ops[i].op_type]
         assert op["op_type"] == expected_type
 
 
 # Stage and tile plan tests
 
 
-def test_stages_preserved(diamond_path):
-    ag = _full_pipeline(diamond_path, budget=512)
+def test_stages_preserved(conv_relu_chain_path):
+    ag = _full_pipeline(conv_relu_chain_path, budget=6144)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
+    assert len(ag.stages) >= 2
     assert plan["num_stages"] == len(ag.stages)
     for i, stage in enumerate(plan["stages"]):
         assert stage["peak_bytes"] == ag.stages[i].peak_bytes
 
 
-def test_tile_plans_preserved(conv_relu_chain_path):
+def test_tile_plans_preserved(conv_pool_chain_path):
     """If pipeline produces tile plans, verify they survive the round-trip."""
-    # Use a tiny budget to force tiling
-    ag = _full_pipeline(conv_relu_chain_path, budget=1024)
+    # This fixture has a feasible 4 KiB tile plan.
+    ag = _full_pipeline(conv_pool_chain_path, budget=4096)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
     tiled_stages = [s for s in ag.stages if s.tile_plan is not None]
+    assert tiled_stages
     assert plan["num_tile_plans"] == len(tiled_stages)
 
     for tp_bin, stage in zip(plan["tile_plans"], tiled_stages):
@@ -266,15 +271,40 @@ def test_all_fixtures_with_budget(
         linear_3op_path, diamond_path, large_activations_path,
         conv_relu_chain_path, conv_with_flatten_path, conv_pool_chain_path,
     ]:
-        ag = _full_pipeline(path, budget=1024)
+        ag = _full_pipeline(path, budget=8192)
         data = emit_binary_bytes(ag)
         plan = read_binary_plan(data)
         assert plan["magic"] == MAGIC
         assert plan["num_ops"] == len(ag.ops)
-        assert plan["budget"] == 1024
+        assert plan["budget"] == 8192
 
 
 # Error handling
+
+
+@pytest.mark.parametrize("version", [0, 1, SCHEMA_VERSION, 99])
+def test_schema_version_validation(linear_3op_path, version):
+    ag = _full_pipeline(linear_3op_path)
+    data = bytearray(emit_binary_bytes(ag))
+    struct.pack_into("<I", data, 4, version)
+
+    if version == SCHEMA_VERSION:
+        assert read_binary_plan(bytes(data))["version"] == SCHEMA_VERSION
+    else:
+        with pytest.raises(ValueError) as exc_info:
+            read_binary_plan(bytes(data))
+        assert str(exc_info.value) == (
+            f"Unsupported schema version: {version} (expected {SCHEMA_VERSION})"
+        )
+
+
+def test_missing_required_section_is_rejected_cleanly(linear_3op_path):
+    ag = _full_pipeline(linear_3op_path)
+    data = bytearray(emit_binary_bytes(ag))
+    struct.pack_into("<II", data, HEADER_SIZE, 0, 0)
+
+    with pytest.raises(ValueError, match="Missing required section type"):
+        read_binary_plan(bytes(data))
 
 
 def test_bad_magic():

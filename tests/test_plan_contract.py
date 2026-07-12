@@ -14,7 +14,7 @@ import onnx
 from tigris import SCHEMA_VERSION
 from tigris.cli import _run_pipeline
 from tigris.fixtures import build_linear_3op, build_conv_relu_chain, build_ds_cnn
-from tigris.emitters.binary.defs import MAGIC, HEADER_SIZE
+from tigris.emitters.binary.defs import HEADER_SIZE, MAGIC, OP_SIZE
 from tigris.emitters.binary.writer import emit_binary_bytes
 
 
@@ -36,7 +36,7 @@ def _parse_header(data):
     assert len(data) >= HEADER_SIZE
     h = {}
     h["magic"] = data[:4]
-    h["version"] = struct.unpack_from("<H", data, 4)[0]
+    h["version"] = struct.unpack_from("<I", data, 4)[0]
     h["file_size"] = struct.unpack_from("<I", data, 8)[0]
     h["num_tensors"] = struct.unpack_from("<H", data, 16)[0]
     h["num_ops"] = struct.unpack_from("<H", data, 18)[0]
@@ -58,7 +58,7 @@ CONTRACT = {
     "linear_3op": {
         "builder": build_linear_3op,
         "budget_str": "4K",
-        "version": 1,
+        "version": 2,
         "num_tensors": 4,
         "num_ops": 3,
         "num_stages": 1,
@@ -75,7 +75,7 @@ CONTRACT = {
         # would (correctly) force multi-stage slow-overflow; 64K keeps this a
         # clean single-stage plan, which is what this format contract checks.
         "budget_str": "64K",
-        "version": 1,
+        "version": 2,
         "num_tensors": 3,
         "num_ops": 2,        # Relu fused into first Conv
         "num_stages": 1,
@@ -88,7 +88,7 @@ CONTRACT = {
     "ds_cnn": {
         "builder": build_ds_cnn,
         "budget_str": "256K",
-        "version": 1,
+        "version": 2,
         "num_tensors": 13,
         "num_ops": 12,
         "num_stages": 1,
@@ -110,8 +110,13 @@ def test_header_size():
 
 
 def test_schema_version():
-    """Schema version constant must be 1."""
-    assert SCHEMA_VERSION == 1
+    """Schema version constant must be 2."""
+    assert SCHEMA_VERSION == 2
+
+
+def test_op_size():
+    """Schema-v2 operator records must be exactly 38 bytes."""
+    assert OP_SIZE == 38
 
 
 def test_linear_3op_contract():

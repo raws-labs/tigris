@@ -67,11 +67,11 @@ TENSOR_FLAG_CONSTANT = 0x01
 TENSOR_FLAG_MODEL_INPUT = 0x02
 TENSOR_FLAG_MODEL_OUTPUT = 0x04
 
-# Struct sizes
+# Struct sizes (schema v2)
 HEADER_SIZE = 48
 SECTION_ENTRY_SIZE = 8
 TENSOR_SIZE = 16
-OP_SIZE = 38  # schema v2: spatial attrs pad/dilation widened u8->u16 (12->18 bytes)
+OP_SIZE = 38  # spatial attrs pad/dilation widened u8->u16 (12->18 bytes)
 STAGE_SIZE = 28
 TILE_PLAN_SIZE = 24
 WEIGHT_ENTRY_SIZE = 12
@@ -82,7 +82,6 @@ WEIGHT_BLOCK_SIZE = 20
 NO_WEIGHT = 0xFFFF
 NO_QUANT_PARAM = 0xFFFF
 
-# Spatial attr keys we extract from ONNX op attrs
 # Fused activation enum
 ACT_NONE = 0
 ACT_RELU = 1

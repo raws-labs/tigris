@@ -63,6 +63,9 @@ class Findings:
     untileable_op_types: list[str] = field(default_factory=list)
     untileable_stages: list[UntileableStage] = field(default_factory=list)
     min_untileable_peak: int = 0
+    feasibility_errors: list[str] = field(default_factory=list)
+    unsupported_operators: list[str] = field(default_factory=list)
+    dtype_errors: list[str] = field(default_factory=list)
 
     # quantization
     is_float32: bool = False
@@ -119,7 +122,7 @@ def _estimate_weight_sizes(ag: AnalyzedGraph) -> tuple[int, int, int]:
 def _estimate_plan_overhead(ag: AnalyzedGraph) -> int:
     """Estimate non-weight plan size (header, section directory, tables)."""
     from tigris.emitters.binary.defs import (
-        HEADER_SIZE, SECTION_ENTRY_SIZE, STAGE_SIZE,
+        HEADER_SIZE, OP_SIZE, SECTION_ENTRY_SIZE, STAGE_SIZE,
     )
     n_tensors = sum(1 for t in ag.tensors.values() if not t.is_constant)
     n_ops = len(ag.ops)
@@ -127,9 +130,9 @@ def _estimate_plan_overhead(ag: AnalyzedGraph) -> int:
     n_weights = len(ag.weight_data)
 
     overhead = HEADER_SIZE
-    overhead += 10 * SECTION_ENTRY_SIZE   # section directory (max sections + sentinel)
+    overhead += 11 * SECTION_ENTRY_SIZE   # 10 max sections + sentinel
     overhead += n_tensors * 16            # tensor table
-    overhead += n_ops * 28                # op table
+    overhead += n_ops * OP_SIZE           # op table
     overhead += n_stages * STAGE_SIZE     # stage table
     overhead += n_stages * 24             # tile plans (upper bound)
     overhead += n_weights * 12            # weight entries
@@ -149,7 +152,27 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, slow_budget: int 
     f.flash_budget = flash_budget
     f.slow_budget = slow_budget
 
+    from tigris.analysis.validation import (
+        validate_execution_dtype,
+        validate_operator_support,
+    )
+
+    operator_validation = validate_operator_support(ag)
+    f.unsupported_operators = [
+        issue.describe() for issue in operator_validation.issues
+    ]
+    dtype_validation = validate_execution_dtype(ag)
+    f.dtype_errors = list(dtype_validation.issues)
+
     if not ag.lifetimes:
+        if f.unsupported_operators or f.dtype_errors:
+            f.verdict = "needs_work"
+            if f.unsupported_operators:
+                f.verdict_text = (
+                    "Unsupported operators: " + ", ".join(f.unsupported_operators)
+                )
+            else:
+                f.verdict_text = f.dtype_errors[0]
         return f
 
     # Largest tensor
@@ -196,31 +219,13 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, slow_budget: int 
         f.untileable_stages.sort(key=lambda u: -u.peak_bytes)
         f.min_untileable_peak = f.untileable_stages[0].peak_bytes
 
-    # Scheduled peak: max SRAM actually needed after partitioning + tiling + chains
-    from tigris.analysis.partition_spatial import (
-        _back_propagate_tile_heights, _chain_fast_bytes, _get_stage_spatial_params,
-    )
-    scheduled = 0
-    for s in ag.stages:
-        # Skip non-head chain members — their peak is governed by the chain head
-        if s.chain_id != 0xFFFF and s.chain_id != s.stage_id:
-            continue
+    # Analysis and deployment share one execution-unit validator, so a CLI
+    # PASS cannot disagree with `tigris compile` about memory feasibility.
+    from tigris.analysis.validation import validate_memory_plan
 
-        if s.chain_id != 0xFFFF and s.chain_tile_h > 0:
-            # Chain head — recompute actual memory with solved tile height
-            chain_stages_list = [
-                cs for cs in ag.stages if cs.chain_id == s.chain_id
-            ]
-            chain_params = [_get_stage_spatial_params(ag, cs) for cs in chain_stages_list]
-            heights = _back_propagate_tile_heights(chain_params, s.chain_tile_h)
-            stage_peak = _chain_fast_bytes(ag, chain_stages_list, heights)
-        elif s.tile_plan is not None and s.tile_plan.tileable:
-            stage_peak = s.tile_plan.tiled_peak_bytes
-        else:
-            stage_peak = s.peak_bytes
-        if stage_peak > scheduled:
-            scheduled = stage_peak
-    f.scheduled_peak_bytes = scheduled
+    validation = validate_memory_plan(ag)
+    f.scheduled_peak_bytes = validation.scheduled_peak_bytes
+    f.feasibility_errors = [issue.describe() for issue in validation.issues]
 
     # Verdict
     if budget > 0:
@@ -228,7 +233,10 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, slow_budget: int 
         f.stages_needing_tiling = sum(1 for s in ag.stages if s.warnings)
         f.total_stages = len(ag.stages)
 
-        if f.ratio <= 1.0:
+        if not validation.feasible:
+            f.verdict = "needs_work"
+            f.verdict_text = f.feasibility_errors[0]
+        elif f.ratio <= 1.0:
             f.verdict = "ok"
             f.verdict_text = (
                 f"Peak memory ({fmt_bytes(peak)}) fits within budget "
@@ -259,6 +267,15 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, slow_budget: int 
                 f"{f.total_stages} stages exceed budget. "
                 f"{f.stages_untileable} stage(s) contain untileable ops."
             )
+
+    if f.unsupported_operators:
+        f.verdict = "needs_work"
+        f.verdict_text = (
+            "Unsupported operators: " + ", ".join(f.unsupported_operators)
+        )
+    elif f.dtype_errors:
+        f.verdict = "needs_work"
+        f.verdict_text = f.dtype_errors[0]
 
     # Spill/reload cost
     if ag.stages and len(ag.stages) > 1:

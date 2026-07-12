@@ -2,6 +2,8 @@
 
 import struct
 
+from tigris import SCHEMA_VERSION
+
 from .defs import (
     HEADER_SIZE,
     MAGIC,
@@ -49,18 +51,58 @@ def read_binary_plan(data: bytes) -> dict:
 
     if magic != MAGIC:
         raise ValueError(f"Bad magic: {magic!r}")
+    if version != SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported schema version: {version} (expected {SCHEMA_VERSION})"
+        )
     if file_size != len(data):
         raise ValueError(f"File size mismatch: header says {file_size}, got {len(data)}")
 
     # Parse section directory
     sections: dict[int, int] = {}
     off = section_dir_off
+    found_sentinel = False
     while off + SECTION_ENTRY_SIZE <= len(data):
         sec_type, sec_off = struct.unpack_from("<II", data, off)
         off += SECTION_ENTRY_SIZE
         if sec_type == 0:
+            found_sentinel = True
             break
+        if sec_type > SEC_WEIGHT_BLOCKS:
+            raise ValueError(f"Unknown section type: {sec_type}")
+        if sec_type in sections:
+            raise ValueError(f"Duplicate section type: {sec_type}")
+        if sec_off > len(data):
+            raise ValueError(
+                f"Section {sec_type} offset {sec_off} exceeds file size {len(data)}"
+            )
         sections[sec_type] = sec_off
+
+    if not found_sentinel:
+        raise ValueError("Section directory has no sentinel")
+
+    required_sections = {
+        SEC_TENSORS,
+        SEC_OPS,
+        SEC_INDEX_POOL,
+        SEC_SHAPE_POOL,
+        SEC_STRINGS,
+    }
+    if num_stages:
+        required_sections.add(SEC_STAGES)
+    if num_tile_plans:
+        required_sections.add(SEC_TILE_PLANS)
+    if num_weights:
+        required_sections.add(SEC_WEIGHTS)
+    if num_quant_params:
+        required_sections.add(SEC_QUANT_PARAMS)
+    missing = sorted(
+        sec_type
+        for sec_type in required_sections
+        if not sections.get(sec_type)
+    )
+    if missing:
+        raise ValueError(f"Missing required section type(s): {missing}")
 
     def _read_string(str_off: int) -> str:
         base = sections[SEC_STRINGS]

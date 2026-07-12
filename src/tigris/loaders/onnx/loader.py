@@ -9,18 +9,29 @@ from onnx import numpy_helper, shape_inference
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 
 
-def _extract_shape(type_proto: onnx.TypeProto) -> tuple[int, ...]:
-    """Extract concrete shape from an ONNX TypeProto, treating dynamic dims as 1."""
+def _extract_shape(type_proto: onnx.TypeProto, tensor_name: str) -> tuple[int, ...]:
+    """Extract a fully concrete deployment shape from an ONNX TypeProto.
+
+    Memory planning cannot safely guess symbolic or otherwise unresolved
+    dimensions.  Reject them before they enter the IR rather than silently
+    treating them as one and understating the required arena size.
+    """
     tensor_type = type_proto.tensor_type
     if not tensor_type.HasField("shape"):
-        return ()
+        raise ValueError(
+            f"Tensor {tensor_name!r} has unknown rank; TiGrIS requires "
+            "concrete deployment shapes"
+        )
     dims: list[int] = []
-    for d in tensor_type.shape.dim:
+    for axis, d in enumerate(tensor_type.shape.dim):
         if d.dim_value > 0:
             dims.append(d.dim_value)
         else:
-            # Dynamic / symbolic dimension - default to 1 for memory estimation
-            dims.append(1)
+            detail = f"symbolic value {d.dim_param!r}" if d.dim_param else "unknown value"
+            raise ValueError(
+                f"Tensor {tensor_name!r} dimension {axis} has {detail}; "
+                "TiGrIS requires concrete deployment shapes"
+            )
     return tuple(dims)
 
 
@@ -64,7 +75,7 @@ def load_model(path: str | Path) -> AnalyzedGraph:
             continue
         ag.tensors[vi.name] = TensorInfo(
             name=vi.name,
-            shape=_extract_shape(vi.type),
+            shape=_extract_shape(vi.type, vi.name),
             dtype=_extract_dtype(vi.type),
             is_constant=vi.name in initializer_names,
         )

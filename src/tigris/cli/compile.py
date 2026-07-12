@@ -19,9 +19,39 @@ from tigris.utils import fmt_bytes
               help="Execute-in-place: weights read directly from flash at runtime")
 def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None, compress: str, xip: bool):
     """Compile an ONNX model to binary deployment format."""
+    from tigris.analysis.validation import (
+        validate_execution_dtype,
+        validate_memory_plan,
+        validate_operator_support,
+    )
     from tigris.emitters.binary.writer import emit_binary
 
     ag, budget = _run_pipeline(model, mem)
+    if budget <= 0:
+        raise click.ClickException("Fast-memory budget must be greater than zero")
+    if budget > 0xFFFFFFFF:
+        raise click.ClickException(
+            "Fast-memory budget exceeds the uint32 plan-format limit"
+        )
+
+    dtype_validation = validate_execution_dtype(ag)
+    if not dtype_validation.supported:
+        raise click.ClickException(
+            "Cannot compile a plan with unsupported tensor dtypes: "
+            + dtype_validation.describe()
+        )
+
+    operator_validation = validate_operator_support(ag)
+    if not operator_validation.supported:
+        raise click.ClickException(
+            "Cannot compile a plan with unsupported operators: "
+            + operator_validation.describe()
+        )
+
+    validation = validate_memory_plan(ag)
+    if not validation.feasible:
+        details = "; ".join(issue.describe() for issue in validation.issues)
+        raise click.ClickException(f"Cannot compile an infeasible memory plan: {details}")
 
     compress_arg = compress if compress != "none" else None
     out = Path(output) if output else Path(model).with_suffix(".tgrs")

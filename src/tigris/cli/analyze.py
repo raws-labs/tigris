@@ -60,8 +60,28 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
         model_grid.add_row("Quantization", "INT8 (QDQ)")
     elif findings.is_float32:
         model_grid.add_row("Dtype", "float32")
+    if findings.unsupported_operators:
+        model_grid.add_row(
+            "[red]Unsupported operators[/]",
+            "[red]" + ", ".join(findings.unsupported_operators) + "[/]",
+        )
+    if findings.dtype_errors:
+        model_grid.add_row(
+            "[red]Unsupported dtype[/]",
+            "[red]" + "; ".join(findings.dtype_errors) + "[/]",
+        )
 
-    model_panel = Panel(model_grid, title=f"[bold]TiGrIS - {ag.model_name}[/]", border_style="blue")
+    model_failed = bool(findings.unsupported_operators or findings.dtype_errors)
+    model_panel = Panel(
+        model_grid,
+        title=f"[bold]TiGrIS - {ag.model_name}[/]",
+        subtitle=(
+            "[bold red] FAIL - unsupported deployment contract [/]"
+            if model_failed
+            else None
+        ),
+        border_style="red" if model_failed else "blue",
+    )
     console.print(model_panel)
 
     # SRAM
@@ -78,6 +98,8 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
         vs = sram_style_map.get(findings.verdict, "dim")
         vlabel = sram_label_map.get(findings.verdict, "?")
         vtext = sram_verdict_map.get(findings.verdict, "")
+        if findings.unsupported_operators or findings.dtype_errors:
+            vtext = "unsupported deployment contract"
 
         sram = Table.grid(padding=(0, 2))
         sram.add_column(style="bold")
@@ -102,9 +124,11 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
             sram.add_row("", "")
             sram.add_row("Need tiling", f"{findings.stages_needing_tiling} of {findings.total_stages} stages")
             if findings.stages_tileable > 0:
+                tile_style = "red" if findings.feasibility_errors else "green"
                 sram.add_row(
                     "  tileable",
-                    f"[green]{findings.stages_tileable}[/] ({findings.total_tiles} tiles, max halo {findings.max_halo})",
+                    f"[{tile_style}]{findings.stages_tileable}[/] "
+                    f"({findings.total_tiles} tiles, max halo {findings.max_halo})",
                 )
             if findings.stages_untileable > 0:
                 ops = ", ".join(findings.untileable_op_types)
@@ -122,6 +146,14 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
                         f"    stage {us.stage_id}",
                         f"{fmt_bytes(us.peak_bytes)} ({ops_str})",
                     )
+
+        if findings.feasibility_errors:
+            sram.add_row("", "")
+            for i, error in enumerate(findings.feasibility_errors[:3]):
+                sram.add_row("Infeasible" if i == 0 else "", f"[red]{error}[/]")
+            if len(findings.feasibility_errors) > 3:
+                sram.add_row("", f"... and {len(findings.feasibility_errors) - 3} more")
+            vtext = "minimum execution unit exceeds budget"
 
         # Slow memory (PSRAM) overflow warning
         if slow_budget > 0 and not findings.slow_fits:

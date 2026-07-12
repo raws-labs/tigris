@@ -28,8 +28,8 @@ Passes applied in sequence (matches ``normalize()`` call order):
     ``Resize`` ops' constant inputs and store in ``strides`` attr.
 10. **Concat axis normalization**: Translate Concat axis from NCHW to NHWC
     and store in ``kernel_shape`` attr for spatial packing.
-11. **Output transpose trimming**: Remove trailing ``Transpose`` ops before
-    model outputs (host-side post-processing handles layout).
+11. **Output transpose validation**: Reject trailing ``Transpose`` ops until
+    their permutation can be represented in the deployment contract.
 12. **Activation absorption**: Fuse Relu/Relu6 into preceding
     Conv/DepthwiseConv/Gemm/Conv1D ops as ``fused_activation`` attr.
     Runs last so all relabeling and rewiring is already done.
@@ -53,7 +53,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_shape_ops(ag)
     ag = _extract_resize_scales(ag)
     ag = _normalize_concat_axis(ag)
-    ag = _trim_output_transpose(ag)
+    ag = _validate_output_transposes(ag)
     ag = _absorb_activations(ag)
     return ag
 
@@ -928,53 +928,41 @@ def _normalize_concat_axis(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _trim_output_transpose(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Remove trailing Transpose ops before model outputs.
+def _validate_output_transposes(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Reject output Transpose ops whose observable permutation would be lost.
 
-    YOLOv5 and similar models often end with Transpose ops for output
-    layout. Since host-side post-processing can handle any layout, we
-    remove these to avoid needing a general Transpose kernel.
+    The plan schema has no output-layout transform metadata and the runtime has
+    no general Transpose kernel.  Removing a trailing Transpose therefore
+    changes the model output name, shape, and element order.  Keep the graph
+    fail-closed until such a permutation is explicit in the deployment
+    contract rather than silently delegating it to unspecified host code.
     """
-    # Build output->op map
-    output_to_op_idx: dict[str, int] = {}
-    for i, op in enumerate(ag.ops):
+    output_to_op: dict[str, OpNode] = {}
+    for op in ag.ops:
         for out in op.outputs:
-            output_to_op_idx[out] = i
-
-    removed: set[int] = set()
-    new_model_outputs: list[str] = []
+            output_to_op[out] = op
 
     for out_name in ag.model_outputs:
-        if out_name not in output_to_op_idx:
-            new_model_outputs.append(out_name)
+        op = output_to_op.get(out_name)
+        if op is None or op.op_type != "Transpose":
             continue
 
-        op_idx = output_to_op_idx[out_name]
-        op = ag.ops[op_idx]
+        input_name = op.inputs[0] if op.inputs else ""
+        input_info = ag.tensors.get(input_name)
+        output_info = ag.tensors.get(out_name)
+        rank = len(input_info.shape) if input_info is not None else 0
+        perm = op.attrs.get("perm")
+        if perm is None and rank:
+            perm = list(reversed(range(rank)))
 
-        if op.op_type != "Transpose":
-            new_model_outputs.append(out_name)
-            continue
-
-        # Replace model output with the Transpose's input
-        transpose_input = op.inputs[0]
-        new_model_outputs.append(transpose_input)
-
-        # Mark the input tensor as model output
-        if transpose_input in ag.tensors:
-            pass  # tensor flags are set by the writer based on model_outputs
-
-        # Remove intermediate tensor
-        if out_name in ag.tensors and out_name != transpose_input:
-            del ag.tensors[out_name]
-
-        removed.add(op_idx)
-
-    if removed:
-        ag.model_outputs = new_model_outputs
-        ag.ops = [op for i, op in enumerate(ag.ops) if i not in removed]
-        for step, op in enumerate(ag.ops):
-            op.step = step
+        input_shape = input_info.shape if input_info is not None else "unknown"
+        output_shape = output_info.shape if output_info is not None else "unknown"
+        raise ValueError(
+            f"Cannot preserve model output '{out_name}': trailing Transpose "
+            f"'{op.name}' uses perm={perm}, changing shape {input_shape} to "
+            f"{output_shape}. The deployment contract does not encode output "
+            "permutations, so TiGrIS refuses to remove this operator."
+        )
 
     return ag
 
