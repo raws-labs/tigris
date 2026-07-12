@@ -10,6 +10,7 @@ from tigris.analysis.partition_spatial import partition_spatial
 from tigris.emitters.binary.defs import NO_WEIGHT
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
 
 
@@ -95,6 +96,39 @@ def test_weight_blob_data(conv_relu_chain_path):
         assert blob_bytes == expected, f"Weight blob mismatch for {name}"
 
 
+def test_full_shape_elementwise_constant_is_emitted_in_nhwc_layout():
+    constant = np.arange(12, dtype=np.float32).reshape(1, 2, 2, 3)
+    graph = AnalyzedGraph(
+        ops=[
+            OpNode(
+                name="constant_first_add",
+                op_type="Add",
+                inputs=["constant", "input"],
+                outputs=["output"],
+            )
+        ],
+        tensors={
+            "input": TensorInfo("input", constant.shape, 1),
+            "constant": TensorInfo(
+                "constant", constant.shape, 1, is_constant=True
+            ),
+            "output": TensorInfo("output", constant.shape, 1),
+        },
+        weight_data={"constant": constant},
+        model_inputs=["input"],
+        model_outputs=["output"],
+    )
+
+    data = emit_binary_bytes(graph)
+    plan = read_binary_plan(data)
+    weight = plan["weights"][0]
+    start = weight["blob_base"] + weight["offset"]
+    actual = data[start : start + weight["size_bytes"]]
+
+    assert actual == constant.transpose(0, 2, 3, 1).tobytes()
+    assert plan["ops"][0]["weight_idx"] == 0
+
+
 def test_no_weights_section_when_empty(diamond_path):
     """Binary plan should not have a weights section for activation-only graphs."""
     ag = _full_pipeline(diamond_path)
@@ -151,7 +185,7 @@ def test_all_fixtures_with_weights(
 ):
     """All fixtures with weights should produce valid binaries."""
     for path in [conv_relu_chain_path, conv_with_flatten_path, conv_pool_chain_path]:
-        ag = _full_pipeline(path, budget=4096)
+        ag = _full_pipeline(path, budget=8192)
         data = emit_binary_bytes(ag)
         plan = read_binary_plan(data)
         assert plan["num_weights"] > 0

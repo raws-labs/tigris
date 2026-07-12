@@ -43,7 +43,7 @@ def test_lz4_roundtrip():
 
 def test_compressed_plan_has_weight_blocks(conv_relu_chain_path):
     """Compressed plan should contain SEC_WEIGHT_BLOCKS section."""
-    ag = _full_pipeline(conv_relu_chain_path, budget=4096)
+    ag = _full_pipeline(conv_relu_chain_path, budget=8192)
     data = emit_binary_bytes(ag, compress="lz4")
     plan = read_binary_plan(data)
 
@@ -56,7 +56,7 @@ def test_compressed_plan_has_weight_blocks(conv_relu_chain_path):
 
 def test_compressed_weight_data_matches(conv_relu_chain_path):
     """Decompressed weight data from compressed plan matches uncompressed plan."""
-    ag = _full_pipeline(conv_relu_chain_path, budget=4096)
+    ag = _full_pipeline(conv_relu_chain_path, budget=8192)
 
     data_plain = emit_binary_bytes(ag)
     data_lz4 = emit_binary_bytes(ag, compress="lz4")
@@ -86,7 +86,7 @@ def test_compressed_weight_data_matches(conv_relu_chain_path):
 
 def test_uncompressed_plan_unchanged(conv_relu_chain_path):
     """Without --compress, no SEC_WEIGHT_BLOCKS section should appear."""
-    ag = _full_pipeline(conv_relu_chain_path, budget=4096)
+    ag = _full_pipeline(conv_relu_chain_path, budget=8192)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -102,7 +102,7 @@ def test_all_fixtures_compressed(
 ):
     """All fixtures with weights produce valid compressed plans."""
     for path in [linear_3op_path, conv_relu_chain_path, conv_pool_chain_path]:
-        ag = _full_pipeline(path, budget=4096)
+        ag = _full_pipeline(path, budget=8192)
         if not ag.weight_data:
             continue
         data = emit_binary_bytes(ag, compress="lz4")
@@ -117,10 +117,11 @@ def test_all_fixtures_compressed(
 
 def test_weight_grouping_by_stage(conv_relu_chain_path):
     """Each weight block maps to exactly one stage."""
-    ag = _full_pipeline(conv_relu_chain_path, budget=4096)
+    ag = _full_pipeline(conv_relu_chain_path, budget=8192)
     data = emit_binary_bytes(ag, compress="lz4")
     plan = read_binary_plan(data)
 
+    assert len(plan["weight_blocks"]) >= 2
     # Each block has a valid stage index
     for block in plan["weight_blocks"]:
         assert block["stage_idx"] < plan["num_stages"]
@@ -135,7 +136,7 @@ def test_weight_grouping_by_stage(conv_relu_chain_path):
 
 def test_weightless_graph_no_blocks(diamond_path):
     """A graph with no weights should produce no weight blocks."""
-    ag = _full_pipeline(diamond_path, budget=512)
+    ag = _full_pipeline(diamond_path, budget=1536)
     data = emit_binary_bytes(ag, compress="lz4")
     plan = read_binary_plan(data)
 
@@ -148,7 +149,7 @@ def test_weightless_graph_no_blocks(diamond_path):
 
 def test_compressed_plan_smaller(conv_relu_chain_path):
     """Compressed plan should not be larger than uncompressed (with real data)."""
-    ag = _full_pipeline(conv_relu_chain_path, budget=4096)
+    ag = _full_pipeline(conv_relu_chain_path, budget=8192)
 
     # Replace zero weights with random data for better compression test
     for name in ag.weight_data:

@@ -1,18 +1,92 @@
 """C code generator — emits a deployment harness from a .tgrs plan.
 
 Backend selection implies the target platform:
-- reference  → POSIX (load plan from file, malloc)
-- esp-nn     → ESP-IDF (plan in flash partition, heap_caps, PSRAM)
-- cmsis-nn   → Cortex-M bare metal (plan linked as extern symbol, static buffers)
+- reference  → POSIX (float reference or s8_ref, selected by plan dtype)
+- esp-nn     → ESP-IDF (ESP-NN int8 with s8_ref fallback; float reference)
+- cmsis-nn   → Cortex-M (CMSIS-NN int8 with s8_ref fallback; float reference)
 """
 
 from __future__ import annotations
 
+from tigris.capabilities import (
+    CODEGEN_BACKENDS,
+    DTypeMode,
+    OP_TYPE_BY_CODE,
+    describe_codegen_route,
+    effective_operators,
+    resolve_kernel_backend,
+)
 from tigris.emitters.binary.defs import FLAG_XIP
 from tigris.emitters.binary.reader import read_binary_plan
 
 
-BACKENDS = ("reference", "esp-nn", "cmsis-nn")
+BACKENDS = CODEGEN_BACKENDS
+_CMSIS_TENSOR_ALIGN = 16
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _cmsis_weight_decompression_overhead(plan: dict) -> int:
+    """Mirror the runtime's simultaneous compressed-weight reservation.
+
+    Cortex-M codegen uses a static arena, so this value must be part of the
+    generated array size rather than discovered after allocation.
+    """
+    blocks = [
+        block
+        for block in plan.get("weight_blocks", [])
+        if block["compressed_size"] > 0
+    ]
+    if not blocks:
+        return 0
+
+    def block_size(block: dict) -> int:
+        return _align_up(block["uncompressed_size"], _CMSIS_TENSOR_ALIGN)
+
+    max_required = max(block_size(block) for block in blocks)
+    stages = plan.get("stages", [])
+    for stage_idx, stage in enumerate(stages):
+        chain_len = stage["chain_len"]
+        if (
+            chain_len < 2
+            or stage["chain_id"] != stage_idx
+            or chain_len > len(stages) - stage_idx
+        ):
+            continue
+
+        chain_required = 0
+        for member_idx in range(stage_idx, stage_idx + chain_len):
+            block = next(
+                (item for item in blocks if item["stage_idx"] == member_idx),
+                None,
+            )
+            if block is not None:
+                chain_required += block_size(block)
+        max_required = max(max_required, chain_required)
+
+    return max_required
+
+
+def _plan_dtype(plan: dict) -> DTypeMode:
+    """Resolve the graph-wide runtime dtype from serialized tensors."""
+    tensor_dtypes = {tensor["dtype"] for tensor in plan.get("tensors", [])}
+    num_quant_params = plan.get("num_quant_params", 0)
+
+    if tensor_dtypes == {1} and num_quant_params == 0:
+        return "float32"
+    if tensor_dtypes == {3} and num_quant_params > 0:
+        return "int8"
+
+    labels = {1: "float32", 3: "int8"}
+    found = ", ".join(
+        labels.get(dtype, f"ONNX dtype {dtype}") for dtype in sorted(tensor_dtypes)
+    ) or "none"
+    raise ValueError(
+        "Plan cannot select one graph-wide runtime dispatcher: activation "
+        f"dtypes are {found}, quantization parameter count is {num_quant_params}"
+    )
 
 
 def generate_c(plan_data: bytes, backend: str) -> str:
@@ -21,10 +95,31 @@ def generate_c(plan_data: bytes, backend: str) -> str:
         raise ValueError(f"Unknown backend: {backend!r}. Choose from: {', '.join(BACKENDS)}")
 
     plan = read_binary_plan(plan_data)
+    if not plan["stages"]:
+        raise ValueError("Plan has no executable stages; compile it with a memory budget")
     xip = bool(plan["flags"] & FLAG_XIP)
-    is_quantized = plan.get("num_quant_params", 0) > 0
+    dtype = _plan_dtype(plan)
+    is_quantized = dtype == "int8"
+    kernel_backend = resolve_kernel_backend(backend, dtype)
+    supported = effective_operators(kernel_backend)
 
-    header_comment = _header_comment(plan, backend, xip)
+    unsupported = []
+    for op in plan["ops"]:
+        opcode = op["op_type"]
+        op_type = OP_TYPE_BY_CODE.get(opcode)
+        if op_type is None or op_type not in supported:
+            label = op_type if op_type is not None else f"opcode {opcode}"
+            unsupported.append(f"{op['name']} ({label})")
+
+    if unsupported:
+        route = describe_codegen_route(backend, dtype)
+        raise ValueError(
+            f"Backend {backend!r} cannot execute this {dtype} plan. "
+            f"Kernel route: {route}. Unsupported operators: "
+            + ", ".join(unsupported)
+        )
+
+    header_comment = _header_comment(plan, backend, xip, dtype)
 
     if backend == "esp-nn":
         return header_comment + _generate_esp(plan, is_quantized)
@@ -34,7 +129,10 @@ def generate_c(plan_data: bytes, backend: str) -> str:
         return header_comment + _generate_posix(plan, is_quantized)
 
 
-def _header_comment(plan: dict, backend: str, xip: bool) -> str:
+def _header_comment(
+    plan: dict, backend: str, xip: bool, dtype: DTypeMode
+) -> str:
+    route = describe_codegen_route(backend, dtype)
     return f"""\
 /*
  * Auto-generated by: tigris codegen --backend {backend}
@@ -45,6 +143,8 @@ def _header_comment(plan: dict, backend: str, xip: bool) -> str:
  * Weights: {plan['num_weights']}
  * Budget:  {plan['budget']} bytes
  * XIP:     {'yes' if xip else 'no'}
+ * Dtype:   {dtype}
+ * Kernels: {route}
  */
 
 """
@@ -57,6 +157,7 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
 
     return f"""\
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -70,11 +171,19 @@ static uint8_t *load_file(const char *path, uint32_t *out_len)
 {{
     FILE *f = fopen(path, "rb");
     if (!f) {{ perror(path); return NULL; }}
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {{ fclose(f); return NULL; }}
     long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (sz < 0 || (unsigned long)sz > UINT32_MAX ||
+        fseek(f, 0, SEEK_SET) != 0) {{
+        fclose(f);
+        return NULL;
+    }}
     uint8_t *buf = malloc((size_t)sz);
-    if (buf) fread(buf, 1, (size_t)sz, f);
+    if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {{
+        free(buf);
+        fclose(f);
+        return NULL;
+    }}
     fclose(f);
     *out_len = (uint32_t)sz;
     return buf;
@@ -96,6 +205,7 @@ int main(int argc, char **argv)
     tigris_error_t err = tigris_plan_load(plan_buf, plan_len, &plan);
     if (err != TIGRIS_OK) {{
         fprintf(stderr, "Plan load failed: %s\\n", tigris_error_str(err));
+        free(plan_buf);
         return 1;
     }}
 
@@ -106,9 +216,20 @@ int main(int argc, char **argv)
     /* 2. Allocate buffers */
     uint32_t fast_size = plan.header->budget;
     if (fast_size == 0) fast_size = {budget};
-    fast_size += tigris_weight_decompression_overhead(&plan);
+    uint32_t weight_overhead = tigris_weight_decompression_overhead(&plan);
+    if (weight_overhead == UINT32_MAX || fast_size > UINT32_MAX - weight_overhead) {{
+        fprintf(stderr, "Invalid compressed-weight arena requirement\\n");
+        free(plan_buf);
+        return 1;
+    }}
+    fast_size += weight_overhead;
 
-    uint32_t slow_size = plan.header->peak * 4;
+    if (plan.header->peak > UINT32_MAX / 4u) {{
+        fprintf(stderr, "Slow-memory arena requirement exceeds uint32\\n");
+        free(plan_buf);
+        return 1;
+    }}
+    uint32_t slow_size = plan.header->peak * 4u;
     if (slow_size < 256 * 1024) slow_size = 256 * 1024;
 
     void *fast_buf = malloc(fast_size);
@@ -117,17 +238,30 @@ int main(int argc, char **argv)
     void **tensor_ptrs = calloc(num_t, sizeof(void *));
     if (!fast_buf || !slow_buf || !tensor_ptrs) {{
         fprintf(stderr, "Allocation failed\\n");
+        free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
         return 1;
     }}
 
     /* 3. Init memory manager */
     tigris_mem_t mem;
-    tigris_mem_init(&mem, tensor_ptrs, num_t, fast_buf, fast_size, slow_buf, slow_size);
+    tigris_mem_error_t merr = tigris_mem_init(
+        &mem, tensor_ptrs, num_t, fast_buf, fast_size, slow_buf, slow_size);
+    if (merr != TIGRIS_MEM_OK) {{
+        fprintf(stderr, "Memory init failed: %s\\n", tigris_mem_error_str(merr));
+        free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
+        return 1;
+    }}
 
     /* 4. Allocate and zero-fill model inputs */
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {{
         uint16_t tidx = plan.model_inputs[i];
-        tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
+        merr = tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
+        if (merr != TIGRIS_MEM_OK) {{
+            fprintf(stderr, "Input allocation failed for tensor %u: %s\\n",
+                    tidx, tigris_mem_error_str(merr));
+            free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
+            return 1;
+        }}
         memset(mem.tensor_ptrs[tidx], 0, plan.tensors[tidx].size_bytes);
     }}
 
@@ -136,6 +270,7 @@ int main(int argc, char **argv)
     tigris_exec_error_t eerr = tigris_run(&plan, &mem, {dispatch}, NULL, &stats);
     if (eerr != TIGRIS_EXEC_OK) {{
         fprintf(stderr, "Inference failed: %s\\n", tigris_exec_error_str(eerr));
+        free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
         return 1;
     }}
 
@@ -149,11 +284,11 @@ int main(int argc, char **argv)
         void *ptr = mem.tensor_ptrs[tidx];
         if (!ptr) continue;
         printf("Output '%s': %u bytes\\n", tigris_tensor_name(&plan, t), t->size_bytes);
-        float *out = (float *)ptr;
-        uint32_t n = t->size_bytes / sizeof(float);
+        {"int8_t" if is_quantized else "float"} *out = ({"int8_t" if is_quantized else "float"} *)ptr;
+        uint32_t n = t->size_bytes / {"1" if is_quantized else "sizeof(float)"};
         uint32_t show = n < 10 ? n : 10;
         for (uint32_t j = 0; j < show; j++)
-            printf("  [%u] %.6f\\n", j, out[j]);
+            printf("  [%u] {"% d" if is_quantized else "%.6f"}\\n", j, {"(int)" if is_quantized else ""}out[j]);
         if (n > show) printf("  ... (%u more)\\n", n - show);
     }}
 
@@ -175,7 +310,10 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
         prepare_block = """\
 
     /* ESP-NN scratch buffer setup */
-    tigris_esp_nn_prepare(&plan, &mem);
+    if (tigris_esp_nn_prepare(&plan, &mem) != 0) {
+        ESP_LOGE(TAG, "ESP-NN preparation failed");
+        goto cleanup;
+    }
 """
     else:
         dispatch = "tigris_dispatch_kernel"
@@ -220,8 +358,18 @@ void app_main(void)
     }}
 
     /* 2. Load the plan (zero-copy from flash) */
+    if (part->size < sizeof(tigris_file_header_t)) {{
+        ESP_LOGE(TAG, "plan partition is smaller than the file header");
+        esp_partition_munmap(mmap_handle);
+        return;
+    }}
     const tigris_file_header_t *raw_hdr = (const tigris_file_header_t *)mapped_ptr;
     uint32_t plan_size = raw_hdr->file_size;
+    if ((size_t)plan_size > part->size) {{
+        ESP_LOGE(TAG, "plan file size exceeds the mapped partition");
+        esp_partition_munmap(mmap_handle);
+        return;
+    }}
 
     tigris_plan_t plan;
     tigris_error_t perr = tigris_plan_load(
@@ -238,7 +386,13 @@ void app_main(void)
     /* 3. Allocate buffers */
     uint32_t fast_size = plan.header->budget;
     if (fast_size == 0) fast_size = {budget};
-    fast_size += tigris_weight_decompression_overhead(&plan);
+    uint32_t weight_overhead = tigris_weight_decompression_overhead(&plan);
+    if (weight_overhead == UINT32_MAX || fast_size > UINT32_MAX - weight_overhead) {{
+        ESP_LOGE(TAG, "invalid compressed-weight arena requirement");
+        esp_partition_munmap(mmap_handle);
+        return;
+    }}
+    fast_size += weight_overhead;
 
 #if CONFIG_SPIRAM
     uint32_t slow_size = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
@@ -273,12 +427,22 @@ void app_main(void)
 
     /* 4. Init memory manager */
     tigris_mem_t mem;
-    tigris_mem_init(&mem, tensor_ptrs, num_t, fast_buf, fast_size, slow_buf, slow_size);
+    tigris_mem_error_t merr = tigris_mem_init(
+        &mem, tensor_ptrs, num_t, fast_buf, fast_size, slow_buf, slow_size);
+    if (merr != TIGRIS_MEM_OK) {{
+        ESP_LOGE(TAG, "memory init failed: %s", tigris_mem_error_str(merr));
+        goto cleanup;
+    }}
 {prepare_block}
     /* 5. Allocate and zero-fill model inputs */
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {{
         uint16_t tidx = plan.model_inputs[i];
-        tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
+        merr = tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
+        if (merr != TIGRIS_MEM_OK) {{
+            ESP_LOGE(TAG, "input allocation failed for tensor %u: %s",
+                     tidx, tigris_mem_error_str(merr));
+            goto cleanup;
+        }}
         memset(mem.tensor_ptrs[tidx], 0, plan.tensors[tidx].size_bytes);
     }}
 
@@ -326,6 +490,28 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
     dispatch = "tigris_dispatch_kernel_cmsis_nn" if is_quantized else "tigris_dispatch_kernel"
     kernel_include = '#include "tigris_kernels_cmsis_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
     budget = plan["budget"] or 65536
+    weight_overhead = _cmsis_weight_decompression_overhead(plan)
+    fast_arena_size = budget + weight_overhead
+    if fast_arena_size > 0xFFFFFFFF:
+        raise ValueError(
+            "CMSIS-NN static fast arena exceeds the uint32 runtime size limit"
+        )
+    slow_arena_size = max(budget * 4, 256 * 1024)
+    if slow_arena_size > 0xFFFFFFFF:
+        raise ValueError(
+            "CMSIS-NN static slow arena exceeds the uint32 runtime size limit"
+        )
+
+    if is_quantized:
+        prepare_block = """\
+
+    if (tigris_cmsis_nn_prepare(&plan, &mem) != 0) {
+        printf("CMSIS-NN preparation failed\\n");
+        return 1;
+    }
+"""
+    else:
+        prepare_block = ""
 
     return f"""\
 /*
@@ -351,9 +537,9 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
 extern const uint8_t _binary_model_tgrs_start[];
 extern const uint8_t _binary_model_tgrs_end[];
 
-/* Static buffers — adjust sizes to match your target's SRAM */
-static uint8_t fast_arena[{budget}] __attribute__((aligned(16)));
-static uint8_t slow_arena[{max(budget * 4, 256 * 1024)}] __attribute__((aligned(16)));
+/* Static buffers. The fast arena includes the plan's compressed-weight reserve. */
+static uint8_t fast_arena[{fast_arena_size}] __attribute__((aligned(16)));
+static uint8_t slow_arena[{slow_arena_size}] __attribute__((aligned(16)));
 static void *tensor_ptrs[{plan['num_tensors']}];
 
 int main(void)
@@ -371,21 +557,33 @@ int main(void)
     printf("Model: %s  Ops: %u  Stages: %u\\n",
            tigris_model_name(&plan), plan.header->num_ops, plan.header->num_stages);
 
-    /* 2. Init memory manager */
-    uint32_t fast_size = sizeof(fast_arena);
-    fast_size += tigris_weight_decompression_overhead(&plan);
-    /* Note: if decompression overhead > 0, increase fast_arena[] accordingly */
+    /* 2. Validate the generated static compressed-weight reservation. */
+    uint32_t weight_overhead = tigris_weight_decompression_overhead(&plan);
+    if (weight_overhead > {weight_overhead}u) {{
+        printf("Compressed-weight arena requirement exceeds generated reserve\\n");
+        return 1;
+    }}
 
     tigris_mem_t mem;
     memset(tensor_ptrs, 0, sizeof(tensor_ptrs));
-    tigris_mem_init(&mem, tensor_ptrs, {plan['num_tensors']},
-                    fast_arena, sizeof(fast_arena),
-                    slow_arena, sizeof(slow_arena));
+    tigris_mem_error_t merr = tigris_mem_init(
+        &mem, tensor_ptrs, {plan['num_tensors']},
+        fast_arena, sizeof(fast_arena), slow_arena, sizeof(slow_arena));
+    if (merr != TIGRIS_MEM_OK) {{
+        printf("Memory init failed: %s\\n", tigris_mem_error_str(merr));
+        return 1;
+    }}
+{prepare_block}
 
     /* 3. Allocate and zero-fill model inputs */
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {{
         uint16_t tidx = plan.model_inputs[i];
-        tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
+        merr = tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
+        if (merr != TIGRIS_MEM_OK) {{
+            printf("Input allocation failed for tensor %u: %s\\n",
+                   tidx, tigris_mem_error_str(merr));
+            return 1;
+        }}
         memset(mem.tensor_ptrs[tidx], 0, plan.tensors[tidx].size_bytes);
     }}
 
