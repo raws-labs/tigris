@@ -25,6 +25,7 @@ from onnx import TensorProto, helper, numpy_helper
 
 from tigris.cli import _run_pipeline
 from tigris.emitters.binary.reader import read_binary_plan
+from tigris.emitters.binary.defs import COMPRESS_LZ4, FLAG_XIP
 from tigris.emitters.binary.writer import emit_binary
 
 
@@ -44,6 +45,11 @@ class ContractCase:
     compile_model: onnx.ModelProto
     reference_model: onnx.ModelProto
     inputs: dict[str, Array]
+    mem_budget: str = "4K"
+    compression: str | None = None
+    xip: bool = False
+    expect_tiled: bool = False
+    expect_chain: bool = False
 
 
 def _model(
@@ -169,6 +175,124 @@ def _dilated_conv_case() -> ContractCase:
                 dtype=np.float32,
             )
         },
+    )
+
+
+def _depthwise_conv_case() -> ContractCase:
+    """Float depthwise Conv exercises its distinct weight layout and route."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 8, 8]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 2, 8, 8]
+    )
+    weights = numpy_helper.from_array(
+        np.array(
+            [
+                [[[1.0, 0.0, -1.0], [0.5, 0.25, -0.5], [0.0, 1.0, 0.0]]],
+                [[[-0.5, 0.25, 0.5], [1.0, -1.0, 0.0], [0.25, 0.0, -0.25]]],
+            ],
+            dtype=np.float32,
+        ),
+        "weights",
+    )
+    model = _model(
+        "depthwise_conv",
+        [
+            helper.make_node(
+                "Conv",
+                ["input", "weights"],
+                ["output"],
+                pads=[1, 1, 1, 1],
+                group=2,
+            )
+        ],
+        [model_input],
+        [model_output],
+        [weights],
+    )
+    return ContractCase(
+        "float_depthwise_conv",
+        model,
+        model,
+        {"input": np.linspace(-2.0, 2.0, 128, dtype=np.float32).reshape(1, 2, 8, 8)},
+    )
+
+
+def _tiled_pool_case() -> ContractCase:
+    """A pool case large enough to require standalone tiled execution."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 64, 64]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 1, 32, 32]
+    )
+    model = _model(
+        "tiled_pool",
+        [
+            helper.make_node(
+                "AveragePool",
+                ["input"],
+                ["output"],
+                kernel_shape=[2, 2],
+                strides=[2, 2],
+            )
+        ],
+        [model_input],
+        [model_output],
+    )
+    return ContractCase(
+        "float_tiled_averagepool",
+        model,
+        model,
+        {"input": np.arange(4096, dtype=np.float32).reshape(1, 1, 64, 64) / 64.0},
+        mem_budget="4K",
+        expect_tiled=True,
+    )
+
+
+def _tiled_chain_case(*, compression: str | None = None, xip: bool = False) -> ContractCase:
+    """Three padded Conv stages force the streamable-chain executor."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 3, 64, 64]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 8, 64, 64]
+    )
+    rng = np.random.default_rng(7)
+    weights = [
+        numpy_helper.from_array(
+            rng.normal(0.0, 0.05, size=shape).astype(np.float32), name
+        )
+        for name, shape in (
+            ("w0", (4, 3, 3, 3)),
+            ("w1", (4, 4, 3, 3)),
+            ("w2", (8, 4, 3, 3)),
+        )
+    ]
+    nodes = [
+        helper.make_node(
+            "Conv", ["input", "w0"], ["mid0"], pads=[1, 1, 1, 1]
+        ),
+        helper.make_node(
+            "Conv", ["mid0", "w1"], ["mid1"], pads=[1, 1, 1, 1]
+        ),
+        helper.make_node(
+            "Conv", ["mid1", "w2"], ["output"], pads=[1, 1, 1, 1]
+        ),
+    ]
+    model = _model("tiled_chain", nodes, [model_input], [model_output], weights)
+    suffix = "lz4" if compression else "xip"
+    return ContractCase(
+        f"float_tiled_chain_{suffix}",
+        model,
+        model,
+        {"input": np.linspace(-1.0, 1.0, 12288, dtype=np.float32).reshape(1, 3, 64, 64)},
+        mem_budget="32K",
+        compression=compression,
+        xip=xip,
+        expect_tiled=True,
+        expect_chain=True,
     )
 
 
@@ -309,9 +433,16 @@ def _from_runtime_layout(value: Array, original_ndim: int) -> Array:
     return value
 
 
-def _compile_plan(model_path: Path, plan_path: Path) -> dict:
-    graph, _ = _run_pipeline(str(model_path), ("4K",))
-    emit_binary(graph, plan_path)
+def _compile_plan(
+    model_path: Path,
+    plan_path: Path,
+    *,
+    mem_budget: str,
+    compression: str | None,
+    xip: bool,
+) -> dict:
+    graph, _ = _run_pipeline(str(model_path), (mem_budget,))
+    emit_binary(graph, plan_path, compress=compression, xip=xip)
     return read_binary_plan(plan_path.read_bytes())
 
 
@@ -424,7 +555,14 @@ def _run_case(
     onnx.save(case.compile_model, compile_path)
     onnx.save(case.reference_model, reference_path)
 
-    plan = _compile_plan(compile_path, plan_path)
+    plan = _compile_plan(
+        compile_path,
+        plan_path,
+        mem_budget=case.mem_budget,
+        compression=case.compression,
+        xip=case.xip,
+    )
+    _assert_plan_mode(case, plan)
     session = ort.InferenceSession(
         str(reference_path), providers=["CPUExecutionProvider"]
     )
@@ -452,6 +590,30 @@ def _run_case(
     return plan_path
 
 
+def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
+    """Ensure each corpus case actually exercises the intended plan mode."""
+    standalone_tiled = any(
+        tile["tileable"] and tile["num_tiles"] > 1
+        for tile in plan["tile_plans"]
+    )
+    chained = any(stage["chain_len"] >= 2 for stage in plan["stages"])
+    # Streamable chains encode their tile height on the chain head rather than
+    # creating standalone tile-plan records.
+    tiled = standalone_tiled or chained
+    if tiled != case.expect_tiled:
+        raise AssertionError(f"{case.name}: tiled={tiled}, expected {case.expect_tiled}")
+    if chained != case.expect_chain:
+        raise AssertionError(f"{case.name}: chained={chained}, expected {case.expect_chain}")
+    if case.compression == "lz4":
+        if plan["weight_blocks_compression"] != COMPRESS_LZ4:
+            raise AssertionError(f"{case.name}: expected LZ4 weight blocks")
+    elif plan["weight_blocks"]:
+        raise AssertionError(f"{case.name}: unexpected compressed weight blocks")
+    has_xip = bool(plan["flags"] & FLAG_XIP)
+    if has_xip != case.xip:
+        raise AssertionError(f"{case.name}: XIP flag={has_xip}, expected {case.xip}")
+
+
 def _assert_compile_rejected(work_dir: Path) -> None:
     cases = [
         _model(
@@ -471,7 +633,13 @@ def _assert_compile_rejected(work_dir: Path) -> None:
         path = work_dir / f"rejected-{index}.onnx"
         onnx.save(model, path)
         try:
-            _compile_plan(path, work_dir / f"rejected-{index}.tgrs")
+            _compile_plan(
+                path,
+                work_dir / f"rejected-{index}.tgrs",
+                mem_budget="4K",
+                compression=None,
+                xip=False,
+            )
         except (ClickException, ValueError):
             continue
         raise AssertionError(f"{model.graph.name} unexpectedly compiled")
@@ -506,6 +674,10 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _constant_add_case(),
         _residual_case(),
         _dilated_conv_case(),
+        _depthwise_conv_case(),
+        _tiled_pool_case(),
+        _tiled_chain_case(compression="lz4"),
+        _tiled_chain_case(xip=True),
         _qdq_case("Conv"),
         _qdq_case("AveragePool"),
     ]
