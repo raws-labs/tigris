@@ -67,7 +67,7 @@ TENSOR_FLAG_CONSTANT = 0x01
 TENSOR_FLAG_MODEL_INPUT = 0x02
 TENSOR_FLAG_MODEL_OUTPUT = 0x04
 
-# Struct sizes (schema v2)
+# Struct sizes (layout retained by schema v3)
 HEADER_SIZE = 48
 SECTION_ENTRY_SIZE = 8
 TENSOR_SIZE = 16

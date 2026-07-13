@@ -51,9 +51,9 @@ def read_binary_plan(data: bytes) -> dict:
 
     if magic != MAGIC:
         raise ValueError(f"Bad magic: {magic!r}")
-    if version != SCHEMA_VERSION:
+    if version not in {2, SCHEMA_VERSION}:
         raise ValueError(
-            f"Unsupported schema version: {version} (expected {SCHEMA_VERSION})"
+            f"Unsupported schema version: {version} (expected 2 or {SCHEMA_VERSION})"
         )
     if file_size != len(data):
         raise ValueError(f"File size mismatch: header says {file_size}, got {len(data)}")
@@ -150,7 +150,7 @@ def read_binary_plan(data: bytes) -> dict:
         )
         spatial_pos = pos + 12  # after the first 12 bytes
         (kh, kw, sh, sw, pt, pb, pl, pr, dh, dw, group) = struct.unpack_from(
-            "<4B7H", data, spatial_pos  # schema v2: 18-byte spatial (pad/dilation u16)
+            "<4B7H", data, spatial_pos  # 18-byte spatial (pad/dilation u16)
         )
         weight_idx_val, bias_idx_val = struct.unpack_from("<HH", data, pos + 30)
         fused_act, act_min, act_max = struct.unpack_from("<Bbbx", data, pos + 34)
@@ -242,12 +242,23 @@ def read_binary_plan(data: bytes) -> dict:
     quant_params = []
     qp_base = sections.get(SEC_QUANT_PARAMS, 0)
     if qp_base:
-        nqp, qd_len = struct.unpack_from("<HH", data, qp_base)
+        nqp, qd_field = struct.unpack_from("<HH", data, qp_base)
         entries_start = qp_base + 4
         data_start = entries_start + nqp * QUANT_PARAM_SIZE
+        if version == 2:
+            qd_len = qd_field
+        else:
+            quant_end = min(
+                (offset for offset in sections.values() if offset > qp_base),
+                default=len(data),
+            )
+            qd_bytes = quant_end - data_start
+            if qd_bytes < 0 or qd_bytes % 4:
+                raise ValueError("Malformed v3 quant-data section")
+            qd_len = qd_bytes // 4
         for i in range(nqp):
             pos = entries_start + i * QUANT_PARAM_SIZE
-            scale, zp, num_ch, mult_off, shift_off, _pad = struct.unpack_from(
+            scale, zp, num_ch, mult_off, shift_off, page = struct.unpack_from(
                 "<fiHHHH", data, pos
             )
             qp_entry = {
@@ -259,8 +270,9 @@ def read_binary_plan(data: bytes) -> dict:
             }
             if num_ch > 1:
                 # Read per-channel multipliers and shifts
-                m_pos = data_start + mult_off * 4
-                s_pos = data_start + shift_off * 4
+                page_base = 0 if version == 2 else page * (1 << 16)
+                m_pos = data_start + (page_base + mult_off) * 4
+                s_pos = data_start + (page_base + shift_off) * 4
                 qp_entry["multipliers"] = list(struct.unpack_from(f"<{num_ch}i", data, m_pos))
                 qp_entry["shifts"] = list(struct.unpack_from(f"<{num_ch}i", data, s_pos))
             quant_params.append(qp_entry)
