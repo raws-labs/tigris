@@ -3,6 +3,12 @@
 from tigris.graph.ir import AnalyzedGraph, Stage
 
 
+def _aligned_size(size_bytes: int, alignment: int) -> int:
+    if alignment <= 0 or alignment & (alignment - 1):
+        raise ValueError("tensor_alignment must be a positive power of two")
+    return (size_bytes + alignment - 1) & ~(alignment - 1)
+
+
 def partition_temporal(ag: AnalyzedGraph, budget: int) -> AnalyzedGraph:
     """Partition the execution graph into sequential stages.
 
@@ -102,7 +108,7 @@ def _stage_peak_memory(
             # Within this stage, the tensor is live if:
             # it's alive at this step AND (born in stage OR consumed in stage)
             if alive_from <= step and step < freed_at:
-                live += lt.size_bytes
+                live += _aligned_size(lt.size_bytes, ag.tensor_alignment)
         if live > peak:
             peak = live
     return peak
