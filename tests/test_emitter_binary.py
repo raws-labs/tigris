@@ -334,19 +334,19 @@ def test_all_fixtures_with_budget(
 # Error handling
 
 
-@pytest.mark.parametrize("version", [0, 1, 2, SCHEMA_VERSION, 99])
+@pytest.mark.parametrize("version", [0, 1, 2, 3, SCHEMA_VERSION, 99])
 def test_schema_version_validation(linear_3op_path, version):
     ag = _full_pipeline(linear_3op_path)
     data = bytearray(emit_binary_bytes(ag))
     struct.pack_into("<I", data, 4, version)
 
-    if version in {2, SCHEMA_VERSION}:
+    if version in {2, 3, SCHEMA_VERSION}:
         assert read_binary_plan(bytes(data))["version"] == version
     else:
         with pytest.raises(ValueError) as exc_info:
             read_binary_plan(bytes(data))
         assert str(exc_info.value) == (
-            f"Unsupported schema version: {version} (expected 2 or {SCHEMA_VERSION})"
+            f"Unsupported schema version: {version} (expected 2, 3, or {SCHEMA_VERSION})"
         )
 
 

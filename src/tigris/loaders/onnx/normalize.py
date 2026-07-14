@@ -28,8 +28,8 @@ Passes applied in sequence (matches ``normalize()`` call order):
     ``Resize`` ops' constant inputs and store in ``strides`` attr.
 10. **Concat axis normalization**: Translate Concat axis from NCHW to NHWC
     and store in ``kernel_shape`` attr for spatial packing.
-11. **Output transpose validation**: Reject trailing ``Transpose`` ops until
-    their permutation can be represented in the deployment contract.
+11. **Transpose validation**: Validate explicit/default permutations before
+    emission; the binary plan records them as per-operator attributes.
 12. **Activation absorption**: Fuse Relu/Relu6 into preceding
     Conv/DepthwiseConv/Gemm/Conv1D ops as ``fused_activation`` attr.
     Runs last so all relabeling and rewiring is already done.
@@ -53,7 +53,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_shape_ops(ag)
     ag = _extract_resize_scales(ag)
     ag = _normalize_concat_axis(ag)
-    ag = _validate_output_transposes(ag)
+    ag = _validate_transposes(ag)
     ag = _absorb_activations(ag)
     return ag
 
@@ -928,42 +928,34 @@ def _normalize_concat_axis(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _validate_output_transposes(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Reject output Transpose ops whose observable permutation would be lost.
-
-    The plan schema has no output-layout transform metadata and the runtime has
-    no general Transpose kernel.  Removing a trailing Transpose therefore
-    changes the model output name, shape, and element order.  Keep the graph
-    fail-closed until such a permutation is explicit in the deployment
-    contract rather than silently delegating it to unspecified host code.
-    """
-    output_to_op: dict[str, OpNode] = {}
+def _validate_transposes(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Validate Transpose permutations retained in the deployment plan."""
     for op in ag.ops:
-        for out in op.outputs:
-            output_to_op[out] = op
-
-    for out_name in ag.model_outputs:
-        op = output_to_op.get(out_name)
-        if op is None or op.op_type != "Transpose":
+        if op.op_type != "Transpose":
             continue
-
-        input_name = op.inputs[0] if op.inputs else ""
-        input_info = ag.tensors.get(input_name)
-        output_info = ag.tensors.get(out_name)
-        rank = len(input_info.shape) if input_info is not None else 0
-        perm = op.attrs.get("perm")
-        if perm is None and rank:
-            perm = list(reversed(range(rank)))
-
-        input_shape = input_info.shape if input_info is not None else "unknown"
-        output_shape = output_info.shape if output_info is not None else "unknown"
-        raise ValueError(
-            f"Cannot preserve model output '{out_name}': trailing Transpose "
-            f"'{op.name}' uses perm={perm}, changing shape {input_shape} to "
-            f"{output_shape}. The deployment contract does not encode output "
-            "permutations, so TiGrIS refuses to remove this operator."
-        )
-
+        if len(op.inputs) != 1 or len(op.outputs) != 1:
+            raise ValueError(
+                f"Transpose '{op.name}' must have exactly one input and one output"
+            )
+        input_info = ag.tensors.get(op.inputs[0])
+        output_info = ag.tensors.get(op.outputs[0])
+        if input_info is None or output_info is None:
+            raise ValueError(f"Transpose '{op.name}' has unknown tensor metadata")
+        rank = len(input_info.shape)
+        perm = op.attrs.get("perm", list(reversed(range(rank))))
+        perm = [int(axis) for axis in perm]
+        if (rank != len(output_info.shape) or len(perm) != rank or
+                sorted(perm) != list(range(rank))):
+            raise ValueError(
+                f"Transpose '{op.name}' has invalid perm={perm} for rank {rank}"
+            )
+        expected_shape = tuple(input_info.shape[axis] for axis in perm)
+        if tuple(output_info.shape) != expected_shape:
+            raise ValueError(
+                f"Transpose '{op.name}' perm={perm} expects output shape "
+                f"{expected_shape}, got {output_info.shape}"
+            )
+        op.attrs["perm"] = perm
     return ag
 
 

@@ -58,7 +58,7 @@ CONTRACT = {
     "linear_3op": {
         "builder": build_linear_3op,
         "budget_str": "4K",
-        "version": 3,
+        "version": 4,
         "num_tensors": 4,
         "num_ops": 3,
         "num_stages": 1,
@@ -75,7 +75,7 @@ CONTRACT = {
         # would (correctly) force multi-stage slow-overflow; 64K keeps this a
         # clean single-stage plan, which is what this format contract checks.
         "budget_str": "64K",
-        "version": 3,
+        "version": 4,
         "num_tensors": 3,
         "num_ops": 2,        # Relu fused into first Conv
         "num_stages": 1,
@@ -88,7 +88,7 @@ CONTRACT = {
     "ds_cnn": {
         "builder": build_ds_cnn,
         "budget_str": "256K",
-        "version": 3,
+        "version": 4,
         "num_tensors": 13,
         "num_ops": 12,
         "num_stages": 1,
@@ -111,7 +111,7 @@ def test_header_size():
 
 def test_schema_version():
     """Schema version constant must match the current runtime contract."""
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
 
 
 def test_op_size():
