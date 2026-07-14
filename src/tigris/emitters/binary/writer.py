@@ -553,6 +553,47 @@ def _build_weights_compressed(
     return bytes(entries_buf), weight_blocks_section, weight_idx
 
 
+def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
+    """Return the peak fast-arena reservation for compressed weight blocks.
+
+    This mirrors ``tigris_weight_decompression_overhead()`` in the runtime:
+    a normal stage needs one aligned decompressed block, while a tiled chain
+    holds its member-stage blocks simultaneously.  It deliberately builds the
+    same block grouping as serialization so plan validation cannot approve an
+    arena that the executor later overcommits.
+    """
+    if not ag.weight_data:
+        return 0
+
+    # ``none`` retains the exact block layout without doing needless LZ4 work.
+    _, section, _ = _build_weights_compressed(ag, _StringTable(), "none")
+    if len(section) < 4:
+        return 0
+    num_blocks, _ = struct.unpack_from("<HH", section, 0)
+    block_size = struct.calcsize("<HHHHIII")
+    block_bytes: dict[int, int] = {}
+    for i in range(num_blocks):
+        off = 4 + i * block_size
+        stage_idx, _, _, _, _, _, uncompressed = struct.unpack_from(
+            "<HHHHIII", section, off
+        )
+        aligned = (uncompressed + ag.tensor_alignment - 1) & ~(
+            ag.tensor_alignment - 1
+        )
+        block_bytes[stage_idx] = aligned
+
+    reserve = max(block_bytes.values(), default=0)
+    for stage in ag.stages:
+        if stage.chain_len < 2 or stage.chain_id != stage.stage_id:
+            continue
+        chain = sum(
+            block_bytes.get(stage_idx, 0)
+            for stage_idx in range(stage.stage_id, stage.stage_id + stage.chain_len)
+        )
+        reserve = max(reserve, chain)
+    return reserve
+
+
 # Section builders
 
 
@@ -1091,11 +1132,44 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
             + operator_validation.describe()
         )
 
+    if ag.fast_memory_reserve_bytes < 0:
+        raise ValueError("Fast-memory reservation must not be negative")
+
+    compressed_reserve = compressed_weight_reserve_bytes(ag) if compress else 0
+    reserved_activation_budget = ag.fast_memory_reserve_bytes > 0
+    if reserved_activation_budget and compressed_reserve > ag.fast_memory_reserve_bytes:
+        raise ValueError(
+            "Cannot emit a compressed plan: compressed-weight reservation "
+            f"({compressed_reserve:,} bytes) exceeds the declared reservation "
+            f"({ag.fast_memory_reserve_bytes:,} bytes)"
+        )
+    if (
+        not reserved_activation_budget
+        and ag.mem_budget > 0
+        and compressed_reserve > ag.mem_budget
+    ):
+        raise ValueError(
+            "Cannot emit a compressed plan: compressed-weight reservation "
+            f"({compressed_reserve:,} bytes) exceeds the fast-memory budget "
+            f"({ag.mem_budget:,} bytes)"
+        )
+
     if ag.mem_budget > 0:
-        validation = validate_memory_plan(ag)
+        validation = validate_memory_plan(
+            ag,
+            fast_reserve_bytes=0 if reserved_activation_budget else compressed_reserve,
+        )
         if not validation.feasible:
             details = "; ".join(issue.describe() for issue in validation.issues)
             raise ValueError(f"Cannot emit an infeasible memory plan: {details}")
+
+    # The serialized plan budget is the activation arena.  The compile command
+    # already partitions with the compressed-weight reservation removed.  Keep
+    # the defensive direct-emitter behaviour for callers that still provide a
+    # total arena budget instead.
+    serialized_budget = (
+        ag.mem_budget if reserved_activation_budget else ag.mem_budget - compressed_reserve
+    )
 
     # Reject counts before any fixed-width table field is packed. The runtime
     # has a deliberately bounded tensor working set; the other limits are
@@ -1243,7 +1317,7 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
         num_ops,
         num_stages,
         num_tile_plans,
-        ag.mem_budget,
+        serialized_budget,
         ag.peak_memory_bytes,
         model_name_off,
         model_io_off,

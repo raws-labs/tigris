@@ -151,6 +151,13 @@ class AnalyzedGraph:
     stages: list[Stage] = field(default_factory=list)
     mem_budget: int = 0  # primary (fastest) memory pool size in bytes
 
+    # Bytes deliberately held outside ``mem_budget`` by the deployment
+    # harness.  ``mem_budget`` is consequently always the activation arena
+    # represented in the binary plan.  The compiler currently uses this for
+    # compressed-weight blocks; it also makes an explicit target scratch
+    # reservation possible without making activation feasibility ambiguous.
+    fast_memory_reserve_bytes: int = 0
+
     # Physical allocation alignment used by the deployment memory model.
     # 32 bytes is conservative for the currently supported Cortex-M, ESP32-S3,
     # and host SIMD runtimes; target runtimes that need less simply have spare

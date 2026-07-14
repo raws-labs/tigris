@@ -268,13 +268,18 @@ class MemoryPlanValidation:
         return not self.issues
 
 
-def validate_memory_plan(ag: AnalyzedGraph) -> MemoryPlanValidation:
+def validate_memory_plan(
+    ag: AnalyzedGraph, *, fast_reserve_bytes: int = 0
+) -> MemoryPlanValidation:
     """Validate that every stage or chain fits the fast-memory budget.
 
     A zero budget means no deployment constraint was requested.  Structural
     analysis and binary-format tests may use that mode; the deployment CLI
     separately requires a positive budget before emitting a plan.
     """
+    if fast_reserve_bytes < 0:
+        raise ValueError("fast_reserve_bytes must not be negative")
+
     budget = ag.mem_budget
     if budget <= 0:
         return MemoryPlanValidation(scheduled_peak_bytes=0, issues=())
@@ -287,8 +292,11 @@ def validate_memory_plan(ag: AnalyzedGraph) -> MemoryPlanValidation:
         if stage.chain_id != 0xFFFF and stage.chain_id != stage.stage_id:
             continue
 
-        required, reason, invalid = _execution_unit_requirement(ag, stage)
+        activation_required, reason, invalid = _execution_unit_requirement(ag, stage)
+        required = activation_required + fast_reserve_bytes
         scheduled_peak = max(scheduled_peak, required)
+        if fast_reserve_bytes:
+            reason = f"{reason}; {fast_reserve_bytes:,} bytes reserved"
         if invalid or required > budget:
             issues.append(
                 MemoryPlanIssue(
