@@ -70,6 +70,31 @@ Several kernel backends are available (portable C99, ESP32 family, Cortex-M fami
 
 Link the harness against [tigris-runtime](https://github.com/raws-labs/tigris-runtime) and your chosen kernel library, flash the `.tgrs` alongside the firmware, and you have a working inference binary.
 
+### Embedding in an existing application
+
+The default `--format app` emits that standalone example program. Use
+`--format core` when your firmware already owns its entry point, plan placement,
+arenas, input source, or observability:
+
+```bash
+tigris codegen model.tgrs --backend cmsis-nn --format core \
+  -o generated/tigris_codegen_core.c \
+  --header generated/tigris_codegen_core.h \
+  --name model_codegen
+```
+
+Core output is backend-specific but platform-neutral. It produces a C source and
+header that load the plan, reset runtime memory, prepare the selected backend,
+and run the generated dispatcher. Initialize the core once, then reset it before
+each subsequent inference. The embedding application supplies the plan
+bytes, arena buffers, and an optional input-initialization callback. If
+`--header` is omitted, codegen writes a sibling `.h` file next to `--output`.
+`--name` prefixes the public C symbols, so multiple generated cores can coexist
+in one firmware. The header also exports the model's tensor-table capacity,
+plan budget, and compressed-weight reserve for static allocation decisions.
+This is suitable for bare-metal firmware, RTOS applications, and custom
+instrumentation without introducing a hardware-specific codegen target.
+
 ## Further reading
 
 - [Getting started](https://tigris-ml.dev/docs): installation, first compile, deploying to ESP32

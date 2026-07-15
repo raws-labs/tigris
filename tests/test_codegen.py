@@ -21,7 +21,7 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.emitters.codegen import generate_c
+from tigris.emitters.codegen import generate_c, generate_core_header
 from tigris.loaders import load_model
 
 
@@ -142,6 +142,12 @@ def test_cli_exposes_codegen_and_xip():
     assert top.exit_code == 0
     assert "codegen" in top.output
 
+    codegen_help = runner.invoke(cli, ["codegen", "--help"])
+    assert codegen_help.exit_code == 0
+    assert "--format" in codegen_help.output
+    assert "--header" in codegen_help.output
+    assert "--name" in codegen_help.output
+
     compile_help = runner.invoke(cli, ["compile", "--help"])
     assert compile_help.exit_code == 0
     assert "--xip" in compile_help.output
@@ -195,6 +201,106 @@ def test_quantized_reference_codegen_prints_int8_outputs(qdq_conv_path):
     assert "tigris_dispatch_kernel_s8" in source
     assert "int8_t *out = (int8_t *)ptr" in source
     assert "float *out = (float *)ptr" not in source
+
+
+@pytest.mark.parametrize(
+    ("backend", "dispatch"),
+    [
+        ("reference", "tigris_dispatch_kernel_s8"),
+        ("cmsis-nn", "tigris_dispatch_kernel_cmsis_nn"),
+    ],
+)
+def test_core_codegen_is_embeddable_and_backend_specific(
+    qdq_conv_path, backend, dispatch
+):
+    ag = _full_pipeline(qdq_conv_path, budget=4096)
+
+    source = generate_c(
+        emit_binary_bytes(ag), backend, output_format="core",
+        core_header="generated_core.h",
+    )
+
+    assert '#include "generated_core.h"' in source
+    assert "int main" not in source
+    assert "malloc(" not in source
+    assert "tigris_codegen_load_plan" in source
+    assert "tigris_codegen_init" in source
+    assert "tigris_codegen_reset" in source
+    assert dispatch in source
+    if backend == "cmsis-nn":
+        assert "tigris_cmsis_nn_prepare" in source
+        assert "tigris_cmsis_nn_deinit(mem)" in source
+        assert source.index("tigris_cmsis_nn_deinit(mem)") < source.index(
+            "tigris_mem_init("
+        )
+
+
+def test_core_codegen_header_exposes_embedding_api(qdq_conv_path):
+    header = generate_core_header(
+        emit_binary_bytes(_full_pipeline(qdq_conv_path, budget=4096))
+    )
+
+    assert "tigris_codegen_input_init_fn" in header
+    assert "tigris_codegen_load_plan" in header
+    assert "tigris_codegen_init" in header
+    assert "tigris_codegen_reset" in header
+    assert "tigris_codegen_run" in header
+    assert "TIGRIS_CODEGEN_TENSOR_CAPACITY" in header
+    assert "TIGRIS_CODEGEN_PLAN_BUDGET_BYTES" in header
+    assert "TIGRIS_CODEGEN_WEIGHT_DECOMPRESSION_RESERVE_BYTES" in header
+
+
+def test_core_codegen_custom_name_is_linkable_alongside_default(qdq_conv_path):
+    data = emit_binary_bytes(_full_pipeline(qdq_conv_path, budget=4096))
+    source = generate_c(
+        data, "reference", output_format="core", core_header="audio_core.h",
+        core_name="audio_codegen",
+    )
+    header = generate_core_header(data, "audio_codegen")
+
+    assert "audio_codegen_load_plan" in source
+    assert "audio_codegen_load_plan" in header
+    assert "AUDIO_CODEGEN_TENSOR_CAPACITY" in header
+    assert "#ifndef AUDIO_CODEGEN_CORE_H" in header
+    assert "tigris_codegen_load_plan" not in source
+
+
+def test_cli_core_writes_matched_source_and_header(linear_3op_path, tmp_path):
+    plan_data = emit_binary_bytes(_full_pipeline(linear_3op_path, budget=4096))
+    plan_path = tmp_path / "model.tgrs"
+    source_path = tmp_path / "generated.c"
+    header_path = tmp_path / "generated.h"
+    plan_path.write_bytes(plan_data)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "codegen", str(plan_path), "--format", "core",
+            "--name", "sensor_codegen", "--output", str(source_path),
+            "--header", str(header_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert source_path.is_file()
+    assert header_path.is_file()
+    assert '#include "generated.h"' in source_path.read_text()
+    assert "sensor_codegen_load_plan" in source_path.read_text()
+    assert "sensor_codegen_load_plan" in header_path.read_text()
+
+
+@pytest.mark.parametrize("option", ["--header", "--name"])
+def test_cli_rejects_core_only_options_for_app(linear_3op_path, option):
+    args = ["codegen", str(linear_3op_path), option]
+    if option == "--header":
+        args.append("ignored.h")
+    else:
+        args.append("custom_codegen")
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code != 0
+    assert "requires --format core" in result.output
 
 
 def test_codegen_rejects_plan_with_mixed_serialized_dtypes(qdq_conv_path):

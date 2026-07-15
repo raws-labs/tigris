@@ -1,5 +1,6 @@
 """Tests for tigris.analysis.memory."""
 
+from tigris.graph.ir import AnalyzedGraph, OpNode, TensorLifetime
 from tigris.loaders import load_model
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
@@ -69,3 +70,20 @@ def test_final_output_counted_in_peak(linear_3op_path):
     ag = compute_lifetimes(ag)
     ag = compute_memory_timeline(ag)
     assert "output" in ag.timeline[-1].live_tensors
+
+
+def test_peak_accounts_for_allocator_alignment():
+    """The planner must model physical bump allocations, not raw byte sums."""
+    ag = AnalyzedGraph(
+        ops=[OpNode("op", "Relu", ["input"], ["output"])],
+        lifetimes={
+            "input": TensorLifetime("input", -1, 0, 5),
+            "output": TensorLifetime("output", 0, 1, 5),
+        },
+        tensor_alignment=32,
+    )
+
+    ag = compute_memory_timeline(ag)
+
+    # Both values co-reside at the producing step: 2 * align_up(5, 32).
+    assert ag.peak_memory_bytes == 64

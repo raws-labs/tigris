@@ -3,6 +3,13 @@
 from tigris.graph.ir import AnalyzedGraph, MemorySnapshot
 
 
+def _aligned_size(size_bytes: int, alignment: int) -> int:
+    """Match the runtime bump allocator's power-of-two size rounding."""
+    if alignment <= 0 or alignment & (alignment - 1):
+        raise ValueError("tensor_alignment must be a positive power of two")
+    return (size_bytes + alignment - 1) & ~(alignment - 1)
+
+
 def compute_memory_timeline(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Compute the memory footprint at each execution step using an event-sweep.
 
@@ -15,7 +22,7 @@ def compute_memory_timeline(ag: AnalyzedGraph) -> AnalyzedGraph:
     if num_ops == 0:
         return ag
 
-    # Build sorted event list: (step, +/- size, tensor_name)
+    # Build sorted event list: (step, +/- physically allocated size, tensor_name)
     # +size at birth_step: the runtime (exec_stage_normal) ALLOCATES an op's
     #   output before running the kernel and frees the consumed inputs only after
     #   it returns, so the output is live AT its producing step, co-resident with
@@ -29,8 +36,9 @@ def compute_memory_timeline(ag: AnalyzedGraph) -> AnalyzedGraph:
         freed_at = lt.death_step + 1    # freed *after* the last consumer
         # For model inputs (birth=-1): alive_from=0
         # For model outputs (death=num_ops): freed_at=num_ops+1 (never freed during exec)
-        events.append((alive_from, lt.size_bytes, lt.tensor_name))
-        events.append((freed_at, -lt.size_bytes, lt.tensor_name))
+        size = _aligned_size(lt.size_bytes, ag.tensor_alignment)
+        events.append((alive_from, size, lt.tensor_name))
+        events.append((freed_at, -size, lt.tensor_name))
 
     # Sort by step, then frees before allocs at the same step
     events.sort(key=lambda e: (e[0], e[1]))

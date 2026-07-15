@@ -11,7 +11,7 @@ from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import partition_spatial
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.emitters.codegen import generate_c
+from tigris.emitters.codegen import generate_c, generate_core_header
 from tigris.loaders import load_model
 
 
@@ -140,4 +140,62 @@ def test_generated_harness_is_valid_c99(
     command.append(str(source_path))
 
     result = subprocess.run(command, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("backend", ["reference", "cmsis-nn", "esp-nn"])
+def test_generated_core_is_valid_c99(qdq_conv_path, tmp_path, backend):
+    source_path = tmp_path / "generated-core.c"
+    header_path = tmp_path / "generated_core.h"
+    source_path.write_text(
+        generate_c(
+            _plan_bytes(qdq_conv_path), backend, output_format="core",
+            core_header=header_path.name,
+        )
+    )
+    plan_data = _plan_bytes(qdq_conv_path)
+    header_path.write_text(generate_core_header(plan_data))
+
+    command = [
+        _CC, "-std=c99", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
+        f"-I{_RUNTIME_INCLUDE}", f"-I{tmp_path}", str(source_path),
+    ]
+    if backend == "cmsis-nn":
+        command.append("-DTIGRIS_HAS_CMSIS_NN")
+    elif backend == "esp-nn":
+        command.append("-DTIGRIS_HAS_ESP_NN")
+
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_named_generated_cores_link_together(qdq_conv_path, tmp_path):
+    plan_data = _plan_bytes(qdq_conv_path)
+    cores = [("tigris_codegen", "default"), ("audio_codegen", "audio")]
+    objects = []
+    for core_name, stem in cores:
+        source_path = tmp_path / f"{stem}.c"
+        header_path = tmp_path / f"{stem}.h"
+        object_path = tmp_path / f"{stem}.o"
+        source_path.write_text(
+            generate_c(
+                plan_data, "reference", output_format="core",
+                core_header=header_path.name, core_name=core_name,
+            )
+        )
+        header_path.write_text(generate_core_header(plan_data, core_name))
+        result = subprocess.run(
+            [
+                _CC, "-std=c99", "-c", f"-I{_RUNTIME_INCLUDE}",
+                f"-I{tmp_path}", str(source_path), "-o", str(object_path),
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        objects.append(object_path)
+
+    result = subprocess.run(
+        [_CC, "-r", *(str(path) for path in objects), "-o", str(tmp_path / "cores.o")],
+        text=True, capture_output=True, check=False,
+    )
     assert result.returncode == 0, result.stdout + result.stderr

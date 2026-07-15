@@ -403,8 +403,8 @@ def _back_propagate_tile_heights(
     return heights
 
 
-def _align_up(x: int, align: int = 8) -> int:
-    """Round up to alignment boundary (matches TIGRIS_TENSOR_ALIGN on Xtensa)."""
+def _align_up(x: int, align: int) -> int:
+    """Round up to the deployment memory model's tensor alignment."""
     return (x + align - 1) & ~(align - 1)
 
 
@@ -419,8 +419,8 @@ def _chain_fast_bytes(
       - First stage's input tile (loaded from slow)
       - All op output tiles across all stages
 
-    Each allocation is rounded up to TIGRIS_TENSOR_ALIGN (8 bytes) to match
-    the runtime bump allocator's alignment overhead.
+    Each allocation is rounded up to the graph's conservative deployment
+    alignment to match the runtime bump allocator's alignment overhead.
 
     Within each stage, forward-computes the intermediate height through
     spatial ops to match the runtime executor's memory calculation.
@@ -434,7 +434,8 @@ def _chain_fast_bytes(
         info = ag.tensors.get(name)
         if info and len(info.shape) == 4:
             N, C, H, W = info.shape  # NCHW in Python IR
-            total += _align_up(N * in_h * W * C * info.elem_size)
+            total += _align_up(N * in_h * W * C * info.elem_size,
+                               ag.tensor_alignment)
 
     # All op output tiles - forward-compute height through spatial ops
     for s_idx, stage in enumerate(chain_stages):
@@ -454,7 +455,8 @@ def _chain_fast_bytes(
                 info = ag.tensors.get(out_name)
                 if info and len(info.shape) == 4:
                     N, C, H, W = info.shape
-                    total += _align_up(N * cur_h * W * C * info.elem_size)
+                    total += _align_up(N * cur_h * W * C * info.elem_size,
+                                       ag.tensor_alignment)
 
     return total
 

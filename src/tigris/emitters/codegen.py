@@ -8,6 +8,8 @@ Backend selection implies the target platform:
 
 from __future__ import annotations
 
+import re
+
 from tigris.capabilities import (
     CODEGEN_BACKENDS,
     DTypeMode,
@@ -89,10 +91,28 @@ def _plan_dtype(plan: dict) -> DTypeMode:
     )
 
 
-def generate_c(plan_data: bytes, backend: str) -> str:
-    """Generate a C inference harness for the given plan and backend."""
+def generate_c(
+    plan_data: bytes,
+    backend: str,
+    output_format: str = "app",
+    core_header: str = "tigris_codegen_core.h",
+    core_name: str = "tigris_codegen",
+) -> str:
+    """Generate C deployment code for the given plan and backend.
+
+    ``app`` is the self-contained example program historically produced by the
+    command.  ``core`` is deliberately platform-neutral: an application owns
+    flash placement, arena placement, input contents, and its entry point,
+    while the generated source owns plan loading, backend preparation, and
+    dispatch.  That lets the same backend output be embedded in bare-metal,
+    RTOS, and benchmark applications without a target-specific codegen mode.
+    """
     if backend not in BACKENDS:
         raise ValueError(f"Unknown backend: {backend!r}. Choose from: {', '.join(BACKENDS)}")
+    if output_format not in {"app", "core"}:
+        raise ValueError("Unknown output format: choose from: app, core")
+    if output_format == "core":
+        _validate_core_name(core_name)
 
     plan = read_binary_plan(plan_data)
     if not plan["stages"]:
@@ -121,12 +141,195 @@ def generate_c(plan_data: bytes, backend: str) -> str:
 
     header_comment = _header_comment(plan, backend, xip, dtype)
 
+    if output_format == "core":
+        return header_comment + _generate_core(
+            plan, backend, is_quantized, core_header, core_name
+        )
     if backend == "esp-nn":
         return header_comment + _generate_esp(plan, is_quantized)
     elif backend == "cmsis-nn":
         return header_comment + _generate_cmsis(plan, is_quantized)
     else:
         return header_comment + _generate_posix(plan, is_quantized)
+
+
+def _validate_core_name(core_name: str) -> None:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", core_name):
+        raise ValueError(
+            "Core name must be an ASCII C identifier "
+            "([A-Za-z_][A-Za-z0-9_]*)"
+        )
+
+
+def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") -> str:
+    """Return the model-specific public header for ``codegen --format core``."""
+    _validate_core_name(core_name)
+    plan = read_binary_plan(plan_data)
+    macro_prefix = core_name.upper()
+    guard = f"{macro_prefix}_CORE_H"
+    weight_reserve = _cmsis_weight_decompression_overhead(plan)
+    return f"""\
+/* Auto-generated-code API.  This header is target-neutral. */
+#ifndef {guard}
+#define {guard}
+
+#include <stdint.h>
+
+#include "tigris.h"
+#include "tigris_executor.h"
+#include "tigris_loader.h"
+#include "tigris_mem.h"
+
+/* Model-specific compile-time requirements for static embedding. */
+#define {macro_prefix}_TENSOR_CAPACITY {plan['num_tensors']}u
+#define {macro_prefix}_PLAN_BUDGET_BYTES {plan['budget']}u
+#define {macro_prefix}_WEIGHT_DECOMPRESSION_RESERVE_BYTES {weight_reserve}u
+
+typedef void (*{core_name}_input_init_fn)(
+    void *data, uint32_t size_bytes, uint16_t tensor_index, void *user_ctx);
+
+/* Load and validate the serialized plan supplied by the embedding app. */
+tigris_error_t {core_name}_load_plan(
+    const uint8_t *plan_data, uint32_t plan_len, tigris_plan_t *out_plan);
+
+/* Set up runtime memory, prepare the selected backend, and allocate inputs.
+ * Call once before using reset/run. ``init_input`` may be NULL. */
+tigris_mem_error_t {core_name}_init(
+    const tigris_plan_t *plan, tigris_mem_t *mem,
+    void **tensor_ptrs, uint16_t tensor_capacity,
+    void *fast_arena, uint32_t fast_arena_size,
+    void *slow_arena, uint32_t slow_arena_size,
+    {core_name}_input_init_fn init_input, void *user_ctx);
+
+/* Reset activations and inputs for another inference. The backend reservation
+ * created by init is retained, so CMSIS-NN scratch cannot alias activations. */
+tigris_mem_error_t {core_name}_reset(
+    const tigris_plan_t *plan, tigris_mem_t *mem,
+    {core_name}_input_init_fn init_input, void *user_ctx);
+
+/* The backend dispatcher is generated from --backend. */
+tigris_kernel_fn {core_name}_dispatch(void);
+
+/* Run using the generated dispatcher. */
+tigris_exec_error_t {core_name}_run(
+    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats);
+
+#endif
+"""
+
+
+def _generate_core(
+    plan: dict, backend: str, is_quantized: bool, core_header: str,
+    core_name: str,
+) -> str:
+    """Generate embeddable backend glue with no platform or entry-point policy."""
+    if backend == "cmsis-nn":
+        dispatch = "tigris_dispatch_kernel_cmsis_nn" if is_quantized else "tigris_dispatch_kernel"
+        kernel_include = '#include "tigris_kernels_cmsis_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
+        teardown = """\
+    /* CMSIS-NN reserves scratch from the previous fast arena.  Release that
+     * reservation before reinitializing the arena so repeated reset() calls
+     * cannot make scratch alias live activations.  The first reset has no
+     * reservation; deinit intentionally returns -1 and is harmless. */
+    (void)tigris_cmsis_nn_deinit(mem);
+""" if is_quantized else ""
+        prepare = """\
+    if (tigris_cmsis_nn_prepare(plan, mem) != 0)
+        return TIGRIS_MEM_ERR_OOM;
+""" if is_quantized else ""
+    elif backend == "esp-nn":
+        dispatch = "tigris_dispatch_kernel_esp_nn" if is_quantized else "tigris_dispatch_kernel"
+        kernel_include = '#include "tigris_kernels_esp_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
+        teardown = ""
+        prepare = """\
+    if (tigris_esp_nn_prepare(plan, mem) != 0)
+        return TIGRIS_MEM_ERR_OOM;
+""" if is_quantized else ""
+    else:
+        dispatch = "tigris_dispatch_kernel_s8" if is_quantized else "tigris_dispatch_kernel"
+        kernel_include = '#include "tigris_kernels_s8.h"' if is_quantized else '#include "tigris_kernels.h"'
+        teardown = ""
+        prepare = ""
+
+    return f'''\
+#include <string.h>
+
+#include "{core_header}"
+{kernel_include}
+
+static tigris_mem_error_t {core_name}_allocate_inputs(
+    const tigris_plan_t *plan, tigris_mem_t *mem,
+    {core_name}_input_init_fn init_input, void *user_ctx)
+{{
+    for (uint8_t i = 0; i < plan->header->num_model_inputs; i++) {{
+        uint16_t tidx = plan->model_inputs[i];
+        uint32_t size = plan->tensors[tidx].size_bytes;
+        tigris_mem_error_t err = tigris_mem_alloc_slow(mem, tidx, size);
+        if (err != TIGRIS_MEM_OK)
+            return err;
+        if (init_input)
+            init_input(mem->tensor_ptrs[tidx], size, tidx, user_ctx);
+    }}
+    return TIGRIS_MEM_OK;
+}}
+
+tigris_error_t {core_name}_load_plan(
+    const uint8_t *plan_data, uint32_t plan_len, tigris_plan_t *out_plan)
+{{
+    return tigris_plan_load(plan_data, plan_len, out_plan);
+}}
+
+tigris_mem_error_t {core_name}_init(
+    const tigris_plan_t *plan, tigris_mem_t *mem,
+    void **tensor_ptrs, uint16_t tensor_capacity,
+    void *fast_arena, uint32_t fast_arena_size,
+    void *slow_arena, uint32_t slow_arena_size,
+    {core_name}_input_init_fn init_input, void *user_ctx)
+{{
+    if (plan->header->num_tensors > tensor_capacity)
+        return TIGRIS_MEM_ERR_BAD_INDEX;
+
+{teardown}
+    memset(tensor_ptrs, 0, (size_t)tensor_capacity * sizeof(*tensor_ptrs));
+    tigris_mem_error_t err = tigris_mem_init(
+        mem, tensor_ptrs, plan->header->num_tensors,
+        fast_arena, fast_arena_size, slow_arena, slow_arena_size);
+    if (err != TIGRIS_MEM_OK)
+        return err;
+{prepare}
+    return {core_name}_allocate_inputs(plan, mem, init_input, user_ctx);
+}}
+
+tigris_mem_error_t {core_name}_reset(
+    const tigris_plan_t *plan, tigris_mem_t *mem,
+    {core_name}_input_init_fn init_input, void *user_ctx)
+{{
+    if (!plan || !plan->header || !mem || !mem->tensor_ptrs ||
+        !mem->fast_base || !mem->slow_base)
+        return TIGRIS_MEM_ERR_NULL;
+
+    /* Preserve the backend's reservation. CMSIS-NN reduces fast_size in init;
+     * reinitializing with that reduced size keeps scratch disjoint from fresh
+     * activation allocations on every inference. */
+    tigris_mem_error_t err = tigris_mem_init(
+        mem, mem->tensor_ptrs, plan->header->num_tensors,
+        mem->fast_base, mem->fast_size, mem->slow_base, mem->slow_size);
+    if (err != TIGRIS_MEM_OK)
+        return err;
+    return {core_name}_allocate_inputs(plan, mem, init_input, user_ctx);
+}}
+
+tigris_kernel_fn {core_name}_dispatch(void)
+{{
+    return {dispatch};
+}}
+
+tigris_exec_error_t {core_name}_run(
+    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats)
+{{
+    return tigris_run(plan, mem, {dispatch}, NULL, stats);
+}}
+'''
 
 
 def _header_comment(

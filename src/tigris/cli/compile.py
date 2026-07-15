@@ -8,6 +8,41 @@ from tigris.cli import cli, console, _parse_size, _run_pipeline
 from tigris.utils import fmt_bytes
 
 
+def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
+    """Plan a compressed model against its actual activation capacity.
+
+    Weight blocks depend on stage boundaries, while stage boundaries depend on
+    the memory left after reserving those blocks.  Re-plan until the computed
+    reservation fits the reservation used for partitioning.  Keeping the
+    larger value on a changing layout is conservative: the emitted plan can
+    never require more fast memory than the caller supplied.
+    """
+    from tigris.emitters.binary.writer import compressed_weight_reserve_bytes
+
+    reserve = 0
+    # Each additional reservation can only be introduced by a stage layout;
+    # this bound also turns an accidental planner oscillation into a clear
+    # compiler error instead of an unbounded command.
+    max_attempts = 64
+    for _ in range(max_attempts):
+        ag, total_budget = _run_pipeline(
+            model, mem, fast_reserve_bytes=reserve
+        )
+        required = compressed_weight_reserve_bytes(ag)
+        if required <= reserve:
+            # ``mem_budget`` is already the reduced activation capacity.  The
+            # writer uses this marker to avoid subtracting the same reserve a
+            # second time from the serialized plan budget.
+            ag.fast_memory_reserve_bytes = required
+            return ag, total_budget, reserve, required
+        reserve = required
+
+    raise click.ClickException(
+        "Compressed-weight reservation did not converge after "
+        f"{max_attempts} planning attempts"
+    )
+
+
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
 @click.option("--mem", "-m", multiple=True, required=True, help="Memory pool size, fast to slow (e.g. 256K)")
@@ -26,7 +61,15 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     )
     from tigris.emitters.binary.writer import emit_binary
 
-    ag, budget = _run_pipeline(model, mem)
+    compress_arg = compress if compress != "none" else None
+    if compress_arg:
+        ag, budget, reserved_budget, weight_reserve = _run_compressed_pipeline(
+            model, mem
+        )
+    else:
+        ag, budget = _run_pipeline(model, mem)
+        reserved_budget = 0
+        weight_reserve = 0
     if budget <= 0:
         raise click.ClickException("Fast-memory budget must be greater than zero")
     if budget > 0xFFFFFFFF:
@@ -53,7 +96,6 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         details = "; ".join(issue.describe() for issue in validation.issues)
         raise click.ClickException(f"Cannot compile an infeasible memory plan: {details}")
 
-    compress_arg = compress if compress != "none" else None
     out = Path(output) if output else Path(model).with_suffix(".tgrs")
     with console.status("Writing binary plan..."):
         emit_binary(ag, out, compress=compress_arg, xip=xip)
@@ -65,7 +107,18 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         uncompressed_size = len(emit_binary_bytes(ag))
         ratio = plan_bytes / uncompressed_size if uncompressed_size > 0 else 1.0
         console.print(f"[bold green]Binary plan written to {out}[/] (LZ4 compressed)")
-        console.print(f"  {len(ag.ops)} ops, {len(ag.stages)} stages @ {fmt_bytes(budget)} budget", style="dim")
+        console.print(
+            f"  {len(ag.ops)} ops, {len(ag.stages)} stages @ "
+            f"{fmt_bytes(budget)} total fast memory "
+            f"({fmt_bytes(ag.mem_budget)} activations + "
+            f"{fmt_bytes(weight_reserve)} compressed weights)",
+            style="dim",
+        )
+        if reserved_budget != weight_reserve:
+            console.print(
+                f"  conservative planning reserve: {fmt_bytes(reserved_budget)}",
+                style="dim",
+            )
         console.print(f"  plan size: {fmt_bytes(plan_bytes)} (uncompressed: {fmt_bytes(uncompressed_size)}, ratio: {ratio:.2f}x)", style="dim")
     else:
         console.print(f"[bold green]Binary plan written to {out}[/]")

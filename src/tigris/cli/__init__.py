@@ -17,8 +17,17 @@ def _parse_size(s: str) -> int:
     return int(s)
 
 
-def _run_pipeline(model: str, mem: tuple[str, ...]):
-    """Shared pipeline: load -> lifetimes -> memory -> partition -> tiling. Returns (ag, budget)."""
+def _run_pipeline(
+    model: str, mem: tuple[str, ...], *, fast_reserve_bytes: int = 0
+):
+    """Run the shared planning pipeline.
+
+    ``--mem`` is the total fast arena supplied by the embedding application.
+    A caller that needs bytes outside the activation allocator (for example,
+    decompressed weights) supplies ``fast_reserve_bytes``; partitioning then
+    sees only the remaining activation capacity.  The returned budget remains
+    the caller's total, preserving the CLI's public accounting.
+    """
     from tigris.analysis.lifetime import compute_lifetimes
     from tigris.analysis.memory import compute_memory_timeline
     from tigris.analysis.partition_spatial import (
@@ -30,6 +39,8 @@ def _run_pipeline(model: str, mem: tuple[str, ...]):
 
     model_path = Path(model)
     mem_pools = [_parse_size(m) for m in mem]
+    if fast_reserve_bytes < 0:
+        raise click.ClickException("Fast-memory reservation must not be negative")
 
     try:
         with console.status("Loading model..."):
@@ -44,11 +55,18 @@ def _run_pipeline(model: str, mem: tuple[str, ...]):
             "Peak activation memory exceeds the uint32 plan-format limit"
         )
 
-    budget = mem_pools[0] if mem_pools else 0
-    if budget > 0xFFFFFFFF:
+    total_budget = mem_pools[0] if mem_pools else 0
+    if total_budget > 0xFFFFFFFF:
         raise click.ClickException(
             "Fast-memory budget exceeds the uint32 plan-format limit"
         )
+    if total_budget >= 0 and fast_reserve_bytes > total_budget:
+        raise click.ClickException(
+            "Fast-memory reservation "
+            f"({fast_reserve_bytes:,} bytes) exceeds the total budget "
+            f"({total_budget:,} bytes)"
+        )
+    budget = total_budget - fast_reserve_bytes
     if budget > 0:
         with console.status("Partitioning..."):
             ag = partition_temporal(ag, budget)
@@ -56,7 +74,8 @@ def _run_pipeline(model: str, mem: tuple[str, ...]):
             ag = partition_spatial(ag)
             ag = detect_and_solve_chains(ag)
 
-    return ag, budget
+    ag.fast_memory_reserve_bytes = fast_reserve_bytes
+    return ag, total_budget
 
 
 @click.group()

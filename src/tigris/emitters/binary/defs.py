@@ -17,6 +17,10 @@ SEC_STRINGS = 7
 SEC_WEIGHTS = 8
 SEC_QUANT_PARAMS = 9
 SEC_WEIGHT_BLOCKS = 10
+SEC_OP_ATTRIBUTES = 11
+
+# Per-operator attribute kinds stored in SEC_OP_ATTRIBUTES.
+OP_ATTR_TRANSPOSE_PERM = 1
 
 # Compression types
 COMPRESS_NONE = 0
@@ -67,7 +71,7 @@ TENSOR_FLAG_CONSTANT = 0x01
 TENSOR_FLAG_MODEL_INPUT = 0x02
 TENSOR_FLAG_MODEL_OUTPUT = 0x04
 
-# Struct sizes (schema v2)
+# Struct sizes (layout retained by schema v3)
 HEADER_SIZE = 48
 SECTION_ENTRY_SIZE = 8
 TENSOR_SIZE = 16

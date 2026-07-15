@@ -49,6 +49,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "MaxPool",
     "Concat",
     "Resize",
+    "Transpose",
 })
 
 _S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS | {"AveragePool"}

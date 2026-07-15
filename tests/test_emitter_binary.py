@@ -1,7 +1,10 @@
 """Tests for the binary plan emitter."""
 
 import struct
+from collections import OrderedDict
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tigris.analysis.lifetime import compute_lifetimes
@@ -15,7 +18,8 @@ from tigris.emitters.binary.defs import (
     OP_TYPE_MAP,
 )
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.emitters.binary.writer import emit_binary, emit_binary_bytes
+from tigris.emitters.binary.writer import _build_quant_params, emit_binary, emit_binary_bytes
+from tigris.graph.ir import QuantParam, TensorInfo
 from tigris.loaders import load_model
 
 
@@ -47,6 +51,54 @@ def test_file_size_matches(linear_3op_path):
 
     file_size = struct.unpack_from("<I", data, 8)[0]
     assert file_size == len(data)
+
+
+def test_v3_quant_data_pages_keep_offsets_in_uint16_range():
+    """A large aggregate quant pool uses v3 pages instead of wrapping offsets."""
+    large = QuantParam(
+        scale=np.full(32768, 0.125, dtype=np.float32),
+        zero_point=np.zeros(32768, dtype=np.int32),
+        axis=0,
+    )
+    small = QuantParam(
+        scale=np.array([0.25], dtype=np.float32),
+        zero_point=np.array([0], dtype=np.int32),
+    )
+    ag = SimpleNamespace(
+        is_quantized=True,
+        ops=[],
+        tensors=OrderedDict([
+            ("large", TensorInfo("large", (32768,), 3, quant=large)),
+            ("small", TensorInfo("small", (1,), 3, quant=small)),
+        ]),
+    )
+
+    section, indices = _build_quant_params(ag)
+
+    assert indices == {"large": 0, "small": 1}
+    assert struct.unpack_from("<HH", section, 0) == (2, 2)
+    first = struct.unpack_from("<fiHHHH", section, 4)
+    second = struct.unpack_from("<fiHHHH", section, 20)
+    assert first[2:] == (32768, 0, 32768, 0)
+    assert second[2:] == (1, 0, 1, 1)
+
+
+def test_v3_quant_param_rejects_arrays_that_cannot_fit_one_page():
+    too_large = QuantParam(
+        scale=np.full(32769, 0.125, dtype=np.float32),
+        zero_point=np.zeros(32769, dtype=np.int32),
+        axis=0,
+    )
+    ag = SimpleNamespace(
+        is_quantized=True,
+        ops=[],
+        tensors=OrderedDict([
+            ("too_large", TensorInfo("too_large", (32769,), 3, quant=too_large)),
+        ]),
+    )
+
+    with pytest.raises(ValueError, match="v3 per-param limit"):
+        _build_quant_params(ag)
 
 
 # Round-trip tests
@@ -282,19 +334,19 @@ def test_all_fixtures_with_budget(
 # Error handling
 
 
-@pytest.mark.parametrize("version", [0, 1, SCHEMA_VERSION, 99])
+@pytest.mark.parametrize("version", [0, 1, 2, 3, SCHEMA_VERSION, 99])
 def test_schema_version_validation(linear_3op_path, version):
     ag = _full_pipeline(linear_3op_path)
     data = bytearray(emit_binary_bytes(ag))
     struct.pack_into("<I", data, 4, version)
 
-    if version == SCHEMA_VERSION:
-        assert read_binary_plan(bytes(data))["version"] == SCHEMA_VERSION
+    if version in {2, 3, SCHEMA_VERSION}:
+        assert read_binary_plan(bytes(data))["version"] == version
     else:
         with pytest.raises(ValueError) as exc_info:
             read_binary_plan(bytes(data))
         assert str(exc_info.value) == (
-            f"Unsupported schema version: {version} (expected {SCHEMA_VERSION})"
+            f"Unsupported schema version: {version} (expected 2, 3, or {SCHEMA_VERSION})"
         )
 
 

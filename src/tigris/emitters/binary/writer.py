@@ -20,8 +20,10 @@ from .defs import (
     MAGIC,
     NO_QUANT_PARAM,
     NO_WEIGHT,
+    OP_ATTR_TRANSPOSE_PERM,
     OP_TYPE_MAP,
     SEC_INDEX_POOL,
+    SEC_OP_ATTRIBUTES,
     SEC_OPS,
     SEC_QUANT_PARAMS,
     SEC_SHAPE_POOL,
@@ -44,6 +46,20 @@ from .defs import (
 # The optimized CMSIS-NN Cortex-M kernels read weights/bias with LDRD (8-byte)
 # and wide SIMD loads, which fault on unaligned data; 16 also covers Helium MVE.
 WEIGHT_ALIGN = 16
+
+# These are execution limits of the current runtime, rather than wire-format
+# limits. Keep them explicit here so the compiler fails before producing a plan
+# the loader will inevitably reject.
+RUNTIME_MAX_TENSORS = 512
+RUNTIME_MAX_STAGE_INPUTS = 16
+RUNTIME_MAX_STAGE_OUTPUTS = 16
+RUNTIME_MAX_CHAIN_STAGES = 16
+
+
+def _require_uint(value: int, bits: int, field: str) -> None:
+    """Reject a value that cannot be represented by a plan field."""
+    if not 0 <= value < (1 << bits):
+        raise ValueError(f"{field}={value} exceeds uint{bits} plan-format limit")
 
 
 # Helper: String Table
@@ -92,6 +108,10 @@ class _IndexPool:
         """Add a list of indices, return (offset, count)."""
         offset = len(self._items)
         count = len(indices)
+        _require_uint(offset, 16, "index-pool offset")
+        _require_uint(count, 16, "index-pool count")
+        for index in indices:
+            _require_uint(index, 16, "index-pool value")
         self._items.extend(indices)
         return offset, count
 
@@ -111,6 +131,8 @@ class _ShapePool:
     def add(self, shape: tuple[int, ...]) -> tuple[int, int]:
         """Add shape dims, return (offset, ndim)."""
         offset = len(self._items)
+        _require_uint(offset, 16, "shape-pool offset")
+        _require_uint(len(shape), 8, "tensor rank")
         self._items.extend(int(d) for d in shape)
         return offset, len(shape)
 
@@ -124,7 +146,7 @@ class _ShapePool:
 def _pack_spatial_attrs(
     op: OpNode, weight_data: dict[str, np.ndarray] | None = None
 ) -> bytes:
-    """Pack 18 bytes of spatial attributes (schema v2).
+    """Pack the 18-byte spatial-attribute layout.
 
     Layout:
         kernel_h(u8) kernel_w(u8) stride_h(u8) stride_w(u8)
@@ -533,6 +555,47 @@ def _build_weights_compressed(
     return bytes(entries_buf), weight_blocks_section, weight_idx
 
 
+def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
+    """Return the peak fast-arena reservation for compressed weight blocks.
+
+    This mirrors ``tigris_weight_decompression_overhead()`` in the runtime:
+    a normal stage needs one aligned decompressed block, while a tiled chain
+    holds its member-stage blocks simultaneously.  It deliberately builds the
+    same block grouping as serialization so plan validation cannot approve an
+    arena that the executor later overcommits.
+    """
+    if not ag.weight_data:
+        return 0
+
+    # ``none`` retains the exact block layout without doing needless LZ4 work.
+    _, section, _ = _build_weights_compressed(ag, _StringTable(), "none")
+    if len(section) < 4:
+        return 0
+    num_blocks, _ = struct.unpack_from("<HH", section, 0)
+    block_size = struct.calcsize("<HHHHIII")
+    block_bytes: dict[int, int] = {}
+    for i in range(num_blocks):
+        off = 4 + i * block_size
+        stage_idx, _, _, _, _, _, uncompressed = struct.unpack_from(
+            "<HHHHIII", section, off
+        )
+        aligned = (uncompressed + ag.tensor_alignment - 1) & ~(
+            ag.tensor_alignment - 1
+        )
+        block_bytes[stage_idx] = aligned
+
+    reserve = max(block_bytes.values(), default=0)
+    for stage in ag.stages:
+        if stage.chain_len < 2 or stage.chain_id != stage.stage_id:
+            continue
+        chain = sum(
+            block_bytes.get(stage_idx, 0)
+            for stage_idx in range(stage.stage_id, stage.stage_id + stage.chain_len)
+        )
+        reserve = max(reserve, chain)
+    return reserve
+
+
 # Section builders
 
 
@@ -541,6 +604,7 @@ def _build_tensors(
     strings: _StringTable,
     shapes: _ShapePool,
     quant_idx_map: dict[str, int] | None = None,
+    preserve_layout_names: set[str] | None = None,
 ) -> tuple[bytes, dict[str, int]]:
     """Build tensor table. Returns (bytes, name->index map)."""
     buf = bytearray()
@@ -557,9 +621,13 @@ def _build_tensors(
 
         name_off = strings.add(name)
 
-        # Transpose shapes from NCHW->NHWC / NCL->NLC at emission time
+        # Internal tensors use NHWC/NLC layout. A terminal Transpose is an
+        # explicit model-output boundary, so its output keeps the observable
+        # ONNX shape and element ordering instead.
         shape = info.shape
-        if len(shape) == 4:
+        if preserve_layout_names and name in preserve_layout_names:
+            pass
+        elif len(shape) == 4:
             shape = (shape[0], shape[2], shape[3], shape[1])
         elif len(shape) == 3:
             shape = (shape[0], shape[2], shape[1])
@@ -590,6 +658,65 @@ def _build_tensors(
         ))
 
     return bytes(buf), tensor_idx
+
+
+def _serialized_axis_map(rank: int, preserve_layout: bool = False) -> list[int]:
+    """Map an ONNX axis to its serialized tensor axis."""
+    if preserve_layout:
+        return list(range(rank))
+    if rank == 4:
+        return [0, 3, 1, 2]  # NCHW -> NHWC
+    if rank == 3:
+        return [0, 2, 1]     # NCL -> NLC
+    return list(range(rank))
+
+
+def _build_op_attributes(
+    ag: AnalyzedGraph, tensor_idx: dict[str, int], preserve_layout_names: set[str]
+) -> bytes:
+    """Build optional, typed per-operator attributes.
+
+    The section is intentionally omitted when no operator needs metadata.
+    Its fixed-width records keep the loader zero-copy while the data pool
+    carries variable-sized payloads such as a Transpose permutation.
+    """
+    records: list[tuple[int, int, bytes]] = []
+    for op_index, op in enumerate(ag.ops):
+        if op.op_type != "Transpose":
+            continue
+        input_name, output_name = op.inputs[0], op.outputs[0]
+        if input_name not in tensor_idx or output_name not in tensor_idx:
+            raise ValueError(f"Transpose '{op.name}' must use runtime tensors")
+        input_info = ag.tensors[input_name]
+        rank = len(input_info.shape)
+        raw_perm = [int(axis) for axis in op.attrs["perm"]]
+        input_axes = _serialized_axis_map(rank)
+        output_axes = _serialized_axis_map(
+            rank, output_name in preserve_layout_names
+        )
+        output_raw_by_serialized = [0] * rank
+        for raw_axis, serialized_axis in enumerate(output_axes):
+            output_raw_by_serialized[serialized_axis] = raw_axis
+        serialized_perm = bytes(
+            input_axes[raw_perm[output_raw_by_serialized[serialized_axis]]]
+            for serialized_axis in range(rank)
+        )
+        records.append((op_index, OP_ATTR_TRANSPOSE_PERM, serialized_perm))
+
+    if not records:
+        return b""
+    if len(records) > 0xFFFF:
+        raise ValueError("operator-attribute count exceeds uint16 plan limit")
+
+    entries = bytearray()
+    data = bytearray()
+    for op_index, attr_type, payload in records:
+        _require_uint(op_index, 16, "operator-attribute operator index")
+        if len(payload) > 0xFF:
+            raise ValueError("operator-attribute payload exceeds uint8 length")
+        entries.extend(struct.pack("<HBBI", op_index, attr_type, len(payload), len(data)))
+        data.extend(payload)
+    return struct.pack("<HH", len(records), 0) + bytes(entries) + bytes(data)
 
 
 def _resolve_weight_bias(op: OpNode, weight_idx: dict[str, int]) -> tuple[int, int]:
@@ -678,6 +805,12 @@ def _build_ops(
 
         inp_off, inp_count = index_pool.add(inp_indices)
         out_off, out_count = index_pool.add(out_indices)
+        _require_uint(inp_count, 8, f"operator {op.name!r} input count")
+        _require_uint(out_count, 8, f"operator {op.name!r} output count")
+        if not -1 <= op.stage <= 0xFF:
+            raise ValueError(
+                f"operator {op.name!r} stage {op.stage} exceeds the uint8 plan-format limit"
+            )
 
         spatial = _pack_spatial_attrs(op, ag.weight_data)
 
@@ -689,7 +822,7 @@ def _build_ops(
         fused_act = {"Relu": ACT_RELU, "Relu6": ACT_RELU6}.get(fused_act_str, ACT_NONE)
         act_min, act_max = _compute_act_bounds(ag, op, fused_act)
 
-        # tigris_op_t: 38 bytes (schema v2)
+        # tigris_op_t: 38 bytes (layout retained by schema v3)
         # name_str(u32) op_type(u8) num_inputs(u8) num_outputs(u8) stage(u8)
         # inputs_offset(u16) outputs_offset(u16)
         # spatial_attrs(18 bytes)
@@ -701,7 +834,7 @@ def _build_ops(
             op_type,
             inp_count,
             out_count,
-            max(op.stage, 0) & 0xFF,
+            max(op.stage, 0),
             inp_off,
             out_off,
         ))
@@ -725,6 +858,25 @@ def _build_stages(
 
         inp_indices = [tensor_idx[n] for n in stage.input_tensors if n in tensor_idx]
         out_indices = [tensor_idx[n] for n in stage.output_tensors if n in tensor_idx]
+
+        if len(inp_indices) > RUNTIME_MAX_STAGE_INPUTS:
+            raise ValueError(
+                f"stage {stage.stage_id} has {len(inp_indices)} inputs; current runtime limit is "
+                f"{RUNTIME_MAX_STAGE_INPUTS}"
+            )
+        if len(out_indices) > RUNTIME_MAX_STAGE_OUTPUTS:
+            raise ValueError(
+                f"stage {stage.stage_id} has {len(out_indices)} outputs; current runtime limit is "
+                f"{RUNTIME_MAX_STAGE_OUTPUTS}"
+            )
+        if stage.chain_len > RUNTIME_MAX_CHAIN_STAGES:
+            raise ValueError(
+                f"stage {stage.stage_id} chain length {stage.chain_len} exceeds current runtime "
+                f"limit {RUNTIME_MAX_CHAIN_STAGES}"
+            )
+        _require_uint(stage.chain_id, 16, f"stage {stage.stage_id} chain id")
+        _require_uint(stage.chain_len, 16, f"stage {stage.stage_id} chain length")
+        _require_uint(stage.chain_tile_h, 16, f"stage {stage.stage_id} chain tile height")
 
         inp_off, inp_count = index_pool.add(inp_indices)
         out_off, out_count = index_pool.add(out_indices)
@@ -750,9 +902,9 @@ def _build_stages(
             inp_off, inp_count,
             out_off, out_count,
             tile_idx, 0,
-            stage.chain_id & 0xFFFF,
-            stage.chain_len & 0xFFFF,
-            stage.chain_tile_h & 0xFFFF,
+            stage.chain_id,
+            stage.chain_len,
+            stage.chain_tile_h,
             0,  # _reserved1
         ))
 
@@ -908,7 +1060,7 @@ def _build_quant_params(
 
     Section layout:
         uint16_t num_quant_params
-        uint16_t quant_data_len  (number of int32 elements in data blob)
+        uint16_t quant_data_pages (v3: 64K-element pages in data blob)
         tigris_quant_param_t[num_quant_params]
         int32_t[] quant_data  (multiplier/shift arrays for all params)
     """
@@ -922,6 +1074,7 @@ def _build_quant_params(
     entries_buf = bytearray()
     data_buf = bytearray()  # int32 elements
     data_offset = 0  # in int32 elements
+    page_size = 1 << 16
     idx = 0
 
     for name, info in ag.tensors.items():
@@ -939,6 +1092,21 @@ def _build_quant_params(
         # for per-channel weight quant), not the per-tensor activation scale -
         # otherwise per-channel conv requant is stored as per-tensor.
         num_channels = len(eff) if eff is not None else len(qp.scale)
+        # One v3 entry selects one 64K-element page for both arrays, so the
+        # multiplier and shift arrays must fit together in that page.
+        if num_channels > page_size // 2:
+            raise ValueError(
+                f"quantization channels for {name!r} exceed the v3 per-param "
+                f"limit ({num_channels} > {page_size // 2})")
+
+        # v3 retains the compact 16-byte entry and uses its former padding as
+        # a page number. Keep each multiplier/shift pair inside one 64K-element
+        # page so v2-sized offsets remain valid within that page.
+        needed = 2 * num_channels
+        if data_offset % page_size + needed > page_size:
+            next_page = ((data_offset + page_size - 1) // page_size) * page_size
+            data_buf.extend(b"\x00" * ((next_page - data_offset) * 4))
+            data_offset = next_page
 
         # Store multiplier/shift for both per-tensor (1) and per-channel (>1)
         multiplier_off = data_offset
@@ -960,16 +1128,21 @@ def _build_quant_params(
             float(qp.scale[0]),
             int(qp.zero_point[0]),
             num_channels,
-            multiplier_off,
-            shift_off,
-            0,  # pad
+            multiplier_off % page_size,
+            shift_off % page_size,
+            multiplier_off // page_size,  # v3 quant-data page
         ))
 
     if not quant_idx_map:
         return b"", {}
 
-    # Section header: num_quant_params(u16) + quant_data_len(u16)
-    header = struct.pack("<HH", len(quant_idx_map), data_offset)
+    if len(quant_idx_map) > 0xFFFF:
+        raise ValueError("quantization parameter count exceeds uint16 plan limit")
+    pages = (data_offset + page_size - 1) // page_size
+    if pages > 0xFFFF:
+        raise ValueError("quantization data exceeds v3 page-count limit")
+    # v3 section header: num_quant_params(u16) + quant_data_pages(u16).
+    header = struct.pack("<HH", len(quant_idx_map), pages)
     return header + bytes(entries_buf) + bytes(data_buf), quant_idx_map
 
 
@@ -1025,11 +1198,60 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
             + operator_validation.describe()
         )
 
+    if ag.fast_memory_reserve_bytes < 0:
+        raise ValueError("Fast-memory reservation must not be negative")
+
+    compressed_reserve = compressed_weight_reserve_bytes(ag) if compress else 0
+    reserved_activation_budget = ag.fast_memory_reserve_bytes > 0
+    if reserved_activation_budget and compressed_reserve > ag.fast_memory_reserve_bytes:
+        raise ValueError(
+            "Cannot emit a compressed plan: compressed-weight reservation "
+            f"({compressed_reserve:,} bytes) exceeds the declared reservation "
+            f"({ag.fast_memory_reserve_bytes:,} bytes)"
+        )
+    if (
+        not reserved_activation_budget
+        and ag.mem_budget > 0
+        and compressed_reserve > ag.mem_budget
+    ):
+        raise ValueError(
+            "Cannot emit a compressed plan: compressed-weight reservation "
+            f"({compressed_reserve:,} bytes) exceeds the fast-memory budget "
+            f"({ag.mem_budget:,} bytes)"
+        )
+
     if ag.mem_budget > 0:
-        validation = validate_memory_plan(ag)
+        validation = validate_memory_plan(
+            ag,
+            fast_reserve_bytes=0 if reserved_activation_budget else compressed_reserve,
+        )
         if not validation.feasible:
             details = "; ".join(issue.describe() for issue in validation.issues)
             raise ValueError(f"Cannot emit an infeasible memory plan: {details}")
+
+    # The serialized plan budget is the activation arena.  The compile command
+    # already partitions with the compressed-weight reservation removed.  Keep
+    # the defensive direct-emitter behaviour for callers that still provide a
+    # total arena budget instead.
+    serialized_budget = (
+        ag.mem_budget if reserved_activation_budget else ag.mem_budget - compressed_reserve
+    )
+
+    # Reject counts before any fixed-width table field is packed. The runtime
+    # has a deliberately bounded tensor working set; the other limits are
+    # direct consequences of the current wire layout.
+    runtime_tensor_count = sum(1 for info in ag.tensors.values() if not info.is_constant)
+    if runtime_tensor_count > RUNTIME_MAX_TENSORS:
+        raise ValueError(
+            f"plan has {runtime_tensor_count} tensors; current runtime loader limit is "
+            f"{RUNTIME_MAX_TENSORS}"
+        )
+    _require_uint(len(ag.weight_data), 16, "weight count")
+    _require_uint(len(ag.stages), 16, "stage count")
+    if len(ag.stages) > 256:
+        raise ValueError(
+            f"plan has {len(ag.stages)} stages; operators encode a uint8 stage index"
+        )
 
     strings = _StringTable()
     shapes = _ShapePool()
@@ -1051,13 +1273,24 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     quant_data, quant_idx_map = _build_quant_params(ag)
 
     # Add model I/O to index pool
-    tensor_data, tensor_idx = _build_tensors(ag, strings, shapes, quant_idx_map or None)
+    preserve_output_layouts = {
+        op.outputs[0]
+        for op in ag.ops
+        if op.op_type == "Transpose" and len(op.outputs) == 1 and
+        op.outputs[0] in ag.model_outputs
+    }
+    tensor_data, tensor_idx = _build_tensors(
+        ag, strings, shapes, quant_idx_map or None, preserve_output_layouts
+    )
 
     model_inp_indices = [tensor_idx[n] for n in ag.model_inputs if n in tensor_idx]
     model_out_indices = [tensor_idx[n] for n in ag.model_outputs if n in tensor_idx]
     model_io_off, model_io_count = index_pool.add(model_inp_indices + model_out_indices)
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
+    op_attributes_data = _build_op_attributes(
+        ag, tensor_idx, preserve_output_layouts
+    )
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
     tile_data, stage_to_tile = _build_tile_plans(ag)
     stage_data_final = _patch_stage_tile_indices(stage_data, ag, stage_to_tile)
@@ -1072,6 +1305,22 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     num_stages = len(ag.stages)
     num_tile_plans = len(stage_to_tile)
     num_weights = len(weight_idx)
+
+    for value, field in (
+        (num_tensors, "tensor count"),
+        (num_ops, "operator count"),
+        (num_stages, "stage count"),
+        (num_tile_plans, "tile-plan count"),
+        (num_weights, "weight count"),
+    ):
+        _require_uint(value, 16, field)
+    if num_stages > 256:
+        raise ValueError(
+            f"plan has {num_stages} stages; operators encode a uint8 stage index"
+        )
+    _require_uint(model_io_off, 16, "model I/O index-pool offset")
+    _require_uint(len(model_inp_indices), 8, "model input count")
+    _require_uint(len(model_out_indices), 8, "model output count")
 
     # Section directory (one entry per section + sentinel)
     section_parts = [
@@ -1089,6 +1338,8 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
         section_parts.append((SEC_QUANT_PARAMS, quant_data))
     if len(weight_blocks_data) > 0:
         section_parts.append((SEC_WEIGHT_BLOCKS, weight_blocks_data))
+    if op_attributes_data:
+        section_parts.append((SEC_OP_ATTRIBUTES, op_attributes_data))
 
     section_dir_size = (len(section_parts) + 1) * SECTION_ENTRY_SIZE  # +1 for sentinel
     body_start = HEADER_SIZE + section_dir_size
@@ -1145,7 +1396,7 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
         num_ops,
         num_stages,
         num_tile_plans,
-        ag.mem_budget,
+        serialized_budget,
         ag.peak_memory_bytes,
         model_name_off,
         model_io_off,
