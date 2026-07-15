@@ -11,6 +11,7 @@ from .defs import (
     QUANT_PARAM_SIZE,
     SECTION_ENTRY_SIZE,
     SEC_INDEX_POOL,
+    SEC_OP_ATTRIBUTES,
     SEC_OPS,
     SEC_QUANT_PARAMS,
     SEC_SHAPE_POOL,
@@ -51,9 +52,9 @@ def read_binary_plan(data: bytes) -> dict:
 
     if magic != MAGIC:
         raise ValueError(f"Bad magic: {magic!r}")
-    if version not in {2, SCHEMA_VERSION}:
+    if version not in {2, 3, SCHEMA_VERSION}:
         raise ValueError(
-            f"Unsupported schema version: {version} (expected 2 or {SCHEMA_VERSION})"
+            f"Unsupported schema version: {version} (expected 2, 3, or {SCHEMA_VERSION})"
         )
     if file_size != len(data):
         raise ValueError(f"File size mismatch: header says {file_size}, got {len(data)}")
@@ -68,7 +69,7 @@ def read_binary_plan(data: bytes) -> dict:
         if sec_type == 0:
             found_sentinel = True
             break
-        if sec_type > SEC_WEIGHT_BLOCKS:
+        if sec_type > SEC_OP_ATTRIBUTES:
             raise ValueError(f"Unknown section type: {sec_type}")
         if sec_type in sections:
             raise ValueError(f"Duplicate section type: {sec_type}")
@@ -242,12 +243,10 @@ def read_binary_plan(data: bytes) -> dict:
     quant_params = []
     qp_base = sections.get(SEC_QUANT_PARAMS, 0)
     if qp_base:
-        nqp, qd_field = struct.unpack_from("<HH", data, qp_base)
+        nqp, _qd_field = struct.unpack_from("<HH", data, qp_base)
         entries_start = qp_base + 4
         data_start = entries_start + nqp * QUANT_PARAM_SIZE
-        if version == 2:
-            qd_len = qd_field
-        else:
+        if version != 2:
             quant_end = min(
                 (offset for offset in sections.values() if offset > qp_base),
                 default=len(data),
@@ -255,7 +254,6 @@ def read_binary_plan(data: bytes) -> dict:
             qd_bytes = quant_end - data_start
             if qd_bytes < 0 or qd_bytes % 4:
                 raise ValueError("Malformed v3 quant-data section")
-            qd_len = qd_bytes // 4
         for i in range(nqp):
             pos = entries_start + i * QUANT_PARAM_SIZE
             scale, zp, num_ch, mult_off, shift_off, page = struct.unpack_from(
@@ -311,6 +309,31 @@ def read_binary_plan(data: bytes) -> dict:
                 block_entry["decompressed"] = comp_data
             weight_blocks.append(block_entry)
 
+    # Parse optional typed operator attributes.
+    op_attributes = []
+    attrs_base = sections.get(SEC_OP_ATTRIBUTES, 0)
+    if attrs_base:
+        num_attrs, _reserved = struct.unpack_from("<HH", data, attrs_base)
+        entries_start = attrs_base + 4
+        data_start = entries_start + num_attrs * 8
+        section_end = min(
+            (offset for offset in sections.values() if offset > attrs_base),
+            default=len(data),
+        )
+        if data_start > section_end:
+            raise ValueError("operator-attribute entries exceed section")
+        for i in range(num_attrs):
+            op_index, attr_type, data_len, data_off = struct.unpack_from(
+                "<HBBI", data, entries_start + i * 8
+            )
+            if data_off + data_len > section_end - data_start:
+                raise ValueError("operator-attribute payload exceeds section")
+            op_attributes.append({
+                "op_index": op_index,
+                "type": attr_type,
+                "data": data[data_start + data_off:data_start + data_off + data_len],
+            })
+
     # Resolve model I/O from index pool
     all_io = _read_index_pool(model_io_off, num_model_inputs + num_model_outputs)
     model_inputs_idx = all_io[:num_model_inputs]
@@ -340,4 +363,5 @@ def read_binary_plan(data: bytes) -> dict:
         "model_outputs": model_outputs_idx,
         "weight_blocks": weight_blocks,
         "weight_blocks_compression": weight_blocks_compression,
+        "op_attributes": op_attributes,
     }

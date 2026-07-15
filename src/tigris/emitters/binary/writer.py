@@ -20,8 +20,10 @@ from .defs import (
     MAGIC,
     NO_QUANT_PARAM,
     NO_WEIGHT,
+    OP_ATTR_TRANSPOSE_PERM,
     OP_TYPE_MAP,
     SEC_INDEX_POOL,
+    SEC_OP_ATTRIBUTES,
     SEC_OPS,
     SEC_QUANT_PARAMS,
     SEC_SHAPE_POOL,
@@ -602,6 +604,7 @@ def _build_tensors(
     strings: _StringTable,
     shapes: _ShapePool,
     quant_idx_map: dict[str, int] | None = None,
+    preserve_layout_names: set[str] | None = None,
 ) -> tuple[bytes, dict[str, int]]:
     """Build tensor table. Returns (bytes, name->index map)."""
     buf = bytearray()
@@ -618,9 +621,13 @@ def _build_tensors(
 
         name_off = strings.add(name)
 
-        # Transpose shapes from NCHW->NHWC / NCL->NLC at emission time
+        # Internal tensors use NHWC/NLC layout. A terminal Transpose is an
+        # explicit model-output boundary, so its output keeps the observable
+        # ONNX shape and element ordering instead.
         shape = info.shape
-        if len(shape) == 4:
+        if preserve_layout_names and name in preserve_layout_names:
+            pass
+        elif len(shape) == 4:
             shape = (shape[0], shape[2], shape[3], shape[1])
         elif len(shape) == 3:
             shape = (shape[0], shape[2], shape[1])
@@ -651,6 +658,65 @@ def _build_tensors(
         ))
 
     return bytes(buf), tensor_idx
+
+
+def _serialized_axis_map(rank: int, preserve_layout: bool = False) -> list[int]:
+    """Map an ONNX axis to its serialized tensor axis."""
+    if preserve_layout:
+        return list(range(rank))
+    if rank == 4:
+        return [0, 3, 1, 2]  # NCHW -> NHWC
+    if rank == 3:
+        return [0, 2, 1]     # NCL -> NLC
+    return list(range(rank))
+
+
+def _build_op_attributes(
+    ag: AnalyzedGraph, tensor_idx: dict[str, int], preserve_layout_names: set[str]
+) -> bytes:
+    """Build optional, typed per-operator attributes.
+
+    The section is intentionally omitted when no operator needs metadata.
+    Its fixed-width records keep the loader zero-copy while the data pool
+    carries variable-sized payloads such as a Transpose permutation.
+    """
+    records: list[tuple[int, int, bytes]] = []
+    for op_index, op in enumerate(ag.ops):
+        if op.op_type != "Transpose":
+            continue
+        input_name, output_name = op.inputs[0], op.outputs[0]
+        if input_name not in tensor_idx or output_name not in tensor_idx:
+            raise ValueError(f"Transpose '{op.name}' must use runtime tensors")
+        input_info = ag.tensors[input_name]
+        rank = len(input_info.shape)
+        raw_perm = [int(axis) for axis in op.attrs["perm"]]
+        input_axes = _serialized_axis_map(rank)
+        output_axes = _serialized_axis_map(
+            rank, output_name in preserve_layout_names
+        )
+        output_raw_by_serialized = [0] * rank
+        for raw_axis, serialized_axis in enumerate(output_axes):
+            output_raw_by_serialized[serialized_axis] = raw_axis
+        serialized_perm = bytes(
+            input_axes[raw_perm[output_raw_by_serialized[serialized_axis]]]
+            for serialized_axis in range(rank)
+        )
+        records.append((op_index, OP_ATTR_TRANSPOSE_PERM, serialized_perm))
+
+    if not records:
+        return b""
+    if len(records) > 0xFFFF:
+        raise ValueError("operator-attribute count exceeds uint16 plan limit")
+
+    entries = bytearray()
+    data = bytearray()
+    for op_index, attr_type, payload in records:
+        _require_uint(op_index, 16, "operator-attribute operator index")
+        if len(payload) > 0xFF:
+            raise ValueError("operator-attribute payload exceeds uint8 length")
+        entries.extend(struct.pack("<HBBI", op_index, attr_type, len(payload), len(data)))
+        data.extend(payload)
+    return struct.pack("<HH", len(records), 0) + bytes(entries) + bytes(data)
 
 
 def _resolve_weight_bias(op: OpNode, weight_idx: dict[str, int]) -> tuple[int, int]:
@@ -1207,13 +1273,24 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     quant_data, quant_idx_map = _build_quant_params(ag)
 
     # Add model I/O to index pool
-    tensor_data, tensor_idx = _build_tensors(ag, strings, shapes, quant_idx_map or None)
+    preserve_output_layouts = {
+        op.outputs[0]
+        for op in ag.ops
+        if op.op_type == "Transpose" and len(op.outputs) == 1 and
+        op.outputs[0] in ag.model_outputs
+    }
+    tensor_data, tensor_idx = _build_tensors(
+        ag, strings, shapes, quant_idx_map or None, preserve_output_layouts
+    )
 
     model_inp_indices = [tensor_idx[n] for n in ag.model_inputs if n in tensor_idx]
     model_out_indices = [tensor_idx[n] for n in ag.model_outputs if n in tensor_idx]
     model_io_off, model_io_count = index_pool.add(model_inp_indices + model_out_indices)
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
+    op_attributes_data = _build_op_attributes(
+        ag, tensor_idx, preserve_output_layouts
+    )
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
     tile_data, stage_to_tile = _build_tile_plans(ag)
     stage_data_final = _patch_stage_tile_indices(stage_data, ag, stage_to_tile)
@@ -1261,6 +1338,8 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
         section_parts.append((SEC_QUANT_PARAMS, quant_data))
     if len(weight_blocks_data) > 0:
         section_parts.append((SEC_WEIGHT_BLOCKS, weight_blocks_data))
+    if op_attributes_data:
+        section_parts.append((SEC_OP_ATTRIBUTES, op_attributes_data))
 
     section_dir_size = (len(section_parts) + 1) * SECTION_ENTRY_SIZE  # +1 for sentinel
     body_start = HEADER_SIZE + section_dir_size

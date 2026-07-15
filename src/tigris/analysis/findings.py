@@ -130,7 +130,7 @@ def _estimate_plan_overhead(ag: AnalyzedGraph) -> int:
     n_weights = len(ag.weight_data)
 
     overhead = HEADER_SIZE
-    overhead += 11 * SECTION_ENTRY_SIZE   # 10 max sections + sentinel
+    overhead += 12 * SECTION_ENTRY_SIZE   # 11 max sections + sentinel
     overhead += n_tensors * 16            # tensor table
     overhead += n_ops * OP_SIZE           # op table
     overhead += n_stages * STAGE_SIZE     # stage table

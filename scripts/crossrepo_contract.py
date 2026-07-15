@@ -129,6 +129,32 @@ def _residual_case() -> ContractCase:
     )
 
 
+def _output_transpose_case() -> ContractCase:
+    """A public Transpose must retain its ONNX shape and element ordering."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 3]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [3, 1, 2]
+    )
+    model = _model(
+        "output_transpose",
+        [
+            helper.make_node(
+                "Transpose", ["input"], ["output"], perm=[2, 0, 1]
+            )
+        ],
+        [model_input],
+        [model_output],
+    )
+    return ContractCase(
+        "float_output_transpose",
+        model,
+        model,
+        {"input": np.array([[[1.0, -2.0, 3.0], [4.0, 5.0, -6.0]]], dtype=np.float32)},
+    )
+
+
 def _dilated_conv_case() -> ContractCase:
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 1, 5, 5]
@@ -488,6 +514,13 @@ def _decode_outputs(
     offset = 0
     if len(plan["model_outputs"]) != len(reference_outputs):
         raise AssertionError("plan and ONNX Runtime output counts differ")
+    terminal_transpose_outputs = {
+        plan["ops"][attr["op_index"]]["outputs"][0]
+        for attr in plan["op_attributes"]
+        if attr["type"] == 1
+        and plan["ops"][attr["op_index"]]["op_type"] == 29
+        and len(plan["ops"][attr["op_index"]]["outputs"]) == 1
+    }
     for tensor_index, reference in zip(plan["model_outputs"], reference_outputs):
         tensor = plan["tensors"][tensor_index]
         dtype = _DTYPE_BY_ONNX_CODE.get(tensor["dtype"])
@@ -500,7 +533,9 @@ def _decode_outputs(
             raise AssertionError("runtime output file is truncated")
         value = np.frombuffer(raw[offset:end], dtype=dtype).copy()
         value = value.reshape(tensor["shape"])
-        decoded.append(_from_runtime_layout(value, reference.ndim))
+        if tensor_index not in terminal_transpose_outputs:
+            value = _from_runtime_layout(value, reference.ndim)
+        decoded.append(value)
         offset = end
     if offset != len(raw):
         raise AssertionError("runtime output file has trailing bytes")
@@ -622,12 +657,6 @@ def _assert_compile_rejected(work_dir: Path) -> None:
             [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
             [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
         ),
-        _model(
-            "output_transpose",
-            [helper.make_node("Transpose", ["input"], ["output"], perm=[2, 0, 1])],
-            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2, 3])],
-            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [3, 1, 2])],
-        ),
     ]
     for index, model in enumerate(cases):
         path = work_dir / f"rejected-{index}.onnx"
@@ -673,6 +702,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
         _constant_add_case(),
         _residual_case(),
+        _output_transpose_case(),
         _dilated_conv_case(),
         _depthwise_conv_case(),
         _tiled_pool_case(),
