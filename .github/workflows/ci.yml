@@ -39,12 +39,23 @@ jobs:
         with:
           repository: raws-labs/tigris-runtime
           path: tigris-runtime
+          # Develop is the integration baseline.  A same-named runtime branch,
+          # when present, is selected below for coordinated wire-format work.
+          ref: develop
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
+      - name: Use matching runtime integration branch when available
+        env:
+          RUNTIME_REF: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+        run: |
+          if git -C tigris-runtime ls-remote --exit-code --heads origin "$RUNTIME_REF"; then
+            git -C tigris-runtime fetch --depth=1 origin "$RUNTIME_REF"
+            git -C tigris-runtime checkout --detach FETCH_HEAD
+          fi
       - run: python -m ruff check src tests scripts/ci_codegen_smoke.py
       - run: python -m pytest -q tests/test_codegen_c_syntax.py
       - run: python -m build
