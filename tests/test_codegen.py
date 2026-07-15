@@ -228,6 +228,8 @@ def test_core_codegen_is_embeddable_and_backend_specific(
     assert "tigris_codegen_reset" in source
     assert dispatch in source
     if backend == "cmsis-nn":
+        assert "tigris_cmsis_nn_fast_arena_required(plan)" in source
+        assert "fast_arena_size < cmsis_fast_required" in source
         assert "tigris_cmsis_nn_prepare" in source
         assert "tigris_cmsis_nn_deinit(mem)" in source
         assert source.index("tigris_cmsis_nn_deinit(mem)") < source.index(
@@ -375,6 +377,8 @@ def test_quantized_cmsis_codegen_checks_prepare_and_memory(qdq_conv_path):
 
     source = generate_c(emit_binary_bytes(ag), "cmsis-nn")
 
+    assert "tigris_cmsis_nn_fast_arena_required(&plan)" in source
+    assert "Increase TIGRIS_CMSIS_NN_SCRATCH_BYTES" in source
     assert "if (tigris_cmsis_nn_prepare(&plan, &mem) != 0)" in source
     assert "CMSIS-NN preparation failed" in source
     assert "tigris_mem_error_t merr = tigris_mem_init(" in source
@@ -394,11 +398,14 @@ def test_compressed_cmsis_arena_includes_static_weight_reserve(qdq_conv_path):
 
     source = generate_c(data, "cmsis-nn")
 
+    expected_core = (plan["budget"] + expected_overhead + 15) // 16 * 16
+    assert "#define TIGRIS_CMSIS_NN_SCRATCH_BYTES 4096u" in source
     assert (
-        f"static uint8_t fast_arena[{plan['budget'] + expected_overhead}]"
-        in source
+        f"static uint8_t fast_arena[{expected_core}u + "
+        "TIGRIS_CMSIS_NN_SCRATCH_BYTES]" in source
     )
     assert f"if (weight_overhead > {expected_overhead}u)" in source
+    assert "cmsis_fast_required > sizeof(fast_arena)" in source
     assert "fast_size += tigris_weight_decompression_overhead" not in source
 
 
