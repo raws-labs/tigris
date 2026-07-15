@@ -176,6 +176,19 @@ def test_codegen_reports_xip_and_loads_plan_at_runtime(linear_3op_path):
     assert "tigris_run(&plan, &mem, tigris_dispatch_kernel, NULL, &stats)" in source
 
 
+def test_posix_codegen_aligns_plan_and_arenas(linear_3op_path):
+    source = generate_c(
+        emit_binary_bytes(_full_pipeline(linear_3op_path, budget=4096)),
+        "reference",
+    )
+
+    assert "#define _POSIX_C_SOURCE 200112L" in source
+    assert "posix_memalign(&ptr, alignment, size)" in source
+    assert "uint8_t *buf = allocate_aligned" in source
+    assert "void *fast_buf = allocate_aligned(fast_size)" in source
+    assert "void *slow_buf = allocate_aligned(slow_size)" in source
+
+
 def test_quantized_esp_codegen_has_valid_includes(qdq_conv_path):
     ag = _full_pipeline(qdq_conv_path, budget=4096)
     source = generate_c(emit_binary_bytes(ag), "esp-nn")
@@ -183,6 +196,8 @@ def test_quantized_esp_codegen_has_valid_includes(qdq_conv_path):
     assert "Kernels: esp-nn -> s8_ref fallback" in source
     assert "if (tigris_esp_nn_prepare(&plan, &mem) != 0)" in source
     assert "ESP-NN preparation failed" in source
+    assert "tigris_fast_arena_required(&plan)" in source
+    assert "tigris_weight_decompression_overhead(&plan)" not in source
     assert "tigris_mem_error_t merr = tigris_mem_init(" in source
     assert "merr = tigris_mem_alloc_slow(" in source
     assert "part->size < sizeof(tigris_file_header_t)" in source
