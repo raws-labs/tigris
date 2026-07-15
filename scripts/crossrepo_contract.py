@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -23,9 +24,10 @@ from click import ClickException
 from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
+from tigris.analysis.validation import validate_memory_plan
 from tigris.cli import _run_pipeline
-from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.defs import COMPRESS_LZ4, FLAG_XIP
+from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
 
 
@@ -468,8 +470,14 @@ def _compile_plan(
     xip: bool,
 ) -> dict:
     graph, _ = _run_pipeline(str(model_path), (mem_budget,))
+    validation = validate_memory_plan(graph)
+    if not validation.feasible:
+        details = "; ".join(issue.describe() for issue in validation.issues)
+        raise AssertionError(f"compiler produced an infeasible graph: {details}")
     emit_binary(graph, plan_path, compress=compression, xip=xip)
-    return read_binary_plan(plan_path.read_bytes())
+    plan = read_binary_plan(plan_path.read_bytes())
+    plan["_compiler_scheduled_peak"] = validation.scheduled_peak_bytes
+    return plan
 
 
 def _quantize_input(value: Array, plan: dict, tensor: dict) -> Array:
@@ -542,12 +550,63 @@ def _decode_outputs(
     return decoded
 
 
-def _run(command: list[str], description: str) -> None:
+def _run(command: list[str], description: str) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(command, text=True, capture_output=True, check=False)
     if completed.returncode != 0:
         raise RuntimeError(
             f"{description} failed (exit {completed.returncode}):\n"
             f"{completed.stdout}{completed.stderr}"
+        )
+    return completed
+
+
+_MEMORY_REPORT = re.compile(
+    r"^TIGRIS_CONTRACT_MEMORY budget=(\d+) activation_limit=(\d+) "
+    r"reserve=(\d+) required=(\d+) allocated=(\d+) peak=(\d+)$",
+    re.MULTILINE,
+)
+
+
+def _assert_memory_contract(
+    case: ContractCase, plan: dict, runtime_stdout: str
+) -> None:
+    match = _MEMORY_REPORT.search(runtime_stdout)
+    if match is None:
+        raise AssertionError(f"{case.name}: runtime emitted no memory report")
+
+    budget, activation_limit, reserve, required, allocated, measured_peak = map(
+        int, match.groups()
+    )
+    scheduled_peak = int(plan["_compiler_scheduled_peak"])
+    if budget != plan["budget"]:
+        raise AssertionError(
+            f"{case.name}: runtime budget {budget} != plan budget {plan['budget']}"
+        )
+    if required != budget + reserve:
+        raise AssertionError(
+            f"{case.name}: required arena {required} != budget + reserve "
+            f"({budget} + {reserve})"
+        )
+    if activation_limit != scheduled_peak:
+        raise AssertionError(
+            f"{case.name}: runner activation limit {activation_limit} != "
+            f"compiler scheduled peak {scheduled_peak}"
+        )
+    if scheduled_peak > budget:
+        raise AssertionError(
+            f"{case.name}: compiler scheduled peak {scheduled_peak} exceeds "
+            f"activation budget {budget}"
+        )
+    if allocated != scheduled_peak + reserve:
+        raise AssertionError(
+            f"{case.name}: allocated arena {allocated} != compiler core "
+            f"estimate {scheduled_peak + reserve}"
+        )
+    if measured_peak > allocated:
+        raise AssertionError(
+            f"{case.name}: runtime peak {measured_peak} exceeds compiler "
+            f"core estimate {allocated} "
+            f"({scheduled_peak} activations + {reserve} reserve)"
         )
 
 
@@ -603,10 +662,17 @@ def _run_case(
     )
     reference_outputs = session.run(None, case.inputs)
     inputs_path.write_bytes(_pack_inputs(plan, case.inputs))
-    _run(
-        [str(runner), str(plan_path), str(inputs_path), str(outputs_path)],
+    completed = _run(
+        [
+            str(runner),
+            str(plan_path),
+            str(inputs_path),
+            str(outputs_path),
+            str(plan["_compiler_scheduled_peak"]),
+        ],
         f"{case.name} runtime execution",
     )
+    _assert_memory_contract(case, plan, completed.stdout)
     actual_outputs = _decode_outputs(
         plan, outputs_path.read_bytes(), reference_outputs
     )
@@ -621,7 +687,7 @@ def _run_case(
             np.testing.assert_allclose(
                 actual, expected, rtol=0, atol=_INT8_LSB_TOLERANCE
             )
-    print(f"PASS {case.name}")
+    print(f"PASS {case.name} memory-contract")
     return plan_path
 
 

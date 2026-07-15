@@ -246,8 +246,34 @@ def test_core_codegen_header_exposes_embedding_api(qdq_conv_path):
     assert "tigris_codegen_reset" in header
     assert "tigris_codegen_run" in header
     assert "TIGRIS_CODEGEN_TENSOR_CAPACITY" in header
+    assert "TIGRIS_CODEGEN_PLAN_TENSOR_ALIGNMENT_BYTES 32u" in header
     assert "TIGRIS_CODEGEN_PLAN_BUDGET_BYTES" in header
     assert "TIGRIS_CODEGEN_WEIGHT_DECOMPRESSION_RESERVE_BYTES" in header
+    assert "TIGRIS_CODEGEN_CORE_FAST_ARENA_BYTES" in header
+
+
+def test_compressed_core_header_uses_plan_alignment_for_arena_requirement(
+    qdq_conv_path,
+):
+    data = emit_binary_bytes(
+        _full_pipeline(qdq_conv_path, budget=4096), compress="lz4"
+    )
+    plan = read_binary_plan(data)
+    expected_reserve = max(
+        (block["uncompressed_size"] + 31) // 32 * 32
+        for block in plan["weight_blocks"]
+    )
+
+    header = generate_core_header(data)
+
+    assert (
+        f"TIGRIS_CODEGEN_WEIGHT_DECOMPRESSION_RESERVE_BYTES "
+        f"{expected_reserve}u" in header
+    )
+    assert (
+        f"TIGRIS_CODEGEN_CORE_FAST_ARENA_BYTES "
+        f"{plan['budget'] + expected_reserve}u" in header
+    )
 
 
 def test_core_codegen_custom_name_is_linkable_alongside_default(qdq_conv_path):

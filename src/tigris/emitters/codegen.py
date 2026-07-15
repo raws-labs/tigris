@@ -24,18 +24,15 @@ from tigris.emitters.binary.reader import read_binary_plan
 
 BACKENDS = CODEGEN_BACKENDS
 _CMSIS_TENSOR_ALIGN = 16
+_PLAN_TENSOR_ALIGN = 32
 
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-def _cmsis_weight_decompression_overhead(plan: dict) -> int:
-    """Mirror the runtime's simultaneous compressed-weight reservation.
-
-    Cortex-M codegen uses a static arena, so this value must be part of the
-    generated array size rather than discovered after allocation.
-    """
+def _weight_decompression_overhead(plan: dict, alignment: int) -> int:
+    """Mirror the runtime's grouping at the selected allocation alignment."""
     blocks = [
         block
         for block in plan.get("weight_blocks", [])
@@ -45,7 +42,7 @@ def _cmsis_weight_decompression_overhead(plan: dict) -> int:
         return 0
 
     def block_size(block: dict) -> int:
-        return _align_up(block["uncompressed_size"], _CMSIS_TENSOR_ALIGN)
+        return _align_up(block["uncompressed_size"], alignment)
 
     max_required = max(block_size(block) for block in blocks)
     stages = plan.get("stages", [])
@@ -69,6 +66,11 @@ def _cmsis_weight_decompression_overhead(plan: dict) -> int:
         max_required = max(max_required, chain_required)
 
     return max_required
+
+
+def _cmsis_weight_decompression_overhead(plan: dict) -> int:
+    """Return the exact compressed-weight reserve for CMSIS static codegen."""
+    return _weight_decompression_overhead(plan, _CMSIS_TENSOR_ALIGN)
 
 
 def _plan_dtype(plan: dict) -> DTypeMode:
@@ -167,7 +169,10 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
     plan = read_binary_plan(plan_data)
     macro_prefix = core_name.upper()
     guard = f"{macro_prefix}_CORE_H"
-    weight_reserve = _cmsis_weight_decompression_overhead(plan)
+    weight_reserve = _weight_decompression_overhead(plan, _PLAN_TENSOR_ALIGN)
+    fast_arena_required = plan["budget"] + weight_reserve
+    if fast_arena_required > 0xFFFFFFFF:
+        raise ValueError("Core fast-arena requirement exceeds uint32")
     return f"""\
 /* Auto-generated-code API.  This header is target-neutral. */
 #ifndef {guard}
@@ -180,10 +185,15 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 
-/* Model-specific compile-time requirements for static embedding. */
+/* Model-specific compile-time requirements for static embedding. The plan
+ * cost model uses 32-byte allocations, conservatively covering supported
+ * runtimes whose TIGRIS_TENSOR_ALIGN is at most this value. Backend-specific
+ * scratch/workspace is prepared separately and is not included here. */
 #define {macro_prefix}_TENSOR_CAPACITY {plan['num_tensors']}u
+#define {macro_prefix}_PLAN_TENSOR_ALIGNMENT_BYTES {_PLAN_TENSOR_ALIGN}u
 #define {macro_prefix}_PLAN_BUDGET_BYTES {plan['budget']}u
 #define {macro_prefix}_WEIGHT_DECOMPRESSION_RESERVE_BYTES {weight_reserve}u
+#define {macro_prefix}_CORE_FAST_ARENA_BYTES {fast_arena_required}u
 
 typedef void (*{core_name}_input_init_fn)(
     void *data, uint32_t size_bytes, uint16_t tensor_index, void *user_ctx);
@@ -417,15 +427,13 @@ int main(int argc, char **argv)
            plan.header->num_ops, plan.header->num_stages, plan.header->budget);
 
     /* 2. Allocate buffers */
-    uint32_t fast_size = plan.header->budget;
+    uint32_t fast_size = tigris_fast_arena_required(&plan);
     if (fast_size == 0) fast_size = {budget};
-    uint32_t weight_overhead = tigris_weight_decompression_overhead(&plan);
-    if (weight_overhead == UINT32_MAX || fast_size > UINT32_MAX - weight_overhead) {{
-        fprintf(stderr, "Invalid compressed-weight arena requirement\\n");
+    if (fast_size == UINT32_MAX) {{
+        fprintf(stderr, "Invalid core fast-arena requirement\\n");
         free(plan_buf);
         return 1;
     }}
-    fast_size += weight_overhead;
 
     if (plan.header->peak > UINT32_MAX / 4u) {{
         fprintf(stderr, "Slow-memory arena requirement exceeds uint32\\n");
