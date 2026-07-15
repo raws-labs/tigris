@@ -244,6 +244,11 @@ def _generate_core(
     (void)tigris_cmsis_nn_deinit(mem);
 """ if is_quantized else ""
         prepare = """\
+    uint32_t cmsis_fast_required =
+        tigris_cmsis_nn_fast_arena_required(plan);
+    if (cmsis_fast_required == UINT32_MAX ||
+        fast_arena_size < cmsis_fast_required)
+        return TIGRIS_MEM_ERR_OOM;
     if (tigris_cmsis_nn_prepare(plan, mem) != 0)
         return TIGRIS_MEM_ERR_OOM;
 """ if is_quantized else ""
@@ -369,6 +374,8 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
     budget = plan["budget"] or 65536
 
     return f"""\
+#define _POSIX_C_SOURCE 200112L
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -379,6 +386,16 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
 #include "tigris_mem.h"
 #include "tigris_executor.h"
 {kernel_include}
+
+static void *allocate_aligned(uint32_t size)
+{{
+    void *ptr = NULL;
+    size_t alignment = TIGRIS_TENSOR_ALIGN;
+    if (alignment < sizeof(void *)) alignment = sizeof(void *);
+    if (size == 0 || posix_memalign(&ptr, alignment, size) != 0)
+        return NULL;
+    return ptr;
+}}
 
 static uint8_t *load_file(const char *path, uint32_t *out_len)
 {{
@@ -391,7 +408,7 @@ static uint8_t *load_file(const char *path, uint32_t *out_len)
         fclose(f);
         return NULL;
     }}
-    uint8_t *buf = malloc((size_t)sz);
+    uint8_t *buf = allocate_aligned((uint32_t)sz);
     if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {{
         free(buf);
         fclose(f);
@@ -443,8 +460,8 @@ int main(int argc, char **argv)
     uint32_t slow_size = plan.header->peak * 4u;
     if (slow_size < 256 * 1024) slow_size = 256 * 1024;
 
-    void *fast_buf = malloc(fast_size);
-    void *slow_buf = malloc(slow_size);
+    void *fast_buf = allocate_aligned(fast_size);
+    void *slow_buf = allocate_aligned(slow_size);
     uint16_t num_t = plan.header->num_tensors;
     void **tensor_ptrs = calloc(num_t, sizeof(void *));
     if (!fast_buf || !slow_buf || !tensor_ptrs) {{
@@ -595,15 +612,13 @@ void app_main(void)
            tigris_model_name(&plan), plan.header->num_ops, plan.header->num_stages);
 
     /* 3. Allocate buffers */
-    uint32_t fast_size = plan.header->budget;
+    uint32_t fast_size = tigris_fast_arena_required(&plan);
     if (fast_size == 0) fast_size = {budget};
-    uint32_t weight_overhead = tigris_weight_decompression_overhead(&plan);
-    if (weight_overhead == UINT32_MAX || fast_size > UINT32_MAX - weight_overhead) {{
-        ESP_LOGE(TAG, "invalid compressed-weight arena requirement");
+    if (fast_size == UINT32_MAX) {{
+        ESP_LOGE(TAG, "invalid core fast-arena requirement");
         esp_partition_munmap(mmap_handle);
         return;
     }}
-    fast_size += weight_overhead;
 
 #if CONFIG_SPIRAM
     uint32_t slow_size = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
@@ -702,8 +717,8 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
     kernel_include = '#include "tigris_kernels_cmsis_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
     budget = plan["budget"] or 65536
     weight_overhead = _cmsis_weight_decompression_overhead(plan)
-    fast_arena_size = budget + weight_overhead
-    if fast_arena_size > 0xFFFFFFFF:
+    core_fast_arena_size = _align_up(budget + weight_overhead, 16)
+    if core_fast_arena_size > 0xFFFFFFFF:
         raise ValueError(
             "CMSIS-NN static fast arena exceeds the uint32 runtime size limit"
         )
@@ -714,14 +729,42 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
         )
 
     if is_quantized:
+        scratch_declaration = f"""\
+/* Override at build time for larger plans. The runtime query below validates
+ * this allowance against the linked CMSIS-NN library before initialization. */
+#ifndef TIGRIS_CMSIS_NN_SCRATCH_BYTES
+#define TIGRIS_CMSIS_NN_SCRATCH_BYTES 4096u
+#endif
+#if TIGRIS_CMSIS_NN_SCRATCH_BYTES > UINT32_MAX - {core_fast_arena_size}u
+#error "CMSIS-NN static fast arena exceeds uint32"
+#endif
+"""
+        fast_arena_expr = (
+            f"{core_fast_arena_size}u + TIGRIS_CMSIS_NN_SCRATCH_BYTES"
+        )
         prepare_block = """\
 
+    uint32_t cmsis_fast_required =
+        tigris_cmsis_nn_fast_arena_required(&plan);
+    if (cmsis_fast_required == UINT32_MAX) {
+        printf("CMSIS-NN fast arena requirement is invalid or unrepresentable.\\n");
+        return 1;
+    }
+    if (cmsis_fast_required > sizeof(fast_arena)) {
+        printf("CMSIS-NN fast arena needs %lu bytes; generated capacity is %lu. "
+               "Increase TIGRIS_CMSIS_NN_SCRATCH_BYTES.\\n",
+               (unsigned long)cmsis_fast_required,
+               (unsigned long)sizeof(fast_arena));
+        return 1;
+    }
     if (tigris_cmsis_nn_prepare(&plan, &mem) != 0) {
         printf("CMSIS-NN preparation failed\\n");
         return 1;
     }
 """
     else:
+        scratch_declaration = ""
+        fast_arena_expr = f"{core_fast_arena_size}u"
         prepare_block = ""
 
     return f"""\
@@ -744,12 +787,14 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
 #include "tigris_executor.h"
 {kernel_include}
 
+{scratch_declaration}
+
 /* Plan binary linked into flash — symbol provided by linker */
 extern const uint8_t _binary_model_tgrs_start[];
 extern const uint8_t _binary_model_tgrs_end[];
 
-/* Static buffers. The fast arena includes the plan's compressed-weight reserve. */
-static uint8_t fast_arena[{fast_arena_size}] __attribute__((aligned(16)));
+/* Static buffers. Fast memory preserves the full core arena below CMSIS scratch. */
+static uint8_t fast_arena[{fast_arena_expr}] __attribute__((aligned(16)));
 static uint8_t slow_arena[{slow_arena_size}] __attribute__((aligned(16)));
 static void *tensor_ptrs[{plan['num_tensors']}];
 
