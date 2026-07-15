@@ -54,6 +54,9 @@ tigris = "tigris.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+tigris = ["schema/*.json"]
+
 [tool.setuptools_scm]
 version_file = "src/tigris/_version.py"
 

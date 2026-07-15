@@ -56,7 +56,7 @@ jobs:
             git -C tigris-runtime fetch --depth=1 origin "$RUNTIME_REF"
             git -C tigris-runtime checkout --detach FETCH_HEAD
           fi
-      - run: python -m ruff check src tests scripts/ci_codegen_smoke.py
+      - run: python -m ruff check src tests scripts
       - run: python -m pytest -q tests/test_codegen_c_syntax.py
       - run: python -m build
       - run: python -m venv /tmp/tigris-wheel-smoke
@@ -66,4 +66,11 @@ jobs:
       - run: >-
           cc -std=c99 -Wall -Wextra -Werror -fsyntax-only
           -Itigris-runtime/include /tmp/tigris-smoke.c
-      - run: python scripts/crossrepo_contract.py --runtime tigris-runtime
+      - name: Verify generated plan-schema package
+        run: >-
+          python scripts/generate_schema_package.py
+          --check src/tigris/schema/tigris-plan-v4.json
+      - name: Verify compiler/runtime compatibility metadata
+        run: python scripts/validate_compatibility.py --runtime tigris-runtime
+      - name: Run compiler/runtime differential contract
+        run: python scripts/crossrepo_contract.py --runtime tigris-runtime
