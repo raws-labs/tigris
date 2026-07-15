@@ -1,7 +1,9 @@
-"""Binary plan format - constants, enums, and struct sizes.
+"""Binary plan format - constants, enums, and canonical wire layouts.
 
 Keep in sync with tigris-runtime/include/tigris.h
 """
+
+import struct
 
 # Magic
 MAGIC = b"TGRS"
@@ -18,6 +20,20 @@ SEC_WEIGHTS = 8
 SEC_QUANT_PARAMS = 9
 SEC_WEIGHT_BLOCKS = 10
 SEC_OP_ATTRIBUTES = 11
+
+SECTION_TYPES = (
+    SEC_TENSORS,
+    SEC_OPS,
+    SEC_STAGES,
+    SEC_TILE_PLANS,
+    SEC_INDEX_POOL,
+    SEC_SHAPE_POOL,
+    SEC_STRINGS,
+    SEC_WEIGHTS,
+    SEC_QUANT_PARAMS,
+    SEC_WEIGHT_BLOCKS,
+    SEC_OP_ATTRIBUTES,
+)
 
 # Per-operator attribute kinds stored in SEC_OP_ATTRIBUTES.
 OP_ATTR_TRANSPOSE_PERM = 1
@@ -71,16 +87,62 @@ TENSOR_FLAG_CONSTANT = 0x01
 TENSOR_FLAG_MODEL_INPUT = 0x02
 TENSOR_FLAG_MODEL_OUTPUT = 0x04
 
-# Struct sizes (layout retained by schema v3)
-HEADER_SIZE = 48
-SECTION_ENTRY_SIZE = 8
-TENSOR_SIZE = 16
-OP_SIZE = 38  # spatial attrs pad/dilation widened u8->u16 (12->18 bytes)
-STAGE_SIZE = 28
-TILE_PLAN_SIZE = 24
-WEIGHT_ENTRY_SIZE = 12
-QUANT_PARAM_SIZE = 16
-WEIGHT_BLOCK_SIZE = 20
+# Canonical little-endian wire layouts.  Writer, reader, and size estimates all
+# consume these definitions so a schema edit cannot silently leave one of them
+# using a stale hand-maintained byte count.
+HEADER_STRUCT = struct.Struct("<4sIIIHHHHIIIHBBHHI")
+SECTION_ENTRY_STRUCT = struct.Struct("<II")
+TENSOR_STRUCT = struct.Struct("<IIHBBBHx")
+
+# An operator is emitted in four pieces because its spatial fields are built by
+# a dedicated validator.  Their combined size is the packed tigris_op_t size.
+OP_PREFIX_STRUCT = struct.Struct("<IBBBBHH")
+SPATIAL_ATTRS_STRUCT = struct.Struct("<4B7H")
+OP_WEIGHT_BIAS_STRUCT = struct.Struct("<HH")
+OP_ACTIVATION_STRUCT = struct.Struct("<Bbbx")
+
+STAGE_STRUCT = struct.Struct("<I12H")
+TILE_PLAN_STRUCT = struct.Struct("<BB5H3I")
+WEIGHT_ENTRY_STRUCT = struct.Struct("<III")
+QUANT_PARAM_STRUCT = struct.Struct("<fiHHHH")
+WEIGHT_BLOCK_STRUCT = struct.Struct("<HHHHIII")
+OP_ATTRIBUTE_STRUCT = struct.Struct("<HBBI")
+
+# Section-local headers and primitive pool elements are part of the wire
+# contract too, even though they are not named C record types.
+QUANT_SECTION_HEADER_STRUCT = struct.Struct("<HH")
+WEIGHT_BLOCK_SECTION_HEADER_STRUCT = struct.Struct("<HH")
+OP_ATTRIBUTE_SECTION_HEADER_STRUCT = struct.Struct("<HH")
+INDEX_STRUCT = struct.Struct("<H")
+SHAPE_DIM_STRUCT = struct.Struct("<i")
+QUANT_DATA_STRUCT = struct.Struct("<i")
+
+# Every section begins on this boundary.  The weights section receives an
+# additional pre-padding adjustment so its blob begins on the same boundary.
+PLAN_SECTION_ALIGNMENT = 16
+
+# Derived sizes remain available under the established public names.
+HEADER_SIZE = HEADER_STRUCT.size
+SECTION_ENTRY_SIZE = SECTION_ENTRY_STRUCT.size
+TENSOR_SIZE = TENSOR_STRUCT.size
+OP_SIZE = (
+    OP_PREFIX_STRUCT.size
+    + SPATIAL_ATTRS_STRUCT.size
+    + OP_WEIGHT_BIAS_STRUCT.size
+    + OP_ACTIVATION_STRUCT.size
+)
+STAGE_SIZE = STAGE_STRUCT.size
+TILE_PLAN_SIZE = TILE_PLAN_STRUCT.size
+WEIGHT_ENTRY_SIZE = WEIGHT_ENTRY_STRUCT.size
+QUANT_PARAM_SIZE = QUANT_PARAM_STRUCT.size
+WEIGHT_BLOCK_SIZE = WEIGHT_BLOCK_STRUCT.size
+OP_ATTRIBUTE_SIZE = OP_ATTRIBUTE_STRUCT.size
+
+# Derived field offsets used for staged decoding/patching.
+OP_SPATIAL_OFFSET = OP_PREFIX_STRUCT.size
+OP_WEIGHT_BIAS_OFFSET = OP_SPATIAL_OFFSET + SPATIAL_ATTRS_STRUCT.size
+OP_ACTIVATION_OFFSET = OP_WEIGHT_BIAS_OFFSET + OP_WEIGHT_BIAS_STRUCT.size
+STAGE_TILE_PLAN_INDEX_OFFSET = struct.calcsize("<I6H")
 
 # Sentinel for no weight/bias
 NO_WEIGHT = 0xFFFF
