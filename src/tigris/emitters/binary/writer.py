@@ -17,11 +17,22 @@ from .defs import (
     COMPRESS_NONE,
     FLAG_XIP,
     HEADER_SIZE,
+    HEADER_STRUCT,
+    INDEX_STRUCT,
     MAGIC,
     NO_QUANT_PARAM,
     NO_WEIGHT,
     OP_ATTR_TRANSPOSE_PERM,
+    OP_ACTIVATION_STRUCT,
+    OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
+    OP_ATTRIBUTE_STRUCT,
+    OP_PREFIX_STRUCT,
     OP_TYPE_MAP,
+    OP_WEIGHT_BIAS_STRUCT,
+    PLAN_SECTION_ALIGNMENT,
+    QUANT_DATA_STRUCT,
+    QUANT_PARAM_STRUCT,
+    QUANT_SECTION_HEADER_STRUCT,
     SEC_INDEX_POOL,
     SEC_OP_ATTRIBUTES,
     SEC_OPS,
@@ -34,18 +45,27 @@ from .defs import (
     SEC_WEIGHT_BLOCKS,
     SEC_WEIGHTS,
     SECTION_ENTRY_SIZE,
+    SECTION_ENTRY_STRUCT,
+    SPATIAL_ATTRS_STRUCT,
     STAGE_SIZE,
+    STAGE_STRUCT,
+    STAGE_TILE_PLAN_INDEX_OFFSET,
     TENSOR_FLAG_CONSTANT,
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
+    TENSOR_STRUCT,
+    TILE_PLAN_STRUCT,
+    WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
+    WEIGHT_BLOCK_STRUCT,
     WEIGHT_ENTRY_SIZE,
+    WEIGHT_ENTRY_STRUCT,
 )
 
 
 # Weight blobs are padded so every weight/bias starts on this byte boundary.
 # The optimized CMSIS-NN Cortex-M kernels read weights/bias with LDRD (8-byte)
 # and wide SIMD loads, which fault on unaligned data; 16 also covers Helium MVE.
-WEIGHT_ALIGN = 16
+WEIGHT_ALIGN = PLAN_SECTION_ALIGNMENT
 
 # These are execution limits of the current runtime, rather than wire-format
 # limits. Keep them explicit here so the compiler fails before producing a plan
@@ -219,8 +239,7 @@ def _pack_spatial_attrs(
         pad_bottom = int(pa[2]) if len(pa) >= 3 else 0
         pad_right = int(pa[3]) if len(pa) >= 4 else 0
 
-    return struct.pack(
-        "<4B7H",
+    return SPATIAL_ATTRS_STRUCT.pack(
         kernel_h, kernel_w, stride_h, stride_w,
         pad_top, pad_bottom, pad_left, pad_right,
         dilation_h, dilation_w,
@@ -400,8 +419,7 @@ def _build_weights(
         # the section) every weight/bias pointer is aligned for the opt kernels.
         blob_buf.extend(b"\x00" * ((-len(blob_buf)) % WEIGHT_ALIGN))
         blob_offset = len(blob_buf)
-        entries_buf.extend(struct.pack(
-            "<III",
+        entries_buf.extend(WEIGHT_ENTRY_STRUCT.pack(
             name_off,
             blob_offset,
             len(raw),
@@ -503,8 +521,8 @@ def _build_weights_compressed(
             # the uncompressed path.
             block_buf.extend(b"\x00" * ((-len(block_buf)) % WEIGHT_ALIGN))
             # Write entry with block-relative offset
-            struct.pack_into(
-                "<III", entries_buf, widx * WEIGHT_ENTRY_SIZE,
+            WEIGHT_ENTRY_STRUCT.pack_into(
+                entries_buf, widx * WEIGHT_ENTRY_SIZE,
                 name_off, len(block_buf), len(raw),
             )
             block_buf.extend(raw)
@@ -528,8 +546,8 @@ def _build_weights_compressed(
     for widx in range(len(prepared)):
         if widx not in assigned:
             raw, name_off = prepared[widx]
-            struct.pack_into(
-                "<III", entries_buf, widx * WEIGHT_ENTRY_SIZE,
+            WEIGHT_ENTRY_STRUCT.pack_into(
+                entries_buf, widx * WEIGHT_ENTRY_SIZE,
                 name_off, 0, len(raw),
             )
 
@@ -538,12 +556,11 @@ def _build_weights_compressed(
     # block entries: tigris_weight_block_t[num_blocks]
     # blob data
     num_blocks = len(blocks)
-    sec_header = struct.pack("<HH", num_blocks, compress_type)
+    sec_header = WEIGHT_BLOCK_SECTION_HEADER_STRUCT.pack(num_blocks, compress_type)
     block_entries = bytearray()
     current_blob_off = 0
     for stage_idx, first_widx, num_w, uncomp_sz, comp_sz, comp_data in blocks:
-        block_entries.extend(struct.pack(
-            "<HHHH III",
+        block_entries.extend(WEIGHT_BLOCK_STRUCT.pack(
             stage_idx, first_widx, num_w, 0,  # pad
             current_blob_off, comp_sz, uncomp_sz,
         ))
@@ -571,13 +588,13 @@ def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
     _, section, _ = _build_weights_compressed(ag, _StringTable(), "none")
     if len(section) < 4:
         return 0
-    num_blocks, _ = struct.unpack_from("<HH", section, 0)
-    block_size = struct.calcsize("<HHHHIII")
+    num_blocks, _ = WEIGHT_BLOCK_SECTION_HEADER_STRUCT.unpack_from(section, 0)
+    block_size = WEIGHT_BLOCK_STRUCT.size
     block_bytes: dict[int, int] = {}
     for i in range(num_blocks):
         off = 4 + i * block_size
-        stage_idx, _, _, _, _, _, uncompressed = struct.unpack_from(
-            "<HHHHIII", section, off
+        stage_idx, _, _, _, _, _, uncompressed = WEIGHT_BLOCK_STRUCT.unpack_from(
+            section, off
         )
         aligned = (uncompressed + ag.tensor_alignment - 1) & ~(
             ag.tensor_alignment - 1
@@ -646,8 +663,7 @@ def _build_tensors(
 
         # tigris_tensor_t: 16 bytes
         # name_str(u32) size_bytes(u32) shape_off(u16) ndim(u8) dtype(u8) flags(u8) quant_param_idx(u16) pad(1)
-        buf.extend(struct.pack(
-            "<IIHBBBHx",
+        buf.extend(TENSOR_STRUCT.pack(
             name_off,
             info.size_bytes,
             shape_off,
@@ -714,9 +730,15 @@ def _build_op_attributes(
         _require_uint(op_index, 16, "operator-attribute operator index")
         if len(payload) > 0xFF:
             raise ValueError("operator-attribute payload exceeds uint8 length")
-        entries.extend(struct.pack("<HBBI", op_index, attr_type, len(payload), len(data)))
+        entries.extend(OP_ATTRIBUTE_STRUCT.pack(
+            op_index, attr_type, len(payload), len(data)
+        ))
         data.extend(payload)
-    return struct.pack("<HH", len(records), 0) + bytes(entries) + bytes(data)
+    return (
+        OP_ATTRIBUTE_SECTION_HEADER_STRUCT.pack(len(records), 0)
+        + bytes(entries)
+        + bytes(data)
+    )
 
 
 def _resolve_weight_bias(op: OpNode, weight_idx: dict[str, int]) -> tuple[int, int]:
@@ -828,8 +850,7 @@ def _build_ops(
         # spatial_attrs(18 bytes)
         # weight_idx(u16) bias_idx(u16)
         # fused_act(u8) act_min(i8) act_max(i8) _pad(u8)
-        buf.extend(struct.pack(
-            "<IBBBB HH",
+        buf.extend(OP_PREFIX_STRUCT.pack(
             name_off,
             op_type,
             inp_count,
@@ -839,8 +860,8 @@ def _build_ops(
             out_off,
         ))
         buf.extend(spatial)
-        buf.extend(struct.pack("<HH", w_idx, b_idx))
-        buf.extend(struct.pack("<Bbbx", fused_act, act_min, act_max))
+        buf.extend(OP_WEIGHT_BIAS_STRUCT.pack(w_idx, b_idx))
+        buf.extend(OP_ACTIVATION_STRUCT.pack(fused_act, act_min, act_max))
 
     return bytes(buf)
 
@@ -895,8 +916,7 @@ def _build_stages(
         # tile_plan_idx(u16) pad(u16)
         # chain_id(u16) chain_len(u16)
         # chain_tile_h(u16) _reserved1(u16)
-        buf.extend(struct.pack(
-            "<I HHHHHH HH HHHH",
+        buf.extend(STAGE_STRUCT.pack(
             stage.peak_bytes,
             ops_off, ops_count,
             inp_off, inp_count,
@@ -932,8 +952,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
         # tiled_peak_bytes(u32)
         # overhead_bytes(u32)
         # reserved(u32)
-        buf.extend(struct.pack(
-            "<BBH HH HH I I I",
+        buf.extend(TILE_PLAN_STRUCT.pack(
             1 if tp.tileable else 0,
             0,  # pad
             tp.tile_height,
@@ -1114,17 +1133,16 @@ def _build_quant_params(
         for c in range(num_channels):
             scale = float(eff[c]) if eff is not None else float(qp.scale[c])
             m, s = _compute_multiplier_shift(scale)
-            data_buf.extend(struct.pack("<i", m))
+            data_buf.extend(QUANT_DATA_STRUCT.pack(m))
         for c in range(num_channels):
             scale = float(eff[c]) if eff is not None else float(qp.scale[c])
             _, s = _compute_multiplier_shift(scale)
-            data_buf.extend(struct.pack("<i", s))
+            data_buf.extend(QUANT_DATA_STRUCT.pack(s))
         data_offset += 2 * num_channels
 
         # tigris_quant_param_t: 16 bytes
         # scale(f32) zero_point(i32) num_channels(u16) multiplier_off(u16) shift_off(u16) pad(u16)
-        entries_buf.extend(struct.pack(
-            "<fiHHHH",
+        entries_buf.extend(QUANT_PARAM_STRUCT.pack(
             float(qp.scale[0]),
             int(qp.zero_point[0]),
             num_channels,
@@ -1142,7 +1160,7 @@ def _build_quant_params(
     if pages > 0xFFFF:
         raise ValueError("quantization data exceeds v3 page-count limit")
     # v3 section header: num_quant_params(u16) + quant_data_pages(u16).
-    header = struct.pack("<HH", len(quant_idx_map), pages)
+    header = QUANT_SECTION_HEADER_STRUCT.pack(len(quant_idx_map), pages)
     return header + bytes(entries_buf) + bytes(data_buf), quant_idx_map
 
 
@@ -1150,8 +1168,8 @@ def _patch_stage_tile_indices(stage_data: bytearray, ag: AnalyzedGraph, stage_to
     """Patch tile_plan_idx in stage entries."""
     for i, stage in enumerate(ag.stages):
         tile_idx = stage_to_tile.get(stage.stage_id, 0xFFFF)
-        offset = i * STAGE_SIZE + 16  # offset of tile_plan_idx within stage struct
-        struct.pack_into("<H", stage_data, offset, tile_idx)
+        offset = i * STAGE_SIZE + STAGE_TILE_PLAN_INDEX_OFFSET
+        INDEX_STRUCT.pack_into(stage_data, offset, tile_idx)
     return bytes(stage_data)
 
 
@@ -1371,8 +1389,8 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     # Build section directory
     sec_dir = bytearray()
     for sec_type, sec_off in sections:
-        sec_dir.extend(struct.pack("<II", sec_type, sec_off))
-    sec_dir.extend(struct.pack("<II", 0, 0))  # sentinel
+        sec_dir.extend(SECTION_ENTRY_STRUCT.pack(sec_type, sec_off))
+    sec_dir.extend(SECTION_ENTRY_STRUCT.pack(0, 0))  # sentinel
 
     # Build header (48 bytes)
     # magic(4) version(u32)
@@ -1386,8 +1404,7 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     header_flags = 0
     if xip:
         header_flags |= FLAG_XIP
-    header = struct.pack(
-        "<4sI II HHHH II I HBB HH I",
+    header = HEADER_STRUCT.pack(
         MAGIC,
         SCHEMA_VERSION,
         file_size,

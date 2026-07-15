@@ -96,50 +96,207 @@ class Findings:
 
 
 def _estimate_weight_sizes(ag: AnalyzedGraph) -> tuple[int, int, int]:
-    """Return (float32_bytes, int8_bytes, lz4_bytes) from weight_data."""
-    total = 0
+    """Return serialized (current, hypothetical int8, LZ4) weight bytes."""
+    raw_parts: list[bytes] = []
     int8_total = 0
     for arr in ag.weight_data.values():
-        total += arr.nbytes
-        if arr.dtype in (np.float32, np.float64):
+        if arr.dtype in (np.int8, np.int32):
+            raw = arr.tobytes()
+        else:
+            # The writer normalizes every other initializer to float32.
+            raw = arr.astype(np.float32).tobytes()
+        raw_parts.append(raw)
+        if np.issubdtype(arr.dtype, np.floating):
             int8_total += arr.size  # 1 byte per element
         else:
-            int8_total += arr.nbytes
+            int8_total += len(raw)
 
     # LZ4 on the actual weight data (meaningful for the current dtype only)
     lz4_total = 0
     try:
         import lz4.block
-        blob = b"".join(arr.tobytes() for arr in ag.weight_data.values())
+        blob = b"".join(raw_parts)
         if blob:
             lz4_total = len(lz4.block.compress(blob, store_size=False))
     except ImportError:
         pass
 
-    return total, int8_total, lz4_total
+    return sum(map(len, raw_parts)), int8_total, lz4_total
+
+
+def _serialized_weight_sizes(ag: AnalyzedGraph, *, int8: bool) -> list[int]:
+    """Return per-entry blob sizes for one plan-size profile."""
+    sizes = []
+    for arr in ag.weight_data.values():
+        if int8 and np.issubdtype(arr.dtype, np.floating):
+            sizes.append(int(arr.size))
+        elif arr.dtype in (np.int8, np.int32):
+            sizes.append(int(arr.nbytes))
+        else:
+            sizes.append(int(arr.size) * np.dtype(np.float32).itemsize)
+    return sizes
+
+
+def _aligned_weight_blob_size(sizes: list[int], alignment: int) -> int:
+    """Mirror the per-weight padding used by the uncompressed writer."""
+    size = 0
+    for weight_size in sizes:
+        size = (size + alignment - 1) // alignment * alignment
+        size += weight_size
+    return size
+
+
+def _index_pool_item_count(ag: AnalyzedGraph, runtime_names: set[str]) -> int:
+    """Count the uint16 elements appended by the writer's index pool."""
+    count = sum(name in runtime_names for name in ag.model_inputs)
+    count += sum(name in runtime_names for name in ag.model_outputs)
+    for op in ag.ops:
+        count += sum(name in runtime_names for name in op.inputs)
+        count += sum(name in runtime_names for name in op.outputs)
+    for stage in ag.stages:
+        count += len(stage.op_indices)
+        count += sum(name in runtime_names for name in stage.input_tensors)
+        count += sum(name in runtime_names for name in stage.output_tensors)
+    return count
+
+
+def _string_pool_size(ag: AnalyzedGraph, runtime_names: set[str]) -> int:
+    """Measure the writer's deduplicated, NUL-terminated UTF-8 strings."""
+    names = [ag.model_name]
+    names.extend(ag.weight_data)
+    names.extend(name for name in ag.tensors if name in runtime_names)
+    names.extend(op.name for op in ag.ops)
+    unique_names = dict.fromkeys(names)
+    if not unique_names:
+        return 1
+    return sum(len(name.encode("utf-8")) + 1 for name in unique_names)
+
+
+def _op_attribute_section_size(ag: AnalyzedGraph) -> int:
+    """Measure the optional typed operator-attribute section."""
+    from tigris.emitters.binary.defs import (
+        OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
+        OP_ATTRIBUTE_SIZE,
+    )
+
+    payload_bytes = 0
+    count = 0
+    for op in ag.ops:
+        if op.op_type != "Transpose":
+            continue
+        count += 1
+        payload_bytes += len(ag.tensors[op.inputs[0]].shape)
+    if not count:
+        return 0
+    return OP_ATTRIBUTE_SECTION_HEADER_STRUCT.size + count * OP_ATTRIBUTE_SIZE + payload_bytes
+
+
+def _compressed_weight_block_count(ag: AnalyzedGraph) -> int:
+    """Count stage-local blocks created by compressed serialization."""
+    weight_names = set(ag.weight_data)
+    stages_with_weights: set[int] = set()
+    for stage in ag.stages:
+        for op_index in stage.op_indices:
+            if any(name in weight_names for name in ag.ops[op_index].inputs):
+                stages_with_weights.add(stage.stage_id)
+                break
+    return len(stages_with_weights)
+
+
+def _estimate_serialized_plan_size(
+    ag: AnalyzedGraph,
+    weight_sizes: list[int],
+    *,
+    compressed_weight_bytes: int = 0,
+) -> int:
+    """Estimate one complete plan using the canonical schema layouts."""
+    from tigris.emitters.binary.defs import (
+        HEADER_SIZE,
+        INDEX_STRUCT,
+        OP_SIZE,
+        PLAN_SECTION_ALIGNMENT,
+        SEC_INDEX_POOL,
+        SEC_OP_ATTRIBUTES,
+        SEC_OPS,
+        SEC_QUANT_PARAMS,
+        SEC_SHAPE_POOL,
+        SEC_STAGES,
+        SEC_STRINGS,
+        SEC_TENSORS,
+        SEC_TILE_PLANS,
+        SEC_WEIGHT_BLOCKS,
+        SEC_WEIGHTS,
+        SECTION_ENTRY_SIZE,
+        SHAPE_DIM_STRUCT,
+        STAGE_SIZE,
+        TENSOR_SIZE,
+        TILE_PLAN_SIZE,
+        WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
+        WEIGHT_BLOCK_SIZE,
+        WEIGHT_ENTRY_SIZE,
+    )
+    from tigris.emitters.binary.writer import _build_quant_params
+
+    runtime_tensors = [
+        (name, info) for name, info in ag.tensors.items() if not info.is_constant
+    ]
+    runtime_names = {name for name, _ in runtime_tensors}
+    quant_size = len(_build_quant_params(ag)[0])
+    attribute_size = _op_attribute_section_size(ag)
+
+    section_sizes = [
+        (SEC_TENSORS, len(runtime_tensors) * TENSOR_SIZE),
+        (SEC_OPS, len(ag.ops) * OP_SIZE),
+        (SEC_STAGES, len(ag.stages) * STAGE_SIZE),
+        (
+            SEC_TILE_PLANS,
+            sum(stage.tile_plan is not None for stage in ag.stages) * TILE_PLAN_SIZE,
+        ),
+        (SEC_INDEX_POOL, _index_pool_item_count(ag, runtime_names) * INDEX_STRUCT.size),
+        (
+            SEC_SHAPE_POOL,
+            sum(len(info.shape) for _, info in runtime_tensors) * SHAPE_DIM_STRUCT.size,
+        ),
+        (SEC_STRINGS, _string_pool_size(ag, runtime_names)),
+    ]
+
+    num_weights = len(weight_sizes)
+    if num_weights:
+        if compressed_weight_bytes:
+            weight_section_size = num_weights * WEIGHT_ENTRY_SIZE
+        else:
+            weight_section_size = (
+                num_weights * WEIGHT_ENTRY_SIZE
+                + _aligned_weight_blob_size(weight_sizes, PLAN_SECTION_ALIGNMENT)
+            )
+        section_sizes.append((SEC_WEIGHTS, weight_section_size))
+    if quant_size:
+        section_sizes.append((SEC_QUANT_PARAMS, quant_size))
+    if num_weights and compressed_weight_bytes:
+        block_count = _compressed_weight_block_count(ag)
+        section_sizes.append((
+            SEC_WEIGHT_BLOCKS,
+            WEIGHT_BLOCK_SECTION_HEADER_STRUCT.size
+            + block_count * WEIGHT_BLOCK_SIZE
+            + compressed_weight_bytes,
+        ))
+    if attribute_size:
+        section_sizes.append((SEC_OP_ATTRIBUTES, attribute_size))
+
+    current = HEADER_SIZE + (len(section_sizes) + 1) * SECTION_ENTRY_SIZE
+    for section_type, section_size in section_sizes:
+        padding = (-current) % PLAN_SECTION_ALIGNMENT
+        if section_type == SEC_WEIGHTS:
+            blob_pos = current + padding + num_weights * WEIGHT_ENTRY_SIZE
+            padding += (-blob_pos) % PLAN_SECTION_ALIGNMENT
+        current += padding + section_size
+    return current
 
 
 def _estimate_plan_overhead(ag: AnalyzedGraph) -> int:
-    """Estimate non-weight plan size (header, section directory, tables)."""
-    from tigris.emitters.binary.defs import (
-        HEADER_SIZE, OP_SIZE, SECTION_ENTRY_SIZE, STAGE_SIZE,
-    )
-    n_tensors = sum(1 for t in ag.tensors.values() if not t.is_constant)
-    n_ops = len(ag.ops)
-    n_stages = len(ag.stages)
-    n_weights = len(ag.weight_data)
-
-    overhead = HEADER_SIZE
-    overhead += 12 * SECTION_ENTRY_SIZE   # 11 max sections + sentinel
-    overhead += n_tensors * 16            # tensor table
-    overhead += n_ops * OP_SIZE           # op table
-    overhead += n_stages * STAGE_SIZE     # stage table
-    overhead += n_stages * 24             # tile plans (upper bound)
-    overhead += n_weights * 12            # weight entries
-    overhead += n_ops * 8                 # index pool estimate
-    overhead += n_tensors * 16            # shape pool estimate
-    overhead += 4096                      # string table estimate
-    return overhead
+    """Estimate current-plan bytes other than serialized weight payloads."""
+    weight_sizes = _serialized_weight_sizes(ag, int8=False)
+    return _estimate_serialized_plan_size(ag, weight_sizes) - sum(weight_sizes)
 
 
 def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, slow_budget: int = 0) -> Findings:
@@ -305,11 +462,17 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, slow_budget: int 
 
     # Deployment size (weights + plan)
     f.total_weight_bytes, f.int8_weight_bytes, f.lz4_weight_bytes = _estimate_weight_sizes(ag)
-    f.plan_overhead_bytes = _estimate_plan_overhead(ag)
-    f.plan_size_bytes = f.total_weight_bytes + f.plan_overhead_bytes
-    f.int8_plan_size_bytes = f.int8_weight_bytes + f.plan_overhead_bytes
+    current_weight_sizes = _serialized_weight_sizes(ag, int8=False)
+    int8_weight_sizes = _serialized_weight_sizes(ag, int8=True)
+    f.plan_size_bytes = _estimate_serialized_plan_size(ag, current_weight_sizes)
+    f.plan_overhead_bytes = f.plan_size_bytes - f.total_weight_bytes
+    f.int8_plan_size_bytes = _estimate_serialized_plan_size(ag, int8_weight_sizes)
     if f.lz4_weight_bytes > 0:
-        f.lz4_plan_size_bytes = f.lz4_weight_bytes + f.plan_overhead_bytes
+        f.lz4_plan_size_bytes = _estimate_serialized_plan_size(
+            ag,
+            current_weight_sizes,
+            compressed_weight_bytes=f.lz4_weight_bytes,
+        )
     if flash_budget > 0:
         f.plan_fits_flash = f.plan_size_bytes <= flash_budget
         f.int8_fits_flash = f.int8_plan_size_bytes <= flash_budget

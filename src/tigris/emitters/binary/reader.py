@@ -6,10 +6,23 @@ from tigris import SCHEMA_VERSION
 
 from .defs import (
     HEADER_SIZE,
+    HEADER_STRUCT,
     MAGIC,
+    OP_ACTIVATION_OFFSET,
+    OP_ACTIVATION_STRUCT,
+    OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
+    OP_ATTRIBUTE_SIZE,
+    OP_ATTRIBUTE_STRUCT,
+    OP_PREFIX_STRUCT,
     OP_SIZE,
+    OP_SPATIAL_OFFSET,
+    OP_WEIGHT_BIAS_OFFSET,
+    OP_WEIGHT_BIAS_STRUCT,
     QUANT_PARAM_SIZE,
+    QUANT_PARAM_STRUCT,
+    QUANT_SECTION_HEADER_STRUCT,
     SECTION_ENTRY_SIZE,
+    SECTION_ENTRY_STRUCT,
     SEC_INDEX_POOL,
     SEC_OP_ATTRIBUTES,
     SEC_OPS,
@@ -21,11 +34,18 @@ from .defs import (
     SEC_TILE_PLANS,
     SEC_WEIGHT_BLOCKS,
     SEC_WEIGHTS,
+    SPATIAL_ATTRS_STRUCT,
     STAGE_SIZE,
+    STAGE_STRUCT,
     TENSOR_SIZE,
+    TENSOR_STRUCT,
     TILE_PLAN_SIZE,
+    TILE_PLAN_STRUCT,
     WEIGHT_BLOCK_SIZE,
+    WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
+    WEIGHT_BLOCK_STRUCT,
     WEIGHT_ENTRY_SIZE,
+    WEIGHT_ENTRY_STRUCT,
 )
 
 
@@ -48,7 +68,7 @@ def read_binary_plan(data: bytes) -> dict:
         model_name_str,
         model_io_off, num_model_inputs, num_model_outputs,
         num_weights, num_quant_params, flags,
-    ) = struct.unpack_from("<4sI II HHHH II I HBB HH I", data, 0)
+    ) = HEADER_STRUCT.unpack_from(data, 0)
 
     if magic != MAGIC:
         raise ValueError(f"Bad magic: {magic!r}")
@@ -64,7 +84,7 @@ def read_binary_plan(data: bytes) -> dict:
     off = section_dir_off
     found_sentinel = False
     while off + SECTION_ENTRY_SIZE <= len(data):
-        sec_type, sec_off = struct.unpack_from("<II", data, off)
+        sec_type, sec_off = SECTION_ENTRY_STRUCT.unpack_from(data, off)
         off += SECTION_ENTRY_SIZE
         if sec_type == 0:
             found_sentinel = True
@@ -128,8 +148,8 @@ def read_binary_plan(data: bytes) -> dict:
     t_base = sections[SEC_TENSORS]
     for i in range(num_tensors):
         pos = t_base + i * TENSOR_SIZE
-        name_off, size_bytes, shape_off, ndim, dtype, t_flags, qp_idx = struct.unpack_from(
-            "<IIHBBBHx", data, pos
+        name_off, size_bytes, shape_off, ndim, dtype, t_flags, qp_idx = (
+            TENSOR_STRUCT.unpack_from(data, pos)
         )
         tensors.append({
             "name": _read_string(name_off),
@@ -146,15 +166,18 @@ def read_binary_plan(data: bytes) -> dict:
     o_base = sections[SEC_OPS]
     for i in range(num_ops):
         pos = o_base + i * OP_SIZE
-        name_off, op_type, num_inp, num_out, stage, inp_off, out_off = struct.unpack_from(
-            "<IBBBB HH", data, pos
+        name_off, op_type, num_inp, num_out, stage, inp_off, out_off = (
+            OP_PREFIX_STRUCT.unpack_from(data, pos)
         )
-        spatial_pos = pos + 12  # after the first 12 bytes
-        (kh, kw, sh, sw, pt, pb, pl, pr, dh, dw, group) = struct.unpack_from(
-            "<4B7H", data, spatial_pos  # 18-byte spatial (pad/dilation u16)
+        (kh, kw, sh, sw, pt, pb, pl, pr, dh, dw, group) = (
+            SPATIAL_ATTRS_STRUCT.unpack_from(data, pos + OP_SPATIAL_OFFSET)
         )
-        weight_idx_val, bias_idx_val = struct.unpack_from("<HH", data, pos + 30)
-        fused_act, act_min, act_max = struct.unpack_from("<Bbbx", data, pos + 34)
+        weight_idx_val, bias_idx_val = OP_WEIGHT_BIAS_STRUCT.unpack_from(
+            data, pos + OP_WEIGHT_BIAS_OFFSET
+        )
+        fused_act, act_min, act_max = OP_ACTIVATION_STRUCT.unpack_from(
+            data, pos + OP_ACTIVATION_OFFSET
+        )
         ops.append({
             "name": _read_string(name_off),
             "op_type": op_type,
@@ -189,7 +212,7 @@ def read_binary_plan(data: bytes) -> dict:
             tile_idx, _pad,
             chain_id, chain_len,
             chain_tile_h, _reserved1,
-        ) = struct.unpack_from("<I HHHHHH HH HHHH", data, pos)
+        ) = STAGE_STRUCT.unpack_from(data, pos)
         stages.append({
             "peak_bytes": peak_bytes,
             "ops": _read_index_pool(ops_off, ops_count),
@@ -211,7 +234,7 @@ def read_binary_plan(data: bytes) -> dict:
             n_tiles, halo,
             rf, orig_h,
             tiled_peak, overhead, _reserved,
-        ) = struct.unpack_from("<BBH HH HH I I I", data, pos)
+        ) = TILE_PLAN_STRUCT.unpack_from(data, pos)
         tile_plans.append({
             "tileable": bool(tileable),
             "tile_height": tile_height,
@@ -231,7 +254,7 @@ def read_binary_plan(data: bytes) -> dict:
         blob_base = w_base + entries_size
         for i in range(num_weights):
             pos = w_base + i * WEIGHT_ENTRY_SIZE
-            w_name_off, w_offset, w_size = struct.unpack_from("<III", data, pos)
+            w_name_off, w_offset, w_size = WEIGHT_ENTRY_STRUCT.unpack_from(data, pos)
             weights.append({
                 "name": _read_string(w_name_off),
                 "offset": w_offset,
@@ -243,8 +266,8 @@ def read_binary_plan(data: bytes) -> dict:
     quant_params = []
     qp_base = sections.get(SEC_QUANT_PARAMS, 0)
     if qp_base:
-        nqp, _qd_field = struct.unpack_from("<HH", data, qp_base)
-        entries_start = qp_base + 4
+        nqp, _qd_field = QUANT_SECTION_HEADER_STRUCT.unpack_from(data, qp_base)
+        entries_start = qp_base + QUANT_SECTION_HEADER_STRUCT.size
         data_start = entries_start + nqp * QUANT_PARAM_SIZE
         if version != 2:
             quant_end = min(
@@ -256,8 +279,8 @@ def read_binary_plan(data: bytes) -> dict:
                 raise ValueError("Malformed v3 quant-data section")
         for i in range(nqp):
             pos = entries_start + i * QUANT_PARAM_SIZE
-            scale, zp, num_ch, mult_off, shift_off, page = struct.unpack_from(
-                "<fiHHHH", data, pos
+            scale, zp, num_ch, mult_off, shift_off, page = (
+                QUANT_PARAM_STRUCT.unpack_from(data, pos)
             )
             qp_entry = {
                 "scale": scale,
@@ -280,15 +303,16 @@ def read_binary_plan(data: bytes) -> dict:
     weight_blocks_compression = 0
     wb_base = sections.get(SEC_WEIGHT_BLOCKS, 0)
     if wb_base:
-        num_blocks, compression_type = struct.unpack_from("<HH", data, wb_base)
+        num_blocks, compression_type = WEIGHT_BLOCK_SECTION_HEADER_STRUCT.unpack_from(
+            data, wb_base
+        )
         weight_blocks_compression = compression_type
-        entries_start = wb_base + 4
+        entries_start = wb_base + WEIGHT_BLOCK_SECTION_HEADER_STRUCT.size
         blobs_start = entries_start + num_blocks * WEIGHT_BLOCK_SIZE
         for i in range(num_blocks):
             pos = entries_start + i * WEIGHT_BLOCK_SIZE
             (stage_idx, first_widx, num_w, _pad,
-             blob_off, comp_sz, uncomp_sz) = struct.unpack_from(
-                "<HHHH III", data, pos)
+             blob_off, comp_sz, uncomp_sz) = WEIGHT_BLOCK_STRUCT.unpack_from(data, pos)
             block_entry = {
                 "stage_idx": stage_idx,
                 "first_weight_idx": first_widx,
@@ -313,9 +337,11 @@ def read_binary_plan(data: bytes) -> dict:
     op_attributes = []
     attrs_base = sections.get(SEC_OP_ATTRIBUTES, 0)
     if attrs_base:
-        num_attrs, _reserved = struct.unpack_from("<HH", data, attrs_base)
-        entries_start = attrs_base + 4
-        data_start = entries_start + num_attrs * 8
+        num_attrs, _reserved = OP_ATTRIBUTE_SECTION_HEADER_STRUCT.unpack_from(
+            data, attrs_base
+        )
+        entries_start = attrs_base + OP_ATTRIBUTE_SECTION_HEADER_STRUCT.size
+        data_start = entries_start + num_attrs * OP_ATTRIBUTE_SIZE
         section_end = min(
             (offset for offset in sections.values() if offset > attrs_base),
             default=len(data),
@@ -323,8 +349,8 @@ def read_binary_plan(data: bytes) -> dict:
         if data_start > section_end:
             raise ValueError("operator-attribute entries exceed section")
         for i in range(num_attrs):
-            op_index, attr_type, data_len, data_off = struct.unpack_from(
-                "<HBBI", data, entries_start + i * 8
+            op_index, attr_type, data_len, data_off = OP_ATTRIBUTE_STRUCT.unpack_from(
+                data, entries_start + i * OP_ATTRIBUTE_SIZE
             )
             if data_off + data_len > section_end - data_start:
                 raise ValueError("operator-attribute payload exceeds section")
