@@ -220,9 +220,10 @@ tigris_mem_error_t {core_name}_reset(
 /* The backend dispatcher is generated from --backend. */
 tigris_kernel_fn {core_name}_dispatch(void);
 
-/* Run using the generated dispatcher. */
+/* Run using the generated dispatcher and caller-owned executor workspace. */
 tigris_exec_error_t {core_name}_run(
-    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats);
+    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats,
+    tigris_executor_workspace_t *workspace);
 
 #endif
 """
@@ -340,9 +341,11 @@ tigris_kernel_fn {core_name}_dispatch(void)
 }}
 
 tigris_exec_error_t {core_name}_run(
-    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats)
+    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats,
+    tigris_executor_workspace_t *workspace)
 {{
-    return tigris_run(plan, mem, {dispatch}, NULL, stats);
+    return tigris_run_with_workspace(
+        plan, mem, {dispatch}, NULL, stats, workspace);
 }}
 '''
 
@@ -386,6 +389,8 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
 #include "tigris_mem.h"
 #include "tigris_executor.h"
 {kernel_include}
+
+static tigris_executor_workspace_t executor_workspace;
 
 static void *allocate_aligned(uint32_t size)
 {{
@@ -495,7 +500,8 @@ int main(int argc, char **argv)
 
     /* 5. Run inference */
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run(&plan, &mem, {dispatch}, NULL, &stats);
+    tigris_exec_error_t eerr = tigris_run_with_workspace(
+        &plan, &mem, {dispatch}, NULL, &stats, &executor_workspace);
     if (eerr != TIGRIS_EXEC_OK) {{
         fprintf(stderr, "Inference failed: %s\\n", tigris_exec_error_str(eerr));
         free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
@@ -565,6 +571,7 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
 {kernel_includes}
 
 static const char *TAG = "tigris";
+static tigris_executor_workspace_t executor_workspace;
 
 void app_main(void)
 {{
@@ -675,7 +682,8 @@ void app_main(void)
     /* 6. Run inference */
     int64_t t0 = esp_timer_get_time();
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run(&plan, &mem, {dispatch}, NULL, &stats);
+    tigris_exec_error_t eerr = tigris_run_with_workspace(
+        &plan, &mem, {dispatch}, NULL, &stats, &executor_workspace);
     int64_t t1 = esp_timer_get_time();
 
     if (eerr != TIGRIS_EXEC_OK) {{
@@ -797,6 +805,7 @@ extern const uint8_t _binary_model_tgrs_end[];
 static uint8_t fast_arena[{fast_arena_expr}] __attribute__((aligned(16)));
 static uint8_t slow_arena[{slow_arena_size}] __attribute__((aligned(16)));
 static void *tensor_ptrs[{plan['num_tensors']}];
+static tigris_executor_workspace_t executor_workspace;
 
 int main(void)
 {{
@@ -845,7 +854,8 @@ int main(void)
 
     /* 4. Run inference */
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run(&plan, &mem, {dispatch}, NULL, &stats);
+    tigris_exec_error_t eerr = tigris_run_with_workspace(
+        &plan, &mem, {dispatch}, NULL, &stats, &executor_workspace);
     if (eerr != TIGRIS_EXEC_OK) {{
         printf("Inference failed: %s\\n", tigris_exec_error_str(eerr));
         return 1;
