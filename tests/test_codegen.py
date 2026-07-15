@@ -173,7 +173,9 @@ def test_codegen_reports_xip_and_loads_plan_at_runtime(linear_3op_path):
     assert "merr = tigris_mem_alloc_slow(" in source
     assert source.count("if (merr != TIGRIS_MEM_OK)") >= 2
     assert "plan.header->peak > UINT32_MAX / 4u" in source
-    assert "tigris_run(&plan, &mem, tigris_dispatch_kernel, NULL, &stats)" in source
+    assert "static tigris_executor_workspace_t executor_workspace" in source
+    assert "tigris_run_with_workspace(" in source
+    assert "&plan, &mem, tigris_dispatch_kernel, NULL, &stats," in source
 
 
 def test_posix_codegen_aligns_plan_and_arenas(linear_3op_path):
@@ -262,6 +264,7 @@ def test_core_codegen_header_exposes_embedding_api(qdq_conv_path):
     assert "tigris_codegen_init" in header
     assert "tigris_codegen_reset" in header
     assert "tigris_codegen_run" in header
+    assert "tigris_executor_workspace_t *workspace" in header
     assert "TIGRIS_CODEGEN_TENSOR_CAPACITY" in header
     assert "TIGRIS_CODEGEN_PLAN_TENSOR_ALIGNMENT_BYTES 32u" in header
     assert "TIGRIS_CODEGEN_PLAN_BUDGET_BYTES" in header
