@@ -243,12 +243,10 @@ def read_binary_plan(data: bytes) -> dict:
     quant_params = []
     qp_base = sections.get(SEC_QUANT_PARAMS, 0)
     if qp_base:
-        nqp, qd_field = struct.unpack_from("<HH", data, qp_base)
+        nqp, _qd_field = struct.unpack_from("<HH", data, qp_base)
         entries_start = qp_base + 4
         data_start = entries_start + nqp * QUANT_PARAM_SIZE
-        if version == 2:
-            qd_len = qd_field
-        else:
+        if version != 2:
             quant_end = min(
                 (offset for offset in sections.values() if offset > qp_base),
                 default=len(data),
@@ -256,7 +254,6 @@ def read_binary_plan(data: bytes) -> dict:
             qd_bytes = quant_end - data_start
             if qd_bytes < 0 or qd_bytes % 4:
                 raise ValueError("Malformed v3 quant-data section")
-            qd_len = qd_bytes // 4
         for i in range(nqp):
             pos = entries_start + i * QUANT_PARAM_SIZE
             scale, zp, num_ch, mult_off, shift_off, page = struct.unpack_from(

@@ -688,7 +688,6 @@ def _build_op_attributes(
         if input_name not in tensor_idx or output_name not in tensor_idx:
             raise ValueError(f"Transpose '{op.name}' must use runtime tensors")
         input_info = ag.tensors[input_name]
-        output_info = ag.tensors[output_name]
         rank = len(input_info.shape)
         raw_perm = [int(axis) for axis in op.attrs["perm"]]
         input_axes = _serialized_axis_map(rank)
