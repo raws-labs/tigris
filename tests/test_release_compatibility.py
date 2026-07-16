@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from importlib.resources import files
 from pathlib import Path
 
@@ -40,6 +42,23 @@ def test_capability_artifact_is_installed_package_data():
         "schema/operator-capabilities-v1.json"
     )
     assert json.loads(artifact.read_text()) == capability_matrix()
+
+
+def test_capability_audit_imports_from_an_uninstalled_source_checkout():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tigris.capabilities import KERNEL_CAPABILITIES; "
+            "assert 'reference' in KERNEL_CAPABILITIES",
+        ],
+        cwd=ROOT,
+        env={"PYTHONPATH": str(ROOT / "src")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_release_manifest_matches_current_runtime_when_available():
