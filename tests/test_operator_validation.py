@@ -232,6 +232,152 @@ def test_unrepresentable_pool_attributes_are_rejected(
         emit_binary_bytes(graph)
 
 
+@pytest.mark.parametrize(
+    ("op", "tensors", "message"),
+    [
+        (
+            OpNode(
+                name="wrong_softmax_axis",
+                op_type="Softmax",
+                inputs=["input"],
+                outputs=["output"],
+                attrs={"axis": 0},
+            ),
+            {
+                "input": TensorInfo("input", (2, 4), TensorProto.FLOAT),
+                "output": TensorInfo("output", (2, 4), TensorProto.FLOAT),
+            },
+            "Softmax axis must map",
+        ),
+        (
+            OpNode(
+                name="spatial_concat",
+                op_type="Concat",
+                inputs=["left", "right"],
+                outputs=["output"],
+                attrs={"kernel_shape": [1]},
+            ),
+            {
+                "left": TensorInfo("left", (1, 2, 3, 4), TensorProto.FLOAT),
+                "right": TensorInfo("right", (1, 2, 3, 4), TensorProto.FLOAT),
+                "output": TensorInfo("output", (1, 2, 6, 4), TensorProto.FLOAT),
+            },
+            "rank-4 channel-axis Concat only",
+        ),
+        (
+            OpNode(
+                name="linear_resize",
+                op_type="Resize",
+                inputs=["input"],
+                outputs=["output"],
+                attrs={
+                    "mode": "linear",
+                    "coordinate_transformation_mode": "asymmetric",
+                    "nearest_mode": "floor",
+                },
+            ),
+            {
+                "input": TensorInfo("input", (1, 3, 4, 4), TensorProto.FLOAT),
+                "output": TensorInfo("output", (1, 3, 8, 8), TensorProto.FLOAT),
+            },
+            "Resize mode must be 'nearest'",
+        ),
+        (
+            OpNode(
+                name="half_pixel_resize",
+                op_type="Resize",
+                inputs=["input"],
+                outputs=["output"],
+                attrs={"mode": "nearest"},
+            ),
+            {
+                "input": TensorInfo("input", (1, 3, 4, 4), TensorProto.FLOAT),
+                "output": TensorInfo("output", (1, 3, 8, 8), TensorProto.FLOAT),
+            },
+            "coordinate_transformation_mode must be 'asymmetric'",
+        ),
+        (
+            OpNode(
+                name="fractional_resize",
+                op_type="Resize",
+                inputs=["input"],
+                outputs=["output"],
+                attrs={
+                    "mode": "nearest",
+                    "coordinate_transformation_mode": "asymmetric",
+                    "nearest_mode": "floor",
+                },
+            ),
+            {
+                "input": TensorInfo("input", (1, 3, 4, 4), TensorProto.FLOAT),
+                "output": TensorInfo("output", (1, 3, 7, 8), TensorProto.FLOAT),
+            },
+            "integer H/W upscaling",
+        ),
+    ],
+)
+def test_unencoded_operator_variants_are_rejected(op, tensors, message):
+    validation = validate_operator_support(AnalyzedGraph(ops=[op], tensors=tensors))
+
+    assert not validation.supported
+    assert message in validation.describe()
+
+
+def test_representable_softmax_concat_and_resize_variants_are_supported():
+    graph = AnalyzedGraph(
+        ops=[
+            OpNode(
+                name="channel_softmax",
+                op_type="Softmax",
+                inputs=["softmax_input"],
+                outputs=["softmax_output"],
+                attrs={"axis": 1},
+            ),
+            OpNode(
+                name="channel_concat",
+                op_type="Concat",
+                inputs=["left", "right"],
+                outputs=["concat_output"],
+                attrs={"kernel_shape": [3]},
+            ),
+            OpNode(
+                name="nearest_resize",
+                op_type="Resize",
+                inputs=["resize_input"],
+                outputs=["resize_output"],
+                attrs={
+                    "mode": "nearest",
+                    "coordinate_transformation_mode": "asymmetric",
+                    "nearest_mode": "floor",
+                },
+            ),
+        ],
+        tensors={
+            "softmax_input": TensorInfo(
+                "softmax_input", (1, 4, 2, 2), TensorProto.FLOAT
+            ),
+            "softmax_output": TensorInfo(
+                "softmax_output", (1, 4, 2, 2), TensorProto.FLOAT
+            ),
+            "left": TensorInfo("left", (1, 2, 3, 4), TensorProto.FLOAT),
+            "right": TensorInfo("right", (1, 2, 3, 5), TensorProto.FLOAT),
+            "concat_output": TensorInfo(
+                "concat_output", (1, 2, 3, 9), TensorProto.FLOAT
+            ),
+            "resize_input": TensorInfo(
+                "resize_input", (1, 3, 4, 4), TensorProto.FLOAT
+            ),
+            "resize_output": TensorInfo(
+                "resize_output", (1, 3, 8, 8), TensorProto.FLOAT
+            ),
+        },
+    )
+
+    validation = validate_operator_support(graph)
+
+    assert validation.supported, validation.describe()
+
+
 def test_dynamic_elementwise_broadcasting_is_rejected():
     graph = AnalyzedGraph(
         ops=[

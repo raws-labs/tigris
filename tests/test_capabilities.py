@@ -1,7 +1,9 @@
 """Audited kernel capability source and documentation rows."""
 
 from tigris.capabilities import (
+    CONDITIONAL_FALLBACKS,
     KERNEL_CAPABILITIES,
+    OPERATOR_CONSTRAINTS,
     capability_rows,
     describe_codegen_route,
     effective_operators,
@@ -32,7 +34,7 @@ def test_accelerated_fallbacks_are_explicit():
 
     assert operator_route("esp-nn", "AveragePool") == "esp-nn"
     assert operator_route("cmsis-nn", "AveragePool") == "cmsis-nn"
-    assert operator_route("reference", "AveragePool") is None
+    assert operator_route("reference", "AveragePool") == "reference"
     assert operator_route("s8_ref", "AveragePool") == "s8_ref"
     assert operator_route("esp-nn", "Relu") == "s8_ref"
     assert operator_route("cmsis-nn", "MaxPool") == "s8_ref"
@@ -50,7 +52,7 @@ def test_capability_rows_are_stable_and_docs_ready():
     assert by_operator["AveragePool"] == {
         "operator": "AveragePool",
         "opcode": OP_TYPE_MAP["AveragePool"],
-        "reference": "unsupported",
+        "reference": "native",
         "s8_ref": "native",
         "esp-nn": "native",
         "cmsis-nn": "native",
@@ -58,10 +60,21 @@ def test_capability_rows_are_stable_and_docs_ready():
     assert by_operator["Relu"]["esp-nn"] == "fallback:s8_ref"
     assert by_operator["GlobalAveragePool"]["esp-nn"] == "fallback:s8_ref"
     assert by_operator["GlobalAveragePool"]["cmsis-nn"] == "native"
+    assert by_operator["Softmax"]["reference"] == "native"
+    assert by_operator["Softmax"]["s8_ref"] == "native"
     assert all(
         by_operator["MatMul"][backend] == "unsupported"
         for backend in KERNEL_CAPABILITIES
     )
+
+
+def test_public_qualifications_reference_real_native_routes():
+    for backend, operators in CONDITIONAL_FALLBACKS.items():
+        for operator in operators:
+            assert operator_route(backend, operator) == backend
+
+    assert set(OPERATOR_CONSTRAINTS) <= OP_TYPE_MAP.keys()
+    assert "final axis" in OPERATOR_CONSTRAINTS["Softmax"][0]
 
 
 def test_codegen_route_descriptions_do_not_imply_float_acceleration():

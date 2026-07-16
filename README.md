@@ -56,7 +56,11 @@ tigris codegen model.tgrs --backend esp-nn -o model.c
 
 The `.tgrs` plan is target-agnostic: it is the same file whether you run it on an ESP32, a Cortex-M, or a POSIX host for testing. The choice of kernel backend happens at `codegen` time and decides which kernel library the generated C calls into.
 
-Several kernel backends are available (portable C99, ESP32 family, Cortex-M family); see [tigris-runtime](https://github.com/raws-labs/tigris-runtime) for the current list. Switching between them is a `--backend` flag, not a rewrite.
+Several kernel backends are available (portable C99, ESP32 family, Cortex-M
+family). The generated [operator/backend capability
+matrix](https://tigris-ml.dev/docs/runtime/operator-and-backend-support/)
+shows which operators are native, use an explicit fallback, or are rejected.
+Switching between them is a `--backend` flag, not a rewrite.
 
 ## What you get
 
