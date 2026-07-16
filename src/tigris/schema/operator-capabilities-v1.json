@@ -1,0 +1,432 @@
+{
+  "artifact_format": 1,
+  "codegen_selections": [
+    {
+      "codegen_backend": "reference",
+      "description": "reference",
+      "dtype": "float32",
+      "kernel_backend": "reference"
+    },
+    {
+      "codegen_backend": "reference",
+      "description": "s8_ref",
+      "dtype": "int8",
+      "kernel_backend": "s8_ref"
+    },
+    {
+      "codegen_backend": "esp-nn",
+      "description": "reference (explicit float32 fallback; esp-nn acceleration is int8-only)",
+      "dtype": "float32",
+      "kernel_backend": "reference"
+    },
+    {
+      "codegen_backend": "esp-nn",
+      "description": "esp-nn -> s8_ref fallback",
+      "dtype": "int8",
+      "kernel_backend": "esp-nn"
+    },
+    {
+      "codegen_backend": "cmsis-nn",
+      "description": "reference (explicit float32 fallback; cmsis-nn acceleration is int8-only)",
+      "dtype": "float32",
+      "kernel_backend": "reference"
+    },
+    {
+      "codegen_backend": "cmsis-nn",
+      "description": "cmsis-nn -> s8_ref fallback",
+      "dtype": "int8",
+      "kernel_backend": "cmsis-nn"
+    }
+  ],
+  "kernel_backends": [
+    {
+      "dtype": "float32",
+      "fallback": null,
+      "name": "reference"
+    },
+    {
+      "dtype": "int8",
+      "fallback": null,
+      "name": "s8_ref"
+    },
+    {
+      "dtype": "int8",
+      "fallback": "s8_ref",
+      "name": "esp-nn"
+    },
+    {
+      "dtype": "int8",
+      "fallback": "s8_ref",
+      "name": "cmsis-nn"
+    }
+  ],
+  "legend": {
+    "fallback:<backend>": "executed by the named explicit fallback backend",
+    "native": "implemented by this kernel backend",
+    "unsupported": "no executable route; code generation rejects the plan"
+  },
+  "operators": [
+    {
+      "conditional_fallbacks": {
+        "cmsis-nn": "falls back when tiled; non-tiled dilation remains native",
+        "esp-nn": "falls back for dilation other than 1; asymmetric padding falls back when its preparation-time workspace is insufficient"
+      },
+      "opcode": 1,
+      "operator": "Conv",
+      "routes": {
+        "cmsis-nn": "native",
+        "esp-nn": "native",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "conditional_fallbacks": {
+        "cmsis-nn": "falls back when tiled; non-tiled dilation remains native",
+        "esp-nn": "falls back for dilation other than 1"
+      },
+      "opcode": 2,
+      "operator": "DepthwiseConv",
+      "routes": {
+        "cmsis-nn": "native",
+        "esp-nn": "native",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 3,
+      "operator": "Relu",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 4,
+      "operator": "Relu6",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "explicit padding, floor output sizing, unit dilation, and no indices output"
+      ],
+      "opcode": 5,
+      "operator": "MaxPool",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "conditional_fallbacks": {
+        "cmsis-nn": "falls back when tiled or when input/output quantization differs",
+        "esp-nn": "falls back when tiled or when input/output quantization differs"
+      },
+      "constraints": [
+        "explicit padding, floor output sizing, unit dilation, and count_include_pad=0"
+      ],
+      "opcode": 6,
+      "operator": "AveragePool",
+      "routes": {
+        "cmsis-nn": "native",
+        "esp-nn": "native",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "dynamic operands must have identical shapes; no general broadcasting"
+      ],
+      "opcode": 7,
+      "operator": "Add",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "dynamic operands must have identical shapes; no general broadcasting"
+      ],
+      "opcode": 8,
+      "operator": "Mul",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 9,
+      "operator": "Gemm",
+      "routes": {
+        "cmsis-nn": "native",
+        "esp-nn": "native",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "final axis only; untiled execution"
+      ],
+      "opcode": 10,
+      "operator": "Softmax",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 11,
+      "operator": "Clip",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 12,
+      "operator": "Sigmoid",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "rank-4 channel-axis concatenation"
+      ],
+      "opcode": 13,
+      "operator": "Concat",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 14,
+      "operator": "Pad",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "conditional_fallbacks": {
+        "cmsis-nn": "falls back when tiled or when input/output quantization differs"
+      },
+      "opcode": 15,
+      "operator": "GlobalAveragePool",
+      "routes": {
+        "cmsis-nn": "native",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 16,
+      "operator": "Flatten",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 17,
+      "operator": "Reshape",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 18,
+      "operator": "Sub",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 19,
+      "operator": "Div",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 20,
+      "operator": "Tanh",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 21,
+      "operator": "LeakyRelu",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 22,
+      "operator": "BatchNormalization",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 23,
+      "operator": "InstanceNormalization",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 24,
+      "operator": "ConvTranspose",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 25,
+      "operator": "MatMul",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 26,
+      "operator": "ReduceMean",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 27,
+      "operator": "Squeeze",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 28,
+      "operator": "Unsqueeze",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "constraints": [
+        "a concrete, valid permutation is stored in schema 4 plans"
+      ],
+      "opcode": 29,
+      "operator": "Transpose",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "rank-4 nearest-neighbor integer H/W upscaling"
+      ],
+      "opcode": 30,
+      "operator": "Resize",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 31,
+      "operator": "GlobalMaxPool",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "unsupported",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 32,
+      "operator": "Conv1D",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    }
+  ],
+  "schema_version": 4,
+  "scope": "post-normalization operator dispatch; model-specific shape, attribute, quantization, memory, and tiling validation still applies",
+  "source": "tigris.capabilities"
+}

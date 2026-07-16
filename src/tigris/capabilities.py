@@ -43,16 +43,68 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Mul",
     "Conv1D",
     "GlobalAveragePool",
+    "AveragePool",
     "Gemm",
     "Reshape",
     "Flatten",
     "MaxPool",
     "Concat",
     "Resize",
+    "Softmax",
     "Transpose",
 })
 
-_S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS | {"AveragePool"}
+_S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS
+
+
+# Native accelerated adapters sometimes route a supported variant through the
+# portable int8 dispatcher to preserve semantics.  Keep these conditions next
+# to the operator sets so generated documentation cannot imply that every
+# variant reaches vendor code.
+CONDITIONAL_FALLBACKS: dict[str, dict[str, str]] = {
+    "esp-nn": {
+        "Conv": (
+            "falls back for dilation other than 1; asymmetric padding falls "
+            "back when its preparation-time workspace is insufficient"
+        ),
+        "DepthwiseConv": "falls back for dilation other than 1",
+        "AveragePool": (
+            "falls back when tiled or when input/output quantization differs"
+        ),
+    },
+    "cmsis-nn": {
+        "Conv": "falls back when tiled; non-tiled dilation remains native",
+        "DepthwiseConv": (
+            "falls back when tiled; non-tiled dilation remains native"
+        ),
+        "AveragePool": (
+            "falls back when tiled or when input/output quantization differs"
+        ),
+        "GlobalAveragePool": (
+            "falls back when tiled or when input/output quantization differs"
+        ),
+    },
+}
+
+
+# Operator-level qualifications that are part of the implemented plan
+# contract.  The compiler's semantic validator remains authoritative for
+# individual models; these concise notes prevent the public matrix from being
+# mistaken for support for every ONNX attribute combination.
+OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
+    "Add": ("dynamic operands must have identical shapes; no general broadcasting",),
+    "Mul": ("dynamic operands must have identical shapes; no general broadcasting",),
+    "AveragePool": (
+        "explicit padding, floor output sizing, unit dilation, and count_include_pad=0",
+    ),
+    "MaxPool": (
+        "explicit padding, floor output sizing, unit dilation, and no indices output",
+    ),
+    "Concat": ("rank-4 channel-axis concatenation",),
+    "Resize": ("rank-4 nearest-neighbor integer H/W upscaling",),
+    "Softmax": ("final axis only; untiled execution",),
+    "Transpose": ("a concrete, valid permutation is stored in schema 4 plans",),
+}
 
 
 KERNEL_CAPABILITIES: dict[str, KernelCapabilities] = {

@@ -154,6 +154,77 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if len(op.outputs) != 1:
                 reasons.append("MaxPool indices output is not implemented")
 
+        if op.op_type == "Softmax":
+            input_tensor = (
+                ag.tensors.get(op.inputs[0]) if len(op.inputs) == 1 else None
+            )
+            if input_tensor is None or not input_tensor.shape:
+                reasons.append("runtime requires one concrete, non-scalar input")
+            else:
+                rank = len(input_tensor.shape)
+                axis = int(op.attrs.get("axis", -1))
+                normalized_axis = axis + rank if axis < 0 else axis
+                # Rank-3/4 activations are converted from NCL/NCHW to NLC/NHWC;
+                # their channel axis becomes the runtime's final dimension.
+                runtime_final_axis = 1 if rank in {3, 4} else rank - 1
+                if normalized_axis != runtime_final_axis:
+                    reasons.append(
+                        "Softmax axis must map to the runtime's final dimension "
+                        f"(axis {runtime_final_axis} for rank {rank})"
+                    )
+
+        if op.op_type == "Concat":
+            tensors = [ag.tensors.get(name) for name in op.inputs]
+            normalized_axis = op.attrs.get("kernel_shape", [])
+            if (
+                not tensors
+                or any(tensor is None or len(tensor.shape) != 4 for tensor in tensors)
+                or normalized_axis != [3]
+            ):
+                reasons.append("runtime supports rank-4 channel-axis Concat only")
+
+        if op.op_type == "Resize":
+            if op.attrs.get("mode", "nearest") != "nearest":
+                reasons.append("Resize mode must be 'nearest'")
+            if op.attrs.get("coordinate_transformation_mode", "half_pixel") != (
+                "asymmetric"
+            ):
+                reasons.append(
+                    "Resize coordinate_transformation_mode must be 'asymmetric'"
+                )
+            if op.attrs.get("nearest_mode", "round_prefer_floor") != "floor":
+                reasons.append("Resize nearest_mode must be 'floor'")
+            if "axes" in op.attrs:
+                reasons.append("Resize axes is not encoded")
+
+            input_tensor = (
+                ag.tensors.get(op.inputs[0]) if len(op.inputs) == 1 else None
+            )
+            output_tensor = (
+                ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
+            )
+            if (
+                input_tensor is None
+                or output_tensor is None
+                or len(input_tensor.shape) != 4
+                or len(output_tensor.shape) != 4
+            ):
+                reasons.append("runtime supports rank-4 Resize only")
+            else:
+                in_n, in_c, in_h, in_w = input_tensor.shape
+                out_n, out_c, out_h, out_w = output_tensor.shape
+                if (
+                    in_h <= 0
+                    or in_w <= 0
+                    or in_n != out_n
+                    or in_c != out_c
+                    or out_h % in_h != 0
+                    or out_w % in_w != 0
+                ):
+                    reasons.append(
+                        "Resize requires unchanged N/C and integer H/W upscaling"
+                    )
+
         if op.op_type in {"Add", "Mul"}:
             dynamic_inputs = [
                 ag.tensors[name]

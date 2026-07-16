@@ -70,6 +70,12 @@ jobs:
         run: >-
           python scripts/generate_schema_package.py
           --check src/tigris/schema/tigris-plan-v4.json
+      - name: Verify generated operator/backend capability package
+        run: >-
+          python scripts/generate_capability_matrix.py
+          --check src/tigris/schema/operator-capabilities-v1.json
+      - name: Audit capability package against runtime dispatch
+        run: python scripts/validate_runtime_capabilities.py --runtime tigris-runtime
       - name: Verify compiler/runtime compatibility metadata
         run: python scripts/validate_compatibility.py --runtime tigris-runtime
       - name: Run compiler/runtime differential contract
