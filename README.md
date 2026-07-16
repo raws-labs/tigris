@@ -102,7 +102,7 @@ instrumentation without introducing a hardware-specific codegen target.
 ## Further reading
 
 - [Getting started](https://tigris-ml.dev/docs): installation, first compile, deploying to ESP32
-- [Core compatibility](COMPATIBILITY.md): exact compiler/runtime releases and plan schemas
+- [Core compatibility data](compatibility.json): exact compiler/runtime releases and plan schemas
 - [Introducing TiGrIS](https://tigris-ml.dev/blog/introducing-tigris): design, benchmarks, how tiling works
 - [CLI reference](https://tigris-ml.dev/docs/cli): every flag, every subcommand
 
