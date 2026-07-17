@@ -7,7 +7,9 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.emitters.binary.defs import ACT_RELU, OP_TYPE_MAP
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
+from tigris.loaders.onnx.normalize import _decompose_silu
 
 
 # Helpers
@@ -24,6 +26,37 @@ def _save_and_load(model, tmp_path, filename="model.onnx"):
     path = tmp_path / filename
     onnx.save(model, str(path))
     return load_model(path)
+
+
+# SiLU decomposition
+
+
+def test_silu_decomposes_to_supported_sigmoid_mul():
+    graph = AnalyzedGraph(
+        ops=[
+            OpNode(
+                name="silu",
+                op_type="Silu",
+                inputs=["input"],
+                outputs=["output"],
+            )
+        ],
+        tensors={
+            "input": TensorInfo("input", (1, 4), TensorProto.FLOAT),
+            "output": TensorInfo("output", (1, 4), TensorProto.FLOAT),
+        },
+        model_inputs=["input"],
+        model_outputs=["output"],
+    )
+
+    normalized = _decompose_silu(graph)
+
+    assert [op.op_type for op in normalized.ops] == ["Sigmoid", "Mul"]
+    assert normalized.ops[0].inputs == ["input"]
+    assert normalized.ops[1].inputs == ["input", "input_sigmoid"]
+    assert normalized.ops[1].outputs == ["output"]
+    assert normalized.tensors["input_sigmoid"].shape == (1, 4)
+    assert [op.step for op in normalized.ops] == [0, 1]
 
 
 # Conv -> Relu fusion
