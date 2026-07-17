@@ -14,6 +14,7 @@ import copy
 import re
 import subprocess
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.validation import validate_memory_plan
+from tigris.capabilities import KERNEL_CAPABILITIES, OP_TYPE_BY_CODE
 from tigris.cli import _run_pipeline
 from tigris.emitters.binary.defs import COMPRESS_LZ4, FLAG_XIP
 from tigris.emitters.binary.reader import read_binary_plan
@@ -47,6 +49,7 @@ class ContractCase:
     compile_model: onnx.ModelProto
     reference_model: onnx.ModelProto
     inputs: dict[str, Array]
+    expected_operators: tuple[str, ...]
     mem_budget: str = "4K"
     compression: str | None = None
     xip: bool = False
@@ -99,6 +102,7 @@ def _constant_add_case() -> ContractCase:
                 [[0.25, -1.0, 5.0, -4.0]], dtype=np.float32
             )
         },
+        ("Add", "Relu"),
     )
 
 
@@ -128,6 +132,7 @@ def _residual_case() -> ContractCase:
                 [[-2.0, -0.5, 0.5, 2.0]], dtype=np.float32
             )
         },
+        ("Relu", "Sigmoid", "Add"),
     )
 
 
@@ -154,6 +159,7 @@ def _output_transpose_case() -> ContractCase:
         model,
         model,
         {"input": np.array([[[1.0, -2.0, 3.0], [4.0, 5.0, -6.0]]], dtype=np.float32)},
+        ("Transpose",),
     )
 
 
@@ -203,6 +209,7 @@ def _dilated_conv_case() -> ContractCase:
                 dtype=np.float32,
             )
         },
+        ("Conv",),
     )
 
 
@@ -244,6 +251,360 @@ def _depthwise_conv_case() -> ContractCase:
         model,
         model,
         {"input": np.linspace(-2.0, 2.0, 128, dtype=np.float32).reshape(1, 2, 8, 8)},
+        ("DepthwiseConv",),
+    )
+
+
+def _math_normalization_case() -> ContractCase:
+    """Constant folding, Clip->Relu6, unary math, Mul, and Softmax."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4]
+    )
+    nodes = [
+        helper.make_node(
+            "Constant",
+            [],
+            ["clip_min"],
+            value=numpy_helper.from_array(np.array(0.0, dtype=np.float32)),
+        ),
+        helper.make_node(
+            "Constant",
+            [],
+            ["clip_max"],
+            value=numpy_helper.from_array(np.array(6.0, dtype=np.float32)),
+        ),
+        helper.make_node(
+            "Clip", ["input", "clip_min", "clip_max"], ["clipped"]
+        ),
+        helper.make_node("Tanh", ["clipped"], ["tanh"]),
+        helper.make_node("Sigmoid", ["clipped"], ["sigmoid"]),
+        helper.make_node("Mul", ["tanh", "sigmoid"], ["product"]),
+        helper.make_node("Softmax", ["product"], ["output"], axis=1),
+    ]
+    model = _model(
+        "math_normalization", nodes, [model_input], [model_output]
+    )
+    return ContractCase(
+        "float_math_normalization",
+        model,
+        model,
+        {
+            "input": np.array(
+                [[-3.0, 0.25, 2.0, 9.0]], dtype=np.float32
+            )
+        },
+        ("Relu6", "Tanh", "Sigmoid", "Mul", "Softmax"),
+    )
+
+
+def _conv1d_case() -> ContractCase:
+    """ONNX Conv1D relabeling and fused activation execution."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 8]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, 8]
+    )
+    weights = numpy_helper.from_array(
+        np.array(
+            [
+                [[0.5, 1.0, -0.5], [0.25, 0.0, 0.75]],
+                [[-1.0, 0.5, 1.0], [0.5, -0.25, 0.25]],
+                [[0.25, 0.25, 0.25], [-0.5, 1.0, -0.5]],
+            ],
+            dtype=np.float32,
+        ),
+        "weights",
+    )
+    bias = numpy_helper.from_array(
+        np.array([0.1, -0.2, 0.3], dtype=np.float32), "bias"
+    )
+    model = _model(
+        "conv1d",
+        [
+            helper.make_node(
+                "Conv",
+                ["input", "weights", "bias"],
+                ["convolved"],
+                kernel_shape=[3],
+                pads=[1, 1],
+            ),
+            helper.make_node("Relu", ["convolved"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+    return ContractCase(
+        "float_conv1d",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -1.5, 1.5, 16, dtype=np.float32
+            ).reshape(1, 2, 8)
+        },
+        ("Conv1D",),
+    )
+
+
+def _reduce_mean_case() -> ContractCase:
+    """ReduceMean over spatial axes must execute as GlobalAveragePool."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 3, 2, 3]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, 1, 1]
+    )
+    model = _model(
+        "reduce_mean_to_gap",
+        [
+            helper.make_node(
+                "ReduceMean",
+                ["input"],
+                ["output"],
+                axes=[2, 3],
+                keepdims=1,
+            )
+        ],
+        [model_input],
+        [model_output],
+    )
+    return ContractCase(
+        "float_reduce_mean_to_gap",
+        model,
+        model,
+        {
+            "input": np.arange(
+                18, dtype=np.float32
+            ).reshape(1, 3, 2, 3)
+        },
+        ("GlobalAveragePool",),
+    )
+
+
+def _normalized_classifier_case() -> ContractCase:
+    """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4]
+    )
+    initializers = [
+        numpy_helper.from_array(
+            np.array([[[[0.75]]], [[[-0.5]]]], dtype=np.float32),
+            "conv_weights",
+        ),
+        numpy_helper.from_array(
+            np.array([0.1, -0.2], dtype=np.float32), "conv_bias"
+        ),
+        numpy_helper.from_array(
+            np.array([1.2, 0.8], dtype=np.float32), "bn_scale"
+        ),
+        numpy_helper.from_array(
+            np.array([0.1, -0.1], dtype=np.float32), "bn_bias"
+        ),
+        numpy_helper.from_array(
+            np.array([0.2, -0.3], dtype=np.float32), "bn_mean"
+        ),
+        numpy_helper.from_array(
+            np.array([0.5, 0.25], dtype=np.float32), "bn_var"
+        ),
+        numpy_helper.from_array(
+            np.linspace(-0.4, 0.5, 32, dtype=np.float32).reshape(4, 8),
+            "fc_weights",
+        ),
+        numpy_helper.from_array(
+            np.array([0.05, -0.1, 0.15, 0.2], dtype=np.float32),
+            "fc_bias",
+        ),
+    ]
+    nodes = [
+        helper.make_node(
+            "Constant",
+            [],
+            ["clip_min"],
+            value=numpy_helper.from_array(np.array(0.0, dtype=np.float32)),
+        ),
+        helper.make_node(
+            "Constant",
+            [],
+            ["clip_max"],
+            value=numpy_helper.from_array(np.array(6.0, dtype=np.float32)),
+        ),
+        helper.make_node(
+            "Constant",
+            [],
+            ["shape_index"],
+            value=numpy_helper.from_array(np.array(0, dtype=np.int64)),
+        ),
+        helper.make_node(
+            "Constant",
+            [],
+            ["unsqueeze_axes"],
+            value=numpy_helper.from_array(np.array([0], dtype=np.int64)),
+        ),
+        helper.make_node(
+            "Constant",
+            [],
+            ["flat_tail"],
+            value=numpy_helper.from_array(np.array([-1], dtype=np.int64)),
+        ),
+        helper.make_node(
+            "Conv",
+            ["input", "conv_weights", "conv_bias"],
+            ["conv"],
+            kernel_shape=[1, 1],
+        ),
+        helper.make_node(
+            "BatchNormalization",
+            ["conv", "bn_scale", "bn_bias", "bn_mean", "bn_var"],
+            ["normalized"],
+        ),
+        helper.make_node(
+            "Clip",
+            ["normalized", "clip_min", "clip_max"],
+            ["activated"],
+        ),
+        helper.make_node(
+            "MaxPool",
+            ["activated"],
+            ["pooled"],
+            kernel_shape=[2, 2],
+            strides=[2, 2],
+        ),
+        helper.make_node("Shape", ["pooled"], ["pool_shape"]),
+        helper.make_node(
+            "Gather", ["pool_shape", "shape_index"], ["batch"], axis=0
+        ),
+        helper.make_node(
+            "Unsqueeze", ["batch", "unsqueeze_axes"], ["batch_vector"]
+        ),
+        helper.make_node(
+            "Concat",
+            ["batch_vector", "flat_tail"],
+            ["target_shape"],
+            axis=0,
+        ),
+        helper.make_node(
+            "Reshape", ["pooled", "target_shape"], ["reshaped"]
+        ),
+        helper.make_node(
+            "Gemm",
+            ["reshaped", "fc_weights", "fc_bias"],
+            ["classified"],
+            transB=1,
+        ),
+        helper.make_node("Flatten", ["classified"], ["output"], axis=1),
+    ]
+    model = _model(
+        "normalized_classifier",
+        nodes,
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    # The deployment shape is static even though the ONNX graph computes its
+    # Reshape input through Shape/Gather/Unsqueeze/Concat. Preserve the
+    # compiler's fail-closed dynamic-shape rule by declaring that known value.
+    model.graph.value_info.extend(
+        [
+            helper.make_tensor_value_info(
+                "reshaped", TensorProto.FLOAT, [1, 8]
+            )
+        ]
+    )
+    onnx.checker.check_model(model)
+    return ContractCase(
+        "float_normalized_classifier",
+        model,
+        model,
+        {
+            "input": np.array(
+                [
+                    [
+                        [
+                            [-1.0, 0.0, 1.0, 2.0],
+                            [3.0, 4.0, 5.0, 6.0],
+                            [2.5, 1.5, 0.5, -0.5],
+                            [4.5, 3.5, 2.5, 1.5],
+                        ]
+                    ]
+                ],
+                dtype=np.float32,
+            )
+        },
+        ("Conv", "MaxPool", "Reshape", "Gemm", "Flatten"),
+        compression="lz4",
+    )
+
+
+def _resize_concat_case() -> ContractCase:
+    """Resize scale extraction and NCHW-to-NHWC Concat-axis mapping."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 2, 2]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 2, 4, 4]
+    )
+    initializers = [
+        numpy_helper.from_array(
+            np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32),
+            "left_scales",
+        ),
+        numpy_helper.from_array(
+            np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32),
+            "right_scales",
+        ),
+        numpy_helper.from_array(
+            np.array(1.5, dtype=np.float32), "multiplier"
+        ),
+    ]
+    resize_attrs = {
+        "coordinate_transformation_mode": "asymmetric",
+        "mode": "nearest",
+        "nearest_mode": "floor",
+    }
+    model = _model(
+        "resize_concat",
+        [
+            helper.make_node(
+                "Resize",
+                ["input", "", "left_scales"],
+                ["left"],
+                **resize_attrs,
+            ),
+            helper.make_node(
+                "Mul", ["input", "multiplier"], ["scaled"]
+            ),
+            helper.make_node(
+                "Resize",
+                ["scaled", "", "right_scales"],
+                ["right"],
+                **resize_attrs,
+            ),
+            helper.make_node(
+                "Concat", ["left", "right"], ["output"], axis=1
+            ),
+        ],
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    return ContractCase(
+        "float_resize_concat",
+        model,
+        model,
+        {
+            "input": np.array(
+                [[[[1.0, -2.0], [3.0, 0.5]]]], dtype=np.float32
+            )
+        },
+        ("Resize", "Mul", "Resize", "Concat"),
     )
 
 
@@ -274,6 +635,7 @@ def _tiled_pool_case() -> ContractCase:
         model,
         model,
         {"input": np.arange(4096, dtype=np.float32).reshape(1, 1, 64, 64) / 64.0},
+        ("AveragePool",),
         mem_budget="4K",
         expect_tiled=True,
     )
@@ -316,6 +678,7 @@ def _tiled_chain_case(*, compression: str | None = None, xip: bool = False) -> C
         model,
         model,
         {"input": np.linspace(-1.0, 1.0, 12288, dtype=np.float32).reshape(1, 3, 64, 64)},
+        ("Conv", "Conv", "Conv"),
         mem_budget="32K",
         compression=compression,
         xip=xip,
@@ -442,6 +805,7 @@ def _qdq_case(operator: str) -> ContractCase:
         compile_model,
         reference_model,
         {"input": input_data},
+        (operator,),
     )
 
 
@@ -693,6 +1057,15 @@ def _run_case(
 
 def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
     """Ensure each corpus case actually exercises the intended plan mode."""
+    actual_operators = tuple(
+        OP_TYPE_BY_CODE[op["op_type"]] for op in plan["ops"]
+    )
+    if Counter(actual_operators) != Counter(case.expected_operators):
+        raise AssertionError(
+            f"{case.name}: plan operators {actual_operators}, expected "
+            f"{case.expected_operators}"
+        )
+
     standalone_tiled = any(
         tile["tileable"] and tile["num_tiles"] > 1
         for tile in plan["tile_plans"]
@@ -716,12 +1089,100 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
 
 
 def _assert_compile_rejected(work_dir: Path) -> None:
+    resize_scales = numpy_helper.from_array(
+        np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), "scales"
+    )
     cases = [
         _model(
             "unsupported_sin",
             [helper.make_node("Sin", ["input"], ["output"])],
             [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
             [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
+        ),
+        _model(
+            "unsupported_softmax_axis",
+            [
+                helper.make_node(
+                    "Softmax", ["input"], ["output"], axis=0
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "input", TensorProto.FLOAT, [2, 4]
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "output", TensorProto.FLOAT, [2, 4]
+                )
+            ],
+        ),
+        _model(
+            "unsupported_concat_axis",
+            [
+                helper.make_node(
+                    "Concat", ["left", "right"], ["output"], axis=2
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "left", TensorProto.FLOAT, [1, 2, 3, 4]
+                ),
+                helper.make_tensor_value_info(
+                    "right", TensorProto.FLOAT, [1, 2, 3, 4]
+                ),
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "output", TensorProto.FLOAT, [1, 2, 6, 4]
+                )
+            ],
+        ),
+        _model(
+            "unsupported_resize_mode",
+            [
+                helper.make_node(
+                    "Resize",
+                    ["input", "", "scales"],
+                    ["output"],
+                    coordinate_transformation_mode="asymmetric",
+                    mode="linear",
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "input", TensorProto.FLOAT, [1, 1, 2, 2]
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "output", TensorProto.FLOAT, [1, 1, 4, 4]
+                )
+            ],
+            [resize_scales],
+        ),
+        _model(
+            "unsupported_pool_ceil",
+            [
+                helper.make_node(
+                    "MaxPool",
+                    ["input"],
+                    ["output"],
+                    ceil_mode=1,
+                    kernel_shape=[2, 2],
+                    strides=[2, 2],
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "input", TensorProto.FLOAT, [1, 1, 3, 3]
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "output", TensorProto.FLOAT, [1, 1, 2, 2]
+                )
+            ],
         ),
     ]
     for index, model in enumerate(cases):
@@ -771,12 +1232,32 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _output_transpose_case(),
         _dilated_conv_case(),
         _depthwise_conv_case(),
+        _math_normalization_case(),
+        _conv1d_case(),
+        _reduce_mean_case(),
+        _normalized_classifier_case(),
+        _resize_concat_case(),
         _tiled_pool_case(),
         _tiled_chain_case(compression="lz4"),
         _tiled_chain_case(xip=True),
         _qdq_case("Conv"),
         _qdq_case("AveragePool"),
     ]
+    covered_operators = {
+        operator for case in cases for operator in case.expected_operators
+    }
+    supported_operators = KERNEL_CAPABILITIES["reference"].native_operators
+    if covered_operators != supported_operators:
+        raise AssertionError(
+            "reference corpus coverage drift: "
+            f"missing={sorted(supported_operators - covered_operators)}, "
+            f"unexpected={sorted(covered_operators - supported_operators)}"
+        )
+    print(
+        f"PASS reference_operator_coverage "
+        f"{len(covered_operators)}/{len(supported_operators)}"
+    )
+
     runner = _build_runner(runtime, work_dir / "runtime-build")
     first_plan = _run_case(cases[0], runner, work_dir)
     for case in cases[1:]:

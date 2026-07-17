@@ -289,12 +289,14 @@ def _transpose_weight_nhwc(arr: np.ndarray, op_type: str | None) -> np.ndarray:
     return arr
 
 
-def _build_fc_flatten_perm(ag: AnalyzedGraph) -> dict[str, tuple[int, ...]]:
-    """Find FC (Gemm) ops whose input comes from Flatten of a spatial tensor.
+def _build_fc_layout_permutations(
+    ag: AnalyzedGraph,
+) -> dict[str, tuple[int, ...]]:
+    """Find FC inputs that flatten a spatial tensor before Gemm.
 
-    For the NHWC layout change, flattening a 3D [N,C,L] tensor gives different
-    element order than flattening [N,L,C]. The FC weight columns need to be
-    permuted to account for this.
+    Both Flatten and a flattening Reshape preserve ONNX's NCHW/NCL byte order.
+    The runtime holds those tensors as NHWC/NLC, so the FC weight columns must
+    be permuted to keep the model's observable result unchanged.
 
     Returns: weight_name -> pre-flatten NCHW shape (for column permutation).
     """
@@ -310,18 +312,26 @@ def _build_fc_flatten_perm(ag: AnalyzedGraph) -> dict[str, tuple[int, ...]]:
             continue
         if len(op.inputs) < 2:
             continue
-        # Check if input[0] comes from Flatten
+        # Check if input[0] comes from a spatial-to-vector transform.
         data_input = op.inputs[0]
         producer = out_to_op.get(data_input)
-        if producer is None or producer.op_type != "Flatten":
+        if producer is None or producer.op_type not in {"Flatten", "Reshape"}:
             continue
-        # Get the pre-flatten tensor shape (NCHW convention in Python IR)
-        flatten_input = producer.inputs[0]
-        flatten_info = ag.tensors.get(flatten_input)
-        if flatten_info is None:
+        spatial_input = producer.inputs[0]
+        spatial_info = ag.tensors.get(spatial_input)
+        vector_info = ag.tensors.get(data_input)
+        if spatial_info is None or vector_info is None:
             continue
-        shape = flatten_info.shape
+        shape = spatial_info.shape
         if len(shape) not in (3, 4):
+            continue
+        if len(vector_info.shape) != 2:
+            continue
+        if (
+            vector_info.shape[0] != shape[0]
+            or int(np.prod(vector_info.shape))
+            != int(np.prod(shape))
+        ):
             continue
         # For 4D [N,C,H,W] with H=W=1 (e.g. after GlobalAvgPool), no permutation needed
         if len(shape) == 4 and shape[2] == 1 and shape[3] == 1:
@@ -395,7 +405,7 @@ def _build_weights(
         return b"", {}
 
     weight_op_map = _build_weight_op_map(ag)
-    fc_flatten_shapes = _build_fc_flatten_perm(ag)
+    fc_layout_shapes = _build_fc_layout_permutations(ag)
 
     weight_idx: dict[str, int] = {}
     entries_buf = bytearray()
@@ -405,9 +415,9 @@ def _build_weights(
         weight_idx[name] = idx
         op_type = weight_op_map.get(name)
         arr = _transpose_weight_nhwc(arr, op_type)
-        # Permute FC weight columns when input comes from Flatten of spatial tensor
-        if name in fc_flatten_shapes:
-            arr = _permute_fc_weight_for_nhwc(arr, fc_flatten_shapes[name])
+        # Preserve ONNX flatten/reshape order across the internal layout change.
+        if name in fc_layout_shapes:
+            arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
         # Preserve int8/int32 dtype for quantized weights
         if arr.dtype in (np.int8, np.int32):
             raw = arr.tobytes()
@@ -480,7 +490,7 @@ def _build_weights_compressed(
         return b"", b"", {}
 
     weight_op_map = _build_weight_op_map(ag)
-    fc_flatten_shapes = _build_fc_flatten_perm(ag)
+    fc_layout_shapes = _build_fc_layout_permutations(ag)
 
     # First pass: prepare all weights (same transform as _build_weights)
     weight_idx: dict[str, int] = {}
@@ -492,8 +502,8 @@ def _build_weights_compressed(
         weight_idx[name] = idx
         op_type = weight_op_map.get(name)
         arr = _transpose_weight_nhwc(arr, op_type)
-        if name in fc_flatten_shapes:
-            arr = _permute_fc_weight_for_nhwc(arr, fc_flatten_shapes[name])
+        if name in fc_layout_shapes:
+            arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
         if arr.dtype in (np.int8, np.int32):
             raw = arr.tobytes()
         else:
