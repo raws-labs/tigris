@@ -73,6 +73,51 @@ def _cmsis_weight_decompression_overhead(plan: dict) -> int:
     return _weight_decompression_overhead(plan, _CMSIS_TENSOR_ALIGN)
 
 
+def _executor_workspace_limits(plan: dict) -> tuple[int, int, int, int, int]:
+    """Return runtime workspace dimensions derived from the serialized plan."""
+    stages = plan.get("stages", [])
+    ops = plan.get("ops", [])
+    max_inputs = max((len(stage["inputs"]) for stage in stages), default=0)
+    max_outputs = max((len(stage["outputs"]) for stage in stages), default=0)
+    max_chain = 0
+    max_spatial = 0
+
+    for stage_idx, stage in enumerate(stages):
+        chain_len = stage["chain_len"]
+        if chain_len < 2 or stage["chain_id"] != stage_idx:
+            continue
+        if stage_idx + chain_len > len(stages):
+            raise ValueError("Plan contains a chain beyond the stage table")
+        max_chain = max(max_chain, chain_len)
+        for member in stages[stage_idx : stage_idx + chain_len]:
+            spatial = sum(
+                OP_TYPE_BY_CODE.get(ops[op_idx]["op_type"])
+                in {"Conv", "DepthwiseConv"}
+                for op_idx in member["ops"]
+            )
+            max_spatial = max(max_spatial, spatial)
+
+    return (
+        plan["num_tensors"],
+        max_inputs,
+        max_outputs,
+        max_chain,
+        max_spatial,
+    )
+
+
+def _executor_workspace_declaration(plan: dict) -> str:
+    tensors, inputs, outputs, chain_stages, spatial_ops = (
+        _executor_workspace_limits(plan)
+    )
+    return f"""\
+#define TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES \\
+    TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS( \\
+        {tensors}u, {inputs}u, {outputs}u, {chain_stages}u, {spatial_ops}u)
+static uint8_t executor_workspace[TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES];
+"""
+
+
 def _plan_dtype(plan: dict) -> DTypeMode:
     """Resolve the graph-wide runtime dtype from serialized tensors."""
     tensor_dtypes = {tensor["dtype"] for tensor in plan.get("tensors", [])}
@@ -171,6 +216,8 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
     guard = f"{macro_prefix}_CORE_H"
     weight_reserve = _weight_decompression_overhead(plan, _PLAN_TENSOR_ALIGN)
     fast_arena_required = plan["budget"] + weight_reserve
+    workspace_limits = _executor_workspace_limits(plan)
+    workspace_limits_args = ", ".join(f"{value}u" for value in workspace_limits)
     if fast_arena_required > 0xFFFFFFFF:
         raise ValueError("Core fast-arena requirement exceeds uint32")
     return f"""\
@@ -194,6 +241,8 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
 #define {macro_prefix}_PLAN_BUDGET_BYTES {plan['budget']}u
 #define {macro_prefix}_WEIGHT_DECOMPRESSION_RESERVE_BYTES {weight_reserve}u
 #define {macro_prefix}_CORE_FAST_ARENA_BYTES {fast_arena_required}u
+#define {macro_prefix}_EXECUTOR_WORKSPACE_BYTES \\
+    TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS({workspace_limits_args})
 
 typedef void (*{core_name}_input_init_fn)(
     void *data, uint32_t size_bytes, uint16_t tensor_index, void *user_ctx);
@@ -224,6 +273,11 @@ tigris_kernel_fn {core_name}_dispatch(void);
 tigris_exec_error_t {core_name}_run(
     const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats,
     tigris_executor_workspace_t *workspace);
+
+/* Plan-sized alternative: no generic executor limits are reserved. */
+tigris_exec_error_t {core_name}_run_with_workspace_buffer(
+    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats,
+    void *workspace, size_t workspace_size);
 
 #endif
 """
@@ -347,6 +401,14 @@ tigris_exec_error_t {core_name}_run(
     return tigris_run_with_workspace(
         plan, mem, {dispatch}, NULL, stats, workspace);
 }}
+
+tigris_exec_error_t {core_name}_run_with_workspace_buffer(
+    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats,
+    void *workspace, size_t workspace_size)
+{{
+    return tigris_run_with_workspace_buffer(
+        plan, mem, {dispatch}, NULL, stats, workspace, workspace_size);
+}}
 '''
 
 
@@ -375,6 +437,7 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
     dispatch = "tigris_dispatch_kernel_s8" if is_quantized else "tigris_dispatch_kernel"
     kernel_include = '#include "tigris_kernels_s8.h"' if is_quantized else '#include "tigris_kernels.h"'
     budget = plan["budget"] or 65536
+    workspace_declaration = _executor_workspace_declaration(plan)
 
     return f"""\
 #define _POSIX_C_SOURCE 200112L
@@ -390,7 +453,7 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
 #include "tigris_executor.h"
 {kernel_include}
 
-static tigris_executor_workspace_t executor_workspace;
+{workspace_declaration}
 
 static void *allocate_aligned(uint32_t size)
 {{
@@ -500,8 +563,9 @@ int main(int argc, char **argv)
 
     /* 5. Run inference */
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run_with_workspace(
-        &plan, &mem, {dispatch}, NULL, &stats, &executor_workspace);
+    tigris_exec_error_t eerr = tigris_run_with_workspace_buffer(
+        &plan, &mem, {dispatch}, NULL, &stats,
+        executor_workspace, sizeof(executor_workspace));
     if (eerr != TIGRIS_EXEC_OK) {{
         fprintf(stderr, "Inference failed: %s\\n", tigris_exec_error_str(eerr));
         free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
@@ -534,6 +598,7 @@ int main(int argc, char **argv)
 
 def _generate_esp(plan: dict, is_quantized: bool) -> str:
     budget = plan["budget"] or 65536
+    workspace_declaration = _executor_workspace_declaration(plan)
 
     if is_quantized:
         dispatch = "tigris_dispatch_kernel_esp_nn"
@@ -571,7 +636,7 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
 {kernel_includes}
 
 static const char *TAG = "tigris";
-static tigris_executor_workspace_t executor_workspace;
+{workspace_declaration}
 
 void app_main(void)
 {{
@@ -682,8 +747,9 @@ void app_main(void)
     /* 6. Run inference */
     int64_t t0 = esp_timer_get_time();
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run_with_workspace(
-        &plan, &mem, {dispatch}, NULL, &stats, &executor_workspace);
+    tigris_exec_error_t eerr = tigris_run_with_workspace_buffer(
+        &plan, &mem, {dispatch}, NULL, &stats,
+        executor_workspace, sizeof(executor_workspace));
     int64_t t1 = esp_timer_get_time();
 
     if (eerr != TIGRIS_EXEC_OK) {{
@@ -731,6 +797,7 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
             "CMSIS-NN static fast arena exceeds the uint32 runtime size limit"
         )
     slow_arena_size = max(budget * 4, 256 * 1024)
+    workspace_declaration = _executor_workspace_declaration(plan)
     if slow_arena_size > 0xFFFFFFFF:
         raise ValueError(
             "CMSIS-NN static slow arena exceeds the uint32 runtime size limit"
@@ -805,7 +872,7 @@ extern const uint8_t _binary_model_tgrs_end[];
 static uint8_t fast_arena[{fast_arena_expr}] __attribute__((aligned(16)));
 static uint8_t slow_arena[{slow_arena_size}] __attribute__((aligned(16)));
 static void *tensor_ptrs[{plan['num_tensors']}];
-static tigris_executor_workspace_t executor_workspace;
+{workspace_declaration}
 
 int main(void)
 {{
@@ -854,8 +921,9 @@ int main(void)
 
     /* 4. Run inference */
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run_with_workspace(
-        &plan, &mem, {dispatch}, NULL, &stats, &executor_workspace);
+    tigris_exec_error_t eerr = tigris_run_with_workspace_buffer(
+        &plan, &mem, {dispatch}, NULL, &stats,
+        executor_workspace, sizeof(executor_workspace));
     if (eerr != TIGRIS_EXEC_OK) {{
         printf("Inference failed: %s\\n", tigris_exec_error_str(eerr));
         return 1;
