@@ -96,6 +96,9 @@ bytes, arena buffers, and an optional input-initialization callback. If
 `--name` prefixes the public C symbols, so multiple generated cores can coexist
 in one firmware. The header also exports the model's tensor-table capacity,
 plan budget, and compressed-weight reserve for static allocation decisions.
+It also exports a plan-sized executor-workspace constant and buffer entry point,
+so generated integrations reserve only the metadata this model needs without
+manual limit tuning.
 This is suitable for bare-metal firmware, RTOS applications, and custom
 instrumentation without introducing a hardware-specific codegen target.
 

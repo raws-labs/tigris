@@ -21,7 +21,11 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.emitters.codegen import generate_c, generate_core_header
+from tigris.emitters.codegen import (
+    _executor_workspace_limits,
+    generate_c,
+    generate_core_header,
+)
 from tigris.loaders import load_model
 
 
@@ -173,9 +177,14 @@ def test_codegen_reports_xip_and_loads_plan_at_runtime(linear_3op_path):
     assert "merr = tigris_mem_alloc_slow(" in source
     assert source.count("if (merr != TIGRIS_MEM_OK)") >= 2
     assert "plan.header->peak > UINT32_MAX / 4u" in source
-    assert "static tigris_executor_workspace_t executor_workspace" in source
-    assert "tigris_run_with_workspace(" in source
+    assert "TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES" in source
+    assert (
+        "uint8_t executor_workspace"
+        "[TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES]" in source
+    )
+    assert "tigris_run_with_workspace_buffer(" in source
     assert "&plan, &mem, tigris_dispatch_kernel, NULL, &stats," in source
+    assert "executor_workspace, sizeof(executor_workspace)" in source
 
 
 def test_posix_codegen_aligns_plan_and_arenas(linear_3op_path):
@@ -265,11 +274,51 @@ def test_core_codegen_header_exposes_embedding_api(qdq_conv_path):
     assert "tigris_codegen_reset" in header
     assert "tigris_codegen_run" in header
     assert "tigris_executor_workspace_t *workspace" in header
+    assert "tigris_codegen_run_with_workspace_buffer" in header
     assert "TIGRIS_CODEGEN_TENSOR_CAPACITY" in header
     assert "TIGRIS_CODEGEN_PLAN_TENSOR_ALIGNMENT_BYTES 32u" in header
     assert "TIGRIS_CODEGEN_PLAN_BUDGET_BYTES" in header
     assert "TIGRIS_CODEGEN_WEIGHT_DECOMPRESSION_RESERVE_BYTES" in header
     assert "TIGRIS_CODEGEN_CORE_FAST_ARENA_BYTES" in header
+    assert "TIGRIS_CODEGEN_EXECUTOR_WORKSPACE_BYTES" in header
+    assert "TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS" in header
+
+
+def test_codegen_workspace_limits_include_only_executable_chain_capacity():
+    plan = {
+        "num_tensors": 9,
+        "ops": [
+            {"op_type": 1},
+            {"op_type": 2},
+            {"op_type": 3},
+            {"op_type": 1},
+        ],
+        "stages": [
+            {
+                "inputs": [0, 1],
+                "outputs": [2],
+                "ops": [0, 1],
+                "chain_id": 0,
+                "chain_len": 2,
+            },
+            {
+                "inputs": [2],
+                "outputs": [3, 4, 5],
+                "ops": [2],
+                "chain_id": 0,
+                "chain_len": 2,
+            },
+            {
+                "inputs": [5],
+                "outputs": [6],
+                "ops": [3],
+                "chain_id": 0xFFFF,
+                "chain_len": 0,
+            },
+        ],
+    }
+
+    assert _executor_workspace_limits(plan) == (9, 2, 3, 2, 2)
 
 
 def test_compressed_core_header_uses_plan_alignment_for_arena_requirement(
