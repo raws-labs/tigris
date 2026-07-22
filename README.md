@@ -56,7 +56,11 @@ tigris codegen model.tgrs --backend esp-nn -o model.c
 
 The `.tgrs` plan is target-agnostic: it is the same file whether you run it on an ESP32, a Cortex-M, or a POSIX host for testing. The choice of kernel backend happens at `codegen` time and decides which kernel library the generated C calls into.
 
-Several kernel backends are available (portable C99, ESP32 family, Cortex-M family); see [tigris-runtime](https://github.com/raws-labs/tigris-runtime) for the current list. Switching between them is a `--backend` flag, not a rewrite.
+Several kernel backends are available (portable C99, ESP32 family, Cortex-M
+family). The generated [operator/backend capability
+matrix](https://tigris-ml.dev/docs/runtime/operator-and-backend-support/)
+shows which operators are native, use an explicit fallback, or are rejected.
+Switching between them is a `--backend` flag, not a rewrite.
 
 ## What you get
 
@@ -92,12 +96,16 @@ bytes, arena buffers, and an optional input-initialization callback. If
 `--name` prefixes the public C symbols, so multiple generated cores can coexist
 in one firmware. The header also exports the model's tensor-table capacity,
 plan budget, and compressed-weight reserve for static allocation decisions.
+It also exports a plan-sized executor-workspace constant and buffer entry point,
+so generated integrations reserve only the metadata this model needs without
+manual limit tuning.
 This is suitable for bare-metal firmware, RTOS applications, and custom
 instrumentation without introducing a hardware-specific codegen target.
 
 ## Further reading
 
 - [Getting started](https://tigris-ml.dev/docs): installation, first compile, deploying to ESP32
+- [Core compatibility data](compatibility.json): exact compiler/runtime releases and plan schemas
 - [Introducing TiGrIS](https://tigris-ml.dev/blog/introducing-tigris): design, benchmarks, how tiling works
 - [CLI reference](https://tigris-ml.dev/docs/cli): every flag, every subcommand
 

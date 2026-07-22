@@ -21,7 +21,11 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.emitters.codegen import generate_c, generate_core_header
+from tigris.emitters.codegen import (
+    _executor_workspace_limits,
+    generate_c,
+    generate_core_header,
+)
 from tigris.loaders import load_model
 
 
@@ -173,7 +177,27 @@ def test_codegen_reports_xip_and_loads_plan_at_runtime(linear_3op_path):
     assert "merr = tigris_mem_alloc_slow(" in source
     assert source.count("if (merr != TIGRIS_MEM_OK)") >= 2
     assert "plan.header->peak > UINT32_MAX / 4u" in source
-    assert "tigris_run(&plan, &mem, tigris_dispatch_kernel, NULL, &stats)" in source
+    assert "TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES" in source
+    assert (
+        "uint8_t executor_workspace"
+        "[TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES]" in source
+    )
+    assert "tigris_run_with_workspace_buffer(" in source
+    assert "&plan, &mem, tigris_dispatch_kernel, NULL, &stats," in source
+    assert "executor_workspace, sizeof(executor_workspace)" in source
+
+
+def test_posix_codegen_aligns_plan_and_arenas(linear_3op_path):
+    source = generate_c(
+        emit_binary_bytes(_full_pipeline(linear_3op_path, budget=4096)),
+        "reference",
+    )
+
+    assert "#define _POSIX_C_SOURCE 200112L" in source
+    assert "posix_memalign(&ptr, alignment, size)" in source
+    assert "uint8_t *buf = allocate_aligned" in source
+    assert "void *fast_buf = allocate_aligned(fast_size)" in source
+    assert "void *slow_buf = allocate_aligned(slow_size)" in source
 
 
 def test_quantized_esp_codegen_has_valid_includes(qdq_conv_path):
@@ -183,6 +207,8 @@ def test_quantized_esp_codegen_has_valid_includes(qdq_conv_path):
     assert "Kernels: esp-nn -> s8_ref fallback" in source
     assert "if (tigris_esp_nn_prepare(&plan, &mem) != 0)" in source
     assert "ESP-NN preparation failed" in source
+    assert "tigris_fast_arena_required(&plan)" in source
+    assert "tigris_weight_decompression_overhead(&plan)" not in source
     assert "tigris_mem_error_t merr = tigris_mem_init(" in source
     assert "merr = tigris_mem_alloc_slow(" in source
     assert "part->size < sizeof(tigris_file_header_t)" in source
@@ -228,6 +254,8 @@ def test_core_codegen_is_embeddable_and_backend_specific(
     assert "tigris_codegen_reset" in source
     assert dispatch in source
     if backend == "cmsis-nn":
+        assert "tigris_cmsis_nn_fast_arena_required(plan)" in source
+        assert "fast_arena_size < cmsis_fast_required" in source
         assert "tigris_cmsis_nn_prepare" in source
         assert "tigris_cmsis_nn_deinit(mem)" in source
         assert source.index("tigris_cmsis_nn_deinit(mem)") < source.index(
@@ -245,9 +273,76 @@ def test_core_codegen_header_exposes_embedding_api(qdq_conv_path):
     assert "tigris_codegen_init" in header
     assert "tigris_codegen_reset" in header
     assert "tigris_codegen_run" in header
+    assert "tigris_executor_workspace_t *workspace" in header
+    assert "tigris_codegen_run_with_workspace_buffer" in header
     assert "TIGRIS_CODEGEN_TENSOR_CAPACITY" in header
+    assert "TIGRIS_CODEGEN_PLAN_TENSOR_ALIGNMENT_BYTES 32u" in header
     assert "TIGRIS_CODEGEN_PLAN_BUDGET_BYTES" in header
     assert "TIGRIS_CODEGEN_WEIGHT_DECOMPRESSION_RESERVE_BYTES" in header
+    assert "TIGRIS_CODEGEN_CORE_FAST_ARENA_BYTES" in header
+    assert "TIGRIS_CODEGEN_EXECUTOR_WORKSPACE_BYTES" in header
+    assert "TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS" in header
+
+
+def test_codegen_workspace_limits_include_only_executable_chain_capacity():
+    plan = {
+        "num_tensors": 9,
+        "ops": [
+            {"op_type": 1},
+            {"op_type": 2},
+            {"op_type": 3},
+            {"op_type": 1},
+        ],
+        "stages": [
+            {
+                "inputs": [0, 1],
+                "outputs": [2],
+                "ops": [0, 1],
+                "chain_id": 0,
+                "chain_len": 2,
+            },
+            {
+                "inputs": [2],
+                "outputs": [3, 4, 5],
+                "ops": [2],
+                "chain_id": 0,
+                "chain_len": 2,
+            },
+            {
+                "inputs": [5],
+                "outputs": [6],
+                "ops": [3],
+                "chain_id": 0xFFFF,
+                "chain_len": 0,
+            },
+        ],
+    }
+
+    assert _executor_workspace_limits(plan) == (9, 2, 3, 2, 2)
+
+
+def test_compressed_core_header_uses_plan_alignment_for_arena_requirement(
+    qdq_conv_path,
+):
+    data = emit_binary_bytes(
+        _full_pipeline(qdq_conv_path, budget=4096), compress="lz4"
+    )
+    plan = read_binary_plan(data)
+    expected_reserve = max(
+        (block["uncompressed_size"] + 31) // 32 * 32
+        for block in plan["weight_blocks"]
+    )
+
+    header = generate_core_header(data)
+
+    assert (
+        f"TIGRIS_CODEGEN_WEIGHT_DECOMPRESSION_RESERVE_BYTES "
+        f"{expected_reserve}u" in header
+    )
+    assert (
+        f"TIGRIS_CODEGEN_CORE_FAST_ARENA_BYTES "
+        f"{plan['budget'] + expected_reserve}u" in header
+    )
 
 
 def test_core_codegen_custom_name_is_linkable_alongside_default(qdq_conv_path):
@@ -349,6 +444,8 @@ def test_quantized_cmsis_codegen_checks_prepare_and_memory(qdq_conv_path):
 
     source = generate_c(emit_binary_bytes(ag), "cmsis-nn")
 
+    assert "tigris_cmsis_nn_fast_arena_required(&plan)" in source
+    assert "Increase TIGRIS_CMSIS_NN_SCRATCH_BYTES" in source
     assert "if (tigris_cmsis_nn_prepare(&plan, &mem) != 0)" in source
     assert "CMSIS-NN preparation failed" in source
     assert "tigris_mem_error_t merr = tigris_mem_init(" in source
@@ -368,11 +465,14 @@ def test_compressed_cmsis_arena_includes_static_weight_reserve(qdq_conv_path):
 
     source = generate_c(data, "cmsis-nn")
 
+    expected_core = (plan["budget"] + expected_overhead + 15) // 16 * 16
+    assert "#define TIGRIS_CMSIS_NN_SCRATCH_BYTES 4096u" in source
     assert (
-        f"static uint8_t fast_arena[{plan['budget'] + expected_overhead}]"
-        in source
+        f"static uint8_t fast_arena[{expected_core}u + "
+        "TIGRIS_CMSIS_NN_SCRATCH_BYTES]" in source
     )
     assert f"if (weight_overhead > {expected_overhead}u)" in source
+    assert "cmsis_fast_required > sizeof(fast_arena)" in source
     assert "fast_size += tigris_weight_decompression_overhead" not in source
 
 

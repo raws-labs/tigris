@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["onnx", "edge-ml", "embedded", "tinyml", "inference", "microcontroller"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
@@ -53,6 +53,9 @@ tigris = "tigris.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+tigris = ["schema/*.json"]
 
 [tool.setuptools_scm]
 version_file = "src/tigris/_version.py"

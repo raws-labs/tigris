@@ -129,6 +129,50 @@ def test_full_shape_elementwise_constant_is_emitted_in_nhwc_layout():
     assert plan["ops"][0]["weight_idx"] == 0
 
 
+def test_gemm_after_spatial_reshape_preserves_onnx_element_order():
+    weights = np.arange(16, dtype=np.float32).reshape(2, 8)
+    graph = AnalyzedGraph(
+        ops=[
+            OpNode(
+                name="flattening_reshape",
+                op_type="Reshape",
+                inputs=["input"],
+                outputs=["vector"],
+            ),
+            OpNode(
+                name="classifier",
+                op_type="Gemm",
+                inputs=["vector", "weights"],
+                outputs=["output"],
+                attrs={"transB": 1},
+            ),
+        ],
+        tensors={
+            "input": TensorInfo("input", (1, 2, 2, 2), 1),
+            "vector": TensorInfo("vector", (1, 8), 1),
+            "weights": TensorInfo(
+                "weights", weights.shape, 1, is_constant=True
+            ),
+            "output": TensorInfo("output", (1, 2), 1),
+        },
+        weight_data={"weights": weights},
+        model_inputs=["input"],
+        model_outputs=["output"],
+    )
+
+    data = emit_binary_bytes(graph)
+    plan = read_binary_plan(data)
+    weight = plan["weights"][0]
+    start = weight["blob_base"] + weight["offset"]
+    actual = np.frombuffer(
+        data[start : start + weight["size_bytes"]], dtype=np.float32
+    ).reshape(2, 8)
+
+    # Runtime order is NHWC: each position alternates its two channels.
+    nhwc_to_nchw = [0, 4, 1, 5, 2, 6, 3, 7]
+    np.testing.assert_array_equal(actual, weights[:, nhwc_to_nchw])
+
+
 def test_no_weights_section_when_empty(diamond_path):
     """Binary plan should not have a weights section for activation-only graphs."""
     ag = _full_pipeline(diamond_path)
