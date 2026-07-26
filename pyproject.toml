@@ -62,3 +62,9 @@ version_file = "src/tigris/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Keep the repository's established correctness-focused baseline explicit.
+# Ruff 0.16 expanded its zero-configuration defaults to additional style
+# families, which otherwise changes CI policy whenever the tool is upgraded.
+select = ["E4", "E7", "E9", "F"]
