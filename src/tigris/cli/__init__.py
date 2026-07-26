@@ -46,7 +46,7 @@ def _run_pipeline(
         with console.status("Loading model..."):
             ag = load_model(model_path)
             ag = compute_lifetimes(ag)
-            ag = compute_memory_timeline(ag)
+            ag = compute_memory_timeline(ag, capture_live_tensors=False)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 

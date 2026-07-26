@@ -10,13 +10,17 @@ def _aligned_size(size_bytes: int, alignment: int) -> int:
     return (size_bytes + alignment - 1) & ~(alignment - 1)
 
 
-def compute_memory_timeline(ag: AnalyzedGraph) -> AnalyzedGraph:
+def compute_memory_timeline(
+    ag: AnalyzedGraph, *, capture_live_tensors: bool = True
+) -> AnalyzedGraph:
     """Compute the memory footprint at each execution step using an event-sweep.
 
     For each step, the live memory is the sum of sizes of all activation tensors
-    whose lifetime spans that step: birth_step < step <= death_step.
+    whose lifetime spans that step: birth_step <= step <= death_step.
 
     Produces a MemorySnapshot per step and records the overall peak.
+    Set ``capture_live_tensors`` to false when only byte totals are needed to
+    avoid retaining a sorted tensor-name snapshot at every execution step.
     """
     num_ops = len(ag.ops)
     if num_ops == 0:
@@ -45,7 +49,7 @@ def compute_memory_timeline(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     # Sweep through steps 0..num_ops-1
     live_bytes = 0
-    live_set: set[str] = set()
+    live_set: set[str] | None = set() if capture_live_tensors else None
     ev_idx = 0
 
     timeline: list[MemorySnapshot] = []
@@ -56,16 +60,17 @@ def compute_memory_timeline(ag: AnalyzedGraph) -> AnalyzedGraph:
         while ev_idx < len(events) and events[ev_idx][0] <= step:
             _, delta, tname = events[ev_idx]
             live_bytes += delta
-            if delta > 0:
-                live_set.add(tname)
-            else:
-                live_set.discard(tname)
+            if live_set is not None:
+                if delta > 0:
+                    live_set.add(tname)
+                else:
+                    live_set.discard(tname)
             ev_idx += 1
 
         snapshot = MemorySnapshot(
             step=step,
             live_bytes=live_bytes,
-            live_tensors=sorted(live_set),
+            live_tensors=sorted(live_set) if live_set is not None else [],
         )
         timeline.append(snapshot)
         if live_bytes > peak:
