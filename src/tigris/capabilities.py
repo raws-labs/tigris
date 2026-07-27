@@ -101,7 +101,11 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "explicit padding, floor output sizing, unit dilation, and no indices output",
     ),
     "Concat": ("rank-4 channel-axis concatenation",),
-    "Resize": ("rank-4 nearest-neighbor integer H/W upscaling",),
+    "Conv1D": ("untiled execution",),
+    "GlobalAveragePool": ("untiled execution",),
+    "Resize": (
+        "rank-4 nearest-neighbor integer H/W upscaling; untiled execution",
+    ),
     "Softmax": ("final axis only; untiled execution",),
     "Transpose": ("a concrete, valid permutation is stored in schema 4 plans",),
 }

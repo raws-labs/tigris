@@ -240,6 +240,9 @@
       "conditional_fallbacks": {
         "cmsis-nn": "falls back when tiled or when input/output quantization differs"
       },
+      "constraints": [
+        "untiled execution"
+      ],
       "opcode": 15,
       "operator": "GlobalAveragePool",
       "routes": {
@@ -394,7 +397,7 @@
     },
     {
       "constraints": [
-        "rank-4 nearest-neighbor integer H/W upscaling"
+        "rank-4 nearest-neighbor integer H/W upscaling; untiled execution"
       ],
       "opcode": 30,
       "operator": "Resize",
@@ -416,6 +419,9 @@
       }
     },
     {
+      "constraints": [
+        "untiled execution"
+      ],
       "opcode": 32,
       "operator": "Conv1D",
       "routes": {
