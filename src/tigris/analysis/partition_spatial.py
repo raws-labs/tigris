@@ -24,46 +24,24 @@ class TileCategory(Enum):
     UNTILEABLE = "untileable"
 
 
-# Op types that are spatially tileable (operate on spatial dims independently)
+# Schema-v4 height tiling is an execution contract, not a purely mathematical
+# classification.  Keep this list aligned with exec_stage_tiled in the runtime:
+# every listed op must consume and produce the height stripe described by the
+# runtime tile context.  Unknown and unaudited ops fail closed as UNTILEABLE.
 _OP_CATEGORY: dict[str, TileCategory] = {
-    # Convolutions
+    # Spatial ops whose height geometry the runtime propagates.
     "Conv": TileCategory.CONV,
-    "Conv1D": TileCategory.CONV,
-    "ConvTranspose": TileCategory.CONV,
     "DepthwiseConv": TileCategory.CONV,
-    # Pooling
     "MaxPool": TileCategory.POOL,
     "AveragePool": TileCategory.POOL,
-    "GlobalAveragePool": TileCategory.POOL,
-    "GlobalMaxPool": TileCategory.POOL,
-    # Pointwise / element-wise (pass through spatial dims unchanged)
+    # Audited, shape-preserving runtime kernels.
     "Relu": TileCategory.POINTWISE,
     "Relu6": TileCategory.POINTWISE,
-    "LeakyRelu": TileCategory.POINTWISE,
     "Sigmoid": TileCategory.POINTWISE,
     "Tanh": TileCategory.POINTWISE,
-    "HardSigmoid": TileCategory.POINTWISE,
-    "HardSwish": TileCategory.POINTWISE,
-    "Clip": TileCategory.POINTWISE,
     "Add": TileCategory.POINTWISE,
-    "Sub": TileCategory.POINTWISE,
     "Mul": TileCategory.POINTWISE,
-    "Div": TileCategory.POINTWISE,
-    "BatchNormalization": TileCategory.POINTWISE,
-    "InstanceNormalization": TileCategory.POINTWISE,
     "Concat": TileCategory.POINTWISE,
-    "Resize": TileCategory.POINTWISE,
-    "Pad": TileCategory.POINTWISE,
-    # Untileable - these collapse or reshape spatial dims
-    "Flatten": TileCategory.UNTILEABLE,
-    "Reshape": TileCategory.UNTILEABLE,
-    "Gemm": TileCategory.UNTILEABLE,
-    "MatMul": TileCategory.UNTILEABLE,
-    "Softmax": TileCategory.UNTILEABLE,
-    "ReduceMean": TileCategory.UNTILEABLE,
-    "Squeeze": TileCategory.UNTILEABLE,
-    "Unsqueeze": TileCategory.UNTILEABLE,
-    "Transpose": TileCategory.UNTILEABLE,
 }
 
 

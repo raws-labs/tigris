@@ -75,6 +75,9 @@ def test_public_qualifications_reference_real_native_routes():
 
     assert set(OPERATOR_CONSTRAINTS) <= OP_TYPE_MAP.keys()
     assert "final axis" in OPERATOR_CONSTRAINTS["Softmax"][0]
+    assert "untiled execution" in OPERATOR_CONSTRAINTS["Conv1D"][0]
+    assert "untiled execution" in OPERATOR_CONSTRAINTS["GlobalAveragePool"][0]
+    assert "untiled execution" in OPERATOR_CONSTRAINTS["Resize"][0]
 
 
 def test_codegen_route_descriptions_do_not_imply_float_acceleration():

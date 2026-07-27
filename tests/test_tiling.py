@@ -1,5 +1,6 @@
 """Tests for tigris.analysis.partition_spatial - op classification, receptive field, tile solver."""
 
+import pytest
 import yaml
 
 from tigris.graph.ir import OpNode
@@ -48,8 +49,19 @@ class TestClassifyOp:
     def test_averagepool_is_pool(self):
         assert classify_op("AveragePool") == TileCategory.POOL
 
-    def test_batchnorm_is_pointwise(self):
-        assert classify_op("BatchNormalization") == TileCategory.POINTWISE
+    @pytest.mark.parametrize(
+        "op_type",
+        [
+            "BatchNormalization",
+            "Conv1D",
+            "GlobalAveragePool",
+            "Resize",
+        ],
+    )
+    def test_operators_without_schema_v4_height_contract_are_untileable(
+        self, op_type
+    ):
+        assert classify_op(op_type) == TileCategory.UNTILEABLE
 
     def test_gemm_is_untileable(self):
         assert classify_op("Gemm") == TileCategory.UNTILEABLE
