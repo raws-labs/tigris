@@ -10,6 +10,7 @@ from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import (
     _back_propagate_tile_heights,
     _chain_fast_bytes,
+    _get_stage_spatial_params,
     detect_and_solve_chains,
     detect_chains,
     partition_spatial,
@@ -123,11 +124,11 @@ def chain_with_fanout_path(tmp_path):
 
 @pytest.fixture
 def chain_with_pool_path(tmp_path):
-    """Conv -> Relu -> MaxPool(stride2) -> Conv. The strided pool sits where a
-    chain would otherwise form. exec_chain_tiled composes receptive fields for
-    Conv/DepthwiseConv only, so a pool inside a chain would get height-preserving
-    (pointwise) tile geometry -> wrong rows / OOB. The pool stage must stay out of
-    any chain."""
+    """Conv -> Relu -> MaxPool(stride2) -> Conv.
+
+    The pool stage must participate in the streamable chain with its stride and
+    receptive field represented in the chain geometry.
+    """
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 64, 64])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 32, 32])
     w0 = helper.make_tensor("w0", TensorProto.FLOAT, [4, 3, 3, 3],
@@ -186,7 +187,7 @@ def chain_with_model_output_mid_path(tmp_path):
     return path
 
 
-_POOL_OP_TYPES = {"MaxPool", "AveragePool", "GlobalAveragePool", "GlobalMaxPool"}
+_POOL_OP_TYPES = {"MaxPool", "AveragePool"}
 
 
 def _stages_then_chains(path, budget):
@@ -208,15 +209,20 @@ def _chain_boundary_tensors(ag, chains):
     return boundaries
 
 
-def test_pool_stage_not_chained(chain_with_pool_path):
-    """A pool op must never appear inside a chained stage (#5: exec_chain_tiled
-    handles only Conv/DepthwiseConv as spatial)."""
+def test_pool_stage_is_chained_with_spatial_geometry(chain_with_pool_path):
     ag, chains = _stages_then_chains(chain_with_pool_path, budget=24000)
-    for group in chains:
-        for si in group:
-            optypes = {ag.ops[oi].op_type for oi in ag.stages[si].op_indices}
-            assert not (optypes & _POOL_OP_TYPES), (
-                f"pool op chained in stage {si}: {optypes}")
+    pooled_stages = {
+        si
+        for group in chains
+        for si in group
+        if {
+            ag.ops[oi].op_type for oi in ag.stages[si].op_indices
+        } & _POOL_OP_TYPES
+    }
+
+    assert pooled_stages, "expected the MaxPool stage in a streamable chain"
+    for si in pooled_stages:
+        assert _get_stage_spatial_params(ag, ag.stages[si]) == (2, 2, 1)
 
 
 def test_chain_does_not_span_model_output(chain_with_model_output_mid_path):
@@ -314,6 +320,11 @@ class TestChainTileSolver:
         heights = _back_propagate_tile_heights(params, 3)
         # out=3, in = 3*2 + (3-2) = 7
         assert heights[0] == (7, 3)
+
+    def test_back_propagate_pool_stride2(self):
+        """Pool2x2(s=2) uses the same spatial range algebra as convolution."""
+        heights = _back_propagate_tile_heights([(2, 2, 1)], 3)
+        assert heights[0] == (6, 3)
 
     def test_solver_returns_positive(self, three_conv_chain_path):
         """Solver should find a valid tile height > 0."""
@@ -435,7 +446,6 @@ class TestChainExecution:
                     for _ in chain_stages
                 ]
                 # Re-derive params properly
-                from tigris.analysis.partition_spatial import _get_stage_spatial_params
                 chain_params = [_get_stage_spatial_params(ag, cs) for cs in chain_stages]
                 heights = _back_propagate_tile_heights(chain_params, s.chain_tile_h)
                 needed = _chain_fast_bytes(ag, chain_stages, heights)
