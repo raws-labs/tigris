@@ -641,6 +641,53 @@ def _tiled_pool_case() -> ContractCase:
     )
 
 
+def _tiled_pool_chain_case() -> ContractCase:
+    """AveragePool -> MaxPool must stream with both spatial ranges composed."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 64, 64]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 1, 16, 16]
+    )
+    model = _model(
+        "tiled_pool_chain",
+        [
+            helper.make_node(
+                "AveragePool",
+                ["input"],
+                ["average"],
+                kernel_shape=[3, 3],
+                pads=[1, 1, 1, 1],
+                strides=[2, 2],
+            ),
+            helper.make_node(
+                "MaxPool",
+                ["average"],
+                ["output"],
+                kernel_shape=[3, 3],
+                pads=[1, 1, 1, 1],
+                strides=[2, 2],
+            ),
+        ],
+        [model_input],
+        [model_output],
+    )
+    return ContractCase(
+        "float_tiled_pool_chain",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -2.0, 3.0, 4096, dtype=np.float32
+            ).reshape(1, 1, 64, 64)
+        },
+        ("AveragePool", "MaxPool"),
+        mem_budget="4K",
+        expect_tiled=True,
+        expect_chain=True,
+    )
+
+
 def _tiled_chain_case(*, compression: str | None = None, xip: bool = False) -> ContractCase:
     """Three padded Conv stages force the streamable-chain executor."""
     model_input = helper.make_tensor_value_info(
@@ -1238,6 +1285,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
+        _tiled_pool_chain_case(),
         _tiled_chain_case(compression="lz4"),
         _tiled_chain_case(xip=True),
         _qdq_case("Conv"),

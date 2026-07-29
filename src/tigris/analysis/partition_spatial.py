@@ -226,20 +226,15 @@ def _estimate_halo_bytes(ag: AnalyzedGraph, stage, halo: int, input_h: int) -> i
 
 def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
     """Check if a stage may be part of a streamable CHAIN (used only by
-    detect_chains): all ops spatially tileable, no POOL op, and 4D I/O.
+    detect_chains): all ops implement the schema-v4 height-stripe contract and
+    all stage I/O is 4D.
 
-    POOL is excluded because the runtime chain executor (exec_chain_tiled)
-    composes/back-propagates receptive fields for Conv/DepthwiseConv only; a POOL
-    op in a chained stage would be treated as height-preserving (pointwise),
-    giving wrong tile row counts and OOB reads. Pool stages still tile standalone
-    via exec_stage_tiled. Remove the POOL exclusion once the chain executor
-    handles pool spatial ops.
+    The runtime composes Conv, DepthwiseConv, MaxPool, and AveragePool geometry
+    while pointwise operators preserve the current stripe height.
     """
     for op_i in stage.op_indices:
         cat = classify_op(ag.ops[op_i].op_type)
         if cat == TileCategory.UNTILEABLE:
-            return False
-        if cat == TileCategory.POOL:
             return False
     # All inputs and outputs must be 4D
     for name in stage.input_tensors:
@@ -325,9 +320,9 @@ def detect_chains(ag: AnalyzedGraph) -> list[list[int]]:
 def _get_stage_spatial_params(ag: AnalyzedGraph, stage: Stage) -> tuple[int, int, int]:
     """Compose (eff_kh, stride_h, 1) across ALL spatial ops in a stage.
 
-    The runtime executor composes receptive fields from all Conv/DW ops
-    in a stage when validating chain tile heights, so the compiler must
-    match by composing here too.
+    The runtime executor composes receptive fields from Conv, DepthwiseConv,
+    MaxPool, and AveragePool ops in a stage when validating chain tile heights,
+    so the compiler must match by composing here too.
 
     Returns (1, 1, 1) for pointwise-only stages.
     """
