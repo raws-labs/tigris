@@ -8,7 +8,7 @@ import json
 import re
 from pathlib import Path
 
-from tigris import SCHEMA_VERSION
+from tigris import SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
@@ -68,6 +68,11 @@ def validate(root: Path, runtime: Path | None = None) -> list[str]:
         "integration.runtime_accepts_schemas",
         errors,
     )
+    if accepted != list(SUPPORTED_SCHEMA_VERSIONS):
+        errors.append(
+            "integration.runtime_accepts_schemas must match the compiler reader's "
+            f"supported schemas {list(SUPPORTED_SCHEMA_VERSIONS)}"
+        )
     if emitted != SCHEMA_VERSION:
         errors.append(
             "integration.compiler_emits_schema must match tigris.SCHEMA_VERSION"

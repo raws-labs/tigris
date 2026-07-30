@@ -4,15 +4,15 @@
     "repository_model": "separate-repositories",
     "schema_owner": "raws-labs/tigris",
     "schema_source": "src/tigris/emitters/binary/defs.py",
-    "schema_artifact": "src/tigris/schema/tigris-plan-v4.json",
+    "schema_artifact": "src/tigris/schema/tigris-plan-v5.json",
     "runtime_dependency": "vendored-wire-contract",
     "integration_branch": "develop"
   },
   "integration": {
     "compiler_branch": "develop",
     "runtime_branch": "develop",
-    "compiler_emits_schema": 4,
-    "runtime_accepts_schemas": [2, 3, 4],
+    "compiler_emits_schema": 5,
+    "runtime_accepts_schemas": [2, 3, 4, 5],
     "contract_gate": "python scripts/crossrepo_contract.py --runtime ../tigris-runtime"
   },
   "releases": [

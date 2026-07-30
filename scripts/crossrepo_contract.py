@@ -302,11 +302,12 @@ def _math_normalization_case() -> ContractCase:
 
 def _conv1d_case() -> ContractCase:
     """ONNX Conv1D relabeling and fused activation execution."""
+    length = 256
     model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 2, 8]
+        "input", TensorProto.FLOAT, [1, 2, length]
     )
     model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 3, 8]
+        "output", TensorProto.FLOAT, [1, 3, length]
     )
     weights = numpy_helper.from_array(
         np.array(
@@ -344,10 +345,12 @@ def _conv1d_case() -> ContractCase:
         model,
         {
             "input": np.linspace(
-                -1.5, 1.5, 16, dtype=np.float32
-            ).reshape(1, 2, 8)
+                -1.5, 1.5, 2 * length, dtype=np.float32
+            ).reshape(1, 2, length)
         },
         ("Conv1D",),
+        mem_budget="1K",
+        expect_tiled=True,
     )
 
 

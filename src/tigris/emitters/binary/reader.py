@@ -2,7 +2,12 @@
 
 import struct
 
-from tigris import SCHEMA_VERSION
+from tigris import (
+    SCHEMA_VERSION_TILE_AXIS,
+    SUPPORTED_SCHEMA_VERSIONS,
+    TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_NONE,
+)
 
 from .defs import (
     HEADER_SIZE,
@@ -72,9 +77,10 @@ def read_binary_plan(data: bytes) -> dict:
 
     if magic != MAGIC:
         raise ValueError(f"Bad magic: {magic!r}")
-    if version not in {2, 3, SCHEMA_VERSION}:
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
+        supported = ", ".join(str(item) for item in SUPPORTED_SCHEMA_VERSIONS)
         raise ValueError(
-            f"Unsupported schema version: {version} (expected 2, 3, or {SCHEMA_VERSION})"
+            f"Unsupported schema version: {version} (expected one of: {supported})"
         )
     if file_size != len(data):
         raise ValueError(f"File size mismatch: header says {file_size}, got {len(data)}")
@@ -230,13 +236,19 @@ def read_binary_plan(data: bytes) -> dict:
     for i in range(num_tile_plans):
         pos = tp_base + i * TILE_PLAN_SIZE
         (
-            tileable, _pad, tile_height,
+            tileable, axis, tile_height,
             n_tiles, halo,
             rf, orig_h,
             tiled_peak, overhead, _reserved,
         ) = TILE_PLAN_STRUCT.unpack_from(data, pos)
         tile_plans.append({
             "tileable": bool(tileable),
+            # Schema v2-v4 used zero here and implicitly meant NHWC height.
+            "axis": (
+                axis
+                if version >= SCHEMA_VERSION_TILE_AXIS
+                else (TILE_AXIS_HEIGHT_OR_LENGTH if tileable else TILE_AXIS_NONE)
+            ),
             "tile_height": tile_height,
             "num_tiles": n_tiles,
             "halo": halo,

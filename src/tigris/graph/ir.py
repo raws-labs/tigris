@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from tigris import TILE_AXIS_NONE
 
 DTYPE_BYTES: dict[int, int] = {
     1: 4,   # FLOAT
@@ -20,7 +21,6 @@ DTYPE_BYTES: dict[int, int] = {
     13: 8,  # UINT64
     16: 2,  # BFLOAT16
 }
-
 
 def _elem_size(dtype: int) -> int:
     return DTYPE_BYTES.get(dtype, 4)
@@ -97,6 +97,7 @@ class TilePlan:
     """Tiling analysis result for a single stage."""
 
     tileable: bool
+    axis: int = TILE_AXIS_NONE
     tile_height: int = 0
     num_tiles: int = 0
     halo: int = 0

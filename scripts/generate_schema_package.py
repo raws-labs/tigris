@@ -7,7 +7,12 @@ import argparse
 import json
 from pathlib import Path
 
-from tigris import SCHEMA_VERSION
+from tigris import (
+    SCHEMA_VERSION,
+    TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_NONE,
+    TILE_AXIS_WIDTH,
+)
 from tigris.emitters.binary import defs
 
 
@@ -35,6 +40,11 @@ def schema_package() -> dict[str, object]:
         },
         "schema_version": SCHEMA_VERSION,
         "section_alignment": defs.PLAN_SECTION_ALIGNMENT,
+        "tile_axes": {
+            "height_or_length": TILE_AXIS_HEIGHT_OR_LENGTH,
+            "none": TILE_AXIS_NONE,
+            "width_reserved": TILE_AXIS_WIDTH,
+        },
         "section_types": {
             "index_pool": defs.SEC_INDEX_POOL,
             "op_attributes": defs.SEC_OP_ATTRIBUTES,

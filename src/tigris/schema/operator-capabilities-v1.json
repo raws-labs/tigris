@@ -384,7 +384,7 @@
     },
     {
       "constraints": [
-        "a concrete, valid permutation is stored in schema 4 plans"
+        "a concrete, valid permutation is stored in schema 4+ plans"
       ],
       "opcode": 29,
       "operator": "Transpose",
@@ -420,7 +420,7 @@
     },
     {
       "constraints": [
-        "untiled execution"
+        "standalone rank-3 length tiling on serialized axis 1"
       ],
       "opcode": 32,
       "operator": "Conv1D",
@@ -432,7 +432,7 @@
       }
     }
   ],
-  "schema_version": 4,
+  "schema_version": 5,
   "scope": "post-normalization operator dispatch; model-specific shape, attribute, quantization, memory, and tiling validation still applies",
   "source": "tigris.capabilities"
 }

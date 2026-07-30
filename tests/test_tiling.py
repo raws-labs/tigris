@@ -2,6 +2,8 @@
 
 import pytest
 import yaml
+import numpy as np
+from onnx import TensorProto, helper, numpy_helper
 
 from tigris.graph.ir import OpNode
 from tigris.loaders import load_model
@@ -15,6 +17,43 @@ from tigris.analysis.partition_spatial import (
     partition_spatial,
 )
 from tigris.emitters.yaml import emit_yaml_str
+
+
+def _write_conv1d(path, length=32):
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, length]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, length]
+    )
+    weights = numpy_helper.from_array(
+        np.linspace(-0.75, 0.75, 18, dtype=np.float32).reshape(3, 2, 3),
+        "weights",
+    )
+    bias = numpy_helper.from_array(
+        np.array([0.1, -0.2, 0.3], dtype=np.float32), "bias"
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Conv",
+                ["input", "weights", "bias"],
+                ["output"],
+                name="conv1d",
+                kernel_shape=[3],
+                pads=[1, 1],
+            )
+        ],
+        "conv1d_tiling",
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)]
+    )
+    path.write_bytes(model.SerializeToString())
+    return path
 
 
 def _full_pipeline(path, budget=0):
@@ -53,7 +92,6 @@ class TestClassifyOp:
         "op_type",
         [
             "BatchNormalization",
-            "Conv1D",
             "GlobalAveragePool",
             "Resize",
         ],
@@ -199,6 +237,17 @@ class TestTilingIntegration:
 
         for s in spatial_stages:
             assert s.tile_plan.receptive_field > 1
+
+    def test_conv1d_uses_serialized_length_axis(self, tmp_path):
+        ag = _full_pipeline(_write_conv1d(tmp_path / "conv1d.onnx"), budget=128)
+
+        assert len(ag.stages) == 1
+        tile_plan = ag.stages[0].tile_plan
+        assert tile_plan is not None
+        assert tile_plan.tileable
+        assert tile_plan.axis == 1
+        assert tile_plan.original_height == 32
+        assert tile_plan.num_tiles > 1
 
 
 # YAML includes tile_plan
