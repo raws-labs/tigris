@@ -6,7 +6,11 @@ from pathlib import Path
 
 import numpy as np
 
-from tigris import SCHEMA_VERSION
+from tigris import (
+    SCHEMA_VERSION,
+    TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_NONE,
+)
 from tigris.graph.ir import AnalyzedGraph, OpNode
 
 from .defs import (
@@ -954,9 +958,17 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
 
         stage_to_tile[stage.stage_id] = idx
         idx += 1
+        if tp.tileable and tp.axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+            raise ValueError(
+                f"stage {stage.stage_id} has unsupported tile axis {tp.axis}"
+            )
+        if not tp.tileable and tp.axis != TILE_AXIS_NONE:
+            raise ValueError(
+                f"untileable stage {stage.stage_id} must use tile axis 0"
+            )
 
         # tigris_tile_plan_t: 24 bytes
-        # tileable(u8) pad(u8) tile_height(u16)
+        # tileable(u8) axis(u8) tile_height(u16)
         # num_tiles(u16) halo(u16)
         # receptive_field(u16) original_height(u16)
         # tiled_peak_bytes(u32)
@@ -964,7 +976,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
         # reserved(u32)
         buf.extend(TILE_PLAN_STRUCT.pack(
             1 if tp.tileable else 0,
-            0,  # pad
+            tp.axis,
             tp.tile_height,
             tp.num_tiles,
             tp.halo,

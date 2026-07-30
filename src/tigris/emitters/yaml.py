@@ -113,6 +113,7 @@ def _stage_entry(s) -> dict:
         tp = s.tile_plan
         entry["tile_plan"] = {
             "tileable": tp.tileable,
+            "axis": tp.axis,
             "tile_height": tp.tile_height,
             "num_tiles": tp.num_tiles,
             "halo": tp.halo,

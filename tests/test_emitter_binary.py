@@ -258,10 +258,20 @@ def test_tile_plans_preserved(conv_pool_chain_path):
     for tp_bin, stage in zip(plan["tile_plans"], tiled_stages):
         tp = stage.tile_plan
         assert tp_bin["tileable"] == tp.tileable
+        assert tp_bin["axis"] == tp.axis
         assert tp_bin["tile_height"] == tp.tile_height
         assert tp_bin["num_tiles"] == tp.num_tiles
         assert tp_bin["halo"] == tp.halo
         assert tp_bin["receptive_field"] == tp.receptive_field
+
+
+def test_writer_rejects_reserved_width_axis(conv_pool_chain_path):
+    ag = _full_pipeline(conv_pool_chain_path, budget=4096)
+    stage = next(item for item in ag.stages if item.tile_plan is not None)
+    stage.tile_plan.axis = 2
+
+    with pytest.raises(ValueError, match="unsupported tile axis 2"):
+        emit_binary_bytes(ag)
 
 
 # Model I/O
@@ -361,6 +371,13 @@ def test_immutable_supported_schema_fixtures():
             0,
             1,
         ),  # 208b322cab7f97c9960c63a8075944374fdfff2c
+        (
+            5,
+            "schema-v5-conv1d-axis.tgrs",
+            "7f0ac56ffe4100feb957917e36bace42e34c3236ebd45a7585d2d13a33b030c6",
+            0,
+            0,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -372,6 +389,9 @@ def test_immutable_supported_schema_fixtures():
         assert plan["version"] == version
         assert len(plan["quant_params"]) == quant_params
         assert len(plan["op_attributes"]) == op_attributes
+        if version == 5:
+            assert plan["tile_plans"][0]["axis"] == 1
+            assert plan["tile_plans"][0]["num_tiles"] > 1
 
 
 @pytest.mark.parametrize("version", [0, 1, *SUPPORTED_SCHEMA_VERSIONS, 99])

@@ -61,7 +61,8 @@ def _print_stage(ag, stage, budget: int, multi: bool):
         if tp and tp.tileable:
             info_parts.append(
                 f"Tiled: {tp.num_tiles} tiles, "
-                f"{tp.tile_height} rows + {tp.halo} halo (RF {tp.receptive_field})"
+                f"axis {tp.axis}, extent {tp.tile_height} + {tp.halo} halo "
+                f"(RF {tp.receptive_field})"
             )
         elif budget > 0 and stage.peak_bytes <= budget:
             info_parts.append("Fits budget")
