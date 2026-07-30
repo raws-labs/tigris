@@ -2,7 +2,7 @@
 
 import struct
 
-from tigris import SCHEMA_VERSION
+from tigris import SUPPORTED_SCHEMA_VERSIONS
 
 from .defs import (
     HEADER_SIZE,
@@ -72,9 +72,10 @@ def read_binary_plan(data: bytes) -> dict:
 
     if magic != MAGIC:
         raise ValueError(f"Bad magic: {magic!r}")
-    if version not in {2, 3, SCHEMA_VERSION}:
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
+        supported = ", ".join(str(item) for item in SUPPORTED_SCHEMA_VERSIONS)
         raise ValueError(
-            f"Unsupported schema version: {version} (expected 2, 3, or {SCHEMA_VERSION})"
+            f"Unsupported schema version: {version} (expected one of: {supported})"
         )
     if file_size != len(data):
         raise ValueError(f"File size mismatch: header says {file_size}, got {len(data)}")

@@ -1,17 +1,19 @@
 """Tests for the binary plan emitter."""
 
+import hashlib
 import struct
 from collections import OrderedDict
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from tigris import SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
-from tigris.analysis.partition_temporal import partition_temporal
 from tigris.analysis.partition_spatial import partition_spatial
-from tigris import SCHEMA_VERSION
+from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary.defs import (
     HEADER_SIZE,
     MAGIC,
@@ -334,19 +336,58 @@ def test_all_fixtures_with_budget(
 # Error handling
 
 
-@pytest.mark.parametrize("version", [0, 1, 2, 3, SCHEMA_VERSION, 99])
+def test_immutable_supported_schema_fixtures():
+    # Each artifact comes from the compiler revision that introduced the
+    # corresponding schema and exercises a version-specific wire feature.
+    fixtures = (
+        (
+            2,
+            "schema-v2-linear.tgrs",
+            "54597dd75d14c54fcb3c6abb3c6cb3a8c2f18a4bc2fa54ea78d9762f75cb96c5",
+            0,
+            0,
+        ),  # b47664926e7a484d6638ecd0fd372da477236619
+        (
+            3,
+            "schema-v3-qdq-conv.tgrs",
+            "fe300785de7401dcc30f05e3c859943a74f02da83df40a0047d1fb637a46b9bb",
+            3,
+            0,
+        ),  # 0fe37d3a53292cf532ba8628d2284c00a896fbb2
+        (
+            4,
+            "schema-v4-transpose.tgrs",
+            "c6892a319b4ca319dfca2f44cbaf6f0f36fca502cdbd493c52b67f2d2aa03e93",
+            0,
+            1,
+        ),  # 208b322cab7f97c9960c63a8075944374fdfff2c
+    )
+    assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
+
+    fixture_dir = Path(__file__).parent / "schema_compat"
+    for version, filename, digest, quant_params, op_attributes in fixtures:
+        data = (fixture_dir / filename).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == digest
+        plan = read_binary_plan(data)
+        assert plan["version"] == version
+        assert len(plan["quant_params"]) == quant_params
+        assert len(plan["op_attributes"]) == op_attributes
+
+
+@pytest.mark.parametrize("version", [0, 1, *SUPPORTED_SCHEMA_VERSIONS, 99])
 def test_schema_version_validation(linear_3op_path, version):
     ag = _full_pipeline(linear_3op_path)
     data = bytearray(emit_binary_bytes(ag))
     struct.pack_into("<I", data, 4, version)
 
-    if version in {2, 3, SCHEMA_VERSION}:
+    if version in SUPPORTED_SCHEMA_VERSIONS:
         assert read_binary_plan(bytes(data))["version"] == version
     else:
         with pytest.raises(ValueError) as exc_info:
             read_binary_plan(bytes(data))
+        supported = ", ".join(str(item) for item in SUPPORTED_SCHEMA_VERSIONS)
         assert str(exc_info.value) == (
-            f"Unsupported schema version: {version} (expected 2, 3, or {SCHEMA_VERSION})"
+            f"Unsupported schema version: {version} (expected one of: {supported})"
         )
 
 

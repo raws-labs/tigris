@@ -10,6 +10,8 @@ venv/
 !examples/*.html
 *.plan.yaml
 *.tgrs
+!tests/schema_compat/
+!tests/schema_compat/*.tgrs
 _version.py
 models/
 
