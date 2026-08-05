@@ -80,3 +80,27 @@ jobs:
         run: python scripts/validate_compatibility.py --runtime tigris-runtime
       - name: Run compiler/runtime differential contract
         run: python scripts/crossrepo_contract.py --runtime tigris-runtime
+
+  trigger-development-docs:
+    name: Trigger development documentation contract
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: quality-and-package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the tigris-web develop pipeline
+        env:
+          TRIGGER_TOKEN: ${{ secrets.TIGRIS_WEB_TRIGGER_TOKEN }}
+          UPSTREAM_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$TRIGGER_TOKEN" ]; then
+            echo "::error::TIGRIS_WEB_TRIGGER_TOKEN is not configured"
+            exit 1
+          fi
+          curl --fail-with-body --request POST \
+            --form "token=$TRIGGER_TOKEN" \
+            --form "ref=develop" \
+            --form "variables[TIGRIS_COMPILER_REF]=$UPSTREAM_SHA" \
+            --form "variables[TIGRIS_RUNTIME_REF]=develop" \
+            --form "variables[TIGRIS_CAPABILITY_URL]=https://raw.githubusercontent.com/raws-labs/tigris/$UPSTREAM_SHA/src/tigris/schema/operator-capabilities-v1.json" \
+            --form "variables[DOCS_TRIGGER_SOURCE]=tigris" \
+            https://gitlab.com/api/v4/projects/81577420/trigger/pipeline
