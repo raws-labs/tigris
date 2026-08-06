@@ -32,6 +32,7 @@ from tigris.emitters.binary.defs import COMPRESS_LZ4, FLAG_XIP
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
 from tigris.fixtures import build_tcn
+from tigris.graph.ir import Stage
 
 
 Array = NDArray[np.generic]
@@ -56,6 +57,7 @@ class ContractCase:
     xip: bool = False
     expect_tiled: bool = False
     expect_chain: bool = False
+    force_one_op_stages: bool = False
 
 
 def _model(
@@ -395,6 +397,35 @@ def _rank3_pointwise_case() -> ContractCase:
         ("Tanh", "Sigmoid", "Mul", "Add"),
         mem_budget="1K",
         expect_tiled=True,
+    )
+
+
+def _many_stage_case() -> ContractCase:
+    """Schema v5 derives full stage IDs from the uint16 stage table."""
+    stage_count = 300
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4]
+    )
+    nodes = []
+    previous = "input"
+    for index in range(stage_count):
+        output = "output" if index == stage_count - 1 else f"value_{index}"
+        nodes.append(helper.make_node("Relu", [previous], [output]))
+        previous = output
+    model = _model(
+        "many_stage_relu", nodes, [model_input], [model_output]
+    )
+    return ContractCase(
+        "float_schema_v5_many_stage",
+        model,
+        model,
+        {"input": np.array([[-2.0, -0.5, 0.25, 3.0]], dtype=np.float32)},
+        ("Relu",) * stage_count,
+        mem_budget="64",
+        force_one_op_stages=True,
     )
 
 
@@ -955,8 +986,37 @@ def _compile_plan(
     mem_budget: str,
     compression: str | None,
     xip: bool,
+    force_one_op_stages: bool = False,
 ) -> dict:
     graph, _ = _run_pipeline(str(model_path), (mem_budget,))
+    if force_one_op_stages:
+        stages: list[Stage] = []
+        for index, op in enumerate(graph.ops):
+            op.stage = index
+            inputs = [
+                name
+                for name in op.inputs
+                if name in graph.tensors and not graph.tensors[name].is_constant
+            ]
+            outputs = [
+                name
+                for name in op.outputs
+                if name in graph.tensors and not graph.tensors[name].is_constant
+            ]
+            peak = sum(
+                (graph.tensors[name].size_bytes + 31) & ~31
+                for name in dict.fromkeys(inputs + outputs)
+            )
+            stages.append(
+                Stage(
+                    stage_id=index,
+                    op_indices=[index],
+                    input_tensors=inputs,
+                    output_tensors=outputs,
+                    peak_bytes=peak,
+                )
+            )
+        graph.stages = stages
     validation = validate_memory_plan(graph)
     if not validation.feasible:
         details = "; ".join(issue.describe() for issue in validation.issues)
@@ -1142,6 +1202,7 @@ def _run_case(
         mem_budget=case.mem_budget,
         compression=case.compression,
         xip=case.xip,
+        force_one_op_stages=case.force_one_op_stages,
     )
     _assert_plan_mode(case, plan)
     session = ort.InferenceSession(
@@ -1358,6 +1419,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _math_normalization_case(),
         _conv1d_case(),
         _rank3_pointwise_case(),
+        _many_stage_case(),
         _tcn_16k_case(),
         _reduce_mean_case(),
         _normalized_classifier_case(),

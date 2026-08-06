@@ -48,6 +48,8 @@ def validate(root: Path, runtime: Path | None = None) -> list[str]:
     expected_policy = {
         "repository_model": "separate-repositories",
         "schema_owner": "raws-labs/tigris",
+        "schema_versioning": "wire-format",
+        "capability_growth": "same-schema with fail-closed runtime validation",
         "runtime_dependency": "vendored-wire-contract",
         "integration_branch": "develop",
     }
