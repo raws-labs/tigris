@@ -5,7 +5,7 @@ import yaml
 import numpy as np
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris.graph.ir import OpNode
+from tigris.graph.ir import AnalyzedGraph, OpNode, Stage, TensorInfo
 from tigris.loaders import load_model
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
@@ -15,8 +15,11 @@ from tigris.analysis.partition_spatial import (
     classify_op,
     compute_receptive_field,
     partition_spatial,
+    _stage_tile_axis,
 )
+from tigris.analysis.validation import validate_memory_plan
 from tigris.emitters.yaml import emit_yaml_str
+from tigris.fixtures import build_tcn
 
 
 def _write_conv1d(path, length=32):
@@ -51,6 +54,36 @@ def _write_conv1d(path, length=32):
     )
     model = helper.make_model(
         graph, opset_imports=[helper.make_opsetid("", 17)]
+    )
+    path.write_bytes(model.SerializeToString())
+    return path
+
+
+def _write_rank3_pointwise(path, op_type, length=64):
+    inputs = [
+        helper.make_tensor_value_info(
+            "left", TensorProto.FLOAT, [1, 4, length]
+        )
+    ]
+    node_inputs = ["left"]
+    if op_type in {"Add", "Mul"}:
+        inputs.append(
+            helper.make_tensor_value_info(
+                "right", TensorProto.FLOAT, [1, 4, length]
+            )
+        )
+        node_inputs.append("right")
+    output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4, length]
+    )
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node(op_type, node_inputs, ["output"], name="pointwise")],
+            f"rank3_{op_type.lower()}",
+            inputs,
+            [output],
+        ),
+        opset_imports=[helper.make_opsetid("", 17)],
     )
     path.write_bytes(model.SerializeToString())
     return path
@@ -248,6 +281,112 @@ class TestTilingIntegration:
         assert tile_plan.axis == 1
         assert tile_plan.original_height == 32
         assert tile_plan.num_tiles > 1
+
+    @pytest.mark.parametrize("op_type", ["Tanh", "Sigmoid", "Add", "Mul"])
+    def test_rank3_pointwise_uses_serialized_length_axis(
+        self, tmp_path, op_type
+    ):
+        model = _write_rank3_pointwise(
+            tmp_path / f"rank3_{op_type.lower()}.onnx", op_type
+        )
+        ag = _full_pipeline(model, budget=256)
+
+        assert len(ag.stages) == 1
+        tile_plan = ag.stages[0].tile_plan
+        assert tile_plan is not None
+        assert tile_plan.tileable
+        assert tile_plan.axis == 1
+        assert tile_plan.original_height == 64
+        assert tile_plan.num_tiles > 1
+
+    @pytest.mark.parametrize("op_type", ["Relu", "Relu6", "Sigmoid", "Tanh"])
+    def test_rank3_unary_may_compose_with_one_conv1d(self, op_type):
+        ops = [
+            OpNode("conv", "Conv1D", ["input"], ["mid"]),
+            OpNode("pointwise", op_type, ["mid"], ["output"]),
+        ]
+        graph = AnalyzedGraph(
+            ops=ops,
+            stages=[
+                Stage(
+                    stage_id=0,
+                    op_indices=[0, 1],
+                    input_tensors=["input"],
+                    output_tensors=["output"],
+                )
+            ],
+            tensors={
+                name: TensorInfo(name, (1, 4, 64), TensorProto.FLOAT)
+                for name in ("input", "mid", "output")
+            },
+        )
+
+        assert _stage_tile_axis(graph, graph.stages[0], ops) == 1
+
+    @pytest.mark.parametrize("op_type", ["Add", "Mul"])
+    def test_rank3_binary_does_not_compose_with_conv1d(self, op_type):
+        ops = [
+            OpNode("conv", "Conv1D", ["input"], ["mid"]),
+            OpNode("binary", op_type, ["mid", "residual"], ["output"]),
+        ]
+        stage = Stage(
+            stage_id=0,
+            op_indices=[0, 1],
+            input_tensors=["input", "residual"],
+            output_tensors=["output"],
+        )
+        graph = AnalyzedGraph(
+            ops=ops,
+            stages=[stage],
+            tensors={
+                name: TensorInfo(name, (1, 4, 64), TensorProto.FLOAT)
+                for name in ("input", "mid", "residual", "output")
+            },
+        )
+
+        assert _stage_tile_axis(graph, stage, ops) == 0
+
+    def test_rank3_concat_remains_untileable(self):
+        op = OpNode("concat", "Concat", ["left", "right"], ["output"])
+        stage = Stage(
+            stage_id=0,
+            op_indices=[0],
+            input_tensors=["left", "right"],
+            output_tensors=["output"],
+        )
+        graph = AnalyzedGraph(
+            ops=[op],
+            stages=[stage],
+            tensors={
+                "left": TensorInfo("left", (1, 2, 64), TensorProto.FLOAT),
+                "right": TensorInfo("right", (1, 2, 64), TensorProto.FLOAT),
+                "output": TensorInfo("output", (1, 4, 64), TensorProto.FLOAT),
+            },
+        )
+
+        assert _stage_tile_axis(graph, stage, [op]) == 0
+
+    def test_tcn_rank3_pointwise_stages_fit_16k(self, tmp_path):
+        model_path = tmp_path / "tcn.onnx"
+        model_path.write_bytes(build_tcn().SerializeToString())
+
+        ag = _full_pipeline(model_path, budget=16 * 1024)
+        tiled_pointwise = {
+            ag.ops[stage.op_indices[0]].op_type: stage.tile_plan
+            for stage in ag.stages
+            if len(stage.op_indices) == 1
+            and ag.ops[stage.op_indices[0]].op_type
+            in {"Tanh", "Sigmoid", "Mul"}
+        }
+
+        assert set(tiled_pointwise) == {"Tanh", "Sigmoid", "Mul"}
+        assert all(
+            tile_plan is not None and tile_plan.tileable
+            for tile_plan in tiled_pointwise.values()
+        )
+        validation = validate_memory_plan(ag)
+        assert validation.feasible, [issue.describe() for issue in validation.issues]
+        assert validation.scheduled_peak_bytes <= 16 * 1024
 
 
 # YAML includes tile_plan

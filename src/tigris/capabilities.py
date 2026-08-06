@@ -92,8 +92,14 @@ CONDITIONAL_FALLBACKS: dict[str, dict[str, str]] = {
 # individual models; these concise notes prevent the public matrix from being
 # mistaken for support for every ONNX attribute combination.
 OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
-    "Add": ("dynamic operands must have identical shapes; no general broadcasting",),
-    "Mul": ("dynamic operands must have identical shapes; no general broadcasting",),
+    "Add": (
+        "dynamic operands must have identical shapes; no general broadcasting",
+        "standalone rank-3 pointwise length tiling on serialized axis 1",
+    ),
+    "Mul": (
+        "dynamic operands must have identical shapes; no general broadcasting",
+        "standalone rank-3 pointwise length tiling on serialized axis 1",
+    ),
     "AveragePool": (
         "explicit padding, floor output sizing, unit dilation, and count_include_pad=0",
     ),
@@ -101,12 +107,19 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "explicit padding, floor output sizing, unit dilation, and no indices output",
     ),
     "Concat": ("rank-4 channel-axis concatenation",),
-    "Conv1D": ("standalone rank-3 length tiling on serialized axis 1",),
+    "Conv1D": (
+        "standalone rank-3 length tiling on serialized axis 1; may compose with "
+        "shape-preserving unary pointwise operators",
+    ),
     "GlobalAveragePool": ("untiled execution",),
     "Resize": (
         "rank-4 nearest-neighbor integer H/W upscaling; untiled execution",
     ),
     "Softmax": ("final axis only; untiled execution",),
+    "Relu": ("rank-3 pointwise length tiling on serialized axis 1",),
+    "Relu6": ("rank-3 pointwise length tiling on serialized axis 1",),
+    "Sigmoid": ("rank-3 pointwise length tiling on serialized axis 1",),
+    "Tanh": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Transpose": ("a concrete, valid permutation is stored in schema 4+ plans",),
 }
 

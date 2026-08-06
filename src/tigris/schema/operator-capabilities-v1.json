@@ -95,6 +95,9 @@
       }
     },
     {
+      "constraints": [
+        "rank-3 pointwise length tiling on serialized axis 1"
+      ],
       "opcode": 3,
       "operator": "Relu",
       "routes": {
@@ -105,6 +108,9 @@
       }
     },
     {
+      "constraints": [
+        "rank-3 pointwise length tiling on serialized axis 1"
+      ],
       "opcode": 4,
       "operator": "Relu6",
       "routes": {
@@ -146,7 +152,8 @@
     },
     {
       "constraints": [
-        "dynamic operands must have identical shapes; no general broadcasting"
+        "dynamic operands must have identical shapes; no general broadcasting",
+        "standalone rank-3 pointwise length tiling on serialized axis 1"
       ],
       "opcode": 7,
       "operator": "Add",
@@ -159,7 +166,8 @@
     },
     {
       "constraints": [
-        "dynamic operands must have identical shapes; no general broadcasting"
+        "dynamic operands must have identical shapes; no general broadcasting",
+        "standalone rank-3 pointwise length tiling on serialized axis 1"
       ],
       "opcode": 8,
       "operator": "Mul",
@@ -204,6 +212,9 @@
       }
     },
     {
+      "constraints": [
+        "rank-3 pointwise length tiling on serialized axis 1"
+      ],
       "opcode": 12,
       "operator": "Sigmoid",
       "routes": {
@@ -293,6 +304,9 @@
       }
     },
     {
+      "constraints": [
+        "rank-3 pointwise length tiling on serialized axis 1"
+      ],
       "opcode": 20,
       "operator": "Tanh",
       "routes": {
@@ -420,7 +434,7 @@
     },
     {
       "constraints": [
-        "standalone rank-3 length tiling on serialized axis 1"
+        "standalone rank-3 length tiling on serialized axis 1; may compose with shape-preserving unary pointwise operators"
       ],
       "opcode": 32,
       "operator": "Conv1D",
