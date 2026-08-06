@@ -2,6 +2,14 @@
   "artifact_format": 1,
   "endianness": "little",
   "magic_ascii": "TGRS",
+  "op_attribute_contract": {
+    "duplicates": "rejected by (op_index, type)",
+    "ordering": [
+      "op_index",
+      "type"
+    ],
+    "payload_length_bits": 8
+  },
   "op_attribute_types": {
     "transpose_perm": 1
   },
@@ -70,5 +78,10 @@
     "height_or_length": 1,
     "none": 0,
     "width_reserved": 2
+  },
+  "versioning": {
+    "capability_growth_requires_schema_bump": false,
+    "scope": "wire_format",
+    "stage_assignment_v5": "stage table authoritative; operator byte is canonical low-byte hint"
   }
 }

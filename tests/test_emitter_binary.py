@@ -21,7 +21,7 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import _build_quant_params, emit_binary, emit_binary_bytes
-from tigris.graph.ir import QuantParam, TensorInfo
+from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, Stage, TensorInfo
 from tigris.loaders import load_model
 
 
@@ -242,6 +242,49 @@ def test_stages_preserved(conv_relu_chain_path):
     assert plan["num_stages"] == len(ag.stages)
     for i, stage in enumerate(plan["stages"]):
         assert stage["peak_bytes"] == ag.stages[i].peak_bytes
+
+
+def test_schema_v5_stage_table_supports_more_than_256_stages():
+    stage_count = 300
+    tensor_names = [f"value_{index}" for index in range(stage_count + 1)]
+    ops = [
+        OpNode(
+            name=f"relu_{index}",
+            op_type="Relu",
+            inputs=[tensor_names[index]],
+            outputs=[tensor_names[index + 1]],
+            step=index,
+            stage=index,
+        )
+        for index in range(stage_count)
+    ]
+    stages = [
+        Stage(
+            stage_id=index,
+            op_indices=[index],
+            input_tensors=[tensor_names[index]],
+            output_tensors=[tensor_names[index + 1]],
+            peak_bytes=64,
+        )
+        for index in range(stage_count)
+    ]
+    graph = AnalyzedGraph(
+        model_name="many_stages",
+        ops=ops,
+        tensors=OrderedDict(
+            (name, TensorInfo(name, (1,), 1)) for name in tensor_names
+        ),
+        model_inputs=[tensor_names[0]],
+        model_outputs=[tensor_names[-1]],
+        stages=stages,
+        mem_budget=64,
+        peak_memory_bytes=64,
+    )
+
+    plan = read_binary_plan(emit_binary_bytes(graph))
+
+    assert plan["num_stages"] == stage_count
+    assert [op["stage"] for op in plan["ops"]] == list(range(stage_count))
 
 
 def test_tile_plans_preserved(conv_pool_chain_path):

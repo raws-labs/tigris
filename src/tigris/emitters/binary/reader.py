@@ -4,6 +4,7 @@ import struct
 
 from tigris import (
     SCHEMA_VERSION_TILE_AXIS,
+    SCHEMA_VERSION_STAGE_TABLE_AUTHORITY,
     SUPPORTED_SCHEMA_VERSIONS,
     TILE_AXIS_HEIGHT_OR_LENGTH,
     TILE_AXIS_NONE,
@@ -229,6 +230,16 @@ def read_binary_plan(data: bytes) -> dict:
             "chain_len": chain_len,
             "chain_tile_h": chain_tile_h,
         })
+
+    # Schema v5 makes the stage table authoritative.  The byte retained in
+    # each operator is only the canonical low-byte hint needed to keep the
+    # v2-v4 record layout zero-copy.  Present callers with the full derived
+    # stage index so Python-side inspection also works beyond 256 stages.
+    if version >= SCHEMA_VERSION_STAGE_TABLE_AUTHORITY:
+        for stage_index, stage_record in enumerate(stages):
+            for op_index in stage_record["ops"]:
+                if op_index < len(ops):
+                    ops[op_index]["stage"] = stage_index
 
     # Parse tile plans
     tile_plans = []

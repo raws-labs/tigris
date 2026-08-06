@@ -5,6 +5,8 @@
     "schema_owner": "raws-labs/tigris",
     "schema_source": "src/tigris/emitters/binary/defs.py",
     "schema_artifact": "src/tigris/schema/tigris-plan-v5.json",
+    "schema_versioning": "wire-format",
+    "capability_growth": "same-schema with fail-closed runtime validation",
     "runtime_dependency": "vendored-wire-contract",
     "integration_branch": "develop"
   },
