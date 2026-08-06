@@ -31,6 +31,7 @@ from tigris.cli import _run_pipeline
 from tigris.emitters.binary.defs import COMPRESS_LZ4, FLAG_XIP
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
+from tigris.fixtures import build_tcn
 
 
 Array = NDArray[np.generic]
@@ -350,6 +351,78 @@ def _conv1d_case() -> ContractCase:
         },
         ("Conv1D",),
         mem_budget="1K",
+        expect_tiled=True,
+    )
+
+
+def _rank3_pointwise_case() -> ContractCase:
+    """Rank-3 unary and exact-shape binary ops tile along NLC length."""
+    length = 256
+    left = helper.make_tensor_value_info(
+        "left", TensorProto.FLOAT, [1, 4, length]
+    )
+    right = helper.make_tensor_value_info(
+        "right", TensorProto.FLOAT, [1, 4, length]
+    )
+    output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4, length]
+    )
+    model = _model(
+        "rank3_pointwise",
+        [
+            helper.make_node("Tanh", ["left"], ["left_tanh"]),
+            helper.make_node("Sigmoid", ["right"], ["right_sigmoid"]),
+            helper.make_node(
+                "Mul", ["left_tanh", "right_sigmoid"], ["gated"]
+            ),
+            helper.make_node("Add", ["gated", "left"], ["output"]),
+        ],
+        [left, right],
+        [output],
+    )
+    return ContractCase(
+        "float_rank3_pointwise",
+        model,
+        model,
+        {
+            "left": np.linspace(
+                -2.0, 2.0, 4 * length, dtype=np.float32
+            ).reshape(1, 4, length),
+            "right": np.linspace(
+                1.5, -1.5, 4 * length, dtype=np.float32
+            ).reshape(1, 4, length),
+        },
+        ("Tanh", "Sigmoid", "Mul", "Add"),
+        mem_budget="1K",
+        expect_tiled=True,
+    )
+
+
+def _tcn_16k_case() -> ContractCase:
+    """The project TCN becomes deployable once its gated pointwise path tiles."""
+    model = build_tcn()
+    return ContractCase(
+        "float_tcn_16k",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -1.0, 1.0, 3 * 128, dtype=np.float32
+            ).reshape(1, 3, 128)
+        },
+        (
+            "Conv1D",
+            "Conv1D",
+            "Conv1D",
+            "Tanh",
+            "Conv1D",
+            "Sigmoid",
+            "Mul",
+            "Conv1D",
+            "Flatten",
+            "Gemm",
+        ),
+        mem_budget="16K",
         expect_tiled=True,
     )
 
@@ -1284,6 +1357,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _depthwise_conv_case(),
         _math_normalization_case(),
         _conv1d_case(),
+        _rank3_pointwise_case(),
+        _tcn_16k_case(),
         _reduce_mean_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),

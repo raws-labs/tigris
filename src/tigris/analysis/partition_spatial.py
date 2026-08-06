@@ -52,6 +52,21 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 }
 
 
+# Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
+# NHWC stages.  Unary pointwise operators preserve the current length and may
+# surround one Conv1D.  Dynamic binary operators are safe only in a
+# pointwise-only stage: combining them with a strided Conv1D could expose
+# external operands at different length resolutions.
+_RANK3_AXIS1_UNARY_OPS = frozenset({
+    "Relu",
+    "Relu6",
+    "Sigmoid",
+    "Tanh",
+})
+_RANK3_AXIS1_BINARY_OPS = frozenset({"Add", "Mul"})
+_RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _RANK3_AXIS1_BINARY_OPS | {"Conv1D"}
+
+
 def classify_op(op_type: str) -> TileCategory:
     """Classify an op type into a tile category. Unknown ops are UNTILEABLE."""
     return _OP_CATEGORY.get(op_type, TileCategory.UNTILEABLE)
@@ -224,10 +239,21 @@ def _stage_tile_axis(
     ranks = _stage_io_ranks(ag, stage)
     if ranks == {4} and all(op.op_type != "Conv1D" for op in stage_ops):
         return TILE_AXIS_HEIGHT_OR_LENGTH
-    if ranks == {3} and stage_ops and all(
-        op.op_type == "Conv1D" for op in stage_ops
-    ):
-        return TILE_AXIS_HEIGHT_OR_LENGTH
+    if ranks == {3} and stage_ops:
+        op_types = [op.op_type for op in stage_ops]
+        conv_count = op_types.count("Conv1D")
+        if (
+            all(op_type in _RANK3_AXIS1_OPS for op_type in op_types)
+            and conv_count <= 1
+            and not (
+                conv_count == 1
+                and any(
+                    op_type in _RANK3_AXIS1_BINARY_OPS
+                    for op_type in op_types
+                )
+            )
+        ):
+            return TILE_AXIS_HEIGHT_OR_LENGTH
     return TILE_AXIS_NONE
 
 
