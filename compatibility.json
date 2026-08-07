@@ -21,6 +21,19 @@
     {
       "status": "supported",
       "compiler": {
+        "tag": "v0.6.0",
+        "commit": "21e25a3380d0bdea479d08de4f39d66566c74721",
+        "emits_schema": 5
+      },
+      "runtime": {
+        "tag": "v0.6.0",
+        "commit": "bc088ad661dfb7bd03069261caa9363a14510518",
+        "accepts_schemas": [2, 3, 4, 5]
+      }
+    },
+    {
+      "status": "supported",
+      "compiler": {
         "tag": "v0.5.0",
         "commit": "549bc099e82f636b587bbe3a3624fcc9201c6d7a",
         "emits_schema": 4
