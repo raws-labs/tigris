@@ -2,7 +2,13 @@
 
 import struct
 
-from tigris import SCHEMA_VERSION
+from tigris import (
+    SCHEMA_VERSION_TILE_AXIS,
+    SCHEMA_VERSION_STAGE_TABLE_AUTHORITY,
+    SUPPORTED_SCHEMA_VERSIONS,
+    TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_NONE,
+)
 
 from .defs import (
     HEADER_SIZE,
@@ -72,9 +78,10 @@ def read_binary_plan(data: bytes) -> dict:
 
     if magic != MAGIC:
         raise ValueError(f"Bad magic: {magic!r}")
-    if version not in {2, 3, SCHEMA_VERSION}:
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
+        supported = ", ".join(str(item) for item in SUPPORTED_SCHEMA_VERSIONS)
         raise ValueError(
-            f"Unsupported schema version: {version} (expected 2, 3, or {SCHEMA_VERSION})"
+            f"Unsupported schema version: {version} (expected one of: {supported})"
         )
     if file_size != len(data):
         raise ValueError(f"File size mismatch: header says {file_size}, got {len(data)}")
@@ -224,19 +231,35 @@ def read_binary_plan(data: bytes) -> dict:
             "chain_tile_h": chain_tile_h,
         })
 
+    # Schema v5 makes the stage table authoritative.  The byte retained in
+    # each operator is only the canonical low-byte hint needed to keep the
+    # v2-v4 record layout zero-copy.  Present callers with the full derived
+    # stage index so Python-side inspection also works beyond 256 stages.
+    if version >= SCHEMA_VERSION_STAGE_TABLE_AUTHORITY:
+        for stage_index, stage_record in enumerate(stages):
+            for op_index in stage_record["ops"]:
+                if op_index < len(ops):
+                    ops[op_index]["stage"] = stage_index
+
     # Parse tile plans
     tile_plans = []
     tp_base = sections.get(SEC_TILE_PLANS, 0)
     for i in range(num_tile_plans):
         pos = tp_base + i * TILE_PLAN_SIZE
         (
-            tileable, _pad, tile_height,
+            tileable, axis, tile_height,
             n_tiles, halo,
             rf, orig_h,
             tiled_peak, overhead, _reserved,
         ) = TILE_PLAN_STRUCT.unpack_from(data, pos)
         tile_plans.append({
             "tileable": bool(tileable),
+            # Schema v2-v4 used zero here and implicitly meant NHWC height.
+            "axis": (
+                axis
+                if version >= SCHEMA_VERSION_TILE_AXIS
+                else (TILE_AXIS_HEIGHT_OR_LENGTH if tileable else TILE_AXIS_NONE)
+            ),
             "tile_height": tile_height,
             "num_tiles": n_tiles,
             "halo": halo,

@@ -69,7 +69,7 @@ jobs:
       - name: Verify generated plan-schema package
         run: >-
           python scripts/generate_schema_package.py
-          --check src/tigris/schema/tigris-plan-v4.json
+          --check src/tigris/schema/tigris-plan-v5.json
       - name: Verify generated operator/backend capability package
         run: >-
           python scripts/generate_capability_matrix.py

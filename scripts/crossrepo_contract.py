@@ -31,6 +31,8 @@ from tigris.cli import _run_pipeline
 from tigris.emitters.binary.defs import COMPRESS_LZ4, FLAG_XIP
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
+from tigris.fixtures import build_tcn
+from tigris.graph.ir import Stage
 
 
 Array = NDArray[np.generic]
@@ -55,6 +57,7 @@ class ContractCase:
     xip: bool = False
     expect_tiled: bool = False
     expect_chain: bool = False
+    force_one_op_stages: bool = False
 
 
 def _model(
@@ -302,11 +305,12 @@ def _math_normalization_case() -> ContractCase:
 
 def _conv1d_case() -> ContractCase:
     """ONNX Conv1D relabeling and fused activation execution."""
+    length = 256
     model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 2, 8]
+        "input", TensorProto.FLOAT, [1, 2, length]
     )
     model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 3, 8]
+        "output", TensorProto.FLOAT, [1, 3, length]
     )
     weights = numpy_helper.from_array(
         np.array(
@@ -344,10 +348,113 @@ def _conv1d_case() -> ContractCase:
         model,
         {
             "input": np.linspace(
-                -1.5, 1.5, 16, dtype=np.float32
-            ).reshape(1, 2, 8)
+                -1.5, 1.5, 2 * length, dtype=np.float32
+            ).reshape(1, 2, length)
         },
         ("Conv1D",),
+        mem_budget="1K",
+        expect_tiled=True,
+    )
+
+
+def _rank3_pointwise_case() -> ContractCase:
+    """Rank-3 unary and exact-shape binary ops tile along NLC length."""
+    length = 256
+    left = helper.make_tensor_value_info(
+        "left", TensorProto.FLOAT, [1, 4, length]
+    )
+    right = helper.make_tensor_value_info(
+        "right", TensorProto.FLOAT, [1, 4, length]
+    )
+    output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4, length]
+    )
+    model = _model(
+        "rank3_pointwise",
+        [
+            helper.make_node("Tanh", ["left"], ["left_tanh"]),
+            helper.make_node("Sigmoid", ["right"], ["right_sigmoid"]),
+            helper.make_node(
+                "Mul", ["left_tanh", "right_sigmoid"], ["gated"]
+            ),
+            helper.make_node("Add", ["gated", "left"], ["output"]),
+        ],
+        [left, right],
+        [output],
+    )
+    return ContractCase(
+        "float_rank3_pointwise",
+        model,
+        model,
+        {
+            "left": np.linspace(
+                -2.0, 2.0, 4 * length, dtype=np.float32
+            ).reshape(1, 4, length),
+            "right": np.linspace(
+                1.5, -1.5, 4 * length, dtype=np.float32
+            ).reshape(1, 4, length),
+        },
+        ("Tanh", "Sigmoid", "Mul", "Add"),
+        mem_budget="1K",
+        expect_tiled=True,
+    )
+
+
+def _many_stage_case() -> ContractCase:
+    """Schema v5 derives full stage IDs from the uint16 stage table."""
+    stage_count = 300
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4]
+    )
+    nodes = []
+    previous = "input"
+    for index in range(stage_count):
+        output = "output" if index == stage_count - 1 else f"value_{index}"
+        nodes.append(helper.make_node("Relu", [previous], [output]))
+        previous = output
+    model = _model(
+        "many_stage_relu", nodes, [model_input], [model_output]
+    )
+    return ContractCase(
+        "float_schema_v5_many_stage",
+        model,
+        model,
+        {"input": np.array([[-2.0, -0.5, 0.25, 3.0]], dtype=np.float32)},
+        ("Relu",) * stage_count,
+        mem_budget="64",
+        force_one_op_stages=True,
+    )
+
+
+def _tcn_16k_case() -> ContractCase:
+    """The project TCN becomes deployable once its gated pointwise path tiles."""
+    model = build_tcn()
+    return ContractCase(
+        "float_tcn_16k",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -1.0, 1.0, 3 * 128, dtype=np.float32
+            ).reshape(1, 3, 128)
+        },
+        (
+            "Conv1D",
+            "Conv1D",
+            "Conv1D",
+            "Tanh",
+            "Conv1D",
+            "Sigmoid",
+            "Mul",
+            "Conv1D",
+            "Flatten",
+            "Gemm",
+        ),
+        mem_budget="16K",
+        expect_tiled=True,
     )
 
 
@@ -641,6 +748,53 @@ def _tiled_pool_case() -> ContractCase:
     )
 
 
+def _tiled_pool_chain_case() -> ContractCase:
+    """AveragePool -> MaxPool must stream with both spatial ranges composed."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 64, 64]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 1, 16, 16]
+    )
+    model = _model(
+        "tiled_pool_chain",
+        [
+            helper.make_node(
+                "AveragePool",
+                ["input"],
+                ["average"],
+                kernel_shape=[3, 3],
+                pads=[1, 1, 1, 1],
+                strides=[2, 2],
+            ),
+            helper.make_node(
+                "MaxPool",
+                ["average"],
+                ["output"],
+                kernel_shape=[3, 3],
+                pads=[1, 1, 1, 1],
+                strides=[2, 2],
+            ),
+        ],
+        [model_input],
+        [model_output],
+    )
+    return ContractCase(
+        "float_tiled_pool_chain",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -2.0, 3.0, 4096, dtype=np.float32
+            ).reshape(1, 1, 64, 64)
+        },
+        ("AveragePool", "MaxPool"),
+        mem_budget="4K",
+        expect_tiled=True,
+        expect_chain=True,
+    )
+
+
 def _tiled_chain_case(*, compression: str | None = None, xip: bool = False) -> ContractCase:
     """Three padded Conv stages force the streamable-chain executor."""
     model_input = helper.make_tensor_value_info(
@@ -832,8 +986,37 @@ def _compile_plan(
     mem_budget: str,
     compression: str | None,
     xip: bool,
+    force_one_op_stages: bool = False,
 ) -> dict:
     graph, _ = _run_pipeline(str(model_path), (mem_budget,))
+    if force_one_op_stages:
+        stages: list[Stage] = []
+        for index, op in enumerate(graph.ops):
+            op.stage = index
+            inputs = [
+                name
+                for name in op.inputs
+                if name in graph.tensors and not graph.tensors[name].is_constant
+            ]
+            outputs = [
+                name
+                for name in op.outputs
+                if name in graph.tensors and not graph.tensors[name].is_constant
+            ]
+            peak = sum(
+                (graph.tensors[name].size_bytes + 31) & ~31
+                for name in dict.fromkeys(inputs + outputs)
+            )
+            stages.append(
+                Stage(
+                    stage_id=index,
+                    op_indices=[index],
+                    input_tensors=inputs,
+                    output_tensors=outputs,
+                    peak_bytes=peak,
+                )
+            )
+        graph.stages = stages
     validation = validate_memory_plan(graph)
     if not validation.feasible:
         details = "; ".join(issue.describe() for issue in validation.issues)
@@ -1019,6 +1202,7 @@ def _run_case(
         mem_budget=case.mem_budget,
         compression=case.compression,
         xip=case.xip,
+        force_one_op_stages=case.force_one_op_stages,
     )
     _assert_plan_mode(case, plan)
     session = ort.InferenceSession(
@@ -1234,10 +1418,14 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _depthwise_conv_case(),
         _math_normalization_case(),
         _conv1d_case(),
+        _rank3_pointwise_case(),
+        _many_stage_case(),
+        _tcn_16k_case(),
         _reduce_mean_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
+        _tiled_pool_chain_case(),
         _tiled_chain_case(compression="lz4"),
         _tiled_chain_case(xip=True),
         _qdq_case("Conv"),

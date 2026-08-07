@@ -24,18 +24,14 @@ def partition_temporal(ag: AnalyzedGraph, budget: int) -> AnalyzedGraph:
     if num_ops == 0:
         return ag
 
-    # Pre-compute which tensors are alive at each step (from the timeline)
-    step_live: dict[int, list[str]] = {}
-    step_bytes: dict[int, int] = {}
-    for snap in ag.timeline:
-        step_live[snap.step] = snap.live_tensors
-        step_bytes[snap.step] = snap.live_bytes
+    # Compute live bytes once.  The old implementation rescanned every tensor
+    # at every step for every candidate stage, making an all-fit graph cubic in
+    # its op count.  A candidate's peak is simply the running maximum of this
+    # graph-wide timeline.
+    step_bytes = _live_bytes_by_step(ag)
 
-    # Which step each tensor is produced at
-    tensor_birth: dict[str, int] = {}
     tensor_death: dict[str, int] = {}
     for lt in ag.lifetimes.values():
-        tensor_birth[lt.tensor_name] = lt.birth_step
         tensor_death[lt.tensor_name] = lt.death_step
 
     stages: list[Stage] = []
@@ -44,30 +40,35 @@ def partition_temporal(ag: AnalyzedGraph, budget: int) -> AnalyzedGraph:
     while current_start < num_ops:
         # Try extending the stage one op at a time
         best_end = current_start  # inclusive end
+        best_peak = 0
+        running_peak = 0
 
         for candidate_end in range(current_start, num_ops):
-            # Compute peak memory for the candidate stage [current_start..candidate_end]
-            # We need to account for stage inputs: tensors born outside this range
-            # but alive inside it. These must be loaded into SRAM.
-            stage_peak = _stage_peak_memory(
-                ag, current_start, candidate_end, tensor_birth, tensor_death
-            )
+            running_peak = max(running_peak, step_bytes[candidate_end])
 
-            if stage_peak <= budget:
+            if running_peak <= budget:
                 best_end = candidate_end
+                best_peak = running_peak
             else:
                 # This op doesn't fit - cut before it
                 if candidate_end == current_start:
                     # Single op exceeds budget - include it with a warning
                     best_end = candidate_end
+                    best_peak = running_peak
                 break
         else:
             # All remaining ops fit
             best_end = num_ops - 1
+            best_peak = running_peak
 
         stage = _build_stage(
-            ag, len(stages), current_start, best_end,
-            tensor_birth, tensor_death, budget,
+            ag,
+            len(stages),
+            current_start,
+            best_end,
+            tensor_death,
+            budget,
+            best_peak,
         )
         stages.append(stage)
 
@@ -81,37 +82,32 @@ def partition_temporal(ag: AnalyzedGraph, budget: int) -> AnalyzedGraph:
     return ag
 
 
-def _stage_peak_memory(
-    ag: AnalyzedGraph,
-    start: int,
-    end: int,
-    tensor_birth: dict[str, int],
-    tensor_death: dict[str, int],
-) -> int:
-    """Compute peak live activation memory for a stage spanning [start..end].
+def _live_bytes_by_step(ag: AnalyzedGraph) -> list[int]:
+    """Return aligned live activation bytes for each execution step.
 
-    A tensor is live within the stage if:
-      - It was born within the stage (birth_step in [start..end]), or
-      - It was born before the stage but is consumed within it (a stage input).
-    And it hasn't died before the step we're examining.
+    Lifetimes use inclusive birth/death steps.  Clipping each lifetime to the
+    execution range and accumulating deltas preserves the memory model while
+    taking O(ops + tensors) time.
     """
-    peak = 0
-    for step in range(start, end + 1):
-        live = 0
-        for lt in ag.lifetimes.values():
-            # Tensor is alive from its producing step (output co-resides with the
-            # inputs that die there - the runtime allocs the output before freeing
-            # inputs) through its last consumer. Same convention as memory.py.
-            alive_from = lt.birth_step
-            freed_at = lt.death_step + 1
+    num_ops = len(ag.ops)
+    deltas = [0] * (num_ops + 1)
 
-            # Within this stage, the tensor is live if:
-            # it's alive at this step AND (born in stage OR consumed in stage)
-            if alive_from <= step and step < freed_at:
-                live += _aligned_size(lt.size_bytes, ag.tensor_alignment)
-        if live > peak:
-            peak = live
-    return peak
+    for lt in ag.lifetimes.values():
+        alive_from = max(0, lt.birth_step)
+        freed_at = min(num_ops, lt.death_step + 1)
+        if alive_from >= freed_at:
+            continue
+
+        size = _aligned_size(lt.size_bytes, ag.tensor_alignment)
+        deltas[alive_from] += size
+        deltas[freed_at] -= size
+
+    live_bytes = 0
+    result: list[int] = []
+    for step in range(num_ops):
+        live_bytes += deltas[step]
+        result.append(live_bytes)
+    return result
 
 
 def _build_stage(
@@ -119,9 +115,9 @@ def _build_stage(
     stage_id: int,
     start: int,
     end: int,
-    tensor_birth: dict[str, int],
     tensor_death: dict[str, int],
     budget: int,
+    peak: int,
 ) -> Stage:
     """Build a Stage object with input/output tensor accounting."""
     op_indices = list(range(start, end + 1))
@@ -149,9 +145,6 @@ def _build_stage(
         death = tensor_death.get(name, -1)
         if death > end:
             output_tensors.append(name)
-
-    # Peak memory for this stage
-    peak = _stage_peak_memory(ag, start, end, tensor_birth, tensor_death)
 
     warnings: list[str] = []
     if peak > budget:

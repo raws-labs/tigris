@@ -7,7 +7,12 @@ import argparse
 import json
 from pathlib import Path
 
-from tigris import SCHEMA_VERSION
+from tigris import (
+    SCHEMA_VERSION,
+    TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_NONE,
+    TILE_AXIS_WIDTH,
+)
 from tigris.emitters.binary import defs
 
 
@@ -19,6 +24,11 @@ def schema_package() -> dict[str, object]:
         "magic_ascii": defs.MAGIC.decode("ascii"),
         "op_attribute_types": {
             "transpose_perm": defs.OP_ATTR_TRANSPOSE_PERM,
+        },
+        "op_attribute_contract": {
+            "duplicates": "rejected by (op_index, type)",
+            "ordering": ["op_index", "type"],
+            "payload_length_bits": 8,
         },
         "op_types": dict(sorted(defs.OP_TYPE_MAP.items())),
         "record_sizes": {
@@ -34,7 +44,19 @@ def schema_package() -> dict[str, object]:
             "weight_entry": defs.WEIGHT_ENTRY_SIZE,
         },
         "schema_version": SCHEMA_VERSION,
+        "versioning": {
+            "capability_growth_requires_schema_bump": False,
+            "scope": "wire_format",
+            "stage_assignment_v5": (
+                "stage table authoritative; operator byte is canonical low-byte hint"
+            ),
+        },
         "section_alignment": defs.PLAN_SECTION_ALIGNMENT,
+        "tile_axes": {
+            "height_or_length": TILE_AXIS_HEIGHT_OR_LENGTH,
+            "none": TILE_AXIS_NONE,
+            "width_reserved": TILE_AXIS_WIDTH,
+        },
         "section_types": {
             "index_pool": defs.SEC_INDEX_POOL,
             "op_attributes": defs.SEC_OP_ATTRIBUTES,

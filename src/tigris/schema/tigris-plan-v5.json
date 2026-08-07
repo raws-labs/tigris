@@ -1,0 +1,87 @@
+{
+  "artifact_format": 1,
+  "endianness": "little",
+  "magic_ascii": "TGRS",
+  "op_attribute_contract": {
+    "duplicates": "rejected by (op_index, type)",
+    "ordering": [
+      "op_index",
+      "type"
+    ],
+    "payload_length_bits": 8
+  },
+  "op_attribute_types": {
+    "transpose_perm": 1
+  },
+  "op_types": {
+    "Add": 7,
+    "AveragePool": 6,
+    "BatchNormalization": 22,
+    "Clip": 11,
+    "Concat": 13,
+    "Conv": 1,
+    "Conv1D": 32,
+    "ConvTranspose": 24,
+    "DepthwiseConv": 2,
+    "Div": 19,
+    "Flatten": 16,
+    "Gemm": 9,
+    "GlobalAveragePool": 15,
+    "GlobalMaxPool": 31,
+    "InstanceNormalization": 23,
+    "LeakyRelu": 21,
+    "MatMul": 25,
+    "MaxPool": 5,
+    "Mul": 8,
+    "Pad": 14,
+    "ReduceMean": 26,
+    "Relu": 3,
+    "Relu6": 4,
+    "Reshape": 17,
+    "Resize": 30,
+    "Sigmoid": 12,
+    "Softmax": 10,
+    "Squeeze": 27,
+    "Sub": 18,
+    "Tanh": 20,
+    "Transpose": 29,
+    "Unsqueeze": 28
+  },
+  "record_sizes": {
+    "header": 48,
+    "op": 38,
+    "op_attribute": 8,
+    "quant_param": 16,
+    "section_entry": 8,
+    "stage": 28,
+    "tensor": 16,
+    "tile_plan": 24,
+    "weight_block": 20,
+    "weight_entry": 12
+  },
+  "schema_version": 5,
+  "section_alignment": 16,
+  "section_types": {
+    "index_pool": 5,
+    "op_attributes": 11,
+    "ops": 2,
+    "quant_params": 9,
+    "shape_pool": 6,
+    "stages": 3,
+    "strings": 7,
+    "tensors": 1,
+    "tile_plans": 4,
+    "weight_blocks": 10,
+    "weights": 8
+  },
+  "tile_axes": {
+    "height_or_length": 1,
+    "none": 0,
+    "width_reserved": 2
+  },
+  "versioning": {
+    "capability_growth_requires_schema_bump": false,
+    "scope": "wire_format",
+    "stage_assignment_v5": "stage table authoritative; operator byte is canonical low-byte hint"
+  }
+}

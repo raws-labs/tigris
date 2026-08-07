@@ -87,3 +87,18 @@ def test_peak_accounts_for_allocator_alignment():
 
     # Both values co-reside at the producing step: 2 * align_up(5, 32).
     assert ag.peak_memory_bytes == 64
+
+
+def test_timeline_can_skip_live_tensor_names(linear_3op_path):
+    """Production planning can retain byte totals without quadratic name lists."""
+    ag = load_model(linear_3op_path)
+    ag = compute_lifetimes(ag)
+    ag = compute_memory_timeline(ag)
+    expected_bytes = [snapshot.live_bytes for snapshot in ag.timeline]
+    expected_peak = ag.peak_memory_bytes
+
+    ag = compute_memory_timeline(ag, capture_live_tensors=False)
+
+    assert [snapshot.live_bytes for snapshot in ag.timeline] == expected_bytes
+    assert ag.peak_memory_bytes == expected_peak
+    assert all(not snapshot.live_tensors for snapshot in ag.timeline)

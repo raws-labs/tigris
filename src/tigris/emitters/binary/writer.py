@@ -6,7 +6,11 @@ from pathlib import Path
 
 import numpy as np
 
-from tigris import SCHEMA_VERSION
+from tigris import (
+    SCHEMA_VERSION,
+    TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_NONE,
+)
 from tigris.graph.ir import AnalyzedGraph, OpNode
 
 from .defs import (
@@ -731,12 +735,20 @@ def _build_op_attributes(
 
     if not records:
         return b""
+    records.sort(key=lambda record: (record[0], record[1]))
     if len(records) > 0xFFFF:
         raise ValueError("operator-attribute count exceeds uint16 plan limit")
 
     entries = bytearray()
     data = bytearray()
+    previous_key: tuple[int, int] | None = None
     for op_index, attr_type, payload in records:
+        key = (op_index, attr_type)
+        if key == previous_key:
+            raise ValueError(
+                f"duplicate operator attribute type {attr_type} for operator {op_index}"
+            )
+        previous_key = key
         _require_uint(op_index, 16, "operator-attribute operator index")
         if len(payload) > 0xFF:
             raise ValueError("operator-attribute payload exceeds uint8 length")
@@ -839,9 +851,9 @@ def _build_ops(
         out_off, out_count = index_pool.add(out_indices)
         _require_uint(inp_count, 8, f"operator {op.name!r} input count")
         _require_uint(out_count, 8, f"operator {op.name!r} output count")
-        if not -1 <= op.stage <= 0xFF:
+        if not -1 <= op.stage <= 0xFFFF:
             raise ValueError(
-                f"operator {op.name!r} stage {op.stage} exceeds the uint8 plan-format limit"
+                f"operator {op.name!r} stage {op.stage} exceeds the uint16 stage-table limit"
             )
 
         spatial = _pack_spatial_attrs(op, ag.weight_data)
@@ -855,7 +867,10 @@ def _build_ops(
         act_min, act_max = _compute_act_bounds(ag, op, fused_act)
 
         # tigris_op_t: 38 bytes (layout retained by schema v3)
-        # name_str(u32) op_type(u8) num_inputs(u8) num_outputs(u8) stage(u8)
+        # name_str(u32) op_type(u8) num_inputs(u8) num_outputs(u8)
+        # stage_hint(u8).  Schema v5 makes the stage table authoritative; this
+        # legacy byte retains the low stage-index byte for canonical encoding
+        # and v2-v4 compatibility without limiting v5 plans to 256 stages.
         # inputs_offset(u16) outputs_offset(u16)
         # spatial_attrs(18 bytes)
         # weight_idx(u16) bias_idx(u16)
@@ -865,7 +880,7 @@ def _build_ops(
             op_type,
             inp_count,
             out_count,
-            max(op.stage, 0),
+            max(op.stage, 0) & 0xFF,
             inp_off,
             out_off,
         ))
@@ -954,9 +969,17 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
 
         stage_to_tile[stage.stage_id] = idx
         idx += 1
+        if tp.tileable and tp.axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+            raise ValueError(
+                f"stage {stage.stage_id} has unsupported tile axis {tp.axis}"
+            )
+        if not tp.tileable and tp.axis != TILE_AXIS_NONE:
+            raise ValueError(
+                f"untileable stage {stage.stage_id} must use tile axis 0"
+            )
 
         # tigris_tile_plan_t: 24 bytes
-        # tileable(u8) pad(u8) tile_height(u16)
+        # tileable(u8) axis(u8) tile_height(u16)
         # num_tiles(u16) halo(u16)
         # receptive_field(u16) original_height(u16)
         # tiled_peak_bytes(u32)
@@ -964,7 +987,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
         # reserved(u32)
         buf.extend(TILE_PLAN_STRUCT.pack(
             1 if tp.tileable else 0,
-            0,  # pad
+            tp.axis,
             tp.tile_height,
             tp.num_tiles,
             tp.halo,
@@ -1276,10 +1299,6 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
         )
     _require_uint(len(ag.weight_data), 16, "weight count")
     _require_uint(len(ag.stages), 16, "stage count")
-    if len(ag.stages) > 256:
-        raise ValueError(
-            f"plan has {len(ag.stages)} stages; operators encode a uint8 stage index"
-        )
 
     strings = _StringTable()
     shapes = _ShapePool()
@@ -1342,10 +1361,6 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
         (num_weights, "weight count"),
     ):
         _require_uint(value, 16, field)
-    if num_stages > 256:
-        raise ValueError(
-            f"plan has {num_stages} stages; operators encode a uint8 stage index"
-        )
     _require_uint(model_io_off, 16, "model I/O index-pool offset")
     _require_uint(len(model_inp_indices), 8, "model input count")
     _require_uint(len(model_out_indices), 8, "model output count")

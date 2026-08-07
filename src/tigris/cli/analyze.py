@@ -271,7 +271,8 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
         table = Table(title="Tiling Analysis", border_style="dim")
         table.add_column("Stage", justify="right")
         table.add_column("Tileable?")
-        table.add_column("Tile H", justify="right")
+        table.add_column("Axis", justify="right")
+        table.add_column("Tile", justify="right")
         table.add_column("Tiles", justify="right")
         table.add_column("Halo", justify="right")
         table.add_column("RF", justify="right")
@@ -283,13 +284,14 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
                 continue
             tileable = Text("Yes", style="green") if tp.tileable else Text("No", style="red")
             tile_h = str(tp.tile_height) if tp.tileable else "-"
+            axis = str(tp.axis) if tp.tileable else "-"
             tiles = str(tp.num_tiles) if tp.tileable else "-"
             halo_str = str(tp.halo) if tp.tileable else "-"
             rf_str = str(tp.receptive_field) if tp.tileable else "-"
             tiled_peak = fmt_bytes(tp.tiled_peak_bytes) if tp.tileable else "-"
 
             table.add_row(
-                str(s.stage_id), tileable, tile_h, tiles,
+                str(s.stage_id), tileable, axis, tile_h, tiles,
                 halo_str, rf_str, tiled_peak,
             )
 

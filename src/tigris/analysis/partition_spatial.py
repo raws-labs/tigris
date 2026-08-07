@@ -11,7 +11,13 @@ tensors can stay in fast memory as tiles, avoiding full-size slow allocation.
 import math
 from enum import Enum
 
-from tigris.graph.ir import AnalyzedGraph, OpNode, Stage, TilePlan
+from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_NONE
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    OpNode,
+    Stage,
+    TilePlan,
+)
 
 
 # Op classification
@@ -24,47 +30,41 @@ class TileCategory(Enum):
     UNTILEABLE = "untileable"
 
 
-# Op types that are spatially tileable (operate on spatial dims independently)
+# Spatial tiling is an execution contract, not a purely mathematical
+# classification.  Keep this list aligned with exec_stage_tiled in the runtime:
+# every listed op is only accepted on a stage axis audited below. Unknown and
+# unaudited ops fail closed as UNTILEABLE.
 _OP_CATEGORY: dict[str, TileCategory] = {
-    # Convolutions
+    # Spatial ops whose height geometry the runtime propagates.
     "Conv": TileCategory.CONV,
     "Conv1D": TileCategory.CONV,
-    "ConvTranspose": TileCategory.CONV,
     "DepthwiseConv": TileCategory.CONV,
-    # Pooling
     "MaxPool": TileCategory.POOL,
     "AveragePool": TileCategory.POOL,
-    "GlobalAveragePool": TileCategory.POOL,
-    "GlobalMaxPool": TileCategory.POOL,
-    # Pointwise / element-wise (pass through spatial dims unchanged)
+    # Audited, shape-preserving runtime kernels.
     "Relu": TileCategory.POINTWISE,
     "Relu6": TileCategory.POINTWISE,
-    "LeakyRelu": TileCategory.POINTWISE,
     "Sigmoid": TileCategory.POINTWISE,
     "Tanh": TileCategory.POINTWISE,
-    "HardSigmoid": TileCategory.POINTWISE,
-    "HardSwish": TileCategory.POINTWISE,
-    "Clip": TileCategory.POINTWISE,
     "Add": TileCategory.POINTWISE,
-    "Sub": TileCategory.POINTWISE,
     "Mul": TileCategory.POINTWISE,
-    "Div": TileCategory.POINTWISE,
-    "BatchNormalization": TileCategory.POINTWISE,
-    "InstanceNormalization": TileCategory.POINTWISE,
     "Concat": TileCategory.POINTWISE,
-    "Resize": TileCategory.POINTWISE,
-    "Pad": TileCategory.POINTWISE,
-    # Untileable - these collapse or reshape spatial dims
-    "Flatten": TileCategory.UNTILEABLE,
-    "Reshape": TileCategory.UNTILEABLE,
-    "Gemm": TileCategory.UNTILEABLE,
-    "MatMul": TileCategory.UNTILEABLE,
-    "Softmax": TileCategory.UNTILEABLE,
-    "ReduceMean": TileCategory.UNTILEABLE,
-    "Squeeze": TileCategory.UNTILEABLE,
-    "Unsqueeze": TileCategory.UNTILEABLE,
-    "Transpose": TileCategory.UNTILEABLE,
 }
+
+
+# Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
+# NHWC stages.  Unary pointwise operators preserve the current length and may
+# surround one Conv1D.  Dynamic binary operators are safe only in a
+# pointwise-only stage: combining them with a strided Conv1D could expose
+# external operands at different length resolutions.
+_RANK3_AXIS1_UNARY_OPS = frozenset({
+    "Relu",
+    "Relu6",
+    "Sigmoid",
+    "Tanh",
+})
+_RANK3_AXIS1_BINARY_OPS = frozenset({"Add", "Mul"})
+_RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _RANK3_AXIS1_BINARY_OPS | {"Conv1D"}
 
 
 def classify_op(op_type: str) -> TileCategory:
@@ -144,19 +144,26 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue  # fits, no tiling needed
 
         stage_ops = [ag.ops[i] for i in stage.op_indices]
+        tile_axis = _stage_tile_axis(ag, stage, stage_ops)
 
         # Check if all ops are tileable
         untileable: list[str] = []
         for op in stage_ops:
             cat = classify_op(op.op_type)
-            if cat == TileCategory.UNTILEABLE:
+            if cat == TileCategory.UNTILEABLE or not _op_supports_axis(
+                op, tile_axis
+            ):
                 untileable.append(f"{op.name} ({op.op_type})")
 
-        if untileable:
+        if tile_axis == TILE_AXIS_NONE or untileable:
             stage.tile_plan = TilePlan(
                 tileable=False,
                 untileable_ops=untileable,
-                warnings=[f"Stage {stage.stage_id} contains untileable ops"],
+                warnings=[
+                    f"Stage {stage.stage_id} has no audited common tile axis"
+                    if tile_axis == TILE_AXIS_NONE
+                    else f"Stage {stage.stage_id} contains untileable ops"
+                ],
             )
             continue
 
@@ -164,8 +171,8 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
         rf, _jump = compute_receptive_field(stage_ops)
         halo = rf - 1
 
-        # Find input height (NCHW layout, index 2)
-        input_h = _find_input_height(ag, stage)
+        # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.
+        input_h = _find_input_extent(ag, stage, tile_axis)
         if input_h <= 0:
             stage.tile_plan = TilePlan(
                 tileable=False,
@@ -197,6 +204,7 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         stage.tile_plan = TilePlan(
             tileable=True,
+            axis=tile_axis,
             tile_height=tile_h,
             num_tiles=num_tiles,
             halo=halo,
@@ -210,8 +218,58 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _find_input_height(ag: AnalyzedGraph, stage) -> int:
-    """Find the spatial height of the stage's primary input tensor (NCHW dim 2)."""
+def _stage_io_ranks(ag: AnalyzedGraph, stage: Stage) -> set[int]:
+    """Return concrete ranks for a stage's external activation tensors."""
+    names = [*stage.input_tensors, *stage.output_tensors]
+    if not names:
+        return set()
+    ranks: set[int] = set()
+    for name in names:
+        info = ag.tensors.get(name)
+        if info is None:
+            return set()
+        ranks.add(len(info.shape))
+    return ranks
+
+
+def _stage_tile_axis(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> int:
+    """Select an audited serialized activation axis for a standalone stage."""
+    ranks = _stage_io_ranks(ag, stage)
+    if ranks == {4} and all(op.op_type != "Conv1D" for op in stage_ops):
+        return TILE_AXIS_HEIGHT_OR_LENGTH
+    if ranks == {3} and stage_ops:
+        op_types = [op.op_type for op in stage_ops]
+        conv_count = op_types.count("Conv1D")
+        if (
+            all(op_type in _RANK3_AXIS1_OPS for op_type in op_types)
+            and conv_count <= 1
+            and not (
+                conv_count == 1
+                and any(
+                    op_type in _RANK3_AXIS1_BINARY_OPS
+                    for op_type in op_types
+                )
+            )
+        ):
+            return TILE_AXIS_HEIGHT_OR_LENGTH
+    return TILE_AXIS_NONE
+
+
+def _op_supports_axis(op: OpNode, axis: int) -> bool:
+    """Fail closed unless an operator implements the selected tile contract."""
+    if axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+        return False
+    if op.op_type == "Conv1D":
+        return True
+    return op.op_type in _OP_CATEGORY
+
+
+def _find_input_extent(ag: AnalyzedGraph, stage: Stage, axis: int) -> int:
+    """Find the H/L extent that serializes as axis 1 (source NCHW/NCL dim 2)."""
+    if axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+        return 0
     # Check stage input tensors first, then look at first op's inputs
     candidates = stage.input_tensors.copy()
     if not candidates:
@@ -220,8 +278,8 @@ def _find_input_height(ag: AnalyzedGraph, stage) -> int:
 
     for name in candidates:
         info = ag.tensors.get(name)
-        if info and len(info.shape) >= 4:
-            return int(info.shape[2])  # NCHW -> H is dim 2
+        if info and len(info.shape) in {3, 4}:
+            return int(info.shape[2])  # NCHW/NCL -> serialized H/L is dim 1
 
     return 0
 
@@ -235,7 +293,7 @@ def _estimate_halo_bytes(ag: AnalyzedGraph, stage, halo: int, input_h: int) -> i
 
     for name in candidates:
         info = ag.tensors.get(name)
-        if info and len(info.shape) >= 4:
+        if info and len(info.shape) in {3, 4}:
             # bytes per row = total_bytes / H
             if input_h > 0:
                 return int(info.size_bytes * halo / input_h)
@@ -248,20 +306,15 @@ def _estimate_halo_bytes(ag: AnalyzedGraph, stage, halo: int, input_h: int) -> i
 
 def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
     """Check if a stage may be part of a streamable CHAIN (used only by
-    detect_chains): all ops spatially tileable, no POOL op, and 4D I/O.
+    detect_chains): all ops implement the schema-v4 height-stripe contract and
+    all stage I/O is 4D.
 
-    POOL is excluded because the runtime chain executor (exec_chain_tiled)
-    composes/back-propagates receptive fields for Conv/DepthwiseConv only; a POOL
-    op in a chained stage would be treated as height-preserving (pointwise),
-    giving wrong tile row counts and OOB reads. Pool stages still tile standalone
-    via exec_stage_tiled. Remove the POOL exclusion once the chain executor
-    handles pool spatial ops.
+    The runtime composes Conv, DepthwiseConv, MaxPool, and AveragePool geometry
+    while pointwise operators preserve the current stripe height.
     """
     for op_i in stage.op_indices:
         cat = classify_op(ag.ops[op_i].op_type)
         if cat == TileCategory.UNTILEABLE:
-            return False
-        if cat == TileCategory.POOL:
             return False
     # All inputs and outputs must be 4D
     for name in stage.input_tensors:
@@ -347,9 +400,9 @@ def detect_chains(ag: AnalyzedGraph) -> list[list[int]]:
 def _get_stage_spatial_params(ag: AnalyzedGraph, stage: Stage) -> tuple[int, int, int]:
     """Compose (eff_kh, stride_h, 1) across ALL spatial ops in a stage.
 
-    The runtime executor composes receptive fields from all Conv/DW ops
-    in a stage when validating chain tile heights, so the compiler must
-    match by composing here too.
+    The runtime executor composes receptive fields from Conv, DepthwiseConv,
+    MaxPool, and AveragePool ops in a stage when validating chain tile heights,
+    so the compiler must match by composing here too.
 
     Returns (1, 1, 1) for pointwise-only stages.
     """
