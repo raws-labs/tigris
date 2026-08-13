@@ -260,3 +260,39 @@ def test_slow_within_budget_compiles(conv_relu_chain_path, tmp_path):
                "-o", str(output)])
     assert result.exit_code == 0
     assert output.exists()
+
+
+def test_compile_refuses_flash_overflow_without_output(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "should-not-exist.tgrs"
+    # -f far below any real plan size.
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
+               "-f", "1", "-o", str(output)])
+    assert result.exit_code != 0
+    assert "exceeds the flash budget" in result.output
+    assert not output.exists()
+
+
+def test_compile_refuses_flash_overflow_compressed(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "should-not-exist.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
+               "--compress", "lz4", "-f", "1", "-o", str(output)])
+    assert result.exit_code != 0
+    assert "exceeds the flash budget" in result.output
+    assert not output.exists()
+
+
+def test_flash_within_budget_compiles(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "out.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
+               "-f", "16M", "-o", str(output)])
+    assert result.exit_code == 0
+    assert output.exists()
