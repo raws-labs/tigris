@@ -57,8 +57,8 @@ def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
 def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None, compress: str, xip: bool):
     """Compile an ONNX model to binary deployment format."""
     from tigris.analysis.validation import (
+        validate_budget,
         validate_execution_dtype,
-        validate_memory_plan,
         validate_operator_support,
     )
     from tigris.emitters.binary.writer import emit_binary
@@ -97,10 +97,16 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
             + operator_validation.describe()
         )
 
-    validation = validate_memory_plan(ag)
-    if not validation.feasible:
-        details = "; ".join(issue.describe() for issue in validation.issues)
-        raise click.ClickException(f"Cannot compile an infeasible memory plan: {details}")
+    result = validate_budget(ag)
+    if not result.fast.feasible:
+        details = "; ".join(issue.describe() for issue in result.fast.issues)
+        raise click.ClickException(
+            f"Cannot compile an infeasible memory plan: {details}"
+        )
+    if not result.slow.fits:
+        raise click.ClickException(
+            f"Cannot compile a plan that overflows slow memory: {result.slow.describe()}"
+        )
 
     out = Path(output) if output else Path(model).with_suffix(".tgrs")
     with console.status("Writing binary plan..."):

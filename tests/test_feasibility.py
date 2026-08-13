@@ -235,3 +235,28 @@ def test_compile_rejects_nonpositive_slow_tier(conv_relu_chain_path, tmp_path):
     assert result.exit_code != 0
     assert "Slow-memory budget must be greater than zero" in result.output
     assert not output.exists()
+
+
+def test_compile_refuses_slow_overflow_without_output(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "should-not-exist.tgrs"
+    # 16K is below the naive peak (52.6K) so stages need tiling and are
+    # still fast-feasible; 1K is a slow tier the stage in+out cannot fit.
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "16K", "-m", "1K",
+               "-o", str(output)])
+    assert result.exit_code != 0
+    assert "overflows slow memory" in result.output
+    assert not output.exists()
+
+
+def test_slow_within_budget_compiles(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "out.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "16K", "-m", "64M",
+               "-o", str(output)])
+    assert result.exit_code == 0
+    assert output.exists()
