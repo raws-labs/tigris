@@ -21,7 +21,7 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import _build_quant_params, emit_binary, emit_binary_bytes
-from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, Stage, TensorInfo
+from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, QuantParam, Stage, TensorInfo
 from tigris.loaders import load_model
 
 
@@ -277,7 +277,7 @@ def test_schema_v5_stage_table_supports_more_than_256_stages():
         model_inputs=[tensor_names[0]],
         model_outputs=[tensor_names[-1]],
         stages=stages,
-        mem_budget=64,
+        budget=MemoryBudget(fast=64),
         peak_memory_bytes=64,
     )
 

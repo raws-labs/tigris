@@ -1,5 +1,6 @@
 """``tigris compile`` command."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import click
@@ -33,7 +34,7 @@ def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
             # ``mem_budget`` is already the reduced activation capacity.  The
             # writer uses this marker to avoid subtracting the same reserve a
             # second time from the serialized plan budget.
-            ag.fast_memory_reserve_bytes = required
+            ag.budget = replace(ag.budget, fast_reserve=required)
             return ag, total_budget, reserve, required
         reserve = required
 

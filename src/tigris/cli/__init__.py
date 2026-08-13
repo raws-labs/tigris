@@ -1,5 +1,6 @@
 """CLI entry point: ``tigris analyze model.onnx --mem 256K``."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import click
@@ -74,7 +75,7 @@ def _run_pipeline(
             ag = partition_spatial(ag)
             ag = detect_and_solve_chains(ag)
 
-    ag.fast_memory_reserve_bytes = fast_reserve_bytes
+    ag.budget = replace(ag.budget, fast_reserve=fast_reserve_bytes)
     return ag, total_budget
 
 

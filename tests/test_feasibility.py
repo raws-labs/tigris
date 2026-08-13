@@ -1,5 +1,7 @@
 """Fail-closed validation for deployment memory budgets."""
 
+from dataclasses import replace
+
 import numpy as np
 import onnx
 import pytest
@@ -183,7 +185,7 @@ def test_writer_defensively_rejects_budget_above_plan_format_limit(
     linear_3op_path,
 ):
     graph, _ = _run_pipeline(str(linear_3op_path), ("4K",))
-    graph.mem_budget = 0x1_0000_0000
+    graph.budget = replace(graph.budget, fast=0x1_0000_0000)
 
     with pytest.raises(ValueError, match="uint32 plan-format limit"):
         emit_binary_bytes(graph)

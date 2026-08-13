@@ -1,5 +1,7 @@
 """Temporal partitioning - greedy depth-axis graph partitioning for a given memory budget."""
 
+from dataclasses import replace
+
 from tigris.graph.ir import AnalyzedGraph, Stage
 
 
@@ -19,7 +21,7 @@ def partition_temporal(ag: AnalyzedGraph, budget: int) -> AnalyzedGraph:
     Stage inputs = tensors produced outside the stage but consumed inside.
     Stage outputs = tensors produced inside the stage but consumed later (or model outputs).
     """
-    ag.mem_budget = budget
+    ag.budget = replace(ag.budget, fast=budget)
     num_ops = len(ag.ops)
     if num_ops == 0:
         return ag
