@@ -89,7 +89,6 @@ class Findings:
     budget_sweep: list[BudgetRow] = field(default_factory=list)
 
     # slow memory (PSRAM) constraints for tiled execution
-    slow_budget: int = 0
     slow_peak_bytes: int = 0  # max(input + output) across tiled stages
     slow_overflow_stages: list[int] = field(default_factory=list)
     slow_fits: bool = True
@@ -299,7 +298,7 @@ def _estimate_plan_overhead(ag: AnalyzedGraph) -> int:
     return _estimate_serialized_plan_size(ag, weight_sizes) - sum(weight_sizes)
 
 
-def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, slow_budget: int = 0) -> Findings:
+def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0) -> Findings:
     """Analyze the graph and produce structured findings."""
     f = Findings()
     peak = ag.peak_memory_bytes
@@ -307,7 +306,6 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, slow_budget: int 
     f.peak_bytes = peak
     f.budget = budget
     f.flash_budget = flash_budget
-    f.slow_budget = slow_budget
 
     from tigris.analysis.validation import (
         validate_execution_dtype,

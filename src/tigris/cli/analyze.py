@@ -52,7 +52,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
     ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
 
     with console.status("Computing findings..."):
-        findings = compute_findings(ag, flash_budget=flash_budget, slow_budget=slow_budget)
+        findings = compute_findings(ag, flash_budget=flash_budget)
 
     # Model
     model_grid = Table.grid(padding=(0, 2))
