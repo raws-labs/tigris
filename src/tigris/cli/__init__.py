@@ -18,6 +18,20 @@ def _parse_size(s: str) -> int:
     return int(s)
 
 
+def _expand_mem(ctx, param, value: tuple[str, ...]) -> tuple[str, ...]:
+    """Expand ``-m 256K+4M`` into separate pools. Sugar for repeated ``-m``."""
+    expanded: list[str] = []
+    for token in value:
+        parts = token.split("+")
+        for part in parts:
+            if not part.strip():
+                raise click.BadParameter(
+                    f"invalid memory budget {token!r}: empty pool around '+'"
+                )
+            expanded.append(part.strip())
+    return tuple(expanded)
+
+
 def _run_pipeline(
     model: str, mem: tuple[str, ...], *, fast_reserve_bytes: int = 0
 ):

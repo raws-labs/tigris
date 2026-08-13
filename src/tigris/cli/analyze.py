@@ -5,7 +5,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from tigris.cli import cli, console, _parse_size, _run_pipeline
+from tigris.cli import cli, console, _expand_mem, _parse_size, _run_pipeline
 from tigris.utils import fmt_bytes
 
 
@@ -32,7 +32,8 @@ def _side_by_side(*panels):
 
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
-@click.option("--mem", "-m", multiple=True, help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K -m 8M)")
+@click.option("--mem", "-m", multiple=True, callback=_expand_mem,
+              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+8M)")
 @click.option("--flash", "-f", default=None, help="Flash size for plan fit check (e.g. 4M)")
 @click.option("--verbose", "-v", is_flag=True, help="Show per-stage and tiling tables")
 def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):

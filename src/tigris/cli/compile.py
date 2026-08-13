@@ -5,7 +5,7 @@ from pathlib import Path
 
 import click
 
-from tigris.cli import cli, console, _parse_size, _run_pipeline
+from tigris.cli import cli, console, _expand_mem, _parse_size, _run_pipeline
 from tigris.utils import fmt_bytes
 
 
@@ -46,7 +46,8 @@ def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
 
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
-@click.option("--mem", "-m", multiple=True, required=True, help="Memory pool size, fast to slow (e.g. 256K)")
+@click.option("--mem", "-m", multiple=True, required=True, callback=_expand_mem,
+              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 @click.option("--output", "-o", default=None, help="Output path (default: <model>.tgrs)")
 @click.option("--flash", "-f", default=None, help="Flash size - warn if plan exceeds (e.g. 4M)")
 @click.option("--compress", "-c", type=click.Choice(["none", "lz4"]), default="none",

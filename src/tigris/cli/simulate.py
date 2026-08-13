@@ -5,13 +5,14 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 
-from tigris.cli import cli, console, _run_pipeline
+from tigris.cli import cli, console, _expand_mem, _run_pipeline
 from tigris.utils import fmt_bytes
 
 
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
-@click.option("--mem", "-m", multiple=True, help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K -m 8M)")
+@click.option("--mem", "-m", multiple=True, callback=_expand_mem,
+              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+8M)")
 def simulate(model: str, mem: tuple[str, ...]):
     """Print a step-by-step execution trace for an ONNX model."""
     ag, budget = _run_pipeline(model, mem)
