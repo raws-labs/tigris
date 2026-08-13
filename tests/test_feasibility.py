@@ -287,6 +287,15 @@ def test_compile_refuses_flash_overflow_compressed(conv_relu_chain_path, tmp_pat
     assert not output.exists()
 
 
+def test_analyze_allows_nonpositive_slow_tier(conv_relu_chain_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    result = CliRunner().invoke(
+        cli, ["analyze", str(conv_relu_chain_path), "-m", "256K", "-m", "0"])
+    assert result.exit_code == 0
+    assert "Slow-memory budget must be greater than zero" not in result.output
+
+
 def test_flash_within_budget_compiles(conv_relu_chain_path, tmp_path):
     from click.testing import CliRunner
     from tigris.cli import cli
