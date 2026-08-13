@@ -212,3 +212,26 @@ def test_analyze_displays_failing_verdict(conv_relu_chain_path):
     assert result.exit_code == 0
     assert "FAIL" in result.output
     assert "Infeasible" in result.output
+
+
+def test_run_pipeline_records_slow_tier(conv_relu_chain_path):
+    ag, total = _run_pipeline(str(conv_relu_chain_path), ("64K", "8M"))
+    assert ag.budget.slow == 8 * 1024 * 1024
+    assert ag.budget.fast + ag.budget.fast_reserve == total
+
+
+def test_run_pipeline_no_slow_tier_is_zero(conv_relu_chain_path):
+    ag, _ = _run_pipeline(str(conv_relu_chain_path), ("64K",))
+    assert ag.budget.slow == 0
+
+
+def test_compile_rejects_nonpositive_slow_tier(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "out.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K", "-m", "0",
+               "-o", str(output)])
+    assert result.exit_code != 0
+    assert "Slow-memory budget must be greater than zero" in result.output
+    assert not output.exists()

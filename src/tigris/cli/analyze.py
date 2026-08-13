@@ -1,5 +1,7 @@
 """``tigris analyze`` command."""
 
+from dataclasses import replace
+
 import click
 from rich.panel import Panel
 from rich.table import Table
@@ -43,7 +45,11 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
     mem_pools = [_parse_size(m) for m in mem]
     flash_budget = _parse_size(flash) if flash else 0
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
-    ag, budget = _run_pipeline(model, mem)
+    # Only forward the fast tier to _run_pipeline: analyze interprets the slow
+    # tier itself below and stays display-only, so a non-positive slow tier
+    # must be reported as unconstrained rather than raised.
+    ag, budget = _run_pipeline(model, mem[:1])
+    ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
 
     with console.status("Computing findings..."):
         findings = compute_findings(ag, flash_budget=flash_budget, slow_budget=slow_budget)

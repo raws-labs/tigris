@@ -72,6 +72,10 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         ag, budget = _run_pipeline(model, mem)
         reserved_budget = 0
         weight_reserve = 0
+
+    flash_budget = _parse_size(flash) if flash else 0
+    ag.budget = replace(ag.budget, flash=flash_budget)
+
     if budget <= 0:
         raise click.ClickException("Fast-memory budget must be greater than zero")
     if budget > 0xFFFFFFFF:

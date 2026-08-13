@@ -90,6 +90,12 @@ def _run_pipeline(
             ag = detect_and_solve_chains(ag)
 
     ag.budget = replace(ag.budget, fast_reserve=fast_reserve_bytes)
+
+    slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
+    if len(mem) > 1 and slow_budget <= 0:
+        raise click.ClickException("Slow-memory budget must be greater than zero")
+    ag.budget = replace(ag.budget, slow=slow_budget)
+
     return ag, total_budget
 
 
