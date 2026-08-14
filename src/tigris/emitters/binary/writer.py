@@ -51,6 +51,7 @@ from .defs import (
     SECTION_ENTRY_SIZE,
     SECTION_ENTRY_STRUCT,
     SPATIAL_ATTRS_STRUCT,
+    STAGE_FLAG_LINE_BUFFERED,
     STAGE_SIZE,
     STAGE_STRUCT,
     STAGE_TILE_PLAN_INDEX_OFFSET,
@@ -941,6 +942,7 @@ def _build_stages(
         # tile_plan_idx(u16) pad(u16)
         # chain_id(u16) chain_len(u16)
         # chain_tile_h(u16) _reserved1(u16)
+        reserved1 = STAGE_FLAG_LINE_BUFFERED if stage.line_buffered else 0
         buf.extend(STAGE_STRUCT.pack(
             stage.peak_bytes,
             ops_off, ops_count,
@@ -950,7 +952,7 @@ def _build_stages(
             stage.chain_id,
             stage.chain_len,
             stage.chain_tile_h,
-            0,  # _reserved1
+            reserved1,
         ))
 
     return bytes(buf)

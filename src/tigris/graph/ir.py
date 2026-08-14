@@ -125,6 +125,7 @@ class Stage:
     chain_id: int = 0xFFFF   # stage index of chain head, or 0xFFFF = standalone
     chain_len: int = 0       # number of stages in chain (0 = not in chain)
     chain_tile_h: int = 0    # output tile height for last stage (set on head only)
+    line_buffered: bool = False  # chain recomputes (set on head only, by detect_and_solve_chains)
 
 
 @dataclass(frozen=True)

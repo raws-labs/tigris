@@ -87,6 +87,9 @@ TENSOR_FLAG_CONSTANT = 0x01
 TENSOR_FLAG_MODEL_INPUT = 0x02
 TENSOR_FLAG_MODEL_OUTPUT = 0x04
 
+# Stage flags - packed into the head stage's _reserved1 field.
+STAGE_FLAG_LINE_BUFFERED = 0x0001
+
 # Canonical little-endian wire layouts.  Writer, reader, and size estimates all
 # consume these definitions so a schema edit cannot silently leave one of them
 # using a stale hand-maintained byte count.

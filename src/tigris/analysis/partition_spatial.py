@@ -586,4 +586,17 @@ def detect_and_solve_chains(ag: AnalyzedGraph) -> AnalyzedGraph:
         # Store tile height on the head stage
         ag.stages[head_id].chain_tile_h = tile_h
 
+        # A chain recomputes iff any member stage has a positive composed
+        # halo (eff_kh - stride > 0). Mark the head so the runtime can later
+        # keep the shared boundary rows in a line buffer instead of
+        # redundantly recomputing them per tile. Memory-neutral, no threshold.
+        recomputes = any(
+            (eff_kh - stride) > 0
+            for eff_kh, stride, _dh in (
+                _get_stage_spatial_params(ag, ag.stages[s_idx]) for s_idx in chain
+            )
+        )
+        if recomputes:
+            ag.stages[head_id].line_buffered = True
+
     return ag
