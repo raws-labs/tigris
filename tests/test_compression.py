@@ -1,6 +1,8 @@
 """Tests for LZ4 weight compression in the binary plan emitter."""
 
 
+from dataclasses import replace
+
 import lz4.block
 import numpy as np
 import pytest
@@ -168,7 +170,7 @@ def test_compressed_plan_fails_when_total_budget_omits_reservation(
     # decompression reserve must still be rejected before emission.
     from tigris.analysis.validation import validate_memory_plan
 
-    ag.mem_budget = validate_memory_plan(ag).scheduled_peak_bytes + reserve - 1
+    ag.budget = replace(ag.budget, fast=validate_memory_plan(ag).scheduled_peak_bytes + reserve - 1)
 
     with pytest.raises(ValueError, match="Cannot emit an infeasible memory plan"):
         emit_binary_bytes(ag, compress="lz4")

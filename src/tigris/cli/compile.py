@@ -1,10 +1,11 @@
 """``tigris compile`` command."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import click
 
-from tigris.cli import cli, console, _parse_size, _run_pipeline
+from tigris.cli import cli, console, _expand_mem, _parse_size, _run_pipeline
 from tigris.utils import fmt_bytes
 
 
@@ -33,7 +34,7 @@ def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
             # ``mem_budget`` is already the reduced activation capacity.  The
             # writer uses this marker to avoid subtracting the same reserve a
             # second time from the serialized plan budget.
-            ag.fast_memory_reserve_bytes = required
+            ag.budget = replace(ag.budget, fast_reserve=required)
             return ag, total_budget, reserve, required
         reserve = required
 
@@ -45,9 +46,10 @@ def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
 
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
-@click.option("--mem", "-m", multiple=True, required=True, help="Memory pool size, fast to slow (e.g. 256K)")
+@click.option("--mem", "-m", multiple=True, required=True, callback=_expand_mem,
+              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 @click.option("--output", "-o", default=None, help="Output path (default: <model>.tgrs)")
-@click.option("--flash", "-f", default=None, help="Flash size - warn if plan exceeds (e.g. 4M)")
+@click.option("--flash", "-f", default=None, help="Flash size budget - fail if plan exceeds (e.g. 4M)")
 @click.option("--compress", "-c", type=click.Choice(["none", "lz4"]), default="none",
               help="Weight compression (default: none)")
 @click.option("--xip", is_flag=True, default=False,
@@ -55,11 +57,11 @@ def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
 def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None, compress: str, xip: bool):
     """Compile an ONNX model to binary deployment format."""
     from tigris.analysis.validation import (
+        validate_budget,
         validate_execution_dtype,
-        validate_memory_plan,
         validate_operator_support,
     )
-    from tigris.emitters.binary.writer import emit_binary
+    from tigris.emitters.binary.writer import emit_binary_bytes
 
     compress_arg = compress if compress != "none" else None
     if compress_arg:
@@ -70,6 +72,9 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         ag, budget = _run_pipeline(model, mem)
         reserved_budget = 0
         weight_reserve = 0
+
+    ag.budget = replace(ag.budget, flash=_parse_size(flash) if flash else 0)
+
     if budget <= 0:
         raise click.ClickException("Fast-memory budget must be greater than zero")
     if budget > 0xFFFFFFFF:
@@ -91,19 +96,31 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
             + operator_validation.describe()
         )
 
-    validation = validate_memory_plan(ag)
-    if not validation.feasible:
-        details = "; ".join(issue.describe() for issue in validation.issues)
-        raise click.ClickException(f"Cannot compile an infeasible memory plan: {details}")
+    result = validate_budget(ag)
+    if not result.fast.feasible:
+        details = "; ".join(issue.describe() for issue in result.fast.issues)
+        raise click.ClickException(
+            f"Cannot compile an infeasible memory plan: {details}"
+        )
+    if not result.slow.fits:
+        raise click.ClickException(
+            f"Cannot compile a plan that overflows slow memory: {result.slow.describe()}"
+        )
 
     out = Path(output) if output else Path(model).with_suffix(".tgrs")
     with console.status("Writing binary plan..."):
-        emit_binary(ag, out, compress=compress_arg, xip=xip)
+        plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip)
+        if ag.budget.flash > 0 and len(plan_data) > ag.budget.flash:
+            raise click.ClickException(
+                f"Cannot compile a plan that exceeds the flash budget: "
+                f"plan is {fmt_bytes(len(plan_data))} but the flash budget is "
+                f"{fmt_bytes(ag.budget.flash)}"
+            )
+        out.write_bytes(plan_data)
 
-    plan_bytes = out.stat().st_size
+    plan_bytes = len(plan_data)
 
     if compress_arg:
-        from tigris.emitters.binary.writer import emit_binary_bytes
         uncompressed_size = len(emit_binary_bytes(ag))
         ratio = plan_bytes / uncompressed_size if uncompressed_size > 0 else 1.0
         console.print(f"[bold green]Binary plan written to {out}[/] (LZ4 compressed)")
@@ -124,14 +141,3 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         console.print(f"[bold green]Binary plan written to {out}[/]")
         console.print(f"  {len(ag.ops)} ops, {len(ag.stages)} stages @ {fmt_bytes(budget)} budget", style="dim")
         console.print(f"  plan size: {fmt_bytes(plan_bytes)}", style="dim")
-
-    if flash:
-        flash_bytes = _parse_size(flash)
-        if plan_bytes <= flash_bytes:
-            console.print(f"  flash {fmt_bytes(flash_bytes)}: [green]fits[/]", style="dim")
-        else:
-            ratio = plan_bytes / flash_bytes
-            console.print(
-                f"  flash {fmt_bytes(flash_bytes)}: [red]does not fit[/] ({ratio:.1f}x)",
-                style="dim",
-            )

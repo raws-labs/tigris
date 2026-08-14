@@ -127,6 +127,21 @@ class Stage:
     chain_tile_h: int = 0    # output tile height for last stage (set on head only)
 
 
+@dataclass(frozen=True)
+class MemoryBudget:
+    """Deployment memory budget across tiers, in bytes.
+
+    ``fast`` is the activation arena represented in the binary plan (the total
+    fast pool minus ``fast_reserve``); the total fast pool the caller supplied
+    is ``fast + fast_reserve``. ``slow`` and ``flash`` are 0 when unconstrained.
+    """
+
+    fast: int = 0
+    slow: int = 0
+    flash: int = 0
+    fast_reserve: int = 0
+
+
 @dataclass
 class AnalyzedGraph:
     """Central object enriched by each pipeline stage."""
@@ -150,14 +165,9 @@ class AnalyzedGraph:
 
     # Populated by partitioner
     stages: list[Stage] = field(default_factory=list)
-    mem_budget: int = 0  # primary (fastest) memory pool size in bytes
 
-    # Bytes deliberately held outside ``mem_budget`` by the deployment
-    # harness.  ``mem_budget`` is consequently always the activation arena
-    # represented in the binary plan.  The compiler currently uses this for
-    # compressed-weight blocks; it also makes an explicit target scratch
-    # reservation possible without making activation feasibility ambiguous.
-    fast_memory_reserve_bytes: int = 0
+    # Populated by partitioner / CLI. Single source of truth for all tiers.
+    budget: MemoryBudget = field(default_factory=MemoryBudget)
 
     # Physical allocation alignment used by the deployment memory model.
     # 32 bytes is conservative for the currently supported Cortex-M, ESP32-S3,
@@ -168,3 +178,13 @@ class AnalyzedGraph:
 
     # Quantization
     is_quantized: bool = False
+
+    @property
+    def mem_budget(self) -> int:
+        """Activation arena (fast tier). Compatibility accessor over ``budget``."""
+        return self.budget.fast
+
+    @property
+    def fast_memory_reserve_bytes(self) -> int:
+        """Bytes held outside the activation arena. Compat accessor over ``budget``."""
+        return self.budget.fast_reserve

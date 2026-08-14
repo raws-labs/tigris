@@ -426,3 +426,66 @@ def _execution_unit_requirement(
         return tile_plan.tiled_peak_bytes, "minimum spatial tile", False
 
     return stage.peak_bytes, "untiled stage", False
+
+
+@dataclass(frozen=True)
+class SlowMemoryUsage:
+    slow_peak_bytes: int
+    slow_budget: int
+    overflow_stage_ids: tuple[int, ...]
+
+    @property
+    def fits(self) -> bool:
+        return not self.overflow_stage_ids
+
+    def describe(self) -> str:
+        from tigris.utils import fmt_bytes
+        return (
+            f"{len(self.overflow_stage_ids)} stage(s) overflow slow memory "
+            f"({fmt_bytes(self.slow_peak_bytes)} needed, "
+            f"{fmt_bytes(self.slow_budget)} available)"
+        )
+
+
+def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
+    """Slow/PSRAM residency for tiled stages. Empty overflow_stage_ids == fits.
+
+    A stage needs tiling when its peak exceeds the TOTAL fast pool
+    (fast + reserve), so compressed and uncompressed compiles gate identically
+    and match analyze (where reserve is 0).
+    """
+    slow_budget = ag.budget.slow
+    if slow_budget <= 0 or not ag.stages:
+        return SlowMemoryUsage(0, slow_budget, ())
+    fast_total = ag.budget.fast + ag.budget.fast_reserve
+    peak = 0
+    overflow: list[int] = []
+    for s in ag.stages:
+        if s.peak_bytes > fast_total:
+            in_size = sum(
+                ag.tensors[n].size_bytes for n in s.input_tensors
+                if n in ag.tensors
+            )
+            out_size = sum(
+                ag.tensors[n].size_bytes for n in s.output_tensors
+                if n in ag.tensors
+            )
+            stage_slow = in_size + out_size
+            peak = max(peak, stage_slow)
+            if stage_slow > slow_budget:
+                overflow.append(s.stage_id)
+    return SlowMemoryUsage(peak, slow_budget, tuple(overflow))
+
+
+@dataclass(frozen=True)
+class BudgetValidation:
+    fast: MemoryPlanValidation
+    slow: SlowMemoryUsage
+
+    @property
+    def feasible(self) -> bool:
+        return self.fast.feasible and self.slow.fits
+
+
+def validate_budget(ag: AnalyzedGraph) -> BudgetValidation:
+    return BudgetValidation(fast=validate_memory_plan(ag), slow=slow_pool_usage(ag))

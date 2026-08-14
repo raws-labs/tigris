@@ -1,5 +1,6 @@
 """CLI entry point: ``tigris analyze model.onnx --mem 256K``."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import click
@@ -15,6 +16,20 @@ def _parse_size(s: str) -> int:
         if s.endswith(suffix):
             return int(float(s[: -len(suffix)]) * mult)
     return int(s)
+
+
+def _expand_mem(ctx, param, value: tuple[str, ...]) -> tuple[str, ...]:
+    """Expand ``-m 256K+4M`` into separate pools. Sugar for repeated ``-m``."""
+    expanded: list[str] = []
+    for token in value:
+        parts = token.split("+")
+        for part in parts:
+            if not part.strip():
+                raise click.BadParameter(
+                    f"invalid memory budget {token!r}: empty pool around '+'"
+                )
+            expanded.append(part.strip())
+    return tuple(expanded)
 
 
 def _run_pipeline(
@@ -74,7 +89,13 @@ def _run_pipeline(
             ag = partition_spatial(ag)
             ag = detect_and_solve_chains(ag)
 
-    ag.fast_memory_reserve_bytes = fast_reserve_bytes
+    ag.budget = replace(ag.budget, fast_reserve=fast_reserve_bytes)
+
+    slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
+    if len(mem) > 1 and slow_budget <= 0:
+        raise click.ClickException("Slow-memory budget must be greater than zero")
+    ag.budget = replace(ag.budget, slow=slow_budget)
+
     return ag, total_budget
 
 
