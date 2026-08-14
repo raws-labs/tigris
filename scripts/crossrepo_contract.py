@@ -13,6 +13,7 @@ import argparse
 import copy
 import re
 import subprocess
+import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
@@ -28,11 +29,20 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.analysis.validation import validate_memory_plan
 from tigris.capabilities import KERNEL_CAPABILITIES, OP_TYPE_BY_CODE
 from tigris.cli import _run_pipeline
-from tigris.emitters.binary.defs import COMPRESS_LZ4, FLAG_XIP
+from tigris.emitters.binary.defs import (
+    COMPRESS_LZ4,
+    FLAG_XIP,
+    STAGE_FLAG_LINE_BUFFERED,
+)
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
 from tigris.fixtures import build_tcn
 from tigris.graph.ir import Stage
+
+# The byte-level line-buffer flag decoder already exists in the compiler's
+# plan test-suite; reuse it rather than duplicating the stage-record parser.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
+from test_linebuffer_plan import _stage_reserved1  # noqa: E402
 
 
 Array = NDArray[np.generic]
@@ -57,6 +67,8 @@ class ContractCase:
     xip: bool = False
     expect_tiled: bool = False
     expect_chain: bool = False
+    expect_line_buffered: bool = False
+    recompute_metric: bool = False
     force_one_op_stages: bool = False
 
 
@@ -792,6 +804,7 @@ def _tiled_pool_chain_case() -> ContractCase:
         mem_budget="4K",
         expect_tiled=True,
         expect_chain=True,
+        expect_line_buffered=True,
     )
 
 
@@ -963,6 +976,183 @@ def _qdq_case(operator: str) -> ContractCase:
     )
 
 
+def _linebuffer_conv_chain_case() -> ContractCase:
+    """A padded Conv chain compiled tight enough to be line-buffered.
+
+    Three 3x3 stride-1 padded Conv stages each compose a halo of 2 rows, so at
+    a 32K budget the compiler forms a recomputing chain and marks the head
+    line-buffered. The runtime re-derives a tile height of 3 against that
+    budget (22 tiles over an output height of 64, with a partial last tile of
+    one row), so a single execution exercises tile 0, interior tiles, and the
+    partial last tile. The Conv nodes carry an explicit kernel_shape so the
+    compiler's halo analysis sees the real 3x3 receptive field. Drives both the
+    differential parity check and the recompute-reduction metric.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 3, 64, 64]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 8, 64, 64]
+    )
+    rng = np.random.default_rng(7)
+    weights = [
+        numpy_helper.from_array(
+            rng.normal(0.0, 0.05, size=shape).astype(np.float32), name
+        )
+        for name, shape in (
+            ("w0", (4, 3, 3, 3)),
+            ("w1", (4, 4, 3, 3)),
+            ("w2", (8, 4, 3, 3)),
+        )
+    ]
+    nodes = [
+        helper.make_node(
+            "Conv", ["input", "w0"], ["mid0"], pads=[1, 1, 1, 1], kernel_shape=[3, 3]
+        ),
+        helper.make_node(
+            "Conv", ["mid0", "w1"], ["mid1"], pads=[1, 1, 1, 1], kernel_shape=[3, 3]
+        ),
+        helper.make_node(
+            "Conv", ["mid1", "w2"], ["output"], pads=[1, 1, 1, 1], kernel_shape=[3, 3]
+        ),
+    ]
+    model = _model(
+        "linebuffer_conv_chain", nodes, [model_input], [model_output], weights
+    )
+    return ContractCase(
+        "float_linebuffer_conv_chain",
+        model,
+        model,
+        {"input": np.linspace(-1.0, 1.0, 12288, dtype=np.float32).reshape(1, 3, 64, 64)},
+        ("Conv", "Conv", "Conv"),
+        mem_budget="32K",
+        expect_tiled=True,
+        expect_chain=True,
+        expect_line_buffered=True,
+        recompute_metric=True,
+    )
+
+
+def _qdq_conv_chain_case() -> ContractCase:
+    """The int8 twin of the line-buffered Conv chain.
+
+    Three QDQ 3x3 stride-1 padded Conv stages, wrapped exactly as ``_qdq_case``
+    wraps a single Conv, fold to an int8 Conv chain. At an 8K budget the
+    compiler forms the recomputing chain and marks the head line-buffered; the
+    runtime re-derives a tile height of 3 (22 tiles over output height 64, a
+    partial last tile of one row). The int8 ORT reference is the quantized
+    (post-final-QuantizeLinear) tensor, matched to one LSB as ``_qdq_case``
+    does.
+    """
+    input_shape = [1, 3, 64, 64]
+    output_shape = [1, 8, 64, 64]
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, input_shape
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, output_shape
+    )
+    int8_output = helper.make_tensor_value_info(
+        "act_q2", TensorProto.INT8, output_shape
+    )
+
+    initializers: list[onnx.TensorProto] = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "act_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "act_zero_point"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear",
+            ["input", "act_scale", "act_zero_point"],
+            ["input_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["input_q", "act_scale", "act_zero_point"],
+            ["act_0"],
+        ),
+    ]
+    rng = np.random.default_rng(11)
+    channels = ((4, 3), (4, 4), (8, 4))
+    previous = "act_0"
+    for index, (out_channels, in_channels) in enumerate(channels):
+        weight_name = f"w{index}"
+        weight_scale = f"w_scale{index}"
+        weight_zero = f"w_zero{index}"
+        initializers.extend(
+            [
+                numpy_helper.from_array(
+                    rng.normal(
+                        0.0, 0.05, size=(out_channels, in_channels, 3, 3)
+                    ).astype(np.float32),
+                    weight_name,
+                ),
+                numpy_helper.from_array(
+                    np.array([0.02], dtype=np.float32), weight_scale
+                ),
+                numpy_helper.from_array(np.array([0], dtype=np.int8), weight_zero),
+            ]
+        )
+        activation = "output" if index == len(channels) - 1 else f"act_{index + 1}"
+        int8_activation = f"act_q{index}"
+        nodes.extend(
+            [
+                helper.make_node(
+                    "QuantizeLinear",
+                    [weight_name, weight_scale, weight_zero],
+                    [f"w_q{index}"],
+                ),
+                helper.make_node(
+                    "DequantizeLinear",
+                    [f"w_q{index}", weight_scale, weight_zero],
+                    [f"w_dq{index}"],
+                ),
+                helper.make_node(
+                    "Conv",
+                    [previous, f"w_dq{index}"],
+                    [f"conv{index}"],
+                    pads=[1, 1, 1, 1],
+                    kernel_shape=[3, 3],
+                ),
+                helper.make_node(
+                    "QuantizeLinear",
+                    [f"conv{index}", "act_scale", "act_zero_point"],
+                    [int8_activation],
+                ),
+                helper.make_node(
+                    "DequantizeLinear",
+                    [int8_activation, "act_scale", "act_zero_point"],
+                    [activation],
+                ),
+            ]
+        )
+        previous = activation
+
+    compile_model = _model(
+        "qdq_conv_chain", nodes, [model_input], [model_output], initializers
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+    return ContractCase(
+        "int8_linebuffer_conv_chain",
+        compile_model,
+        reference_model,
+        {
+            "input": np.linspace(
+                -1.0, 1.0, 3 * 64 * 64, dtype=np.float32
+            ).reshape(1, 3, 64, 64)
+        },
+        ("Conv", "Conv", "Conv"),
+        mem_budget="8K",
+        expect_tiled=True,
+        expect_chain=True,
+        expect_line_buffered=True,
+        recompute_metric=True,
+    )
+
+
 def _to_runtime_layout(value: Array) -> Array:
     if value.ndim == 4:
         return np.ascontiguousarray(value.transpose(0, 2, 3, 1))
@@ -1022,8 +1212,10 @@ def _compile_plan(
         details = "; ".join(issue.describe() for issue in validation.issues)
         raise AssertionError(f"compiler produced an infeasible graph: {details}")
     emit_binary(graph, plan_path, compress=compression, xip=xip)
-    plan = read_binary_plan(plan_path.read_bytes())
+    plan_bytes = plan_path.read_bytes()
+    plan = read_binary_plan(plan_bytes)
     plan["_compiler_scheduled_peak"] = validation.scheduled_peak_bytes
+    plan["_plan_bytes"] = plan_bytes
     return plan
 
 
@@ -1157,7 +1349,13 @@ def _assert_memory_contract(
         )
 
 
-def _build_runner(runtime: Path, build_dir: Path) -> Path:
+def _build_runner(runtime: Path, build_dir: Path) -> tuple[Path, Path]:
+    """Build the default and rows-instrumented contract runners.
+
+    The rows-instrumented runner compiles the runtime sources with
+    TIGRIS_COUNT_KERNEL_ROWS so the gate can read kernel output-row counts. The
+    default runner and the shipping library stay free of that test-only counter.
+    """
     _run(
         [
             "cmake",
@@ -1176,11 +1374,122 @@ def _build_runner(runtime: Path, build_dir: Path) -> Path:
             str(build_dir),
             "--target",
             "tigris_contract_runner",
+            "tigris_contract_runner_rows",
             "--parallel",
         ],
         "runtime contract-runner build",
     )
-    return build_dir / "tigris_contract_runner"
+    return (
+        build_dir / "tigris_contract_runner",
+        build_dir / "tigris_contract_runner_rows",
+    )
+
+
+_ROWS_REPORT = re.compile(
+    r"^TIGRIS_CONTRACT_ROWS kernel_rows=(\d+) chain_tiles=(\d+) "
+    r"chain_tile_h=(\d+) interior_clamps=(\d+)$",
+    re.MULTILINE,
+)
+
+
+def _parse_rows(case: ContractCase, runtime_stdout: str) -> dict[str, int]:
+    match = _ROWS_REPORT.search(runtime_stdout)
+    if match is None:
+        raise AssertionError(f"{case.name}: rows runner emitted no row report")
+    keys = ("kernel_rows", "chain_tiles", "chain_tile_h", "interior_clamps")
+    return {key: int(value) for key, value in zip(keys, match.groups())}
+
+
+def _run_metric_case(
+    case: ContractCase, rows_runner: Path, work_dir: Path
+) -> None:
+    """Prove the line-buffered roll matches ORT and computes fewer kernel rows.
+
+    Compiles the (asserted line-buffered) plan once, then executes it through
+    the rows-instrumented runner twice: normally (roll on) and with
+    ``--no-linebuffer`` (the recompute path). Both runs must match ONNX Runtime,
+    and the roll must reduce total kernel output-rows, approaching the unique
+    output-row count. The reduction ratio is the headline metric.
+    """
+    case_dir = work_dir / case.name
+    case_dir.mkdir()
+    compile_path = case_dir / "compile.onnx"
+    reference_path = case_dir / "reference.onnx"
+    plan_path = case_dir / "model.tgrs"
+    inputs_path = case_dir / "inputs.bin"
+    onnx.save(case.compile_model, compile_path)
+    onnx.save(case.reference_model, reference_path)
+
+    plan = _compile_plan(
+        compile_path,
+        plan_path,
+        mem_budget=case.mem_budget,
+        compression=case.compression,
+        xip=case.xip,
+    )
+    _assert_plan_mode(case, plan)
+    session = ort.InferenceSession(
+        str(reference_path), providers=["CPUExecutionProvider"]
+    )
+    reference_outputs = session.run(None, case.inputs)
+    inputs_path.write_bytes(_pack_inputs(plan, case.inputs))
+    limit = str(plan["_compiler_scheduled_peak"])
+
+    def _execute(extra_args: list[str], label: str) -> dict[str, int]:
+        outputs_path = case_dir / f"outputs_{label}.bin"
+        completed = _run(
+            [str(rows_runner), str(plan_path), str(inputs_path), str(outputs_path), limit]
+            + extra_args,
+            f"{case.name} rows-runner ({label})",
+        )
+        if label == "linebuffered":
+            _assert_memory_contract(case, plan, completed.stdout)
+        actual_outputs = _decode_outputs(
+            plan, outputs_path.read_bytes(), reference_outputs
+        )
+        _assert_output_parity(actual_outputs, reference_outputs)
+        return _parse_rows(case, completed.stdout)
+
+    rows_on = _execute([], "linebuffered")
+    rows_off = _execute(["--no-linebuffer"], "recompute")
+
+    # Model output height (ONNX NCHW reference); the runtime tiles the height.
+    out_h = int(reference_outputs[0].shape[2])
+    tiles = rows_on["chain_tiles"]
+    tile_h = rows_on["chain_tile_h"]
+    if tiles < 3:
+        raise AssertionError(
+            f"{case.name}: chain produced {tiles} tiles, need >= 3 so tile 0, "
+            f"an interior tile, and a last tile all run"
+        )
+    if tile_h <= 0 or out_h % tile_h == 0:
+        raise AssertionError(
+            f"{case.name}: output height {out_h} is not partial against tile "
+            f"height {tile_h}; the last tile must be partial"
+        )
+    if rows_off["chain_tiles"] != tiles or rows_off["chain_tile_h"] != tile_h:
+        raise AssertionError(
+            f"{case.name}: recompute run tiled differently "
+            f"({rows_off['chain_tiles']}x{rows_off['chain_tile_h']}) than the "
+            f"line-buffered run ({tiles}x{tile_h})"
+        )
+    if not (rows_on["kernel_rows"] > 0 and rows_off["kernel_rows"] > 0):
+        raise AssertionError(f"{case.name}: row counter recorded no work")
+    if rows_on["kernel_rows"] >= rows_off["kernel_rows"]:
+        raise AssertionError(
+            f"{case.name}: line-buffered kernel rows "
+            f"{rows_on['kernel_rows']} did not drop below recompute "
+            f"{rows_off['kernel_rows']}"
+        )
+
+    unique_rows = len(case.expected_operators) * out_h
+    ratio = rows_off["kernel_rows"] / rows_on["kernel_rows"]
+    print(
+        f"PASS {case.name} recompute-reduction "
+        f"rows_on={rows_on['kernel_rows']} rows_off={rows_off['kernel_rows']} "
+        f"ratio={ratio:.3f}x unique_rows={unique_rows} "
+        f"tiles={tiles} tile_h={tile_h} last_tile_h={out_h - (tiles - 1) * tile_h}"
+    )
 
 
 def _run_case(
@@ -1224,6 +1533,14 @@ def _run_case(
     actual_outputs = _decode_outputs(
         plan, outputs_path.read_bytes(), reference_outputs
     )
+    _assert_output_parity(actual_outputs, reference_outputs)
+    print(f"PASS {case.name} memory-contract")
+    return plan_path
+
+
+def _assert_output_parity(
+    actual_outputs: list[Array], reference_outputs: list[Array]
+) -> None:
     for actual, expected in zip(actual_outputs, reference_outputs):
         if np.issubdtype(expected.dtype, np.floating):
             np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
@@ -1235,8 +1552,6 @@ def _run_case(
             np.testing.assert_allclose(
                 actual, expected, rtol=0, atol=_INT8_LSB_TOLERANCE
             )
-    print(f"PASS {case.name} memory-contract")
-    return plan_path
 
 
 def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
@@ -1262,6 +1577,22 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
         raise AssertionError(f"{case.name}: tiled={tiled}, expected {case.expect_tiled}")
     if chained != case.expect_chain:
         raise AssertionError(f"{case.name}: chained={chained}, expected {case.expect_chain}")
+
+    # Decode the head-stage line-buffer flag straight from the emitted plan
+    # bytes (a recomputing chain marks only its head, where chain_id equals the
+    # stage's own index). This makes "is actually line-buffered" a checked
+    # precondition of the differential rather than an assumption.
+    plan_bytes = plan["_plan_bytes"]
+    line_buffered = any(
+        _stage_reserved1(plan_bytes, index) & STAGE_FLAG_LINE_BUFFERED
+        for index, stage in enumerate(plan["stages"])
+        if stage["chain_len"] >= 2 and stage["chain_id"] == index
+    )
+    if line_buffered != case.expect_line_buffered:
+        raise AssertionError(
+            f"{case.name}: line_buffered={line_buffered}, expected "
+            f"{case.expect_line_buffered}"
+        )
     if case.compression == "lz4":
         if plan["weight_blocks_compression"] != COMPRESS_LZ4:
             raise AssertionError(f"{case.name}: expected LZ4 weight blocks")
@@ -1430,6 +1761,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_chain_case(xip=True),
         _qdq_case("Conv"),
         _qdq_case("AveragePool"),
+        _linebuffer_conv_chain_case(),
+        _qdq_conv_chain_case(),
     ]
     covered_operators = {
         operator for case in cases for operator in case.expected_operators
@@ -1446,10 +1779,16 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         f"{len(covered_operators)}/{len(supported_operators)}"
     )
 
-    runner = _build_runner(runtime, work_dir / "runtime-build")
-    first_plan = _run_case(cases[0], runner, work_dir)
-    for case in cases[1:]:
-        _run_case(case, runner, work_dir)
+    runner, rows_runner = _build_runner(runtime, work_dir / "runtime-build")
+    first_plan: Path | None = None
+    for case in cases:
+        if case.recompute_metric:
+            _run_metric_case(case, rows_runner, work_dir)
+        else:
+            plan_path = _run_case(case, runner, work_dir)
+            if first_plan is None:
+                first_plan = plan_path
+    assert first_plan is not None, "gate needs at least one non-metric case"
     _assert_compile_rejected(work_dir)
     _assert_runtime_rejects_incompatible_plan(runner, first_plan, work_dir)
 
