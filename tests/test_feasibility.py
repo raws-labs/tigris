@@ -102,7 +102,10 @@ def test_compile_refuses_unsafe_height_tiling_but_keeps_untiled_support(
 
 
 def test_minimum_tile_that_exceeds_budget_is_infeasible(conv_relu_chain_path):
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("1K",))
+    # 300 bytes is below the 1x1 2D core for either stage (halo 2x2, so a
+    # 2D tile solve is attempted once the 1D single-row tile also overflows;
+    # it correctly reports infeasible here too, not just the 1D fallback).
+    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
 
     validation = validate_memory_plan(graph)
 
@@ -112,7 +115,7 @@ def test_minimum_tile_that_exceeds_budget_is_infeasible(conv_relu_chain_path):
 
 
 def test_findings_never_pass_when_scheduled_peak_exceeds_budget(conv_relu_chain_path):
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("1K",))
+    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
 
     findings = compute_findings(graph)
 
@@ -128,7 +131,9 @@ def test_compile_refuses_infeasible_plan_without_creating_output(
 
     result = CliRunner().invoke(
         cli,
-        ["compile", str(conv_relu_chain_path), "-m", "1K", "-o", str(output)],
+        # 300 bytes stays below the 1x1 2D core too; see
+        # test_minimum_tile_that_exceeds_budget_is_infeasible.
+        ["compile", str(conv_relu_chain_path), "-m", "300", "-o", str(output)],
     )
 
     assert result.exit_code != 0
@@ -175,7 +180,7 @@ def test_compile_rejects_budget_above_plan_format_limit(
 
 
 def test_writer_defensively_rejects_infeasible_graph(conv_relu_chain_path):
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("1K",))
+    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
 
     with pytest.raises(ValueError, match="Cannot emit an infeasible memory plan"):
         emit_binary_bytes(graph)
@@ -206,7 +211,7 @@ def test_feasible_plan_still_compiles(conv_relu_chain_path, tmp_path):
 def test_analyze_displays_failing_verdict(conv_relu_chain_path):
     result = CliRunner().invoke(
         cli,
-        ["analyze", str(conv_relu_chain_path), "-m", "1K"],
+        ["analyze", str(conv_relu_chain_path), "-m", "300"],
     )
 
     assert result.exit_code == 0
