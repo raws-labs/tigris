@@ -1,6 +1,7 @@
 """Tests for C harness generation and XIP plan metadata."""
 
 import struct
+from unittest.mock import patch
 
 import numpy as np
 import onnx
@@ -12,6 +13,7 @@ from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import partition_spatial
 from tigris.analysis.partition_temporal import partition_temporal
+from tigris.analysis.validation import OperatorSupportValidation
 from tigris.cli import cli
 from tigris.emitters.binary.defs import (
     FLAG_XIP,
@@ -125,7 +127,19 @@ def quantized_matmul_plan(tmp_path):
     assert [op.op_type for op in analyzed.ops] == ["MatMul"]
 
     plan_path = tmp_path / "quantized_matmul.tgrs"
-    plan_path.write_bytes(emit_binary_bytes(analyzed))
+    # MatMul has no runtime route on any backend, so validate_operator_support
+    # now correctly rejects it at compile time (the fail-closed gate this
+    # fixture predates). This fixture exists to exercise codegen's own,
+    # separate defense-in-depth capability check against an already-serialized
+    # plan (the same check that also guards a plan compiled by an older
+    # toolchain version), so bypass only the compile-time gate to construct
+    # the plan bytes; codegen's check below is untouched and still runs for
+    # real.
+    with patch(
+        "tigris.analysis.validation.validate_operator_support",
+        return_value=OperatorSupportValidation(issues=()),
+    ):
+        plan_path.write_bytes(emit_binary_bytes(analyzed))
     return plan_path
 
 
