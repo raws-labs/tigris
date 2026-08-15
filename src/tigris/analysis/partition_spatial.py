@@ -175,13 +175,18 @@ def solve_2d_tile(
 
     Mirrors the 1D proportional model already used for HEIGHT_OR_LENGTH in
     partition_spatial(): ``tile_h = floor(budget*input_h/peak) - halo`` and
-    ``tiled_peak = int(peak * (tile_h + halo) / input_h)``. The stage's whole
-    peak_bytes (weights/bias/scratch included, which stay resident whole and
-    do not scale with tile size) is scaled by the fraction of the haloed
-    input area the tile covers:
+    ``tiled_peak = int(peak * (tile_h + halo) / input_h)``. ``peak`` is the
+    stage's activation-only peak_bytes (compute_lifetimes skips constant
+    tensors, so weights/bias are never counted there); it is scaled by the
+    fraction of the haloed input area the tile covers:
 
         tiled_peak(th, tw) = int(peak * (th + halo_h) * (tw + halo_w)
                                   / (input_h * input_w))
+
+    Neither this solver nor the 1D one models resident weight/scratch bytes
+    against the tiled budget; that is a known pre-existing gap, and the
+    runtime backstops it by validating the emitted tile shape against the
+    real fast arena and failing closed.
 
     Returns None if even a 1x1 core tile does not fit.
     """
@@ -413,7 +418,11 @@ def _op_supports_axis(op: OpNode, axis: int) -> bool:
         return op.op_type in _OP_CATEGORY
     if axis == TILE_AXIS_HW:
         # Rank-4 spatial/pointwise/channel-Concat set only; Conv1D is rank-3
-        # and has no width axis to tile.
+        # and has no width axis to tile, even though it shares the CONV
+        # category with Conv in _OP_CATEGORY, so it must be excluded here
+        # explicitly rather than relying on the membership check alone.
+        if op.op_type == "Conv1D":
+            return False
         return op.op_type in _OP_CATEGORY
     return False
 
