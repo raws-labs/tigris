@@ -859,8 +859,14 @@ def _tiled_chain_case(*, compression: str | None = None, xip: bool = False) -> C
 
 
 def _qdq_case(operator: str) -> ContractCase:
-    """Build a QDQ Conv or AveragePool model with an int8 ORT reference."""
-    output_shape = [1, 1, 4, 4] if operator == "Conv" else [1, 1, 2, 2]
+    """Build a QDQ Conv, ConvTranspose, or AveragePool model with an int8 ORT reference."""
+    if operator == "Conv":
+        output_shape = [1, 1, 4, 4]
+    elif operator == "ConvTranspose":
+        # stride 2, kernel 2, pad 0: 2 * (4 - 1) + 2 = 8 on each spatial axis.
+        output_shape = [1, 1, 8, 8]
+    else:
+        output_shape = [1, 1, 2, 2]
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 1, 4, 4]
     )
@@ -927,6 +933,43 @@ def _qdq_case(operator: str) -> ContractCase:
                 helper.make_node("Conv", ["input_dq", "weight_dq"], ["raw"]),
             ]
         )
+    elif operator == "ConvTranspose":
+        # ONNX ConvTranspose weight is [C_in, C_out, kH, kW]; here 1 -> 1 with a
+        # 2x2 kernel, stride 2, pad 0, group 1. Weight values are exact
+        # multiples of the weight scale so the fake-quant is lossless.
+        weight = numpy_helper.from_array(
+            np.array([[[[0.5, -0.25], [0.25, 0.75]]]], dtype=np.float32), "weight"
+        )
+        weight_scale = numpy_helper.from_array(
+            np.array([0.25], dtype=np.float32), "weight_scale"
+        )
+        weight_zero_point = numpy_helper.from_array(
+            np.array([0], dtype=np.int8), "weight_zero_point"
+        )
+        initializers.extend([weight, weight_scale, weight_zero_point])
+        nodes.extend(
+            [
+                helper.make_node(
+                    "QuantizeLinear",
+                    ["weight", "weight_scale", "weight_zero_point"],
+                    ["weight_q"],
+                ),
+                helper.make_node(
+                    "DequantizeLinear",
+                    ["weight_q", "weight_scale", "weight_zero_point"],
+                    ["weight_dq"],
+                ),
+                helper.make_node(
+                    "ConvTranspose",
+                    ["input_dq", "weight_dq"],
+                    ["raw"],
+                    kernel_shape=[2, 2],
+                    strides=[2, 2],
+                    pads=[0, 0, 0, 0],
+                    group=1,
+                ),
+            ]
+        )
     else:
         nodes.append(
             helper.make_node(
@@ -977,6 +1020,110 @@ def _qdq_case(operator: str) -> ContractCase:
         reference_model,
         {"input": input_data},
         (operator,),
+    )
+
+
+def _convtranspose_case() -> ContractCase:
+    """A standalone float ConvTranspose upsampler (stride 2, kernel 2, pad 0).
+
+    The ONNX ConvTranspose weight is [C_in, C_out, kH, kW]; the compiler
+    transposes it to the runtime's OHWI layout. Output height/width follow the
+    standard relation stride * (in - 1) + kernel - pad_begin - pad_end, so a
+    4x4 input upsamples to 8x8. The compile and ORT reference models are
+    identical, as in the other single-operator float cases.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, 8, 8]
+    )
+    rng = np.random.default_rng(19)
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(2, 3, 2, 2)).astype(np.float32), "weights"
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(3,)).astype(np.float32), "bias"
+    )
+    model = _model(
+        "convtranspose",
+        [
+            helper.make_node(
+                "ConvTranspose",
+                ["input", "weights", "bias"],
+                ["output"],
+                kernel_shape=[2, 2],
+                strides=[2, 2],
+                pads=[0, 0, 0, 0],
+                group=1,
+            )
+        ],
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+    return ContractCase(
+        "float_convtranspose",
+        model,
+        model,
+        {"input": rng.uniform(-1.0, 1.0, size=(1, 2, 4, 4)).astype(np.float32)},
+        ("ConvTranspose",),
+    )
+
+
+def _conv_then_convtranspose_case() -> ContractCase:
+    """A strided Conv downsampler feeding a ConvTranspose upsampler.
+
+    Conv (stride 2, kernel 2, pad 0) halves an 8x8 input to 4x4, then
+    ConvTranspose (stride 2, kernel 2, pad 0) restores 8x8: the encoder-then-
+    upsample shape that motivates ConvTranspose support. Both stages keep
+    group 1 so the Conv is not relabeled DepthwiseConv.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 8, 8]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 1, 8, 8]
+    )
+    rng = np.random.default_rng(23)
+    conv_weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(2, 1, 2, 2)).astype(np.float32), "conv_weights"
+    )
+    convt_weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(2, 1, 2, 2)).astype(np.float32), "convt_weights"
+    )
+    model = _model(
+        "conv_then_convtranspose",
+        [
+            helper.make_node(
+                "Conv",
+                ["input", "conv_weights"],
+                ["mid"],
+                kernel_shape=[2, 2],
+                strides=[2, 2],
+                pads=[0, 0, 0, 0],
+                group=1,
+            ),
+            helper.make_node(
+                "ConvTranspose",
+                ["mid", "convt_weights"],
+                ["output"],
+                kernel_shape=[2, 2],
+                strides=[2, 2],
+                pads=[0, 0, 0, 0],
+                group=1,
+            ),
+        ],
+        [model_input],
+        [model_output],
+        [conv_weights, convt_weights],
+    )
+    return ContractCase(
+        "float_conv_then_convtranspose",
+        model,
+        model,
+        {"input": rng.uniform(-1.0, 1.0, size=(1, 1, 8, 8)).astype(np.float32)},
+        ("Conv", "ConvTranspose"),
     )
 
 
@@ -2059,6 +2206,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_chain_case(xip=True),
         _qdq_case("Conv"),
         _qdq_case("AveragePool"),
+        _convtranspose_case(),
+        _conv_then_convtranspose_case(),
+        _qdq_case("ConvTranspose"),
         _linebuffer_conv_chain_case(),
         _qdq_conv_chain_case(),
         _2d_tiled_conv_case(),

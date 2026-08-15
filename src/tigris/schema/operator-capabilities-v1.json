@@ -350,10 +350,10 @@
       "opcode": 24,
       "operator": "ConvTranspose",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
-        "reference": "unsupported",
-        "s8_ref": "unsupported"
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
       }
     },
     {

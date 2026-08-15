@@ -34,6 +34,7 @@ class KernelCapabilities:
 
 _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Conv",
+    "ConvTranspose",
     "DepthwiseConv",
     "Relu",
     "Relu6",
