@@ -1127,6 +1127,176 @@ def _conv_then_convtranspose_case() -> ContractCase:
     )
 
 
+def _convtranspose_overlap_case() -> ContractCase:
+    """A float ConvTranspose whose kernel exceeds its stride, so multiple taps
+    overlap-and-sum into each output pixel.
+
+    A 4x4 kernel with stride 2 and pad 1 is the classic U-Net upsampler:
+    output = stride * (in - 1) + kernel - pad_begin - pad_end = 2 * in, so a
+    4x4 input doubles to 8x8. Because kernel (4) exceeds stride (2), up to two
+    taps per axis (four total) accumulate into one output pixel, exercising the
+    gather kernel's multi-tap accumulation against the ORT oracle rather than
+    the single-tap stride==kernel path the other ConvTranspose cases cover.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, 8, 8]
+    )
+    rng = np.random.default_rng(29)
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(2, 3, 4, 4)).astype(np.float32), "weights"
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(3,)).astype(np.float32), "bias"
+    )
+    model = _model(
+        "convtranspose_overlap",
+        [
+            helper.make_node(
+                "ConvTranspose",
+                ["input", "weights", "bias"],
+                ["output"],
+                kernel_shape=[4, 4],
+                strides=[2, 2],
+                pads=[1, 1, 1, 1],
+                group=1,
+            )
+        ],
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+    return ContractCase(
+        "float_convtranspose_overlap",
+        model,
+        model,
+        {"input": rng.uniform(-1.0, 1.0, size=(1, 2, 4, 4)).astype(np.float32)},
+        ("ConvTranspose",),
+    )
+
+
+def _qdq_convtranspose_per_channel_case() -> ContractCase:
+    """Per-channel int8 QDQ ConvTranspose with multiple output channels.
+
+    ONNX ConvTranspose weight is [C_in, C_out, kH, kW], so per-output-channel
+    weight quantization uses axis=1 with a length-C_out scale vector, NOT
+    axis=0 as for Conv (whose weight is [C_out, C_in, kH, kW]). This case uses
+    C_in=2, C_out=3 with a distinct per-channel weight scale so a wrong
+    output-channel axis anywhere in the int8 requant path (the effective-scale
+    indexing) would diverge from the ORT reference beyond one LSB. Matched to
+    one LSB like the other int8 cases.
+    """
+    c_in, c_out = 2, 3
+    input_shape = [1, c_in, 4, 4]
+    output_shape = [1, c_out, 8, 8]
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, input_shape
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, output_shape
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, output_shape
+    )
+
+    rng = np.random.default_rng(31)
+    input_scale = numpy_helper.from_array(
+        np.array([0.25], dtype=np.float32), "input_scale"
+    )
+    input_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "input_zero_point"
+    )
+    output_scale = numpy_helper.from_array(
+        np.array([0.05], dtype=np.float32), "output_scale"
+    )
+    output_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "output_zero_point"
+    )
+    weight = numpy_helper.from_array(
+        rng.normal(0.0, 0.2, size=(c_in, c_out, 2, 2)).astype(np.float32), "weight"
+    )
+    # Per output channel (axis=1): one scale and zero-point per C_out. The
+    # scales differ per channel so a swapped axis mismatches every channel.
+    weight_scale = numpy_helper.from_array(
+        np.array([0.02, 0.03, 0.015], dtype=np.float32), "weight_scale"
+    )
+    weight_zero_point = numpy_helper.from_array(
+        np.zeros(c_out, dtype=np.int8), "weight_zero_point"
+    )
+    initializers = [
+        input_scale,
+        input_zero_point,
+        output_scale,
+        output_zero_point,
+        weight,
+        weight_scale,
+        weight_zero_point,
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear",
+            ["input", "input_scale", "input_zero_point"],
+            ["input_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["input_q", "input_scale", "input_zero_point"],
+            ["input_dq"],
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["weight", "weight_scale", "weight_zero_point"],
+            ["weight_q"],
+            axis=1,
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["weight_q", "weight_scale", "weight_zero_point"],
+            ["weight_dq"],
+            axis=1,
+        ),
+        helper.make_node(
+            "ConvTranspose",
+            ["input_dq", "weight_dq"],
+            ["raw"],
+            kernel_shape=[2, 2],
+            strides=[2, 2],
+            pads=[0, 0, 0, 0],
+            group=1,
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["raw", "output_scale", "output_zero_point"],
+            ["output_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["output_q", "output_scale", "output_zero_point"],
+            ["output"],
+        ),
+    ]
+    compile_model = _model(
+        "qdq_convtranspose_per_channel",
+        nodes,
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+    return ContractCase(
+        "int8_convtranspose_per_channel",
+        compile_model,
+        reference_model,
+        {"input": rng.uniform(-1.0, 1.0, size=input_shape).astype(np.float32)},
+        ("ConvTranspose",),
+    )
+
+
 def _linebuffer_conv_chain_case() -> ContractCase:
     """A padded Conv chain compiled tight enough to be line-buffered.
 
@@ -2208,7 +2378,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _qdq_case("AveragePool"),
         _convtranspose_case(),
         _conv_then_convtranspose_case(),
+        _convtranspose_overlap_case(),
         _qdq_case("ConvTranspose"),
+        _qdq_convtranspose_per_channel_case(),
         _linebuffer_conv_chain_case(),
         _qdq_conv_chain_case(),
         _2d_tiled_conv_case(),
