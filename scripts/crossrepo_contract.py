@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import re
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from click import ClickException
 from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
+from tigris import TILE_AXIS_HW
 from tigris.analysis.validation import validate_memory_plan
 from tigris.capabilities import KERNEL_CAPABILITIES, OP_TYPE_BY_CODE
 from tigris.cli import _run_pipeline
@@ -43,6 +45,7 @@ from tigris.graph.ir import Stage
 # plan test-suite; reuse it rather than duplicating the stage-record parser.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 from test_linebuffer_plan import _stage_reserved1  # noqa: E402
+from test_2d_tiling_plan import decode_first_tile_plan  # noqa: E402
 
 
 Array = NDArray[np.generic]
@@ -68,6 +71,7 @@ class ContractCase:
     expect_tiled: bool = False
     expect_chain: bool = False
     expect_line_buffered: bool = False
+    expect_2d: bool = False
     recompute_metric: bool = False
     force_one_op_stages: bool = False
 
@@ -1153,6 +1157,275 @@ def _qdq_conv_chain_case() -> ContractCase:
     )
 
 
+def build_conv(
+    *,
+    n: int,
+    c_in: int,
+    c_out: int,
+    h: int,
+    w: int,
+    kernel: int,
+    stride: int,
+    pad: int,
+    seed: int = 0,
+) -> tuple[onnx.ModelProto, onnx.ModelProto, dict[str, Array]]:
+    """A single float32 Conv on an NCHW activation.
+
+    The compile model and the ORT reference model are identical (as in
+    _tiled_pool_case and _dilated_conv_case); only random weights and a
+    uniform input distinguish instances at different resolutions.
+    """
+    out_h = (h + 2 * pad - kernel) // stride + 1
+    out_w = (w + 2 * pad - kernel) // stride + 1
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [n, c_in, h, w]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [n, c_out, out_h, out_w]
+    )
+    rng = np.random.default_rng(seed)
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c_out, c_in, kernel, kernel)).astype(
+            np.float32
+        ),
+        "weights",
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c_out,)).astype(np.float32), "bias"
+    )
+    model = _model(
+        "conv2d",
+        [
+            helper.make_node(
+                "Conv",
+                ["input", "weights", "bias"],
+                ["output"],
+                name="conv0",
+                kernel_shape=[kernel, kernel],
+                strides=[stride, stride],
+                pads=[pad, pad, pad, pad],
+            )
+        ],
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+    inputs = {
+        "input": rng.uniform(-1.0, 1.0, size=(n, c_in, h, w)).astype(
+            np.float32
+        )
+    }
+    return model, model, inputs
+
+
+def _2d_tiled_conv_case() -> ContractCase:
+    """A high-res Conv whose 1D height-only tile is infeasible at the budget
+    but a 2D (H and W) tile fits.
+
+    Input NCHW [1, 64, 66, 66], a 3x3 stride-1 pad-1 Conv to [1, 64, 66, 66],
+    at a 24K fast budget. 64 float32 channels give the same 256 bytes per
+    pixel as the int8 sibling's 256 channels, so the compiler solves the same
+    4x5 core tile. 66 is not divisible by 4 or 5, so the last row, the last
+    column, and the bottom-right corner tile are all partial.
+
+    Height-only tiling is infeasible first: partition_spatial only attempts
+    the 2D solve after its 1D tile_h == 1 candidate still exceeds budget, so
+    an emitted axis == TILE_AXIS_HW plan is itself proof the 1D path failed
+    closed at this budget.
+    """
+    compile_model, reference_model, inputs = build_conv(
+        n=1, c_in=64, c_out=64, h=66, w=66, kernel=3, stride=1, pad=1
+    )
+    return ContractCase(
+        "float_2d_tiled_conv",
+        compile_model,
+        reference_model,
+        inputs,
+        expected_operators=("Conv",),
+        mem_budget="24K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
+def _qdq_2d_tiled_conv_case() -> ContractCase:
+    """The int8 sibling of _2d_tiled_conv_case, built via the _qdq_case QDQ
+    pattern: input NCHW [1, 256, 66, 66], a 3x3 stride-1 pad-1 Conv, 24K
+    budget. 256 int8 channels give the same per-pixel byte footprint as the
+    float case's 64 float32 channels, so the compiler solves the same 4x5
+    2D core tile with the same partial last row, column, and corner.
+    """
+    h = w = 66
+    c = 256
+    kernel, stride, pad = 3, 1, 1
+    out_h = (h + 2 * pad - kernel) // stride + 1
+    out_w = (w + 2 * pad - kernel) // stride + 1
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, c, h, w]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, c, out_h, out_w]
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, [1, c, out_h, out_w]
+    )
+
+    rng = np.random.default_rng(3)
+    input_scale = numpy_helper.from_array(
+        np.array([0.02], dtype=np.float32), "input_scale"
+    )
+    input_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "input_zero_point"
+    )
+    output_scale = numpy_helper.from_array(
+        np.array([0.05], dtype=np.float32), "output_scale"
+    )
+    output_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "output_zero_point"
+    )
+    weight = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c, c, kernel, kernel)).astype(
+            np.float32
+        ),
+        "weight",
+    )
+    weight_scale = numpy_helper.from_array(
+        np.array([0.01], dtype=np.float32), "weight_scale"
+    )
+    weight_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "weight_zero_point"
+    )
+    initializers = [
+        input_scale,
+        input_zero_point,
+        output_scale,
+        output_zero_point,
+        weight,
+        weight_scale,
+        weight_zero_point,
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear",
+            ["input", "input_scale", "input_zero_point"],
+            ["input_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["input_q", "input_scale", "input_zero_point"],
+            ["input_dq"],
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["weight", "weight_scale", "weight_zero_point"],
+            ["weight_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["weight_q", "weight_scale", "weight_zero_point"],
+            ["weight_dq"],
+        ),
+        helper.make_node(
+            "Conv",
+            ["input_dq", "weight_dq"],
+            ["raw"],
+            name="conv0",
+            kernel_shape=[kernel, kernel],
+            strides=[stride, stride],
+            pads=[pad, pad, pad, pad],
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["raw", "output_scale", "output_zero_point"],
+            ["output_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["output_q", "output_scale", "output_zero_point"],
+            ["output"],
+        ),
+    ]
+    compile_model = _model(
+        "qdq_2d_tiled_conv", nodes, [model_input], [model_output], initializers
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+
+    input_data = rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32)
+    return ContractCase(
+        "int8_2d_tiled_conv",
+        compile_model,
+        reference_model,
+        {"input": input_data},
+        ("Conv",),
+        mem_budget="24K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
+def _2d_tiled_conv_sigmoid_case() -> ContractCase:
+    """Conv followed by a non-fused pointwise Sigmoid, both forced 2D at the
+    same 24K/66x66/64-channel geometry as _2d_tiled_conv_case.
+
+    Relu/Relu6 fuse into the Conv at compile time, so this uses Sigmoid to
+    keep the pointwise op a standalone stage. At this budget the row-based
+    (full-width) chain streamer cannot fit even one row, so Conv and Sigmoid
+    stay as two independent stages, each solving its own 4x5 HW tile; the
+    Sigmoid stage exercises the 2D executor running a pointwise op on a
+    packed (non-full-width) tile, closing the Task 7 coverage gap.
+    """
+    h = w = 66
+    c = 64
+    kernel, stride, pad = 3, 1, 1
+    rng = np.random.default_rng(5)
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, c, h, w]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, c, h, w]
+    )
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c, c, kernel, kernel)).astype(
+            np.float32
+        ),
+        "weights",
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c,)).astype(np.float32), "bias"
+    )
+    nodes = [
+        helper.make_node(
+            "Conv",
+            ["input", "weights", "bias"],
+            ["conv_out"],
+            name="conv0",
+            kernel_shape=[kernel, kernel],
+            strides=[stride, stride],
+            pads=[pad, pad, pad, pad],
+        ),
+        helper.make_node("Sigmoid", ["conv_out"], ["output"]),
+    ]
+    model = _model(
+        "conv_sigmoid_2d", nodes, [model_input], [model_output], [weights, bias]
+    )
+    inputs = {
+        "input": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32)
+    }
+    return ContractCase(
+        "float_2d_tiled_conv_sigmoid",
+        model,
+        model,
+        inputs,
+        expected_operators=("Conv", "Sigmoid"),
+        mem_budget="24K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
 def _to_runtime_layout(value: Array) -> Array:
     if value.ndim == 4:
         return np.ascontiguousarray(value.transpose(0, 2, 3, 1))
@@ -1593,6 +1866,31 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
             f"{case.name}: line_buffered={line_buffered}, expected "
             f"{case.expect_line_buffered}"
         )
+
+    # A 2D case decodes the plan's first tile-plan record straight from the
+    # emitted bytes (reusing test_2d_tiling_plan.py's decoder) and confirms
+    # both axes actually split into more than one tile. num_tiles is the
+    # solver's ceil(H/tile_h) * ceil(W/tile_w) product, so dividing it by the
+    # H-axis tile count derived from the decoded original_height/tile_height
+    # recovers the W-axis tile count without needing a separate width field
+    # in the plan format.
+    if case.expect_2d:
+        tile_plan = decode_first_tile_plan(plan_bytes)
+        if tile_plan.axis != TILE_AXIS_HW:
+            raise AssertionError(
+                f"{case.name}: tile plan axis {tile_plan.axis}, expected "
+                f"TILE_AXIS_HW ({TILE_AXIS_HW})"
+            )
+        tiles_h = math.ceil(tile_plan.original_height / tile_plan.tile_height)
+        tiles_w = tile_plan.num_tiles // tiles_h
+        if not (tiles_h > 1 and tiles_w > 1):
+            raise AssertionError(
+                f"{case.name}: expected multi-tile on both axes, got "
+                f"tiles_h={tiles_h} tiles_w={tiles_w} "
+                f"(num_tiles={tile_plan.num_tiles}, "
+                f"tile_h={tile_plan.tile_height}, tile_w={tile_plan.tile_width})"
+            )
+
     if case.compression == "lz4":
         if plan["weight_blocks_compression"] != COMPRESS_LZ4:
             raise AssertionError(f"{case.name}: expected LZ4 weight blocks")
@@ -1763,6 +2061,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _qdq_case("AveragePool"),
         _linebuffer_conv_chain_case(),
         _qdq_conv_chain_case(),
+        _2d_tiled_conv_case(),
+        _qdq_2d_tiled_conv_case(),
+        _2d_tiled_conv_sigmoid_case(),
     ]
     covered_operators = {
         operator for case in cases for operator in case.expected_operators
