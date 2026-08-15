@@ -1177,6 +1177,108 @@ def _convtranspose_overlap_case() -> ContractCase:
     )
 
 
+def _convtranspose_output_padding_case() -> ContractCase:
+    """A float ConvTranspose with a nonzero output_padding attribute.
+
+    Kernel 3, stride 2, symmetric pad 1: per the ONNX formula output = stride
+    * (in - 1) + output_padding + kernel - pad_begin - pad_end, a 4x4 input
+    with output_padding=0 would upsample to 7x7. Setting output_padding=[1,1]
+    adds the extra trailing row/column to reach 8x8. The compiler reads that
+    output shape from ONNX's own shape inference rather than re-deriving it
+    (the runtime's gather kernel bounds itself against the allocated output
+    extent, not a shrink formula), so this exercises the case the other
+    ConvTranspose cases leave untested: the compiled output shape must match
+    what output_padding actually produces, not what it would be without it.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, 8, 8]
+    )
+    rng = np.random.default_rng(37)
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(2, 3, 3, 3)).astype(np.float32), "weights"
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(3,)).astype(np.float32), "bias"
+    )
+    model = _model(
+        "convtranspose_output_padding",
+        [
+            helper.make_node(
+                "ConvTranspose",
+                ["input", "weights", "bias"],
+                ["output"],
+                kernel_shape=[3, 3],
+                strides=[2, 2],
+                pads=[1, 1, 1, 1],
+                output_padding=[1, 1],
+                group=1,
+            )
+        ],
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+    return ContractCase(
+        "float_convtranspose_output_padding",
+        model,
+        model,
+        {"input": rng.uniform(-1.0, 1.0, size=(1, 2, 4, 4)).astype(np.float32)},
+        ("ConvTranspose",),
+    )
+
+
+def _convtranspose_asymmetric_pad_case() -> ContractCase:
+    """A float ConvTranspose with asymmetric pads (top != bottom, left != right).
+
+    Kernel 3, stride 2, pads=[0, 1, 1, 0] (ONNX order [h_begin, w_begin,
+    h_end, w_end]): pad_top=0/pad_bottom=1 on height, pad_left=1/pad_right=0
+    on width. Both other ConvTranspose cases in this file use symmetric pads,
+    so this is the only case where a pad_top/pad_bottom or pad_left/pad_right
+    mixup in the compiler or the gather kernel's per-axis pad indexing would
+    surface as a mismatch against the ORT oracle.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, 8, 8]
+    )
+    rng = np.random.default_rng(41)
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(2, 3, 3, 3)).astype(np.float32), "weights"
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.5, size=(3,)).astype(np.float32), "bias"
+    )
+    model = _model(
+        "convtranspose_asymmetric_pad",
+        [
+            helper.make_node(
+                "ConvTranspose",
+                ["input", "weights", "bias"],
+                ["output"],
+                kernel_shape=[3, 3],
+                strides=[2, 2],
+                pads=[0, 1, 1, 0],
+                group=1,
+            )
+        ],
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+    return ContractCase(
+        "float_convtranspose_asymmetric_pad",
+        model,
+        model,
+        {"input": rng.uniform(-1.0, 1.0, size=(1, 2, 4, 4)).astype(np.float32)},
+        ("ConvTranspose",),
+    )
+
+
 def _qdq_convtranspose_per_channel_case() -> ContractCase:
     """Per-channel int8 QDQ ConvTranspose with multiple output channels.
 
@@ -2379,6 +2481,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _convtranspose_case(),
         _conv_then_convtranspose_case(),
         _convtranspose_overlap_case(),
+        _convtranspose_output_padding_case(),
+        _convtranspose_asymmetric_pad_case(),
         _qdq_case("ConvTranspose"),
         _qdq_convtranspose_per_channel_case(),
         _linebuffer_conv_chain_case(),
