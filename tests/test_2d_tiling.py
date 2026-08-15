@@ -221,6 +221,46 @@ def build_high_res_conv_add_graph(h: int, w: int, c: int, mem_budget: int) -> An
     )
 
 
+def build_high_res_conv_concat_graph(h: int, w: int, c: int, mem_budget: int) -> AnalyzedGraph:
+    """Single-stage graph: Conv followed by a channel-axis Concat against a
+    separate full-resolution operand. Concat takes an independent second
+    operand the 2D executor's shared-rectangle load does not co-tile, so the
+    stage must not be 2D eligible (same hazard as the binary-op case).
+    """
+    conv = OpNode(
+        name="conv",
+        op_type="Conv",
+        inputs=["input"],
+        outputs=["conv_out"],
+        attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]},
+    )
+    concat = OpNode(
+        name="concat",
+        op_type="Concat",
+        inputs=["conv_out", "other"],
+        outputs=["output"],
+        attrs={"axis": 1},
+    )
+    stage = Stage(
+        stage_id=0,
+        op_indices=[0, 1],
+        input_tensors=["input", "other"],
+        output_tensors=["output"],
+        peak_bytes=c * h * w,
+    )
+    return AnalyzedGraph(
+        ops=[conv, concat],
+        stages=[stage],
+        tensors={
+            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
+            "conv_out": TensorInfo("conv_out", (1, c, h, w), TensorProto.INT8),
+            "other": TensorInfo("other", (1, c, h, w), TensorProto.INT8),
+            "output": TensorInfo("output", (1, 2 * c, h, w), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=mem_budget),
+    )
+
+
 def build_high_res_conv_sigmoid_graph(h: int, w: int, c: int, mem_budget: int) -> AnalyzedGraph:
     """Single-stage graph: Conv followed by a unary Sigmoid wrapper, at the
     same [1,c,h,w] shape and peak_bytes model as build_high_res_conv_graph.
@@ -265,6 +305,14 @@ def build_high_res_conv_sigmoid_graph(h: int, w: int, c: int, mem_budget: int) -
 def test_stage_2d_eligible_excludes_binary_op():
     # Hand-built stage with a binary op: must not be 2D eligible.
     ag = build_high_res_conv_add_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
+    stage = ag.stages[0]
+    assert _stage_2d_eligible(ag, stage, ag.ops) is False
+
+
+def test_stage_2d_eligible_excludes_concat():
+    # A Conv+Concat stage carries the same non-co-tiled-operand hazard as a
+    # binary op, so it must not be 2D eligible either.
+    ag = build_high_res_conv_concat_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
     stage = ag.stages[0]
     assert _stage_2d_eligible(ag, stage, ag.ops) is False
 

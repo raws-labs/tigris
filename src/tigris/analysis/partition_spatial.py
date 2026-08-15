@@ -256,6 +256,15 @@ def _stage_2d_eligible(
         return False
     if any(op.op_type in _BINARY_OPS for op in stage_ops):
         return False
+    # Concat carries the same hazard as the binary ops above: it takes an
+    # independent second operand, and exec_stage_tiled_2d loads every stage
+    # input with the spatial op's own input-halo rectangle, which is not
+    # guaranteed to be co-tiled with a distinct Concat operand at output
+    # resolution. Exclude it from HW eligibility for symmetry with _BINARY_OPS;
+    # such a stage falls back to the 1D path or fails closed. A Concat that is
+    # a stage head/fan-in is unaffected (it is not a single-spatial-op stage).
+    if any(op.op_type == "Concat" for op in stage_ops):
+        return False
     return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
 
 
