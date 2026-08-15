@@ -52,6 +52,16 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 }
 
 
+# Dynamic binary ops (Add, Mul) whose second operand is an independent
+# tensor. Neither the rank-3 axis-1 executor nor the rank-4 HW (2D) executor
+# guarantees that operand is co-tiled with a spatial op's output: both load
+# every stage input using the spatial op's own tile geometry (length stripe
+# or HW halo rectangle), so a binary op combined with a spatial op can read
+# the wrong region or size from its second operand. Safe only in stages with
+# no spatial op. Shared between the rank-3 and rank-4 eligibility checks
+# below since the hazard is the same in both.
+_BINARY_OPS = frozenset({"Add", "Mul"})
+
 # Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
 # NHWC stages.  Unary pointwise operators preserve the current length and may
 # surround one Conv1D.  Dynamic binary operators are safe only in a
@@ -63,8 +73,7 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Sigmoid",
     "Tanh",
 })
-_RANK3_AXIS1_BINARY_OPS = frozenset({"Add", "Mul"})
-_RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _RANK3_AXIS1_BINARY_OPS | {"Conv1D"}
+_RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
 
 def classify_op(op_type: str) -> TileCategory:
@@ -220,9 +229,21 @@ def _stage_2d_eligible(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
     """A stage may attempt HW tiling only if it is a standalone rank-4 stage
-    with at most one spatial op, all of whose ops implement the HW tile
-    contract. Multi-spatial-op stages are excluded: the runtime executor's
-    2D contract is audited only for a single composed spatial op per stage.
+    with at most one spatial op, no binary op, and all of whose ops implement
+    the HW tile contract. Multi-spatial-op stages are excluded: the runtime
+    executor's 2D contract is audited only for a single composed spatial op
+    per stage.
+
+    Binary ops (Add, Mul) are excluded even though they pass the per-op HW
+    contract check below: exec_stage_tiled_2d loads every stage input using
+    the same conv input-halo rectangle, so a binary op's second operand
+    (e.g. a residual skip tensor) is not guaranteed to be co-tiled with the
+    spatial op's output at that rectangle. Admitting a stage like
+    [Conv, Add(conv_out, skip)] as 2D would load the skip operand with the
+    wrong region and size and silently produce a wrong result. This is the
+    conservative, fail-closed choice: such a stage falls back to the 1D path
+    (or fails closed if 1D is also infeasible). Co-tiled-binary 2D tiling is
+    a future refinement, not attempted here.
     """
     if _stage_io_ranks(ag, stage) != {4}:
         return False
@@ -232,6 +253,8 @@ def _stage_2d_eligible(
         if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL)
     )
     if spatial_count > 1:
+        return False
+    if any(op.op_type in _BINARY_OPS for op in stage_ops):
         return False
     return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
 
@@ -414,7 +437,7 @@ def _stage_tile_axis(
             and not (
                 conv_count == 1
                 and any(
-                    op_type in _RANK3_AXIS1_BINARY_OPS
+                    op_type in _BINARY_OPS
                     for op_type in op_types
                 )
             )
