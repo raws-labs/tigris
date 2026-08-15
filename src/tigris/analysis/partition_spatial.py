@@ -11,7 +11,7 @@ tensors can stay in fast memory as tiles, avoiding full-size slow allocation.
 import math
 from enum import Enum
 
-from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_NONE
+from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.graph.ir import (
     AnalyzedGraph,
     OpNode,
@@ -163,6 +163,74 @@ def _get_dilation_w(op: OpNode) -> int:
 # Tile solver
 
 
+def solve_2d_tile(
+    budget: int,
+    peak: int,
+    input_h: int,
+    input_w: int,
+    halo_h: int,
+    halo_w: int,
+) -> tuple[int, int] | None:
+    """Largest square-ish (tile_h, tile_w) whose proportional working set fits budget.
+
+    Mirrors the 1D proportional model already used for HEIGHT_OR_LENGTH in
+    partition_spatial(): ``tile_h = floor(budget*input_h/peak) - halo`` and
+    ``tiled_peak = int(peak * (tile_h + halo) / input_h)``. The stage's whole
+    peak_bytes (weights/bias/scratch included, which stay resident whole and
+    do not scale with tile size) is scaled by the fraction of the haloed
+    input area the tile covers:
+
+        tiled_peak(th, tw) = int(peak * (th + halo_h) * (tw + halo_w)
+                                  / (input_h * input_w))
+
+    Returns None if even a 1x1 core tile does not fit.
+    """
+    if input_h <= 0 or input_w <= 0:
+        return None
+
+    def tiled_peak(th: int, tw: int) -> int:
+        return int(peak * (th + halo_h) * (tw + halo_w) / (input_h * input_w))
+
+    if tiled_peak(1, 1) > budget:
+        return None
+
+    th = tw = max(min(input_h, input_w), 1)
+
+    # Shrink the larger side first, keeping the core roughly square, until it fits.
+    while tiled_peak(th, tw) > budget:
+        if th >= tw and th > 1:
+            th -= 1
+        elif tw > 1:
+            tw -= 1
+        else:
+            th = tw = 1
+            break
+
+    th = min(th, input_h)
+    tw = min(tw, input_w)
+    return (max(th, 1), max(tw, 1))
+
+
+def _stage_2d_eligible(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """A stage may attempt HW tiling only if it is a standalone rank-4 stage
+    with at most one spatial op, all of whose ops implement the HW tile
+    contract. Multi-spatial-op stages are excluded: the runtime executor's
+    2D contract is audited only for a single composed spatial op per stage.
+    """
+    if _stage_io_ranks(ag, stage) != {4}:
+        return False
+    spatial_count = sum(
+        1
+        for op in stage_ops
+        if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL)
+    )
+    if spatial_count > 1:
+        return False
+    return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
+
+
 def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Analyze each stage and attach a TilePlan where needed.
 
@@ -203,7 +271,7 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         # Compute receptive field
-        rf_h, _rf_w = compute_receptive_field(stage_ops)
+        rf_h, rf_w = compute_receptive_field(stage_ops)
         halo = rf_h - 1
 
         # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.
@@ -224,6 +292,51 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         # Estimate tiled peak memory
         tiled_peak = int(peak * (tile_h + halo) / input_h)
+
+        # A single-row height tile that still overflows the budget cannot be
+        # rescued by any smaller height-only tile: height is already at its
+        # floor. If the stage is eligible for 2D (HW) tiling, try shrinking
+        # both axes together before falling back to the 1D infeasible
+        # warning below.
+        if (
+            tile_h == 1
+            and tiled_peak > budget
+            and _stage_2d_eligible(ag, stage, stage_ops)
+        ):
+            input_w = _find_input_extent_width(ag, stage)
+            if input_w > 0:
+                halo_w = rf_w - 1
+                shape = solve_2d_tile(
+                    budget=budget,
+                    peak=peak,
+                    input_h=input_h,
+                    input_w=input_w,
+                    halo_h=halo,
+                    halo_w=halo_w,
+                )
+                if shape is not None:
+                    tile_h_2d, tile_w_2d = shape
+                    tiled_peak_2d = int(
+                        peak
+                        * (tile_h_2d + halo)
+                        * (tile_w_2d + halo_w)
+                        / (input_h * input_w)
+                    )
+                    stage.tile_plan = TilePlan(
+                        tileable=True,
+                        axis=TILE_AXIS_HW,
+                        tile_height=tile_h_2d,
+                        tile_width=tile_w_2d,
+                        num_tiles=math.ceil(input_h / tile_h_2d)
+                        * math.ceil(input_w / tile_w_2d),
+                        halo=halo,
+                        receptive_field=rf_h,
+                        original_height=input_h,
+                        tiled_peak_bytes=tiled_peak_2d,
+                        overhead_bytes=0,
+                        warnings=[],
+                    )
+                    continue
 
         # Overhead: extra halo reads per tile boundary
         # Each internal tile boundary reads halo rows extra from the input
@@ -294,17 +407,37 @@ def _stage_tile_axis(
 
 def _op_supports_axis(op: OpNode, axis: int) -> bool:
     """Fail closed unless an operator implements the selected tile contract."""
-    if axis != TILE_AXIS_HEIGHT_OR_LENGTH:
-        return False
-    if op.op_type == "Conv1D":
-        return True
-    return op.op_type in _OP_CATEGORY
+    if axis == TILE_AXIS_HEIGHT_OR_LENGTH:
+        if op.op_type == "Conv1D":
+            return True
+        return op.op_type in _OP_CATEGORY
+    if axis == TILE_AXIS_HW:
+        # Rank-4 spatial/pointwise/channel-Concat set only; Conv1D is rank-3
+        # and has no width axis to tile.
+        return op.op_type in _OP_CATEGORY
+    return False
 
 
 def _find_input_extent(ag: AnalyzedGraph, stage: Stage, axis: int) -> int:
     """Find the H/L extent that serializes as axis 1 (source NCHW/NCL dim 2)."""
-    if axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+    if axis not in (TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW):
         return 0
+    return _find_source_dim_extent(ag, stage, dim=2, ranks={3, 4})
+
+
+def _find_input_extent_width(ag: AnalyzedGraph, stage: Stage) -> int:
+    """Find the W extent that serializes as axis 2 (source NCHW dim 3).
+
+    Only rank-4 tensors carry a width dimension; HW tiling never applies to
+    the rank-3 NCL layout.
+    """
+    return _find_source_dim_extent(ag, stage, dim=3, ranks={4})
+
+
+def _find_source_dim_extent(
+    ag: AnalyzedGraph, stage: Stage, dim: int, ranks: set[int]
+) -> int:
+    """Find a stage's source-shape extent at ``dim`` among candidate tensors."""
     # Check stage input tensors first, then look at first op's inputs
     candidates = stage.input_tensors.copy()
     if not candidates:
@@ -313,8 +446,8 @@ def _find_input_extent(ag: AnalyzedGraph, stage: Stage, axis: int) -> int:
 
     for name in candidates:
         info = ag.tensors.get(name)
-        if info and len(info.shape) in {3, 4}:
-            return int(info.shape[2])  # NCHW/NCL -> serialized H/L is dim 1
+        if info and len(info.shape) in ranks:
+            return int(info.shape[dim])
 
     return 0
 

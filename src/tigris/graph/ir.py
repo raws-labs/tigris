@@ -99,6 +99,7 @@ class TilePlan:
     tileable: bool
     axis: int = TILE_AXIS_NONE
     tile_height: int = 0
+    tile_width: int = 0
     num_tiles: int = 0
     halo: int = 0
     receptive_field: int = 1
