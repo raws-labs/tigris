@@ -76,29 +76,40 @@ def classify_op(op_type: str) -> TileCategory:
 
 
 def compute_receptive_field(ops: list[OpNode]) -> tuple[int, int]:
-    """Compute the receptive field and total stride for a sequence of ops.
+    """Compute the height and width receptive fields for a sequence of ops.
 
-    Walks the ops in reverse, accumulating RF and jump (cumulative stride).
-    Returns (receptive_field, total_jump).
+    Walks the ops in reverse once, accumulating RF and jump (cumulative
+    stride) independently for the height and width axes.
+    Returns (rf_h, rf_w).
 
-    For pointwise ops, RF and jump are unchanged.
+    For pointwise ops, RF and jump are unchanged on both axes.
     For conv/pool ops, RF grows based on effective kernel size.
     """
-    rf = 1
-    jump = 1
+    rf_h = 1
+    jump_h = 1
+    rf_w = 1
+    jump_w = 1
 
     for op in reversed(ops):
         cat = classify_op(op.op_type)
         if cat in (TileCategory.CONV, TileCategory.POOL):
-            kernel = _get_kernel_h(op)
-            stride = _get_stride_h(op)
-            dilation = _get_dilation_h(op)
+            kernel_h = _get_kernel_h(op)
+            stride_h = _get_stride_h(op)
+            dilation_h = _get_dilation_h(op)
 
-            effective_k = dilation * (kernel - 1) + 1
-            rf = rf + (effective_k - 1) * jump
-            jump = jump * stride
+            effective_kh = dilation_h * (kernel_h - 1) + 1
+            rf_h = rf_h + (effective_kh - 1) * jump_h
+            jump_h = jump_h * stride_h
 
-    return rf, jump
+            kernel_w = _get_kernel_w(op)
+            stride_w = _get_stride_w(op)
+            dilation_w = _get_dilation_w(op)
+
+            effective_kw = dilation_w * (kernel_w - 1) + 1
+            rf_w = rf_w + (effective_kw - 1) * jump_w
+            jump_w = jump_w * stride_w
+
+    return rf_h, rf_w
 
 
 def _get_kernel_h(op: OpNode) -> int:
@@ -122,6 +133,30 @@ def _get_dilation_h(op: OpNode) -> int:
     dilations = op.attrs.get("dilations")
     if dilations and len(dilations) >= 1:
         return int(dilations[0])
+    return 1
+
+
+def _get_kernel_w(op: OpNode) -> int:
+    """Get the width dimension of the kernel (second element of kernel_shape)."""
+    ks = op.attrs.get("kernel_shape")
+    if ks and len(ks) >= 2:
+        return int(ks[1])
+    return 1
+
+
+def _get_stride_w(op: OpNode) -> int:
+    """Get the width dimension of the stride."""
+    strides = op.attrs.get("strides")
+    if strides and len(strides) >= 2:
+        return int(strides[1])
+    return 1
+
+
+def _get_dilation_w(op: OpNode) -> int:
+    """Get the width dimension of the dilation."""
+    dilations = op.attrs.get("dilations")
+    if dilations and len(dilations) >= 2:
+        return int(dilations[1])
     return 1
 
 
@@ -168,8 +203,8 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         # Compute receptive field
-        rf, _jump = compute_receptive_field(stage_ops)
-        halo = rf - 1
+        rf_h, _rf_w = compute_receptive_field(stage_ops)
+        halo = rf_h - 1
 
         # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.
         input_h = _find_input_extent(ag, stage, tile_axis)
@@ -208,7 +243,7 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             tile_height=tile_h,
             num_tiles=num_tiles,
             halo=halo,
-            receptive_field=rf,
+            receptive_field=rf_h,
             original_height=input_h,
             tiled_peak_bytes=tiled_peak,
             overhead_bytes=overhead,

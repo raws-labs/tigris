@@ -143,29 +143,30 @@ class TestClassifyOp:
 
 class TestReceptiveField:
     def test_single_3x3_conv(self):
-        """A single 3x3 conv has RF=3."""
+        """A single 3x3 conv has RF=3 on both axes."""
         ops = [OpNode(name="c", op_type="Conv", inputs=[], outputs=[],
                       attrs={"kernel_shape": [3, 3], "strides": [1, 1]})]
-        rf, jump = compute_receptive_field(ops)
-        assert rf == 3
-        assert jump == 1
+        rf_h, rf_w = compute_receptive_field(ops)
+        assert rf_h == 3
+        assert rf_w == 3
 
     def test_two_3x3_convs(self):
-        """Two stacked 3x3 convs have RF=5."""
+        """Two stacked 3x3 convs have RF=5 on both axes."""
         ops = [
             OpNode(name="c0", op_type="Conv", inputs=[], outputs=[],
                    attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
             OpNode(name="c1", op_type="Conv", inputs=[], outputs=[],
                    attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
         ]
-        rf, jump = compute_receptive_field(ops)
-        assert rf == 5
-        assert jump == 1
+        rf_h, rf_w = compute_receptive_field(ops)
+        assert rf_h == 5
+        assert rf_w == 5
 
     def test_conv_stride2_pool(self):
-        """Conv3x3(s=1) + MaxPool2x2(s=2) + Conv3x3(s=1).
+        """Conv3x3(s=1) + MaxPool2x2(s=2) + Conv3x3(s=1), symmetric kernel/stride.
 
         reversed: conv1(k=3,s=1): rf=3, j=1 -> pool(k=2,s=2): rf=4, j=2 -> conv0(k=3,s=1): rf=8, j=2
+        Kernel and stride are symmetric across height/width, so rf_h == rf_w == 8.
         """
         ops = [
             OpNode(name="c0", op_type="Conv", inputs=[], outputs=[],
@@ -175,18 +176,18 @@ class TestReceptiveField:
             OpNode(name="c1", op_type="Conv", inputs=[], outputs=[],
                    attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
         ]
-        rf, jump = compute_receptive_field(ops)
-        assert rf == 8
-        assert jump == 2
+        rf_h, rf_w = compute_receptive_field(ops)
+        assert rf_h == 8
+        assert rf_w == 8
 
     def test_dilated_conv(self):
-        """Conv3x3 with dilation=2: effective_k = 2*(3-1)+1 = 5, RF=5."""
+        """Conv3x3 with dilation=2: effective_k = 2*(3-1)+1 = 5, RF=5 on both axes."""
         ops = [OpNode(name="c", op_type="Conv", inputs=[], outputs=[],
                       attrs={"kernel_shape": [3, 3], "strides": [1, 1],
                              "dilations": [2, 2]})]
-        rf, jump = compute_receptive_field(ops)
-        assert rf == 5
-        assert jump == 1
+        rf_h, rf_w = compute_receptive_field(ops)
+        assert rf_h == 5
+        assert rf_w == 5
 
     def test_pointwise_passthrough(self):
         """Pointwise ops (Relu) don't change RF."""
@@ -195,19 +196,19 @@ class TestReceptiveField:
                    attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
             OpNode(name="r", op_type="Relu", inputs=[], outputs=[], attrs={}),
         ]
-        rf, jump = compute_receptive_field(ops)
-        assert rf == 3  # same as single conv
-        assert jump == 1
+        rf_h, rf_w = compute_receptive_field(ops)
+        assert rf_h == 3  # same as single conv
+        assert rf_w == 3
 
     def test_only_pointwise_rf_is_1(self):
-        """A chain of only pointwise ops has RF=1."""
+        """A chain of only pointwise ops has RF=1 on both axes."""
         ops = [
             OpNode(name="r0", op_type="Relu", inputs=[], outputs=[], attrs={}),
             OpNode(name="r1", op_type="Add", inputs=[], outputs=[], attrs={}),
         ]
-        rf, jump = compute_receptive_field(ops)
-        assert rf == 1
-        assert jump == 1
+        rf_h, rf_w = compute_receptive_field(ops)
+        assert rf_h == 1
+        assert rf_w == 1
 
 
 # Integration: full pipeline with ONNX fixtures
