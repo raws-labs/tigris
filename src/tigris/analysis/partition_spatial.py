@@ -303,6 +303,7 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
         # floor. If the stage is eligible for 2D (HW) tiling, try shrinking
         # both axes together before falling back to the 1D infeasible
         # warning below.
+        min_2d_tile_infeasible = False
         if (
             tile_h == 1
             and tiled_peak > budget
@@ -343,13 +344,24 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
                     )
                     continue
 
+                # solve_2d_tile was attempted and even a 1x1 core tile does
+                # not fit the budget. Mark this stage distinctly so the
+                # surfaced diagnostic names the 2D tile instead of falling
+                # back to the generic 1D minimum-tile message below.
+                min_2d_tile_infeasible = True
+
         # Overhead: extra halo reads per tile boundary
         # Each internal tile boundary reads halo rows extra from the input
         halo_tensor_bytes = _estimate_halo_bytes(ag, stage, halo, input_h)
         overhead = halo_tensor_bytes * max(num_tiles - 1, 0)
 
         warnings: list[str] = []
-        if tiled_peak > budget:
+        if min_2d_tile_infeasible:
+            warnings.append(
+                f"Stage {stage.stage_id} minimum 2D tile still exceeds "
+                f"budget ({budget:,} bytes)"
+            )
+        elif tiled_peak > budget:
             warnings.append(
                 f"Stage {stage.stage_id} tiled peak ({tiled_peak:,} bytes) "
                 f"still exceeds budget ({budget:,} bytes)"
@@ -366,6 +378,7 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             tiled_peak_bytes=tiled_peak,
             overhead_bytes=overhead,
             warnings=warnings,
+            min_2d_tile_infeasible=min_2d_tile_infeasible,
         )
 
     return ag

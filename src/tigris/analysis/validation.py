@@ -423,6 +423,8 @@ def _execution_unit_requirement(
             return stage.peak_bytes, reason, True
         if tile_plan.tiled_peak_bytes <= 0:
             return stage.peak_bytes, "tile solver produced no positive working set", True
+        if tile_plan.min_2d_tile_infeasible:
+            return tile_plan.tiled_peak_bytes, "minimum 2D tile", False
         return tile_plan.tiled_peak_bytes, "minimum spatial tile", False
 
     return stage.peak_bytes, "untiled stage", False

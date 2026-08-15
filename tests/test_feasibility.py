@@ -102,16 +102,17 @@ def test_compile_refuses_unsafe_height_tiling_but_keeps_untiled_support(
 
 
 def test_minimum_tile_that_exceeds_budget_is_infeasible(conv_relu_chain_path):
-    # 300 bytes is below the 1x1 2D core for either stage (halo 2x2, so a
-    # 2D tile solve is attempted once the 1D single-row tile also overflows;
-    # it correctly reports infeasible here too, not just the 1D fallback).
+    # 300 bytes is below the 1x1 2D core for either stage (halo 2x2), so a
+    # 2D tile solve is attempted once the 1D single-row tile also overflows
+    # and reports its own distinct "minimum 2D tile" reason, not the generic
+    # 1D "minimum spatial tile" fallback.
     graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
 
     validation = validate_memory_plan(graph)
 
     assert not validation.feasible
     assert validation.scheduled_peak_bytes > graph.mem_budget
-    assert any(issue.reason == "minimum spatial tile" for issue in validation.issues)
+    assert any(issue.reason == "minimum 2D tile" for issue in validation.issues)
 
 
 def test_findings_never_pass_when_scheduled_peak_exceeds_budget(conv_relu_chain_path):

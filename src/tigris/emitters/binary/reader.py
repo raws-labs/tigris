@@ -7,6 +7,7 @@ from tigris import (
     SCHEMA_VERSION_STAGE_TABLE_AUTHORITY,
     SUPPORTED_SCHEMA_VERSIONS,
     TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_HW,
     TILE_AXIS_NONE,
 )
 
@@ -250,17 +251,21 @@ def read_binary_plan(data: bytes) -> dict:
             tileable, axis, tile_height,
             n_tiles, halo,
             rf, orig_h,
-            tiled_peak, overhead, _reserved,
+            tiled_peak, overhead, reserved,
         ) = TILE_PLAN_STRUCT.unpack_from(data, pos)
+        decoded_axis = (
+            axis
+            if version >= SCHEMA_VERSION_TILE_AXIS
+            # Schema v2-v4 used zero here and implicitly meant NHWC height.
+            else (TILE_AXIS_HEIGHT_OR_LENGTH if tileable else TILE_AXIS_NONE)
+        )
         tile_plans.append({
             "tileable": bool(tileable),
-            # Schema v2-v4 used zero here and implicitly meant NHWC height.
-            "axis": (
-                axis
-                if version >= SCHEMA_VERSION_TILE_AXIS
-                else (TILE_AXIS_HEIGHT_OR_LENGTH if tileable else TILE_AXIS_NONE)
-            ),
+            "axis": decoded_axis,
             "tile_height": tile_height,
+            # Packed into the low 16 bits of the trailing reserved u32; only
+            # meaningful for the HW axis, where the writer populates it.
+            "tile_width": reserved & 0xFFFF if decoded_axis == TILE_AXIS_HW else 0,
             "num_tiles": n_tiles,
             "halo": halo,
             "receptive_field": rf,
