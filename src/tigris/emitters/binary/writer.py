@@ -9,6 +9,7 @@ import numpy as np
 from tigris import (
     SCHEMA_VERSION,
     TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_HW,
     TILE_AXIS_NONE,
 )
 from tigris.graph.ir import AnalyzedGraph, OpNode
@@ -971,7 +972,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
 
         stage_to_tile[stage.stage_id] = idx
         idx += 1
-        if tp.tileable and tp.axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+        if tp.tileable and tp.axis not in (TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW):
             raise ValueError(
                 f"stage {stage.stage_id} has unsupported tile axis {tp.axis}"
             )
@@ -986,7 +987,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
         # receptive_field(u16) original_height(u16)
         # tiled_peak_bytes(u32)
         # overhead_bytes(u32)
-        # reserved(u32)
+        # reserved(u32): tile_width packed into the low 16 bits
         buf.extend(TILE_PLAN_STRUCT.pack(
             1 if tp.tileable else 0,
             tp.axis,
@@ -997,7 +998,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
             tp.original_height,
             tp.tiled_peak_bytes,
             tp.overhead_bytes,
-            0,  # reserved
+            tp.tile_width & 0xFFFF,
         ))
 
     return bytes(buf), stage_to_tile
