@@ -3,7 +3,12 @@
 from onnx import TensorProto
 
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW
-from tigris.analysis.partition_spatial import compute_receptive_field, partition_spatial, solve_2d_tile
+from tigris.analysis.partition_spatial import (
+    _op_supports_axis,
+    compute_receptive_field,
+    partition_spatial,
+    solve_2d_tile,
+)
 from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, Stage, TensorInfo
 
 
@@ -44,12 +49,13 @@ def test_receptive_field_asymmetric_kernel():
 #
 # solve_2d_tile mirrors the 1D proportional model already used by
 # partition_spatial() for HEIGHT_OR_LENGTH: tiled_peak(th, tw) scales the
-# stage's whole peak_bytes (which includes weights/bias/scratch that stay
-# resident regardless of tile shape) by the fraction of the haloed input
-# area the tile covers. This is deliberately conservative rather than the
-# activation-only "(th+hh)(tw+hw)*C_in + th*tw*C_out" formula, because that
-# formula omits resident non-activation memory and would let a 2D shape
-# through that overflows the fast arena at runtime.
+# stage's activation-only peak_bytes (compute_lifetimes skips constant
+# tensors, so this never includes weights/bias) by the fraction of the
+# haloed input area the tile covers, instead of the brief's
+# "(th+hh)(tw+hw)*C_in + th*tw*C_out" formula. Resident weight/scratch bytes
+# are not modeled against the tiled budget by either the 1D or 2D solver (a
+# known pre-existing gap); the runtime backstops this by validating the
+# emitted tile shape against the real fast arena and failing closed.
 
 
 def test_solve_2d_tile_fits_budget():
@@ -87,6 +93,19 @@ def test_solve_2d_tile_infeasible_returns_none():
         )
         is None
     )
+
+
+# Op eligibility for the HW axis. Conv1D shares the CONV category with Conv
+# in _OP_CATEGORY, but it is rank-3 and has no width axis to tile, so it
+# must be excluded from TILE_AXIS_HW explicitly rather than relying on the
+# _OP_CATEGORY membership check alone.
+
+
+def test_op_supports_axis_excludes_conv1d_for_hw():
+    conv1d = OpNode(name="c1d", op_type="Conv1D", inputs=[], outputs=[], attrs={})
+    conv2d = OpNode(name="c2d", op_type="Conv", inputs=[], outputs=[], attrs={})
+    assert _op_supports_axis(conv1d, TILE_AXIS_HW) is False
+    assert _op_supports_axis(conv2d, TILE_AXIS_HW) is True
 
 
 # Axis selection: HW only kicks in once the 1D height solve is infeasible
