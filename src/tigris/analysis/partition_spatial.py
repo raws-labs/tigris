@@ -240,15 +240,24 @@ def _cotileable_skip_operands(
     """Every stage-external operand of a pre-spatial Concat/Add/Mul must be a
     rank-4 tensor at the same H/W as the op output, so the executor's shared
     input-halo rectangle load co-tiles it correctly. Intra-stage operands
-    (produced by an earlier op in the stage) are fine - they are not loaded."""
+    (produced by an earlier op in the stage) are fine - they are not loaded.
+
+    A rank-4 CONSTANT operand (an initializer, e.g. a Concat against a baked
+    tensor) is never a stage input, so it escapes the external same-H/W check;
+    but the 2D executor would still have to co-tile it against the spatial
+    op's input-halo rectangle and cannot tile-offset a full-size constant.
+    Fail closed on any such operand rather than silently emit a wrong result.
+    """
     out = ag.tensors.get(op.outputs[0])
     if out is None or len(out.shape) != 4:
         return False
     out_hw = tuple(out.shape[2:4])
     external = set(stage.input_tensors)
     for name in op.inputs:
+        info = ag.tensors.get(name)
+        if info is not None and info.is_constant and len(info.shape) == 4:
+            return False
         if name in external:
-            info = ag.tensors.get(name)
             if info is None or len(info.shape) != 4 or tuple(info.shape[2:4]) != out_hw:
                 return False
     return True

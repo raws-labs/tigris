@@ -422,6 +422,33 @@ def build_high_res_concat_conv_diffres_graph(h, w, c, mem_budget):
         budget=MemoryBudget(fast=mem_budget))
 
 
+def build_high_res_concat_const_skip_graph(h, w, c, mem_budget):
+    """Pre-spatial Concat whose skip operand is a rank-4 CONSTANT (initializer),
+    same H/W as `up`. A constant is never a stage input, so it escapes the
+    external same-H/W co-tile check in _cotileable_skip_operands, yet the 2D
+    executor cannot tile-offset a full-size constant against the spatial op's
+    input-halo rectangle. Must fail closed."""
+    concat = OpNode(name="concat", op_type="Concat",
+                    inputs=["up", "const_skip"], outputs=["cat"], attrs={"axis": 1})
+    conv = OpNode(name="conv", op_type="Conv",
+                  inputs=["cat"], outputs=["output"],
+                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
+    stage = Stage(stage_id=0, op_indices=[0, 1],
+                  input_tensors=["up"], output_tensors=["output"],
+                  peak_bytes=c * h * w)
+    return AnalyzedGraph(
+        ops=[concat, conv], stages=[stage],
+        tensors={
+            "up": TensorInfo("up", (1, c, h, w), TensorProto.INT8),
+            "const_skip": TensorInfo(
+                "const_skip", (1, c, h, w), TensorProto.INT8, is_constant=True
+            ),
+            "cat": TensorInfo("cat", (1, 2 * c, h, w), TensorProto.INT8),
+            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=mem_budget))
+
+
 def test_stage_2d_eligible_admits_pre_spatial_add_skip():
     ag = build_high_res_add_conv_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
     assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is True
@@ -430,6 +457,14 @@ def test_stage_2d_eligible_admits_pre_spatial_add_skip():
 def test_stage_2d_eligible_admits_pre_spatial_concat_skip():
     ag = build_high_res_concat_conv_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
     assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is True
+
+
+def test_stage_2d_eligible_rejects_constant_concat_skip():
+    # A rank-4 constant Concat operand is not a stage input, so it escapes the
+    # external same-H/W co-tile check, but it cannot be tile-offset for the 2D
+    # executor's shared input-halo rectangle load. The stage must fail closed.
+    ag = build_high_res_concat_const_skip_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
+    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is False
 
 
 def test_stage_2d_eligible_rejects_diffres_skip():
