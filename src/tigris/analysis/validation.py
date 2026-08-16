@@ -7,6 +7,7 @@ from tigris.analysis.partition_spatial import (
     _chain_fast_bytes,
     _get_stage_spatial_params,
 )
+from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.graph.ir import AnalyzedGraph, Stage
 
@@ -114,13 +115,39 @@ class OperatorSupportValidation:
         return ", ".join(issue.describe() for issue in self.issues)
 
 
+def _routed_operators() -> frozenset[str]:
+    """Operators reachable through some runtime dispatcher, any backend.
+
+    Wire-encodability (OP_TYPE_MAP) and runtime routing (capabilities) are
+    two separate contracts. An op can be added to the binary schema before a
+    kernel exists for it; without this check the compiler would accept such
+    an op and only fail once the plan reaches a device.
+    """
+    return frozenset().union(
+        *(effective_operators(backend) for backend in KERNEL_CAPABILITIES)
+    )
+
+
 def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
     """Return operators or attributes not representable by the plan/runtime."""
     issues: list[UnsupportedOperatorIssue] = []
+    routed_operators = _routed_operators()
     for op in ag.ops:
         if op.op_type not in OP_TYPE_MAP:
             issues.append(
                 UnsupportedOperatorIssue(op_name=op.name, op_type=op.op_type)
+            )
+            continue
+
+        if op.op_type not in routed_operators:
+            issues.append(
+                UnsupportedOperatorIssue(
+                    op_name=op.name,
+                    op_type=op.op_type,
+                    reason=(
+                        f"{op.op_type} is wire-encodable but has no runtime kernel"
+                    ),
+                )
             )
             continue
 
@@ -135,6 +162,14 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             "AveragePool",
         } and auto_pad not in ("", "NOTSET"):
             reasons.append(f"auto_pad={auto_pad!r} requires explicit pads")
+
+        if op.op_type == "ConvTranspose":
+            group = int(op.attrs.get("group", 1))
+            if group != 1:
+                reasons.append(f"group={group} is not implemented (group=1 only)")
+            dilations = [int(value) for value in op.attrs.get("dilations", [1, 1])]
+            if any(value != 1 for value in dilations):
+                reasons.append("ConvTranspose dilation is not implemented")
 
         if op.op_type in {"MaxPool", "AveragePool"}:
             if int(op.attrs.get("ceil_mode", 0)) != 0:

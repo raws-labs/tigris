@@ -1044,8 +1044,8 @@ def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
     weights) are not included - they keep their raw tensor scale.
     """
     effective: dict[str, np.ndarray] = {}
-    weight_ops = {"Conv", "ConvInteger", "DepthwiseConv", "MatMul", "Gemm",
-                  "QLinearConv", "QLinearMatMul"}
+    weight_ops = {"Conv", "ConvTranspose", "ConvInteger", "DepthwiseConv",
+                  "MatMul", "Gemm", "QLinearConv", "QLinearMatMul"}
 
     for op in ag.ops:
         if op.op_type not in weight_ops:
