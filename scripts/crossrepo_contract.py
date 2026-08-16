@@ -1899,16 +1899,18 @@ def _build_convtranspose_2d(
 
 def _convtranspose_2d_tiled_case() -> ContractCase:
     """A stride-2 ConvTranspose whose expanded output overflows an 8K budget,
-    forcing a 2D (HW) tile with full (evenly divided) core tiles.
+    forcing a 2D (HW) tile.
 
     Input NCHW [1, 24, 16, 16] upsamples to output [1, 24, 32, 32]. The stage's
-    ~120 KB activation peak far exceeds the 8K fast budget, and ConvTranspose is
-    kept untileable on the 1D height and chain paths, so it routes only through
-    the compiler's dedicated output-extent 2D solve. That solve grids the 32x32
-    output into a 4x4 grid of 8x8 tiles; 32 is a multiple of 8, so every tile is
-    a full core tile. An emitted axis == TILE_AXIS_HW plan is itself proof the
-    isolated ConvTranspose 2D branch fired, and the runtime must reproduce ORT's
-    float upsample bit-exact across all sixteen tiles.
+    ~120 KB activation peak far exceeds the 8K fast budget - a single output row
+    does not fit on its own - and ConvTranspose is kept untileable on the 1D
+    height and chain paths, so it routes only through the compiler's dedicated
+    output-extent 2D solve, which splits both the height and width of the 32x32
+    output. The solved core tile does not evenly divide the output, so the last
+    tile row, the last tile column, and the bottom-right corner tile are all
+    partial. An emitted axis == TILE_AXIS_HW plan is itself proof the isolated
+    ConvTranspose 2D branch fired, and the runtime must reproduce ORT's float
+    upsample bit-exact across every tile.
     """
     model, inputs = _build_convtranspose_2d(
         c_in=24, c_out=24, h_in=16, w_in=16, seed=19
@@ -1930,10 +1932,13 @@ def _qdq_convtranspose_2d_tiled_case() -> ContractCase:
     pattern as _qdq_2d_tiled_conv_case but wrapping a stride-2 ConvTranspose.
 
     Input NCHW [1, 48, 16, 16] upsamples to [1, 48, 32, 32]. int8 activations
-    are a quarter the per-pixel footprint of the float case, so twice the
-    channels at a quarter the budget (4K) reproduce the same 4x4 grid of full
-    8x8 output tiles. The runtime executes the s8 reference ConvTranspose kernel
-    under the 2D tile context and must match ORT's int8 QDQ reference to one LSB.
+    are half the per-pixel footprint of the float case (48 int8 channels vs 24
+    float32), and the 4K budget is half the float case's 8K, so the compiler
+    splits both the height and width of the 32x32 output into a 2D tile grid.
+    The solved core tile does not evenly divide the output, so the last row,
+    column, and corner tiles are partial. The runtime executes the s8 reference
+    ConvTranspose kernel under the 2D tile context and must match ORT's int8 QDQ
+    reference to one LSB.
     """
     c_in = c_out = 48
     h_in = w_in = 16
@@ -2047,16 +2052,17 @@ def _qdq_convtranspose_2d_tiled_case() -> ContractCase:
 
 
 def _convtranspose_2d_partial_edge_case() -> ContractCase:
-    """A stride-2 ConvTranspose whose 2D tile does NOT evenly divide the output,
-    exercising the partial edge and corner tiles.
+    """A stride-2 ConvTranspose with a non-square input, whose 2D tile does NOT
+    evenly divide the output, exercising the partial edge and corner tiles.
 
     Input NCHW [1, 32, 15, 15] upsamples to output [1, 24, 30, 30]. At a 24K
-    budget the ConvTranspose solve grids the 30x30 output into a 3x3 tile grid
-    with a non-square 13x14 core: 30 is a multiple of neither 13 nor 14, so the
-    last tile row is 4 rows high, the last tile column is 2 columns wide, and the
-    bottom-right corner tile is 4x2. The runtime must place every partial edge
-    and corner tile at the correct output offset and still match ORT bit-exact,
-    which is the geometry (inverted rect plus effective pads) that Task 3 added.
+    budget the ConvTranspose solve splits both the height and width of the 30x30
+    output into a non-square core tile that divides neither axis evenly, so the
+    last tile row, the last tile column, and the bottom-right corner tile are all
+    partial (and generally differently sized). The runtime must place every
+    partial edge and corner tile at the correct output offset and still match ORT
+    bit-exact, which is the geometry (inverted rect plus effective pads) that
+    Task 3 added.
     """
     model, inputs = _build_convtranspose_2d(
         c_in=32, c_out=24, h_in=15, w_in=15, seed=23
