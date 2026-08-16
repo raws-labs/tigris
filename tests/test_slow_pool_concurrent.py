@@ -29,24 +29,28 @@ def build_long_lived_skip_graph() -> AnalyzedGraph:
       stage3: (mid2(64) + skip(1000)) + output(64) = 1128
       old coarse peak = max(...) = 2064
 
-    Concurrent peak (half-open birth_step < t <= death_step; lifetimes:
-    input birth=-1 death=1, skip birth=0 death=3, mid1 birth=1 death=2,
-    mid2 birth=2 death=3, output birth=3 death=4):
-      t=0 (stage0): input(64) alive; skip born this step, not yet live
-                    -> 64
+    Concurrent peak (closed-closed birth_step <= t <= death_step, matching
+    _live_bytes_by_step / stage.peak_bytes in partition_temporal.py;
+    lifetimes: input birth=-1 death=1, skip birth=0 death=3, mid1 birth=1
+    death=2, mid2 birth=2 death=3, output birth=3 death=4):
+      t=0 (stage0): input(64) alive; skip born this step, already live
+                    -> 64 + 1000 = 1064
       t=1 (stage1): input(64, dies here) + skip(1000, alive)
-                    -> 1064
+                    + mid1(2000, born this step, already live)
+                    -> 64 + 1000 + 2000 = 3064
       t=2 (stage2): skip(1000, still alive) + mid1(2000, dies here)
-                    -> 3000
+                    + mid2(64, born this step, already live)
+                    -> 1000 + 2000 + 64 = 3064
       t=3 (stage3): skip(1000, dies here) + mid2(64, dies here)
-                    -> 1064
-      concurrent peak = max(64, 1064, 3000, 1064) = 3000
+                    + output(64, born this step, already live)
+                    -> 1000 + 64 + 64 = 1128
+      concurrent peak = max(1064, 3064, 3064, 1128) = 3064
 
-    3000 > 2064: at stage 2's own op step, "skip" (produced by stage 0,
-    not yet consumed by stage 3) is concurrently resident alongside
-    "mid1" (stage 2's own input), and the coarse per-stage method never
-    sums a boundary tensor from one stage against a different stage's
-    own boundary tensors.
+    3064 > 2064: at stage 1's own op step, "skip" (produced by stage 0,
+    not yet consumed by stage 3) is concurrently resident alongside both
+    of stage 1's own boundary tensors ("input" and "mid1"), and the
+    coarse per-stage method never sums a boundary tensor from one stage
+    against a different stage's own boundary tensors.
     """
     op0 = OpNode(name="tap", op_type="Conv", inputs=["input"], outputs=["skip"], step=0)
     op1 = OpNode(name="branch", op_type="Conv", inputs=["input"], outputs=["mid1"], step=1)
@@ -91,7 +95,7 @@ def build_long_lived_skip_graph() -> AnalyzedGraph:
 
 
 def test_slow_pool_counts_long_lived_skip_concurrently():
-    expected_concurrent_peak = 3000
+    expected_concurrent_peak = 3064
     old_coarse_peak = 2064
     assert expected_concurrent_peak > old_coarse_peak
 

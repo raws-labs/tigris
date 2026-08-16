@@ -499,6 +499,12 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
     tiled stage of the total bytes of tensors slow-resident at that step,
     not just the current stage's own input+output (which under-counts a
     long-lived skip that spans several stages).
+
+    Liveness uses the closed-closed window birth_step <= step <= death_step,
+    matching _live_bytes_by_step and stage.peak_bytes (partition_temporal.py)
+    so a tensor that is both consumed and produced at the same op-step is
+    counted at that step by both the fast-pool and slow-pool models. This is
+    the conservative (upper-bounding) choice for a fail-closed budget check.
     """
     slow_budget = ag.budget.slow
     if slow_budget <= 0 or not ag.stages:
@@ -517,7 +523,7 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
         return sum(
             lt.size_bytes
             for lt in slow_lifetimes
-            if lt.birth_step < step <= lt.death_step
+            if lt.birth_step <= step <= lt.death_step
         )
 
     peak = 0
