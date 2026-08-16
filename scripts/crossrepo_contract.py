@@ -1845,6 +1845,287 @@ def _2d_tiled_conv_sigmoid_case() -> ContractCase:
     )
 
 
+def _cotiled_concat_2d_case() -> ContractCase:
+    """A pre-spatial channel Concat of two same-resolution skips feeding a
+    Conv, forced to 2D (HW) tiling at a 24K budget.
+
+    up and skip are both NCHW [1, 32, 66, 66]. A channel-axis Concat builds
+    cat [1, 64, 66, 66], which a 3x3 stride-1 pad-1 Conv maps to output
+    [1, 32, 66, 66]. At this budget the greedy temporal partition keeps the
+    Concat and the Conv as separate over-budget stages. Task 1's eligibility
+    change is what lets the multi-input Concat stage tile on both axes at all
+    (any Concat stage was previously excluded from HW tiling); both the
+    Concat and the Conv stage now solve a TILE_AXIS_HW tile with tiles_h > 1
+    and tiles_w > 1, so the plan's first tile-plan record proves 2D. This is
+    the co-tiled skip contract: the runtime loads up and skip at the same
+    tile rectangle and must reproduce the whole-op result bit-exact.
+    """
+    h = w = 66
+    c = 32
+    kernel, stride, pad = 3, 1, 1
+    rng = np.random.default_rng(17)
+    up = helper.make_tensor_value_info("up", TensorProto.FLOAT, [1, c, h, w])
+    skip = helper.make_tensor_value_info(
+        "skip", TensorProto.FLOAT, [1, c, h, w]
+    )
+    output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, c, h, w]
+    )
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c, 2 * c, kernel, kernel)).astype(
+            np.float32
+        ),
+        "weights",
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c,)).astype(np.float32), "bias"
+    )
+    model = _model(
+        "cotiled_concat_2d",
+        [
+            helper.make_node("Concat", ["up", "skip"], ["cat"], axis=1),
+            helper.make_node(
+                "Conv",
+                ["cat", "weights", "bias"],
+                ["output"],
+                name="conv0",
+                kernel_shape=[kernel, kernel],
+                strides=[stride, stride],
+                pads=[pad, pad, pad, pad],
+            ),
+        ],
+        [up, skip],
+        [output],
+        [weights, bias],
+    )
+    inputs = {
+        "up": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
+        "skip": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
+    }
+    return ContractCase(
+        "float_cotiled_concat_2d",
+        model,
+        model,
+        inputs,
+        expected_operators=("Concat", "Conv"),
+        mem_budget="24K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
+def _qdq_cotiled_concat_2d_case() -> ContractCase:
+    """The int8 sibling of _cotiled_concat_2d_case, built via the _qdq
+    QDQ pattern.
+
+    up and skip are NCHW [1, 128, 66, 66]; a channel-axis Concat builds
+    cat [1, 256, 66, 66] which a 3x3 stride-1 pad-1 Conv maps to int8 output
+    [1, 128, 66, 66]. up, skip, and cat share one scale/zero-point so the
+    Concat is a lossless channel copy (the co-tiled multi-input LOAD path,
+    not the requant path, is what this gate exercises); the single int8
+    rounding boundary is the Conv output, exactly as in _qdq_2d_tiled_conv.
+    Both the Concat and the Conv stage tile on TILE_AXIS_HW with tiles_h > 1
+    and tiles_w > 1.
+    """
+    h = w = 66
+    c = 128
+    kernel, stride, pad = 3, 1, 1
+    rng = np.random.default_rng(23)
+    up = helper.make_tensor_value_info("up", TensorProto.FLOAT, [1, c, h, w])
+    skip = helper.make_tensor_value_info(
+        "skip", TensorProto.FLOAT, [1, c, h, w]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, c, h, w]
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, [1, c, h, w]
+    )
+
+    def _scalar(value: float, name: str, dtype=np.float32) -> onnx.TensorProto:
+        return numpy_helper.from_array(np.array([value], dtype=dtype), name)
+
+    # up, skip, and cat share one scale so the Concat rescales nothing.
+    skip_scale = _scalar(0.02, "skip_scale")
+    skip_zero_point = _scalar(0, "skip_zero_point", np.int8)
+    up_scale = _scalar(0.02, "up_scale")
+    up_zero_point = _scalar(0, "up_zero_point", np.int8)
+    cat_scale = _scalar(0.02, "cat_scale")
+    cat_zero_point = _scalar(0, "cat_zero_point", np.int8)
+    output_scale = _scalar(0.05, "output_scale")
+    output_zero_point = _scalar(0, "output_zero_point", np.int8)
+    weight = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c, 2 * c, kernel, kernel)).astype(
+            np.float32
+        ),
+        "weight",
+    )
+    weight_scale = _scalar(0.01, "weight_scale")
+    weight_zero_point = _scalar(0, "weight_zero_point", np.int8)
+    initializers = [
+        up_scale,
+        up_zero_point,
+        skip_scale,
+        skip_zero_point,
+        cat_scale,
+        cat_zero_point,
+        output_scale,
+        output_zero_point,
+        weight,
+        weight_scale,
+        weight_zero_point,
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["up", "up_scale", "up_zero_point"], ["up_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["up_q", "up_scale", "up_zero_point"],
+            ["up_dq"],
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["skip", "skip_scale", "skip_zero_point"],
+            ["skip_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["skip_q", "skip_scale", "skip_zero_point"],
+            ["skip_dq"],
+        ),
+        helper.make_node("Concat", ["up_dq", "skip_dq"], ["cat"], axis=1),
+        helper.make_node(
+            "QuantizeLinear", ["cat", "cat_scale", "cat_zero_point"], ["cat_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["cat_q", "cat_scale", "cat_zero_point"],
+            ["cat_dq"],
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["weight", "weight_scale", "weight_zero_point"],
+            ["weight_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["weight_q", "weight_scale", "weight_zero_point"],
+            ["weight_dq"],
+        ),
+        helper.make_node(
+            "Conv",
+            ["cat_dq", "weight_dq"],
+            ["raw"],
+            name="conv0",
+            kernel_shape=[kernel, kernel],
+            strides=[stride, stride],
+            pads=[pad, pad, pad, pad],
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["raw", "output_scale", "output_zero_point"],
+            ["output_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["output_q", "output_scale", "output_zero_point"],
+            ["output"],
+        ),
+    ]
+    compile_model = _model(
+        "qdq_cotiled_concat_2d",
+        nodes,
+        [up, skip],
+        [model_output],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+
+    inputs = {
+        "up": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
+        "skip": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
+    }
+    return ContractCase(
+        "int8_cotiled_concat_2d",
+        compile_model,
+        reference_model,
+        inputs,
+        ("Concat", "Conv"),
+        mem_budget="24K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
+def _cotiled_add_2d_case() -> ContractCase:
+    """A pre-spatial residual Add of two same-resolution operands feeding a
+    Conv, forced to 2D (HW) tiling at a 24K budget.
+
+    x and skip are both NCHW [1, 64, 66, 66]; Add produces added
+    [1, 64, 66, 66], which a 3x3 stride-1 pad-1 Conv maps to output
+    [1, 64, 66, 66]. Like the Concat sibling, the greedy temporal partition
+    keeps the Add and the Conv as separate over-budget stages; Task 1's
+    change lets the multi-input Add stage tile on both axes (Add was
+    previously excluded from HW tiling). Both stages solve a TILE_AXIS_HW
+    tile with tiles_h > 1 and tiles_w > 1, and the runtime loads x and skip
+    at the same tile rectangle.
+    """
+    h = w = 66
+    c = 64
+    kernel, stride, pad = 3, 1, 1
+    rng = np.random.default_rng(19)
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, c, h, w])
+    skip = helper.make_tensor_value_info(
+        "skip", TensorProto.FLOAT, [1, c, h, w]
+    )
+    output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, c, h, w]
+    )
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c, c, kernel, kernel)).astype(np.float32),
+        "weights",
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c,)).astype(np.float32), "bias"
+    )
+    model = _model(
+        "cotiled_add_2d",
+        [
+            helper.make_node("Add", ["x", "skip"], ["added"]),
+            helper.make_node(
+                "Conv",
+                ["added", "weights", "bias"],
+                ["output"],
+                name="conv0",
+                kernel_shape=[kernel, kernel],
+                strides=[stride, stride],
+                pads=[pad, pad, pad, pad],
+            ),
+        ],
+        [x, skip],
+        [output],
+        [weights, bias],
+    )
+    inputs = {
+        "x": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
+        "skip": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
+    }
+    return ContractCase(
+        "float_cotiled_add_2d",
+        model,
+        model,
+        inputs,
+        expected_operators=("Add", "Conv"),
+        mem_budget="24K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
 def _build_convtranspose_2d(
     c_in: int, c_out: int, h_in: int, w_in: int, seed: int
 ) -> tuple[onnx.ModelProto, dict[str, Array]]:
@@ -2724,6 +3005,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _2d_tiled_conv_case(),
         _qdq_2d_tiled_conv_case(),
         _2d_tiled_conv_sigmoid_case(),
+        _cotiled_concat_2d_case(),
+        _qdq_cotiled_concat_2d_case(),
+        _cotiled_add_2d_case(),
         _convtranspose_2d_tiled_case(),
         _qdq_convtranspose_2d_tiled_case(),
         _convtranspose_2d_partial_edge_case(),
