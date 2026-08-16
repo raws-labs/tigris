@@ -455,3 +455,63 @@ def test_convtranspose_under_budget_untiled():
     ag.budget = MemoryBudget(fast=stage.peak_bytes * 2)  # fits whole, no tiling
     ag = partition_spatial(ag)
     assert _ct_stage(ag).tile_plan is None
+
+
+def _runtime_ct_working_set(
+    th, tw, *, in_ch, out_ch, full_in_h, full_in_w,
+    eff_kh, eff_kw, stride_h, stride_w, in_elem, out_elem, align=32,
+):
+    """Independent reimplementation of the runtime's stage_2d_fast_bytes
+    (tigris-runtime/src/tigris_executor.c) for a single-input, single-output
+    ConvTranspose: one resident input tile plus the output tile, each aligned.
+
+    Kept deliberately separate from the compiler's own model so the test is a
+    real property check, not a tautology: a proportional peak model (the BUG B
+    cost model) emits a 32x32 tile here whose working set is 11104 bytes and
+    exceeds the 8192-byte budget, which this assertion catches.
+    """
+    def align_up(n):
+        return (n + align - 1) & ~(align - 1)
+
+    in_tile_h = min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h)
+    in_tile_w = min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w)
+    total = align_up(1 * in_tile_h * in_tile_w * in_ch * in_elem)
+    total += align_up(1 * th * tw * out_ch * out_elem)
+    return total
+
+
+def test_convtranspose_emitted_tile_fits_runtime_working_set():
+    # Pins the BUG B fix: the tile the solver emits for the over-budget case
+    # must fit the runtime's real working-set model, not just a proportional
+    # activation-area estimate. Recompute the runtime formula independently and
+    # assert working_set <= budget (the invariant the proportional model broke).
+    ag = build_convtranspose_graph(
+        in_hw=(32, 32), stride=2, kernel=2, in_ch=8, out_ch=8
+    )
+    stage = _ct_stage(ag)
+    budget = stage.peak_bytes // 4  # 8192
+    ag.budget = MemoryBudget(fast=budget)
+    ag = partition_spatial(ag)
+    tp = _ct_stage(ag).tile_plan
+    assert tp.tileable and tp.axis == TILE_AXIS_HW
+
+    ws = _runtime_ct_working_set(
+        tp.tile_height, tp.tile_width,
+        in_ch=8, out_ch=8, full_in_h=32, full_in_w=32,
+        eff_kh=2, eff_kw=2, stride_h=2, stride_w=2,
+        in_elem=1, out_elem=1,
+    )
+    assert ws <= budget, (
+        f"emitted tile {tp.tile_height}x{tp.tile_width} needs {ws} bytes "
+        f"> budget {budget}"
+    )
+    # The solver also reports that working set as the tiled peak.
+    assert tp.tiled_peak_bytes == ws
+
+    # Sanity: the old proportional model would have emitted a 32x32 tile whose
+    # working set overflows the budget, proving this is a non-trivial check.
+    overflow = _runtime_ct_working_set(
+        32, 32, in_ch=8, out_ch=8, full_in_h=32, full_in_w=32,
+        eff_kh=2, eff_kw=2, stride_h=2, stride_w=2, in_elem=1, out_elem=1,
+    )
+    assert overflow > budget

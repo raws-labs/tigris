@@ -75,6 +75,15 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
+# Conservative per-tile allocation alignment for the backend-agnostic tiled
+# working-set model. The runtime rounds every fast-arena tile allocation up to
+# its target's TIGRIS_TENSOR_ALIGN (Xtensa 8, aarch64 16, x86_64 32, default 4);
+# 32 is the maximum of that standard set, so aligning the compiler's estimate to
+# it never under-counts against any of them (align_up is monotonic in the
+# alignment). Under-counting would let the solver emit a tile the runtime's
+# stage_2d_fast_bytes check rejects, which is exactly the bug this guards.
+_CONSERVATIVE_TENSOR_ALIGN = 32
+
 
 def classify_op(op_type: str) -> TileCategory:
     """Classify an op type into a tile category. Unknown ops are UNTILEABLE."""
@@ -304,20 +313,47 @@ def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
     return True
 
 
+def _stage_rank4_input_infos(ag: AnalyzedGraph, stage: Stage) -> list:
+    """The stage's external activation inputs that are rank-4 tensors.
+
+    Mirrors the runtime's stage_inputs (tigris_stage_inputs): only the declared
+    external activation inputs, never an op's weight/bias operands. No fallback
+    to op inputs, which would wrongly pull in the ConvTranspose weight tensor.
+    """
+    infos = []
+    for name in stage.input_tensors:
+        info = ag.tensors.get(name)
+        if info and len(info.shape) == 4:
+            infos.append(info)
+    return infos
+
+
 def _solve_convtranspose_2d(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
 ) -> TilePlan:
     """Emit a 2D (HW) tile plan for an over-budget ConvTranspose stage.
 
-    ConvTranspose expands its spatial extent (stride upsampling), so the tile
-    grid and the proportional peak model must run over the OUTPUT tensor, not
-    the input. solve_2d_tile is reused with input_h/input_w set to the OUTPUT
-    extents and zero halo, so its int(peak * (th + 0) * (tw + 0) /
-    (out_h * out_w)) equals the expand-aware tiled peak.
+    The tile grid is normalized over the expanded OUTPUT extent, but the
+    per-tile working set is sized the SAME way the runtime does in
+    stage_2d_fast_bytes (tigris_executor.c): a resident packed INPUT tile plus
+    every op's packed output tile, all live at once. This matters because a
+    ConvTranspose's input tile does NOT shrink by the output-area ratio - it
+    inverts to a fixed-halo rectangle
+    ``in_tile = (out_tile + eff_k + stride - 1)//stride + 2`` (clamped to the
+    full input), which a proportional peak model under-counts. Under-counting
+    made the runtime reject every emitted tile (ERR_TILE); this models the real
+    working set so every emitted tile fits.
 
-    Fails closed (a non-tileable TilePlan) when the output extent cannot be
-    determined, or when no output tile - not even a 1x1 core - fits the budget.
+    Fails closed (a non-tileable TilePlan) when the output/input extent cannot
+    be determined, or when no output tile - not even a 1x1 core - fits budget.
     """
+    ct = next((op for op in stage_ops if op.op_type == "ConvTranspose"), None)
+    if ct is None:  # guarded by _stage_is_convtranspose_2d; defensive
+        return TilePlan(
+            tileable=False,
+            warnings=[f"Stage {stage.stage_id}: no ConvTranspose op in stage"],
+        )
+
     out_h = _find_output_extent(ag, stage)
     out_w = _find_output_extent_width(ag, stage)
     if out_h <= 0 or out_w <= 0:
@@ -329,15 +365,69 @@ def _solve_convtranspose_2d(
             ],
         )
 
-    shape = solve_2d_tile(
-        budget=budget,
-        peak=stage.peak_bytes,
-        input_h=out_h,
-        input_w=out_w,
-        halo_h=0,
-        halo_w=0,
-    )
-    if shape is None:
+    in_infos = _stage_rank4_input_infos(ag, stage)
+    if not in_infos:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine ConvTranspose "
+                f"input extent"
+            ],
+        )
+    full_in_h = int(in_infos[0].shape[2])  # NCHW: H at dim 2
+    full_in_w = int(in_infos[0].shape[3])  # NCHW: W at dim 3
+
+    # group == 1 and unit dilation are enforced by _stage_is_convtranspose_2d;
+    # compute eff_k with dilation folded in anyway to match the runtime exactly.
+    eff_kh = _get_dilation_h(ct) * (_get_kernel_h(ct) - 1) + 1
+    eff_kw = _get_dilation_w(ct) * (_get_kernel_w(ct) - 1) + 1
+    stride_h = _get_stride_h(ct)
+    stride_w = _get_stride_w(ct)
+    if full_in_h <= 0 or full_in_w <= 0 or stride_h <= 0 or stride_w <= 0:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: malformed ConvTranspose geometry"
+            ],
+        )
+
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+
+    def working_set(th: int, tw: int) -> int:
+        """Runtime stage_2d_fast_bytes for one (th, tw) output tile."""
+        # ConvTranspose input tile: inverts to a smaller fixed-halo rectangle,
+        # clamped to the full input, exactly as the runtime computes it.
+        in_tile_h = min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h)
+        in_tile_w = min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w)
+        total = 0
+        for info in in_infos:
+            total += _align_up(
+                int(info.shape[0]) * in_tile_h * in_tile_w
+                * int(info.shape[1]) * info.elem_size,
+                align,
+            )
+        # Walk the op sequence tracking the running tile extent: it starts at
+        # the input tile, the single spatial op resizes it to the output tile,
+        # pointwise ops preserve it. Matches the runtime's cur_h/cur_w walk.
+        cur_h, cur_w = in_tile_h, in_tile_w
+        for op in stage_ops:
+            is_spatial = op is ct
+            ah = th if is_spatial else cur_h
+            aw = tw if is_spatial else cur_w
+            for name in op.outputs:
+                info = ag.tensors.get(name)
+                if info and len(info.shape) == 4:
+                    total += _align_up(
+                        int(info.shape[0]) * ah * aw
+                        * int(info.shape[1]) * info.elem_size,
+                        align,
+                    )
+            if is_spatial:
+                cur_h, cur_w = th, tw
+        return total
+
+    # Fail closed if even a 1x1 output tile overflows the budget.
+    if working_set(1, 1) > budget:
         return TilePlan(
             tileable=False,
             warnings=[
@@ -346,8 +436,27 @@ def _solve_convtranspose_2d(
             ],
         )
 
-    th, tw = shape
-    tiled_peak = int(stage.peak_bytes * th * tw / (out_h * out_w))
+    # Largest output tile whose runtime working set fits, maximizing tile area
+    # (fewest tiles). working_set is monotonic non-decreasing in both th and tw,
+    # so per th the largest feasible tw is a binary search, and once th at tw==1
+    # overflows no larger th can fit at any width.
+    best_th, best_tw, best_area = 1, 1, 1
+    for th in range(1, out_h + 1):
+        if working_set(th, 1) > budget:
+            break
+        lo, hi, tw_for_th = 1, out_w, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if working_set(th, mid) <= budget:
+                tw_for_th = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        area = th * tw_for_th
+        if area > best_area:
+            best_area, best_th, best_tw = area, th, tw_for_th
+
+    th, tw = best_th, best_tw
     return TilePlan(
         tileable=True,
         axis=TILE_AXIS_HW,
@@ -357,7 +466,7 @@ def _solve_convtranspose_2d(
         halo=0,
         receptive_field=1,
         original_height=out_h,
-        tiled_peak_bytes=tiled_peak,
+        tiled_peak_bytes=working_set(th, tw),
         overhead_bytes=0,
         warnings=[],
     )
