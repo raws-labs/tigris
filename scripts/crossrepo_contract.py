@@ -1845,6 +1845,240 @@ def _2d_tiled_conv_sigmoid_case() -> ContractCase:
     )
 
 
+def _build_convtranspose_2d(
+    c_in: int, c_out: int, h_in: int, w_in: int, seed: int
+) -> tuple[onnx.ModelProto, dict[str, Array]]:
+    """Build a stride-2 kernel-2 pad-0 float ConvTranspose upsampler.
+
+    Mirrors _convtranspose_case's node and weight construction (ONNX weight
+    layout [C_in, C_out, kH, kW], transposed to OHWI by the compiler) but
+    parameterizes the geometry so a caller can drive the stage over a tight
+    budget. Output height and width follow stride * (in - 1) + kernel = 2 * in,
+    so the tensor doubles on each spatial axis; the compiler grids the 2D tile
+    over that expanded OUTPUT extent, not the pre-upsample input.
+    """
+    out_h, out_w = 2 * h_in, 2 * w_in
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, c_in, h_in, w_in]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, c_out, out_h, out_w]
+    )
+    rng = np.random.default_rng(seed)
+    weights = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c_in, c_out, 2, 2)).astype(np.float32),
+        "weights",
+    )
+    bias = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c_out,)).astype(np.float32), "bias"
+    )
+    model = _model(
+        "convtranspose2d",
+        [
+            helper.make_node(
+                "ConvTranspose",
+                ["input", "weights", "bias"],
+                ["output"],
+                kernel_shape=[2, 2],
+                strides=[2, 2],
+                pads=[0, 0, 0, 0],
+                group=1,
+            )
+        ],
+        [model_input],
+        [model_output],
+        [weights, bias],
+    )
+    inputs = {
+        "input": rng.uniform(-1.0, 1.0, size=(1, c_in, h_in, w_in)).astype(
+            np.float32
+        )
+    }
+    return model, inputs
+
+
+def _convtranspose_2d_tiled_case() -> ContractCase:
+    """A stride-2 ConvTranspose whose expanded output overflows an 8K budget,
+    forcing a 2D (HW) tile.
+
+    Input NCHW [1, 24, 16, 16] upsamples to output [1, 24, 32, 32]. The stage's
+    ~120 KB activation peak far exceeds the 8K fast budget - a single output row
+    does not fit on its own - and ConvTranspose is kept untileable on the 1D
+    height and chain paths, so it routes only through the compiler's dedicated
+    output-extent 2D solve, which splits both the height and width of the 32x32
+    output. The solved core tile does not evenly divide the output, so the last
+    tile row, the last tile column, and the bottom-right corner tile are all
+    partial. An emitted axis == TILE_AXIS_HW plan is itself proof the isolated
+    ConvTranspose 2D branch fired, and the runtime must reproduce ORT's float
+    upsample bit-exact across every tile.
+    """
+    model, inputs = _build_convtranspose_2d(
+        c_in=24, c_out=24, h_in=16, w_in=16, seed=19
+    )
+    return ContractCase(
+        "float_convtranspose_2d",
+        model,
+        model,
+        inputs,
+        expected_operators=("ConvTranspose",),
+        mem_budget="8K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
+def _qdq_convtranspose_2d_tiled_case() -> ContractCase:
+    """The int8 sibling of _convtranspose_2d_tiled_case, built with the same QDQ
+    pattern as _qdq_2d_tiled_conv_case but wrapping a stride-2 ConvTranspose.
+
+    Input NCHW [1, 48, 16, 16] upsamples to [1, 48, 32, 32]. int8 activations
+    are half the per-pixel footprint of the float case (48 int8 channels vs 24
+    float32), and the 4K budget is half the float case's 8K, so the compiler
+    splits both the height and width of the 32x32 output into a 2D tile grid.
+    The solved core tile does not evenly divide the output, so the last row,
+    column, and corner tiles are partial. The runtime executes the s8 reference
+    ConvTranspose kernel under the 2D tile context and must match ORT's int8 QDQ
+    reference to one LSB.
+    """
+    c_in = c_out = 48
+    h_in = w_in = 16
+    out_h, out_w = 2 * h_in, 2 * w_in
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, c_in, h_in, w_in]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, c_out, out_h, out_w]
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, [1, c_out, out_h, out_w]
+    )
+    rng = np.random.default_rng(7)
+    input_scale = numpy_helper.from_array(
+        np.array([0.02], dtype=np.float32), "input_scale"
+    )
+    input_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "input_zero_point"
+    )
+    output_scale = numpy_helper.from_array(
+        np.array([0.05], dtype=np.float32), "output_scale"
+    )
+    output_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "output_zero_point"
+    )
+    weight = numpy_helper.from_array(
+        rng.normal(0.0, 0.05, size=(c_in, c_out, 2, 2)).astype(np.float32),
+        "weight",
+    )
+    weight_scale = numpy_helper.from_array(
+        np.array([0.01], dtype=np.float32), "weight_scale"
+    )
+    weight_zero_point = numpy_helper.from_array(
+        np.array([0], dtype=np.int8), "weight_zero_point"
+    )
+    initializers = [
+        input_scale,
+        input_zero_point,
+        output_scale,
+        output_zero_point,
+        weight,
+        weight_scale,
+        weight_zero_point,
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear",
+            ["input", "input_scale", "input_zero_point"],
+            ["input_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["input_q", "input_scale", "input_zero_point"],
+            ["input_dq"],
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["weight", "weight_scale", "weight_zero_point"],
+            ["weight_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["weight_q", "weight_scale", "weight_zero_point"],
+            ["weight_dq"],
+        ),
+        helper.make_node(
+            "ConvTranspose",
+            ["input_dq", "weight_dq"],
+            ["raw"],
+            kernel_shape=[2, 2],
+            strides=[2, 2],
+            pads=[0, 0, 0, 0],
+            group=1,
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["raw", "output_scale", "output_zero_point"],
+            ["output_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["output_q", "output_scale", "output_zero_point"],
+            ["output"],
+        ),
+    ]
+    compile_model = _model(
+        "qdq_convtranspose_2d",
+        nodes,
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+    input_data = rng.uniform(-1.0, 1.0, size=(1, c_in, h_in, w_in)).astype(
+        np.float32
+    )
+    return ContractCase(
+        "int8_convtranspose_2d",
+        compile_model,
+        reference_model,
+        {"input": input_data},
+        ("ConvTranspose",),
+        mem_budget="4K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
+def _convtranspose_2d_partial_edge_case() -> ContractCase:
+    """A stride-2 ConvTranspose with a non-square input, whose 2D tile does NOT
+    evenly divide the output, exercising the partial edge and corner tiles.
+
+    Input NCHW [1, 32, 15, 15] upsamples to output [1, 24, 30, 30]. At a 24K
+    budget the ConvTranspose solve splits both the height and width of the 30x30
+    output into a non-square core tile that divides neither axis evenly, so the
+    last tile row, the last tile column, and the bottom-right corner tile are all
+    partial (and generally differently sized). The runtime must place every
+    partial edge and corner tile at the correct output offset and still match ORT
+    bit-exact, which is the geometry (inverted rect plus effective pads) that
+    Task 3 added.
+    """
+    model, inputs = _build_convtranspose_2d(
+        c_in=32, c_out=24, h_in=15, w_in=15, seed=23
+    )
+    return ContractCase(
+        "float_convtranspose_2d_partial",
+        model,
+        model,
+        inputs,
+        expected_operators=("ConvTranspose",),
+        mem_budget="24K",
+        expect_tiled=True,
+        expect_2d=True,
+    )
+
+
 def _to_runtime_layout(value: Array) -> Array:
     if value.ndim == 4:
         return np.ascontiguousarray(value.transpose(0, 2, 3, 1))
@@ -2490,6 +2724,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _2d_tiled_conv_case(),
         _qdq_2d_tiled_conv_case(),
         _2d_tiled_conv_sigmoid_case(),
+        _convtranspose_2d_tiled_case(),
+        _qdq_convtranspose_2d_tiled_case(),
+        _convtranspose_2d_partial_edge_case(),
     ]
     covered_operators = {
         operator for case in cases for operator in case.expected_operators

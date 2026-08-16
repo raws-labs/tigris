@@ -1,5 +1,7 @@
 """Tests for 2D (height + width) receptive field computation and tile solving."""
 
+import math
+
 from onnx import TensorProto
 
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW
@@ -343,3 +345,173 @@ def test_conv_plus_unary_stage_still_goes_hw():
     ag = partition_spatial(ag)
     stage_plan = plan_for_single_stage(ag)
     assert stage_plan.axis == TILE_AXIS_HW
+
+
+# ConvTranspose 2D tiling over the OUTPUT extent.
+#
+# ConvTranspose stays UNTILEABLE in _OP_CATEGORY (so it is auto-excluded from
+# chains, the 1D height solve, and receptive-field composition). Its 2D tiling
+# is handled by a dedicated isolated branch in partition_spatial that grids the
+# OUTPUT extent (the expanded, post-upsample shape) with zero halo. These tests
+# exercise that branch end to end.
+
+
+def build_convtranspose_graph(
+    in_hw: tuple[int, int],
+    stride: int,
+    kernel: int,
+    in_ch: int,
+    out_ch: int,
+) -> AnalyzedGraph:
+    """Single-stage AnalyzedGraph for one ConvTranspose on an int8 activation.
+
+    group == 1 and unit dilation (the runtime-supported subset). The output
+    tensor shape is the ONNX-inferred expanded extent for pads == 0:
+        out = (in - 1) * stride + kernel
+
+    peak_bytes is the whole OUTPUT activation working set (channels included),
+    matching the c*h*w convention of build_high_res_conv_graph above, so a
+    single output pixel costs exactly out_ch bytes and the proportional
+    tiled-peak model tiles the expanded output area.
+    """
+    in_h, in_w = in_hw
+    out_h = (in_h - 1) * stride + kernel
+    out_w = (in_w - 1) * stride + kernel
+    op = OpNode(
+        name="conv_transpose",
+        op_type="ConvTranspose",
+        inputs=["input"],
+        outputs=["output"],
+        attrs={
+            "kernel_shape": [kernel, kernel],
+            "strides": [stride, stride],
+            "pads": [0, 0, 0, 0],
+            "dilations": [1, 1],
+            "group": 1,
+        },
+    )
+    stage = Stage(
+        stage_id=0,
+        op_indices=[0],
+        input_tensors=["input"],
+        output_tensors=["output"],
+        peak_bytes=out_ch * out_h * out_w,
+    )
+    return AnalyzedGraph(
+        ops=[op],
+        stages=[stage],
+        tensors={
+            "input": TensorInfo("input", (1, in_ch, in_h, in_w), TensorProto.INT8),
+            "output": TensorInfo("output", (1, out_ch, out_h, out_w), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=0),
+    )
+
+
+def _ct_stage(ag):
+    """The single ConvTranspose stage."""
+    return next(
+        s
+        for s in ag.stages
+        if any(ag.ops[i].op_type == "ConvTranspose" for i in s.op_indices)
+    )
+
+
+def test_convtranspose_over_budget_tiles_2d():
+    ag = build_convtranspose_graph(
+        in_hw=(32, 32), stride=2, kernel=2, in_ch=8, out_ch=8
+    )  # out 64x64
+    stage = _ct_stage(ag)
+    ag.budget = MemoryBudget(fast=stage.peak_bytes // 4)  # multiple tiles needed
+    ag = partition_spatial(ag)
+    tp = _ct_stage(ag).tile_plan
+    assert tp.tileable and tp.axis == TILE_AXIS_HW
+    assert tp.original_height == 64  # OUTPUT extent, not the 32-row input
+    assert tp.halo == 0 and tp.receptive_field == 1
+    tiles_h = math.ceil(tp.original_height / tp.tile_height)
+    tiles_w = tp.num_tiles // tiles_h
+    assert tiles_h > 1 and tiles_w > 1
+
+
+def test_convtranspose_infeasible_budget_fails_closed():
+    ag = build_convtranspose_graph(
+        in_hw=(32, 32), stride=2, kernel=2, in_ch=8, out_ch=8
+    )
+    # 4 bytes is smaller than even a single output pixel's working set (out_ch
+    # == 8 int8 bytes), so no output tile fits: the solve must fail closed.
+    # (The brief's illustrative literal 256 assumes a many-channel stage; at
+    # out_ch == 8 the honest per-pixel threshold is 8 bytes, matching the
+    # brief's own "smaller than a 1x1 output tile working set" comment.)
+    ag.budget = MemoryBudget(fast=4)
+    ag = partition_spatial(ag)
+    assert not _ct_stage(ag).tile_plan.tileable
+
+
+def test_convtranspose_under_budget_untiled():
+    ag = build_convtranspose_graph(
+        in_hw=(32, 32), stride=2, kernel=2, in_ch=8, out_ch=8
+    )
+    stage = _ct_stage(ag)
+    ag.budget = MemoryBudget(fast=stage.peak_bytes * 2)  # fits whole, no tiling
+    ag = partition_spatial(ag)
+    assert _ct_stage(ag).tile_plan is None
+
+
+def _runtime_ct_working_set(
+    th, tw, *, in_ch, out_ch, full_in_h, full_in_w,
+    eff_kh, eff_kw, stride_h, stride_w, in_elem, out_elem, align=32,
+):
+    """Independent reimplementation of the runtime's stage_2d_fast_bytes
+    (tigris-runtime/src/tigris_executor.c) for a single-input, single-output
+    ConvTranspose: one resident input tile plus the output tile, each aligned.
+
+    Kept deliberately separate from the compiler's own model so the test is a
+    real property check, not a tautology: a proportional peak model (the BUG B
+    cost model) emits a 32x32 tile here whose working set is 11104 bytes and
+    exceeds the 8192-byte budget, which this assertion catches.
+    """
+    def align_up(n):
+        return (n + align - 1) & ~(align - 1)
+
+    in_tile_h = min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h)
+    in_tile_w = min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w)
+    total = align_up(1 * in_tile_h * in_tile_w * in_ch * in_elem)
+    total += align_up(1 * th * tw * out_ch * out_elem)
+    return total
+
+
+def test_convtranspose_emitted_tile_fits_runtime_working_set():
+    # Pins the BUG B fix: the tile the solver emits for the over-budget case
+    # must fit the runtime's real working-set model, not just a proportional
+    # activation-area estimate. Recompute the runtime formula independently and
+    # assert working_set <= budget (the invariant the proportional model broke).
+    ag = build_convtranspose_graph(
+        in_hw=(32, 32), stride=2, kernel=2, in_ch=8, out_ch=8
+    )
+    stage = _ct_stage(ag)
+    budget = stage.peak_bytes // 4  # 8192
+    ag.budget = MemoryBudget(fast=budget)
+    ag = partition_spatial(ag)
+    tp = _ct_stage(ag).tile_plan
+    assert tp.tileable and tp.axis == TILE_AXIS_HW
+
+    ws = _runtime_ct_working_set(
+        tp.tile_height, tp.tile_width,
+        in_ch=8, out_ch=8, full_in_h=32, full_in_w=32,
+        eff_kh=2, eff_kw=2, stride_h=2, stride_w=2,
+        in_elem=1, out_elem=1,
+    )
+    assert ws <= budget, (
+        f"emitted tile {tp.tile_height}x{tp.tile_width} needs {ws} bytes "
+        f"> budget {budget}"
+    )
+    # The solver also reports that working set as the tiled peak.
+    assert tp.tiled_peak_bytes == ws
+
+    # Sanity: the old proportional model would have emitted a 32x32 tile whose
+    # working set overflows the budget, proving this is a non-trivial check.
+    overflow = _runtime_ct_working_set(
+        32, 32, in_ch=8, out_ch=8, full_in_h=32, full_in_w=32,
+        eff_kh=2, eff_kw=2, stride_h=2, stride_w=2, in_elem=1, out_elem=1,
+    )
+    assert overflow > budget

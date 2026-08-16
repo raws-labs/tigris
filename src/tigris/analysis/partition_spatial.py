@@ -75,6 +75,15 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
+# Conservative per-tile allocation alignment for the backend-agnostic tiled
+# working-set model. The runtime rounds every fast-arena tile allocation up to
+# its target's TIGRIS_TENSOR_ALIGN (Xtensa 8, aarch64 16, x86_64 32, default 4);
+# 32 is the maximum of that standard set, so aligning the compiler's estimate to
+# it never under-counts against any of them (align_up is monotonic in the
+# alignment). Under-counting would let the solver emit a tile the runtime's
+# stage_2d_fast_bytes check rejects, which is exactly the bug this guards.
+_CONSERVATIVE_TENSOR_ALIGN = 32
+
 
 def classify_op(op_type: str) -> TileCategory:
     """Classify an op type into a tile category. Unknown ops are UNTILEABLE."""
@@ -268,6 +277,201 @@ def _stage_2d_eligible(
     return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
 
 
+def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
+    """A stage qualifies for the dedicated ConvTranspose 2D solve iff exactly
+    one op is a ConvTranspose (group == 1, unit dilation) and every other op is
+    an audited unary pointwise wrapper.
+
+    ConvTranspose is deliberately kept UNTILEABLE in _OP_CATEGORY, so it never
+    reaches the height (1D), HW-conv, or chain paths; this predicate gates the
+    isolated 2D-output-extent branch that replaces them for it. The group and
+    dilation checks are defense in depth: validate_operator_support already
+    rejects group != 1 or non-unit dilation, but a not-yet-rejected op must
+    never fall into the 2D solve.
+
+    "Audited pointwise" reuses the same set _stage_2d_eligible admits: the
+    POINTWISE category minus _BINARY_OPS and Concat. Those take an independent
+    second operand that the shared input-halo rectangle load does not co-tile,
+    so they are excluded here for the same reason. This bounds Phase 1.3c to a
+    ConvTranspose plus optional unary pointwise.
+    """
+    convtranspose = [op for op in stage_ops if op.op_type == "ConvTranspose"]
+    if len(convtranspose) != 1:
+        return False
+    ct = convtranspose[0]
+    if int(ct.attrs.get("group", 1)) != 1:
+        return False
+    if _get_dilation_h(ct) != 1 or _get_dilation_w(ct) != 1:
+        return False
+    for op in stage_ops:
+        if op is ct:
+            continue
+        if op.op_type in _BINARY_OPS or op.op_type == "Concat":
+            return False
+        if classify_op(op.op_type) != TileCategory.POINTWISE:
+            return False
+    return True
+
+
+def _stage_rank4_input_infos(ag: AnalyzedGraph, stage: Stage) -> list:
+    """The stage's external activation inputs that are rank-4 tensors.
+
+    Mirrors the runtime's stage_inputs (tigris_stage_inputs): only the declared
+    external activation inputs, never an op's weight/bias operands. No fallback
+    to op inputs, which would wrongly pull in the ConvTranspose weight tensor.
+    """
+    infos = []
+    for name in stage.input_tensors:
+        info = ag.tensors.get(name)
+        if info and len(info.shape) == 4:
+            infos.append(info)
+    return infos
+
+
+def _solve_convtranspose_2d(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Emit a 2D (HW) tile plan for an over-budget ConvTranspose stage.
+
+    The tile grid is normalized over the expanded OUTPUT extent, but the
+    per-tile working set is sized the SAME way the runtime does in
+    stage_2d_fast_bytes (tigris_executor.c): a resident packed INPUT tile plus
+    every op's packed output tile, all live at once. This matters because a
+    ConvTranspose's input tile does NOT shrink by the output-area ratio - it
+    inverts to a fixed-halo rectangle
+    ``in_tile = (out_tile + eff_k + stride - 1)//stride + 2`` (clamped to the
+    full input), which a proportional peak model under-counts. Under-counting
+    made the runtime reject every emitted tile (ERR_TILE); this models the real
+    working set so every emitted tile fits.
+
+    Fails closed (a non-tileable TilePlan) when the output/input extent cannot
+    be determined, or when no output tile - not even a 1x1 core - fits budget.
+    """
+    ct = next((op for op in stage_ops if op.op_type == "ConvTranspose"), None)
+    if ct is None:  # guarded by _stage_is_convtranspose_2d; defensive
+        return TilePlan(
+            tileable=False,
+            warnings=[f"Stage {stage.stage_id}: no ConvTranspose op in stage"],
+        )
+
+    out_h = _find_output_extent(ag, stage)
+    out_w = _find_output_extent_width(ag, stage)
+    if out_h <= 0 or out_w <= 0:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine ConvTranspose "
+                f"output extent"
+            ],
+        )
+
+    in_infos = _stage_rank4_input_infos(ag, stage)
+    if not in_infos:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine ConvTranspose "
+                f"input extent"
+            ],
+        )
+    full_in_h = int(in_infos[0].shape[2])  # NCHW: H at dim 2
+    full_in_w = int(in_infos[0].shape[3])  # NCHW: W at dim 3
+
+    # group == 1 and unit dilation are enforced by _stage_is_convtranspose_2d;
+    # compute eff_k with dilation folded in anyway to match the runtime exactly.
+    eff_kh = _get_dilation_h(ct) * (_get_kernel_h(ct) - 1) + 1
+    eff_kw = _get_dilation_w(ct) * (_get_kernel_w(ct) - 1) + 1
+    stride_h = _get_stride_h(ct)
+    stride_w = _get_stride_w(ct)
+    if full_in_h <= 0 or full_in_w <= 0 or stride_h <= 0 or stride_w <= 0:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: malformed ConvTranspose geometry"
+            ],
+        )
+
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+
+    def working_set(th: int, tw: int) -> int:
+        """Runtime stage_2d_fast_bytes for one (th, tw) output tile."""
+        # ConvTranspose input tile: inverts to a smaller fixed-halo rectangle,
+        # clamped to the full input, exactly as the runtime computes it.
+        in_tile_h = min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h)
+        in_tile_w = min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w)
+        total = 0
+        for info in in_infos:
+            total += _align_up(
+                int(info.shape[0]) * in_tile_h * in_tile_w
+                * int(info.shape[1]) * info.elem_size,
+                align,
+            )
+        # Walk the op sequence tracking the running tile extent: it starts at
+        # the input tile, the single spatial op resizes it to the output tile,
+        # pointwise ops preserve it. Matches the runtime's cur_h/cur_w walk.
+        cur_h, cur_w = in_tile_h, in_tile_w
+        for op in stage_ops:
+            is_spatial = op is ct
+            ah = th if is_spatial else cur_h
+            aw = tw if is_spatial else cur_w
+            for name in op.outputs:
+                info = ag.tensors.get(name)
+                if info and len(info.shape) == 4:
+                    total += _align_up(
+                        int(info.shape[0]) * ah * aw
+                        * int(info.shape[1]) * info.elem_size,
+                        align,
+                    )
+            if is_spatial:
+                cur_h, cur_w = th, tw
+        return total
+
+    # Fail closed if even a 1x1 output tile overflows the budget.
+    if working_set(1, 1) > budget:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum 2D ConvTranspose tile still "
+                f"exceeds budget ({budget:,} bytes)"
+            ],
+        )
+
+    # Largest output tile whose runtime working set fits, maximizing tile area
+    # (fewest tiles). working_set is monotonic non-decreasing in both th and tw,
+    # so per th the largest feasible tw is a binary search, and once th at tw==1
+    # overflows no larger th can fit at any width.
+    best_th, best_tw, best_area = 1, 1, 1
+    for th in range(1, out_h + 1):
+        if working_set(th, 1) > budget:
+            break
+        lo, hi, tw_for_th = 1, out_w, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if working_set(th, mid) <= budget:
+                tw_for_th = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        area = th * tw_for_th
+        if area > best_area:
+            best_area, best_th, best_tw = area, th, tw_for_th
+
+    th, tw = best_th, best_tw
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HW,
+        tile_height=th,
+        tile_width=tw,
+        num_tiles=math.ceil(out_h / th) * math.ceil(out_w / tw),
+        halo=0,
+        receptive_field=1,
+        original_height=out_h,
+        tiled_peak_bytes=working_set(th, tw),
+        overhead_bytes=0,
+        warnings=[],
+    )
+
+
 def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Analyze each stage and attach a TilePlan where needed.
 
@@ -284,6 +488,16 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue  # fits, no tiling needed
 
         stage_ops = [ag.ops[i] for i in stage.op_indices]
+
+        # ConvTranspose stays UNTILEABLE in _OP_CATEGORY on purpose (so it is
+        # auto-excluded from chains, the 1D height solve, and receptive-field
+        # composition). Its 2D tiling is handled here by a dedicated isolated
+        # branch that grids the expanded OUTPUT extent. Every other stage falls
+        # through to the existing byte-identical path below.
+        if _stage_is_convtranspose_2d(stage_ops):
+            stage.tile_plan = _solve_convtranspose_2d(ag, stage, stage_ops, budget)
+            continue
+
         tile_axis = _stage_tile_axis(ag, stage, stage_ops)
 
         # Check if all ops are tileable
@@ -497,6 +711,42 @@ def _find_source_dim_extent(
     if not candidates:
         first_op = ag.ops[stage.op_indices[0]]
         candidates = [n for n in first_op.inputs if n in ag.tensors]
+
+    for name in candidates:
+        info = ag.tensors.get(name)
+        if info and len(info.shape) in ranks:
+            return int(info.shape[dim])
+
+    return 0
+
+
+def _find_output_extent(ag: AnalyzedGraph, stage: Stage) -> int:
+    """Find the H extent of the stage OUTPUT (source NCHW/NCL dim 2)."""
+    return _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
+
+
+def _find_output_extent_width(ag: AnalyzedGraph, stage: Stage) -> int:
+    """Find the W extent of the stage OUTPUT (source NCHW dim 3).
+
+    Only rank-4 tensors carry a width dimension, so this mirrors the rank
+    restriction of _find_input_extent_width.
+    """
+    return _find_output_dim_extent(ag, stage, dim=3, ranks={4})
+
+
+def _find_output_dim_extent(
+    ag: AnalyzedGraph, stage: Stage, dim: int, ranks: set[int]
+) -> int:
+    """Find a stage's OUTPUT-shape extent at ``dim`` among candidate tensors.
+
+    Mirrors _find_source_dim_extent but reads the stage's output tensors
+    (falling back to the last op's outputs), so ConvTranspose tiling grids over
+    the expanded output extent rather than the pre-upsample input.
+    """
+    candidates = stage.output_tensors.copy()
+    if not candidates:
+        last_op = ag.ops[stage.op_indices[-1]]
+        candidates = [n for n in last_op.outputs if n in ag.tensors]
 
     for name in candidates:
         info = ag.tensors.get(name)
