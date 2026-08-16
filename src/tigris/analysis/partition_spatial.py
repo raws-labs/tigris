@@ -268,6 +268,101 @@ def _stage_2d_eligible(
     return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
 
 
+def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
+    """A stage qualifies for the dedicated ConvTranspose 2D solve iff exactly
+    one op is a ConvTranspose (group == 1, unit dilation) and every other op is
+    an audited unary pointwise wrapper.
+
+    ConvTranspose is deliberately kept UNTILEABLE in _OP_CATEGORY, so it never
+    reaches the height (1D), HW-conv, or chain paths; this predicate gates the
+    isolated 2D-output-extent branch that replaces them for it. The group and
+    dilation checks are defense in depth: validate_operator_support already
+    rejects group != 1 or non-unit dilation, but a not-yet-rejected op must
+    never fall into the 2D solve.
+
+    "Audited pointwise" reuses the same set _stage_2d_eligible admits: the
+    POINTWISE category minus _BINARY_OPS and Concat. Those take an independent
+    second operand that the shared input-halo rectangle load does not co-tile,
+    so they are excluded here for the same reason. This bounds Phase 1.3c to a
+    ConvTranspose plus optional unary pointwise.
+    """
+    convtranspose = [op for op in stage_ops if op.op_type == "ConvTranspose"]
+    if len(convtranspose) != 1:
+        return False
+    ct = convtranspose[0]
+    if int(ct.attrs.get("group", 1)) != 1:
+        return False
+    if _get_dilation_h(ct) != 1 or _get_dilation_w(ct) != 1:
+        return False
+    for op in stage_ops:
+        if op is ct:
+            continue
+        if op.op_type in _BINARY_OPS or op.op_type == "Concat":
+            return False
+        if classify_op(op.op_type) != TileCategory.POINTWISE:
+            return False
+    return True
+
+
+def _solve_convtranspose_2d(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Emit a 2D (HW) tile plan for an over-budget ConvTranspose stage.
+
+    ConvTranspose expands its spatial extent (stride upsampling), so the tile
+    grid and the proportional peak model must run over the OUTPUT tensor, not
+    the input. solve_2d_tile is reused with input_h/input_w set to the OUTPUT
+    extents and zero halo, so its int(peak * (th + 0) * (tw + 0) /
+    (out_h * out_w)) equals the expand-aware tiled peak.
+
+    Fails closed (a non-tileable TilePlan) when the output extent cannot be
+    determined, or when no output tile - not even a 1x1 core - fits the budget.
+    """
+    out_h = _find_output_extent(ag, stage)
+    out_w = _find_output_extent_width(ag, stage)
+    if out_h <= 0 or out_w <= 0:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine ConvTranspose "
+                f"output extent"
+            ],
+        )
+
+    shape = solve_2d_tile(
+        budget=budget,
+        peak=stage.peak_bytes,
+        input_h=out_h,
+        input_w=out_w,
+        halo_h=0,
+        halo_w=0,
+    )
+    if shape is None:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum 2D ConvTranspose tile still "
+                f"exceeds budget ({budget:,} bytes)"
+            ],
+        )
+
+    th, tw = shape
+    tiled_peak = int(stage.peak_bytes * th * tw / (out_h * out_w))
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HW,
+        tile_height=th,
+        tile_width=tw,
+        num_tiles=math.ceil(out_h / th) * math.ceil(out_w / tw),
+        halo=0,
+        receptive_field=1,
+        original_height=out_h,
+        tiled_peak_bytes=tiled_peak,
+        overhead_bytes=0,
+        warnings=[],
+    )
+
+
 def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Analyze each stage and attach a TilePlan where needed.
 
@@ -284,6 +379,16 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue  # fits, no tiling needed
 
         stage_ops = [ag.ops[i] for i in stage.op_indices]
+
+        # ConvTranspose stays UNTILEABLE in _OP_CATEGORY on purpose (so it is
+        # auto-excluded from chains, the 1D height solve, and receptive-field
+        # composition). Its 2D tiling is handled here by a dedicated isolated
+        # branch that grids the expanded OUTPUT extent. Every other stage falls
+        # through to the existing byte-identical path below.
+        if _stage_is_convtranspose_2d(stage_ops):
+            stage.tile_plan = _solve_convtranspose_2d(ag, stage, stage_ops, budget)
+            continue
+
         tile_axis = _stage_tile_axis(ag, stage, stage_ops)
 
         # Check if all ops are tileable
@@ -497,6 +602,42 @@ def _find_source_dim_extent(
     if not candidates:
         first_op = ag.ops[stage.op_indices[0]]
         candidates = [n for n in first_op.inputs if n in ag.tensors]
+
+    for name in candidates:
+        info = ag.tensors.get(name)
+        if info and len(info.shape) in ranks:
+            return int(info.shape[dim])
+
+    return 0
+
+
+def _find_output_extent(ag: AnalyzedGraph, stage: Stage) -> int:
+    """Find the H extent of the stage OUTPUT (source NCHW/NCL dim 2)."""
+    return _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
+
+
+def _find_output_extent_width(ag: AnalyzedGraph, stage: Stage) -> int:
+    """Find the W extent of the stage OUTPUT (source NCHW dim 3).
+
+    Only rank-4 tensors carry a width dimension, so this mirrors the rank
+    restriction of _find_input_extent_width.
+    """
+    return _find_output_dim_extent(ag, stage, dim=3, ranks={4})
+
+
+def _find_output_dim_extent(
+    ag: AnalyzedGraph, stage: Stage, dim: int, ranks: set[int]
+) -> int:
+    """Find a stage's OUTPUT-shape extent at ``dim`` among candidate tensors.
+
+    Mirrors _find_source_dim_extent but reads the stage's output tensors
+    (falling back to the last op's outputs), so ConvTranspose tiling grids over
+    the expanded output extent rather than the pre-upsample input.
+    """
+    candidates = stage.output_tensors.copy()
+    if not candidates:
+        last_op = ag.ops[stage.op_indices[-1]]
+        candidates = [n for n in last_op.outputs if n in ag.tensors]
 
     for name in candidates:
         info = ag.tensors.get(name)
