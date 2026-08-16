@@ -95,6 +95,10 @@ def build_long_lived_skip_graph() -> AnalyzedGraph:
 
 
 def test_slow_pool_counts_long_lived_skip_concurrently():
+    # Interval-overlap over each single-op stage's op-step interval reproduces
+    # the same concurrent peak (3064) the closed-closed per-step model gave for
+    # this all-single-op graph, so this expectation is unchanged by the
+    # multi-op interval-overlap fix.
     expected_concurrent_peak = 3064
     old_coarse_peak = 2064
     assert expected_concurrent_peak > old_coarse_peak
@@ -108,3 +112,62 @@ def test_slow_pool_counts_long_lived_skip_concurrently():
     ag.budget = MemoryBudget(fast=ag.budget.fast, slow=expected_concurrent_peak - 1)
     usage_tight = slow_pool_usage(ag)
     assert usage_tight.overflow_stage_ids != ()
+
+
+def build_multi_op_tiled_stage_graph() -> AnalyzedGraph:
+    """One tiled stage of two ops: Conv(in)->c, Sigmoid(c)->out. Both ``in``
+    and ``out`` are stage-boundary tensors (equal size); ``c`` is intra-stage
+    (produced and consumed inside the stage), so it is not slow-resident.
+
+    The stage is tiled: peak_bytes 100_000 exceeds the fast pool (64). PSRAM is
+    freed at STAGE granularity, but under the OLD per-op-step sampling ``in``
+    dies at the Conv step (step 0) and ``out`` is born only at the Sigmoid step
+    (step 1), so no single sampled step counts both and the stage reports
+    max(in, out). Interval-overlap over the stage op-step interval [0, 1]
+    counts both, reporting in + out.
+
+    Sizes (INT8, so num_elements == size_bytes): in=1000, out=1000.
+    """
+    conv = OpNode(name="conv", op_type="Conv", inputs=["in"], outputs=["c"], step=0)
+    sig = OpNode(name="sig", op_type="Sigmoid", inputs=["c"], outputs=["out"], step=1)
+    stage = Stage(
+        stage_id=0, op_indices=[0, 1],
+        input_tensors=["in"], output_tensors=["out"],
+        peak_bytes=100_000,
+    )
+    return AnalyzedGraph(
+        ops=[conv, sig],
+        stages=[stage],
+        model_inputs=["in"],
+        model_outputs=["out"],
+        tensors={
+            "in": TensorInfo("in", (1, 1000), TensorProto.INT8),
+            "c": TensorInfo("c", (1, 1000), TensorProto.INT8),
+            "out": TensorInfo("out", (1, 1000), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=64),
+    )
+
+
+def test_slow_pool_counts_multi_op_stage_boundaries_concurrently():
+    in_bytes = 1000
+    out_bytes = 1000
+    concurrent = in_bytes + out_bytes           # 2000, interval-overlap
+    per_op_step = max(in_bytes, out_bytes)       # 1000, the old under-count
+    assert concurrent > per_op_step
+
+    ag = build_multi_op_tiled_stage_graph()
+    ag.budget = MemoryBudget(fast=ag.budget.fast, slow=concurrent)
+    usage = slow_pool_usage(ag)
+    assert usage.slow_peak_bytes == concurrent
+    assert usage.overflow_stage_ids == ()
+
+    # A slow budget just below in+out must be rejected. The old per-op-step
+    # model reports only max(in, out) and would have wrongly accepted it,
+    # letting a plan that overflows PSRAM through the fail-closed check.
+    ag.budget = MemoryBudget(fast=ag.budget.fast, slow=concurrent - 1)
+    assert slow_pool_usage(ag).overflow_stage_ids != ()
+
+    # Just above in+out fits.
+    ag.budget = MemoryBudget(fast=ag.budget.fast, slow=concurrent + 1)
+    assert slow_pool_usage(ag).overflow_stage_ids == ()

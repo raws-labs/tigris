@@ -493,18 +493,25 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
     and match analyze (where reserve is 0).
 
     The slow-resident set is every tensor that crosses a stage boundary (a
-    stage's input or output tensor). A tensor born before a tiled stage and
-    not yet consumed by the time that stage runs stays slow-resident
-    throughout it, so the peak is the max over every op-step belonging to a
-    tiled stage of the total bytes of tensors slow-resident at that step,
-    not just the current stage's own input+output (which under-counts a
-    long-lived skip that spans several stages).
+    stage's input or output tensor). PSRAM is freed at STAGE granularity, not
+    at per-op granularity, so residency is measured per tiled stage over that
+    stage's whole op-step INTERVAL, never sampled at individual op steps.
 
-    Liveness uses the closed-closed window birth_step <= step <= death_step,
-    matching _live_bytes_by_step and stage.peak_bytes (partition_temporal.py)
-    so a tensor that is both consumed and produced at the same op-step is
-    counted at that step by both the fast-pool and slow-pool models. This is
-    the conservative (upper-bounding) choice for a fail-closed budget check.
+    For a tiled stage S, let its op-step interval be
+    [first, last] = [min(op_indices), max(op_indices)]. A boundary tensor is
+    slow-resident during S iff its lifetime interval overlaps that interval:
+    birth_step <= last and death_step >= first. The stage's residency is the
+    sum of those tensors' sizes; the peak is the max over tiled stages, and a
+    stage overflows when its sum exceeds slow_budget.
+
+    Interval overlap counts a stage's own inputs AND outputs concurrently
+    (both always overlap S) as well as a long-lived skip that spans S (its
+    interval still overlaps). A per-op-step sample under-counts a MULTI-OP
+    stage whose input dies at an early op step and whose output is born at a
+    later op step to max(input, output): no single sampled step sees both,
+    even though both occupy slow memory for the whole stage. Interval overlap
+    upper-bounds true concurrent residency, the conservative choice for a
+    fail-closed budget check.
     """
     slow_budget = ag.budget.slow
     if slow_budget <= 0 or not ag.stages:
@@ -519,19 +526,19 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
         slow_names.update(s.output_tensors)
     slow_lifetimes = [ag.lifetimes[n] for n in slow_names if n in ag.lifetimes]
 
-    def live_bytes(step: int) -> int:
+    def interval_bytes(first: int, last: int) -> int:
         return sum(
             lt.size_bytes
             for lt in slow_lifetimes
-            if lt.birth_step <= step <= lt.death_step
+            if lt.birth_step <= last and lt.death_step >= first
         )
 
     peak = 0
     overflow: list[int] = []
     for s in ag.stages:
-        if s.peak_bytes <= fast_total:
+        if s.peak_bytes <= fast_total or not s.op_indices:
             continue
-        stage_peak = max((live_bytes(t) for t in s.op_indices), default=0)
+        stage_peak = interval_bytes(min(s.op_indices), max(s.op_indices))
         peak = max(peak, stage_peak)
         if stage_peak > slow_budget:
             overflow.append(s.stage_id)
