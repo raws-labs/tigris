@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.partition_spatial import (
     _back_propagate_tile_heights,
     _chain_fast_bytes,
@@ -490,27 +491,57 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
     A stage needs tiling when its peak exceeds the TOTAL fast pool
     (fast + reserve), so compressed and uncompressed compiles gate identically
     and match analyze (where reserve is 0).
+
+    The slow-resident set is every tensor that crosses a stage boundary (a
+    stage's input or output tensor). PSRAM is freed at STAGE granularity, not
+    at per-op granularity, so residency is measured per tiled stage over that
+    stage's whole op-step INTERVAL, never sampled at individual op steps.
+
+    For a tiled stage S, let its op-step interval be
+    [first, last] = [min(op_indices), max(op_indices)]. A boundary tensor is
+    slow-resident during S iff its lifetime interval overlaps that interval:
+    birth_step <= last and death_step >= first. The stage's residency is the
+    sum of those tensors' sizes; the peak is the max over tiled stages, and a
+    stage overflows when its sum exceeds slow_budget.
+
+    Interval overlap counts a stage's own inputs AND outputs concurrently
+    (both always overlap S) as well as a long-lived skip that spans S (its
+    interval still overlaps). A per-op-step sample under-counts a MULTI-OP
+    stage whose input dies at an early op step and whose output is born at a
+    later op step to max(input, output): no single sampled step sees both,
+    even though both occupy slow memory for the whole stage. Interval overlap
+    upper-bounds true concurrent residency, the conservative choice for a
+    fail-closed budget check.
     """
     slow_budget = ag.budget.slow
     if slow_budget <= 0 or not ag.stages:
         return SlowMemoryUsage(0, slow_budget, ())
     fast_total = ag.budget.fast + ag.budget.fast_reserve
+    ag = compute_lifetimes(ag)
+
+    # Slow-resident set: every tensor that crosses a stage boundary.
+    slow_names: set[str] = set()
+    for s in ag.stages:
+        slow_names.update(s.input_tensors)
+        slow_names.update(s.output_tensors)
+    slow_lifetimes = [ag.lifetimes[n] for n in slow_names if n in ag.lifetimes]
+
+    def interval_bytes(first: int, last: int) -> int:
+        return sum(
+            lt.size_bytes
+            for lt in slow_lifetimes
+            if lt.birth_step <= last and lt.death_step >= first
+        )
+
     peak = 0
     overflow: list[int] = []
     for s in ag.stages:
-        if s.peak_bytes > fast_total:
-            in_size = sum(
-                ag.tensors[n].size_bytes for n in s.input_tensors
-                if n in ag.tensors
-            )
-            out_size = sum(
-                ag.tensors[n].size_bytes for n in s.output_tensors
-                if n in ag.tensors
-            )
-            stage_slow = in_size + out_size
-            peak = max(peak, stage_slow)
-            if stage_slow > slow_budget:
-                overflow.append(s.stage_id)
+        if s.peak_bytes <= fast_total or not s.op_indices:
+            continue
+        stage_peak = interval_bytes(min(s.op_indices), max(s.op_indices))
+        peak = max(peak, stage_peak)
+        if stage_peak > slow_budget:
+            overflow.append(s.stage_id)
     return SlowMemoryUsage(peak, slow_budget, tuple(overflow))
 
 

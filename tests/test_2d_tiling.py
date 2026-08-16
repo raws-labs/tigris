@@ -347,6 +347,138 @@ def test_conv_plus_unary_stage_still_goes_hw():
     assert stage_plan.axis == TILE_AXIS_HW
 
 
+# Pre-spatial co-tiled skip connections (Add/Concat consumed BEFORE the
+# spatial op) are a different hazard shape than the post-spatial cases
+# above: the skip operand sits at the spatial op's INPUT resolution, which
+# is exactly the halo rectangle exec_stage_tiled_2d loads every stage input
+# at. When every stage-external operand is same-H/W, the shared-rectangle
+# load co-tiles it correctly, so these stages must be admitted. Different
+# resolution operands keep the fail-closed rejection.
+
+
+def build_high_res_add_conv_graph(h, w, c, mem_budget):
+    """Pre-spatial: Add(input, skip) -> Conv. The Add is consumed by the Conv,
+    both operands same [1,c,h,w]. Co-tileable skip -> must be 2D eligible."""
+    add = OpNode(name="add", op_type="Add",
+                 inputs=["input", "skip"], outputs=["added"], attrs={})
+    conv = OpNode(name="conv", op_type="Conv",
+                  inputs=["added"], outputs=["output"],
+                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
+    stage = Stage(stage_id=0, op_indices=[0, 1],
+                  input_tensors=["input", "skip"], output_tensors=["output"],
+                  peak_bytes=c * h * w)
+    return AnalyzedGraph(
+        ops=[add, conv], stages=[stage],
+        tensors={
+            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
+            "skip": TensorInfo("skip", (1, c, h, w), TensorProto.INT8),
+            "added": TensorInfo("added", (1, c, h, w), TensorProto.INT8),
+            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=mem_budget))
+
+
+def build_high_res_concat_conv_graph(h, w, c, mem_budget):
+    """Pre-spatial: Concat(up, skip) -> Conv. Concat on channel axis, both
+    operands same H/W. Co-tileable skip -> must be 2D eligible."""
+    concat = OpNode(name="concat", op_type="Concat",
+                    inputs=["up", "skip"], outputs=["cat"], attrs={"axis": 1})
+    conv = OpNode(name="conv", op_type="Conv",
+                  inputs=["cat"], outputs=["output"],
+                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
+    stage = Stage(stage_id=0, op_indices=[0, 1],
+                  input_tensors=["skip", "up"], output_tensors=["output"],
+                  peak_bytes=c * h * w)
+    return AnalyzedGraph(
+        ops=[concat, conv], stages=[stage],
+        tensors={
+            "up": TensorInfo("up", (1, c, h, w), TensorProto.INT8),
+            "skip": TensorInfo("skip", (1, c, h, w), TensorProto.INT8),
+            "cat": TensorInfo("cat", (1, 2 * c, h, w), TensorProto.INT8),
+            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=mem_budget))
+
+
+def build_high_res_concat_conv_diffres_graph(h, w, c, mem_budget):
+    """Pre-spatial Concat but the skip is a DIFFERENT resolution (h//2 x w//2).
+    Not co-tileable -> must stay rejected (clause 3 fail-closed)."""
+    concat = OpNode(name="concat", op_type="Concat",
+                    inputs=["up", "skip"], outputs=["cat"], attrs={"axis": 1})
+    conv = OpNode(name="conv", op_type="Conv",
+                  inputs=["cat"], outputs=["output"],
+                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
+    stage = Stage(stage_id=0, op_indices=[0, 1],
+                  input_tensors=["skip", "up"], output_tensors=["output"],
+                  peak_bytes=c * h * w)
+    return AnalyzedGraph(
+        ops=[concat, conv], stages=[stage],
+        tensors={
+            "up": TensorInfo("up", (1, c, h, w), TensorProto.INT8),
+            "skip": TensorInfo("skip", (1, c, h // 2, w // 2), TensorProto.INT8),
+            "cat": TensorInfo("cat", (1, 2 * c, h, w), TensorProto.INT8),
+            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=mem_budget))
+
+
+def build_high_res_concat_const_skip_graph(h, w, c, mem_budget):
+    """Pre-spatial Concat whose skip operand is a rank-4 CONSTANT (initializer),
+    same H/W as `up`. A constant is never a stage input, so it escapes the
+    external same-H/W co-tile check in _cotileable_skip_operands, yet the 2D
+    executor cannot tile-offset a full-size constant against the spatial op's
+    input-halo rectangle. Must fail closed."""
+    concat = OpNode(name="concat", op_type="Concat",
+                    inputs=["up", "const_skip"], outputs=["cat"], attrs={"axis": 1})
+    conv = OpNode(name="conv", op_type="Conv",
+                  inputs=["cat"], outputs=["output"],
+                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
+    stage = Stage(stage_id=0, op_indices=[0, 1],
+                  input_tensors=["up"], output_tensors=["output"],
+                  peak_bytes=c * h * w)
+    return AnalyzedGraph(
+        ops=[concat, conv], stages=[stage],
+        tensors={
+            "up": TensorInfo("up", (1, c, h, w), TensorProto.INT8),
+            "const_skip": TensorInfo(
+                "const_skip", (1, c, h, w), TensorProto.INT8, is_constant=True
+            ),
+            "cat": TensorInfo("cat", (1, 2 * c, h, w), TensorProto.INT8),
+            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=mem_budget))
+
+
+def test_stage_2d_eligible_admits_pre_spatial_add_skip():
+    ag = build_high_res_add_conv_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
+    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is True
+
+
+def test_stage_2d_eligible_admits_pre_spatial_concat_skip():
+    ag = build_high_res_concat_conv_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
+    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is True
+
+
+def test_stage_2d_eligible_rejects_constant_concat_skip():
+    # A rank-4 constant Concat operand is not a stage input, so it escapes the
+    # external same-H/W co-tile check, but it cannot be tile-offset for the 2D
+    # executor's shared input-halo rectangle load. The stage must fail closed.
+    ag = build_high_res_concat_const_skip_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
+    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is False
+
+
+def test_stage_2d_eligible_rejects_diffres_skip():
+    ag = build_high_res_concat_conv_diffres_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
+    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is False
+
+
+def test_pre_spatial_concat_skip_goes_hw():
+    # End to end: the admitted pre-spatial concat-skip stage tiles on TILE_AXIS_HW.
+    ag = build_high_res_concat_conv_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
+    ag = partition_spatial(ag)
+    assert plan_for_single_stage(ag).axis == TILE_AXIS_HW
+
+
 # ConvTranspose 2D tiling over the OUTPUT extent.
 #
 # ConvTranspose stays UNTILEABLE in _OP_CATEGORY (so it is auto-excluded from

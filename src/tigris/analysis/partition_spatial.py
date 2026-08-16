@@ -234,25 +234,55 @@ def solve_2d_tile(
     return (max(th, 1), max(tw, 1))
 
 
+def _cotileable_skip_operands(
+    ag: AnalyzedGraph, stage: Stage, op: OpNode
+) -> bool:
+    """Every stage-external operand of a pre-spatial Concat/Add/Mul must be a
+    rank-4 tensor at the same H/W as the op output, so the executor's shared
+    input-halo rectangle load co-tiles it correctly. Intra-stage operands
+    (produced by an earlier op in the stage) are fine - they are not loaded.
+
+    A rank-4 CONSTANT operand (an initializer, e.g. a Concat against a baked
+    tensor) is never a stage input, so it escapes the external same-H/W check;
+    but the 2D executor would still have to co-tile it against the spatial
+    op's input-halo rectangle and cannot tile-offset a full-size constant.
+    Fail closed on any such operand rather than silently emit a wrong result.
+    """
+    out = ag.tensors.get(op.outputs[0])
+    if out is None or len(out.shape) != 4:
+        return False
+    out_hw = tuple(out.shape[2:4])
+    external = set(stage.input_tensors)
+    for name in op.inputs:
+        info = ag.tensors.get(name)
+        if info is not None and info.is_constant and len(info.shape) == 4:
+            return False
+        if name in external:
+            if info is None or len(info.shape) != 4 or tuple(info.shape[2:4]) != out_hw:
+                return False
+    return True
+
+
 def _stage_2d_eligible(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
     """A stage may attempt HW tiling only if it is a standalone rank-4 stage
-    with at most one spatial op, no binary op, and all of whose ops implement
-    the HW tile contract. Multi-spatial-op stages are excluded: the runtime
-    executor's 2D contract is audited only for a single composed spatial op
-    per stage.
+    with at most one spatial op, and all of whose ops implement the HW tile
+    contract. Multi-spatial-op stages are excluded: the runtime executor's
+    2D contract is audited only for a single composed spatial op per stage.
 
-    Binary ops (Add, Mul) are excluded even though they pass the per-op HW
-    contract check below: exec_stage_tiled_2d loads every stage input using
-    the same conv input-halo rectangle, so a binary op's second operand
-    (e.g. a residual skip tensor) is not guaranteed to be co-tiled with the
-    spatial op's output at that rectangle. Admitting a stage like
-    [Conv, Add(conv_out, skip)] as 2D would load the skip operand with the
-    wrong region and size and silently produce a wrong result. This is the
-    conservative, fail-closed choice: such a stage falls back to the 1D path
-    (or fails closed if 1D is also infeasible). Co-tiled-binary 2D tiling is
-    a future refinement, not attempted here.
+    Add/Mul/Concat are admitted only when they are consumed strictly BEFORE
+    the spatial op (their operands then sit at the spatial op's input
+    resolution, which is exactly the halo rectangle exec_stage_tiled_2d
+    loads every stage input at) and every stage-external operand is a
+    same-H/W co-tileable skip (see _cotileable_skip_operands). A stage like
+    [Add(input, skip), Conv] is admitted this way. Post-spatial occurrences
+    (e.g. [Conv, Add(conv_out, skip)]) and different-resolution operands
+    keep the fail-closed rejection: exec_stage_tiled_2d loads every stage
+    input using the spatial op's own input-halo rectangle, and a post-spatial
+    or different-resolution operand is not guaranteed to be co-tiled with
+    that rectangle. Admitting such a stage as 2D would load the operand with
+    the wrong region and size and silently produce a wrong result.
     """
     if _stage_io_ranks(ag, stage) != {4}:
         return False
@@ -263,17 +293,24 @@ def _stage_2d_eligible(
     )
     if spatial_count > 1:
         return False
-    if any(op.op_type in _BINARY_OPS for op in stage_ops):
-        return False
-    # Concat carries the same hazard as the binary ops above: it takes an
-    # independent second operand, and exec_stage_tiled_2d loads every stage
-    # input with the spatial op's own input-halo rectangle, which is not
-    # guaranteed to be co-tiled with a distinct Concat operand at output
-    # resolution. Exclude it from HW eligibility for symmetry with _BINARY_OPS;
-    # such a stage falls back to the 1D path or fails closed. A Concat that is
-    # a stage head/fan-in is unaffected (it is not a single-spatial-op stage).
-    if any(op.op_type == "Concat" for op in stage_ops):
-        return False
+    # Locate the single spatial op (CONV/POOL); spatial_count <= 1 is ensured above.
+    spatial_idx = next(
+        (i for i, o in enumerate(stage_ops)
+         if classify_op(o.op_type) in (TileCategory.CONV, TileCategory.POOL)),
+        None,
+    )
+    # Concat/Add/Mul are admitted only when consumed strictly BEFORE the spatial
+    # op (so their operands sit at the spatial op's input resolution = the halo
+    # rectangle the executor loads every stage input at) and every stage-external
+    # operand is a same-resolution skip. Post-spatial or different-resolution
+    # operands are the deferred cases: fail closed. op_indices/stage_ops are in
+    # topological (execution) order, so list index is dependency order.
+    for i, op in enumerate(stage_ops):
+        if op.op_type in _BINARY_OPS or op.op_type == "Concat":
+            if spatial_idx is not None and i >= spatial_idx:
+                return False
+            if not _cotileable_skip_operands(ag, stage, op):
+                return False
     return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
 
 
