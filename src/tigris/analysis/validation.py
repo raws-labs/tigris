@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.partition_spatial import (
     _back_propagate_tile_heights,
     _chain_fast_bytes,
@@ -490,27 +491,44 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
     A stage needs tiling when its peak exceeds the TOTAL fast pool
     (fast + reserve), so compressed and uncompressed compiles gate identically
     and match analyze (where reserve is 0).
+
+    The slow-resident set is every tensor that crosses a stage boundary (a
+    stage's input or output tensor). A tensor born before a tiled stage and
+    not yet consumed by the time that stage runs stays slow-resident
+    throughout it, so the peak is the max over every op-step belonging to a
+    tiled stage of the total bytes of tensors slow-resident at that step,
+    not just the current stage's own input+output (which under-counts a
+    long-lived skip that spans several stages).
     """
     slow_budget = ag.budget.slow
     if slow_budget <= 0 or not ag.stages:
         return SlowMemoryUsage(0, slow_budget, ())
     fast_total = ag.budget.fast + ag.budget.fast_reserve
+    ag = compute_lifetimes(ag)
+
+    # Slow-resident set: every tensor that crosses a stage boundary.
+    slow_names: set[str] = set()
+    for s in ag.stages:
+        slow_names.update(s.input_tensors)
+        slow_names.update(s.output_tensors)
+    slow_lifetimes = [ag.lifetimes[n] for n in slow_names if n in ag.lifetimes]
+
+    def live_bytes(step: int) -> int:
+        return sum(
+            lt.size_bytes
+            for lt in slow_lifetimes
+            if lt.birth_step < step <= lt.death_step
+        )
+
     peak = 0
     overflow: list[int] = []
     for s in ag.stages:
-        if s.peak_bytes > fast_total:
-            in_size = sum(
-                ag.tensors[n].size_bytes for n in s.input_tensors
-                if n in ag.tensors
-            )
-            out_size = sum(
-                ag.tensors[n].size_bytes for n in s.output_tensors
-                if n in ag.tensors
-            )
-            stage_slow = in_size + out_size
-            peak = max(peak, stage_slow)
-            if stage_slow > slow_budget:
-                overflow.append(s.stage_id)
+        if s.peak_bytes <= fast_total:
+            continue
+        stage_peak = max((live_bytes(t) for t in s.op_indices), default=0)
+        peak = max(peak, stage_peak)
+        if stage_peak > slow_budget:
+            overflow.append(s.stage_id)
     return SlowMemoryUsage(peak, slow_budget, tuple(overflow))
 
 
