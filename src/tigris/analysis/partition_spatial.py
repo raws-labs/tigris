@@ -263,6 +263,31 @@ def _cotileable_skip_operands(
     return True
 
 
+def _has_post_spatial_binary(stage_ops: list[OpNode]) -> bool:
+    """True if a Concat/Add/Mul is consumed at or after the stage's spatial op.
+
+    Both tiled executors (the 1D-height exec_stage_tiled and the 2D
+    exec_stage_tiled_2d) load every stage input at the spatial op's INPUT-halo
+    rectangle. A post-spatial binary/Concat operand lives at the spatial op's
+    OUTPUT resolution, so a strided spatial op would make the executor read that
+    operand at stride*out_start rows -- the wrong rows, and past the operand's
+    height -- on interior tiles. Both tile paths must fail closed on this shape
+    and run the stage untiled. Shared by _stage_2d_eligible and _stage_tile_axis
+    so the height and HW paths reject in lockstep.
+    """
+    spatial_idx = next(
+        (i for i, o in enumerate(stage_ops)
+         if classify_op(o.op_type) in (TileCategory.CONV, TileCategory.POOL)),
+        None,
+    )
+    if spatial_idx is None:
+        return False
+    return any(
+        (op.op_type in _BINARY_OPS or op.op_type == "Concat") and i >= spatial_idx
+        for i, op in enumerate(stage_ops)
+    )
+
+
 def _stage_2d_eligible(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -293,22 +318,16 @@ def _stage_2d_eligible(
     )
     if spatial_count > 1:
         return False
-    # Locate the single spatial op (CONV/POOL); spatial_count <= 1 is ensured above.
-    spatial_idx = next(
-        (i for i, o in enumerate(stage_ops)
-         if classify_op(o.op_type) in (TileCategory.CONV, TileCategory.POOL)),
-        None,
-    )
     # Concat/Add/Mul are admitted only when consumed strictly BEFORE the spatial
     # op (so their operands sit at the spatial op's input resolution = the halo
     # rectangle the executor loads every stage input at) and every stage-external
-    # operand is a same-resolution skip. Post-spatial or different-resolution
-    # operands are the deferred cases: fail closed. op_indices/stage_ops are in
-    # topological (execution) order, so list index is dependency order.
-    for i, op in enumerate(stage_ops):
+    # operand is a same-resolution skip. Post-spatial operands fail closed via the
+    # shared _has_post_spatial_binary check; different-resolution or constant
+    # pre-spatial operands fail closed via _cotileable_skip_operands.
+    if _has_post_spatial_binary(stage_ops):
+        return False
+    for op in stage_ops:
         if op.op_type in _BINARY_OPS or op.op_type == "Concat":
-            if spatial_idx is not None and i >= spatial_idx:
-                return False
             if not _cotileable_skip_operands(ag, stage, op):
                 return False
     return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
@@ -687,6 +706,12 @@ def _stage_tile_axis(
     """Select an audited serialized activation axis for a standalone stage."""
     ranks = _stage_io_ranks(ag, stage)
     if ranks == {4} and all(op.op_type != "Conv1D" for op in stage_ops):
+        # A post-spatial binary/Concat with a stage-external operand mis-tiles on
+        # the height path exactly as on the 2D path (the skip is loaded at the
+        # spatial op's input rows, not its output rows). Fail closed so the stage
+        # runs untiled via exec_stage_normal, matching _stage_2d_eligible.
+        if _has_post_spatial_binary(stage_ops):
+            return TILE_AXIS_NONE
         return TILE_AXIS_HEIGHT_OR_LENGTH
     if ranks == {3} and stage_ops:
         op_types = [op.op_type for op in stage_ops]

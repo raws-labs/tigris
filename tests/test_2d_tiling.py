@@ -4,10 +4,11 @@ import math
 
 from onnx import TensorProto
 
-from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW
+from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.analysis.partition_spatial import (
     _op_supports_axis,
     _stage_2d_eligible,
+    _stage_tile_axis,
     compute_receptive_field,
     partition_spatial,
     solve_2d_tile,
@@ -447,6 +448,54 @@ def build_high_res_concat_const_skip_graph(h, w, c, mem_budget):
             "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
         },
         budget=MemoryBudget(fast=mem_budget))
+
+
+def build_post_spatial_add_skip_graph(h, w, c, mem_budget):
+    """Post-spatial: Conv(stride 2) -> Add(conv_out, skip). The Add is consumed
+    AFTER the strided Conv, and `skip` is a stage-external tensor at the Conv's
+    OUTPUT resolution. The tiled executors load every stage input at the Conv's
+    INPUT-halo rectangle, so a strided Conv would read `skip` at stride*out_start
+    rows (and past its height) on interior tiles. Both the 1D-height and the 2D
+    tile paths must fail closed on this shape (-> exec_stage_normal)."""
+    conv = OpNode(name="conv", op_type="Conv",
+                  inputs=["input"], outputs=["conv_out"],
+                  attrs={"kernel_shape": [1, 1], "strides": [2, 2], "dilations": [1, 1]})
+    add = OpNode(name="add", op_type="Add",
+                 inputs=["conv_out", "skip"], outputs=["output"], attrs={})
+    stage = Stage(stage_id=0, op_indices=[0, 1],
+                  input_tensors=["input", "skip"], output_tensors=["output"],
+                  peak_bytes=c * h * w)
+    return AnalyzedGraph(
+        ops=[conv, add], stages=[stage],
+        tensors={
+            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
+            "conv_out": TensorInfo("conv_out", (1, c, h // 2, w // 2), TensorProto.INT8),
+            "skip": TensorInfo("skip", (1, c, h // 2, w // 2), TensorProto.INT8),
+            "output": TensorInfo("output", (1, c, h // 2, w // 2), TensorProto.INT8),
+        },
+        budget=MemoryBudget(fast=mem_budget))
+
+
+def test_stage_tile_axis_rejects_post_spatial_external_skip():
+    # Conv(stride 2) -> Add(conv_out, external skip): the 1D-height executor loads
+    # the skip at the Conv's input rows, mis-tiling every interior tile (and
+    # reading past the skip's height). The axis selection must fail closed to
+    # TILE_AXIS_NONE so the stage runs untiled, matching the 2D path's rejection.
+    ag = build_post_spatial_add_skip_graph(h=256, w=256, c=64, mem_budget=24 * 1024)
+    assert _stage_tile_axis(ag, ag.stages[0], ag.ops) == TILE_AXIS_NONE
+
+
+def test_stage_2d_eligible_rejects_post_spatial_external_skip():
+    # The 2D path already rejects this shape; keep both paths in lockstep.
+    ag = build_post_spatial_add_skip_graph(h=256, w=256, c=64, mem_budget=24 * 1024)
+    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is False
+
+
+def test_stage_tile_axis_admits_pre_spatial_add_skip():
+    # A pre-spatial Add(input, skip) -> Conv is co-tileable and loaded correctly
+    # at the input resolution, so the 1D-height axis stays admitted.
+    ag = build_high_res_add_conv_graph(h=256, w=256, c=64, mem_budget=24 * 1024)
+    assert _stage_tile_axis(ag, ag.stages[0], ag.ops) == TILE_AXIS_HEIGHT_OR_LENGTH
 
 
 def test_stage_2d_eligible_admits_pre_spatial_add_skip():
