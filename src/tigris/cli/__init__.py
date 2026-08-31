@@ -26,7 +26,7 @@ def _expand_mem(ctx, param, value: tuple[str, ...]) -> tuple[str, ...]:
         for part in parts:
             if not part.strip():
                 raise click.BadParameter(
-                    f"invalid memory budget {token!r}: empty pool around '+'"
+                    f"invalid memory budget {token!r}: empty memory pool"
                 )
             expanded.append(part.strip())
     return tuple(expanded)

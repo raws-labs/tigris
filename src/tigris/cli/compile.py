@@ -104,7 +104,7 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         )
     if not result.slow.fits:
         raise click.ClickException(
-            f"Cannot compile a plan that overflows slow memory: {result.slow.describe()}"
+            f"Cannot compile this plan: {result.slow.describe()}"
         )
 
     out = Path(output) if output else Path(model).with_suffix(".tgrs")
