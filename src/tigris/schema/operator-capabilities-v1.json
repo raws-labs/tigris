@@ -68,7 +68,7 @@
   "operators": [
     {
       "conditional_fallbacks": {
-        "cmsis-nn": "falls back when tiled; non-tiled dilation remains native",
+        "cmsis-nn": "falls back for dilation other than 1",
         "esp-nn": "falls back for dilation other than 1; asymmetric padding falls back when its preparation-time workspace is insufficient"
       },
       "opcode": 1,
@@ -82,7 +82,7 @@
     },
     {
       "conditional_fallbacks": {
-        "cmsis-nn": "falls back when tiled; non-tiled dilation remains native",
+        "cmsis-nn": "falls back for dilation other than 1",
         "esp-nn": "falls back for dilation other than 1"
       },
       "opcode": 2,
