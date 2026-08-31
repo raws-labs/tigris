@@ -74,10 +74,8 @@ CONDITIONAL_FALLBACKS: dict[str, dict[str, str]] = {
         ),
     },
     "cmsis-nn": {
-        "Conv": "falls back when tiled; non-tiled dilation remains native",
-        "DepthwiseConv": (
-            "falls back when tiled; non-tiled dilation remains native"
-        ),
+        "Conv": "falls back for dilation other than 1",
+        "DepthwiseConv": "falls back for dilation other than 1",
         "AveragePool": (
             "falls back when tiled or when input/output quantization differs"
         ),
