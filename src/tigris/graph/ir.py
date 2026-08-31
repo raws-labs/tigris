@@ -146,6 +146,11 @@ class MemoryBudget:
     fast: int = 0
     slow: int = 0
     flash: int = 0
+    # Bytes deliberately held outside the activation arena by the deployment
+    # harness, so ``fast`` is always exactly the arena represented in the
+    # binary plan. The compiler currently uses this for compressed-weight
+    # blocks; it also makes an explicit target scratch reservation possible
+    # without making activation feasibility ambiguous.
     fast_reserve: int = 0
 
 
