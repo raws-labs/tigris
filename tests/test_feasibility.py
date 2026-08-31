@@ -253,7 +253,7 @@ def test_compile_refuses_slow_overflow_without_output(conv_relu_chain_path, tmp_
         cli, ["compile", str(conv_relu_chain_path), "-m", "16K", "-m", "1K",
                "-o", str(output)])
     assert result.exit_code != 0
-    assert "overflows slow memory" in result.output
+    assert "overflow slow memory" in result.output
     assert not output.exists()
 
 

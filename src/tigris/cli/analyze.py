@@ -35,7 +35,7 @@ def _side_by_side(*panels):
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
 @click.option("--mem", "-m", multiple=True, callback=_expand_mem,
-              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+8M)")
+              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 @click.option("--flash", "-f", default=None, help="Flash size for plan fit check (e.g. 4M)")
 @click.option("--verbose", "-v", is_flag=True, help="Show per-stage and tiling tables")
 def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):

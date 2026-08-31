@@ -12,7 +12,7 @@ from tigris.utils import fmt_bytes
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
 @click.option("--mem", "-m", multiple=True, callback=_expand_mem,
-              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+8M)")
+              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 def simulate(model: str, mem: tuple[str, ...]):
     """Print a step-by-step execution trace for an ONNX model."""
     ag, budget = _run_pipeline(model, mem)
