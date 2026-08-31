@@ -93,7 +93,10 @@ def classify_op(op_type: str) -> TileCategory:
 # Receptive field computation
 
 
-def compute_receptive_field(ops: list[OpNode]) -> tuple[int, int]:
+def compute_receptive_field(
+    ops: list[OpNode],
+    weight_shapes: dict[str, tuple[int, ...]] | None = None,
+) -> tuple[int, int]:
     """Compute the height and width receptive fields for a sequence of ops.
 
     Walks the ops in reverse once, accumulating RF and jump (cumulative
@@ -102,6 +105,10 @@ def compute_receptive_field(ops: list[OpNode]) -> tuple[int, int]:
 
     For pointwise ops, RF and jump are unchanged on both axes.
     For conv/pool ops, RF grows based on effective kernel size.
+
+    ``weight_shapes`` (constant tensor name -> shape) lets a Conv that omits
+    the ONNX ``kernel_shape`` attribute recover its kernel from the weight,
+    matching the emitter; without it such ops fall back to a 1x1 kernel.
     """
     rf_h = 1
     jump_h = 1
@@ -111,7 +118,7 @@ def compute_receptive_field(ops: list[OpNode]) -> tuple[int, int]:
     for op in reversed(ops):
         cat = classify_op(op.op_type)
         if cat in (TileCategory.CONV, TileCategory.POOL):
-            kernel_h = _get_kernel_h(op)
+            kernel_h = _get_kernel_h(op, weight_shapes)
             stride_h = _get_stride_h(op)
             dilation_h = _get_dilation_h(op)
 
@@ -119,7 +126,7 @@ def compute_receptive_field(ops: list[OpNode]) -> tuple[int, int]:
             rf_h = rf_h + (effective_kh - 1) * jump_h
             jump_h = jump_h * stride_h
 
-            kernel_w = _get_kernel_w(op)
+            kernel_w = _get_kernel_w(op, weight_shapes)
             stride_w = _get_stride_w(op)
             dilation_w = _get_dilation_w(op)
 
@@ -130,11 +137,51 @@ def compute_receptive_field(ops: list[OpNode]) -> tuple[int, int]:
     return rf_h, rf_w
 
 
-def _get_kernel_h(op: OpNode) -> int:
-    """Get the height dimension of the kernel (first element of kernel_shape)."""
+# Ops whose kernel extent the emitter infers from the weight tensor when the
+# optional ONNX ``kernel_shape`` attribute is absent (emitters/binary/writer.py).
+_KERNEL_INFERRABLE_OPS = {"Conv", "Conv1D", "DepthwiseConv", "ConvTranspose"}
+
+
+def _infer_kernel_shape(
+    op: OpNode, weight_shapes: dict[str, tuple[int, ...]] | None
+) -> tuple[int, ...]:
+    """kernel_shape inferred from the first constant weight operand.
+
+    Mirrors the emitter (emitters/binary/writer.py): a Conv may omit the
+    optional ONNX ``kernel_shape``, in which case the spatial extent is the
+    last one or two dims of its constant weight tensor ([kH, kW] for a 2D
+    weight, [kH] for a 1D-as-height weight). Returns () when nothing can be
+    inferred, so callers keep their prior fallback.
+    """
+    if weight_shapes is None or op.op_type not in _KERNEL_INFERRABLE_OPS:
+        return ()
+    for input_name in op.inputs:
+        shape = weight_shapes.get(input_name)
+        if shape is None:
+            continue
+        if len(shape) >= 4:
+            return (int(shape[-2]), int(shape[-1]))
+        if len(shape) == 3:
+            return (int(shape[-1]),)
+        return ()
+    return ()
+
+
+def _get_kernel_h(
+    op: OpNode, weight_shapes: dict[str, tuple[int, ...]] | None = None
+) -> int:
+    """Get the height dimension of the kernel (first element of kernel_shape).
+
+    Falls back to the constant weight shape when ``kernel_shape`` is absent,
+    matching the emitter, so a recomputing chain that omits the attribute is
+    not silently treated as a 1x1 kernel.
+    """
     ks = op.attrs.get("kernel_shape")
-    if ks and len(ks) >= 1:
+    if ks:
         return int(ks[0])
+    inferred = _infer_kernel_shape(op, weight_shapes)
+    if len(inferred) >= 1:
+        return int(inferred[0])
     return 1
 
 
@@ -154,11 +201,20 @@ def _get_dilation_h(op: OpNode) -> int:
     return 1
 
 
-def _get_kernel_w(op: OpNode) -> int:
-    """Get the width dimension of the kernel (second element of kernel_shape)."""
+def _get_kernel_w(
+    op: OpNode, weight_shapes: dict[str, tuple[int, ...]] | None = None
+) -> int:
+    """Get the width dimension of the kernel (second element of kernel_shape).
+
+    Falls back to the constant weight shape when ``kernel_shape`` is absent,
+    matching the emitter. A present-but-1D ``kernel_shape`` keeps width 1.
+    """
     ks = op.attrs.get("kernel_shape")
-    if ks and len(ks) >= 2:
-        return int(ks[1])
+    if ks:
+        return int(ks[1]) if len(ks) >= 2 else 1
+    inferred = _infer_kernel_shape(op, weight_shapes)
+    if len(inferred) >= 2:
+        return int(inferred[1])
     return 1
 
 
@@ -176,6 +232,11 @@ def _get_dilation_w(op: OpNode) -> int:
     if dilations and len(dilations) >= 2:
         return int(dilations[1])
     return 1
+
+
+def _ag_weight_shapes(ag: AnalyzedGraph) -> dict[str, tuple[int, ...]]:
+    """Constant weight tensor shapes keyed by name, for kernel_shape inference."""
+    return {name: tuple(arr.shape) for name, arr in ag.weight_data.items()}
 
 
 # Tile solver
@@ -435,8 +496,9 @@ def _solve_convtranspose_2d(
 
     # group == 1 and unit dilation are enforced by _stage_is_convtranspose_2d;
     # compute eff_k with dilation folded in anyway to match the runtime exactly.
-    eff_kh = _get_dilation_h(ct) * (_get_kernel_h(ct) - 1) + 1
-    eff_kw = _get_dilation_w(ct) * (_get_kernel_w(ct) - 1) + 1
+    weight_shapes = _ag_weight_shapes(ag)
+    eff_kh = _get_dilation_h(ct) * (_get_kernel_h(ct, weight_shapes) - 1) + 1
+    eff_kw = _get_dilation_w(ct) * (_get_kernel_w(ct, weight_shapes) - 1) + 1
     stride_h = _get_stride_h(ct)
     stride_w = _get_stride_w(ct)
     if full_in_h <= 0 or full_in_w <= 0 or stride_h <= 0 or stride_w <= 0:
@@ -578,7 +640,7 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         # Compute receptive field
-        rf_h, rf_w = compute_receptive_field(stage_ops)
+        rf_h, rf_w = compute_receptive_field(stage_ops, _ag_weight_shapes(ag))
         halo = rf_h - 1
 
         # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.

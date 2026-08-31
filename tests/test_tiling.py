@@ -210,6 +210,27 @@ class TestReceptiveField:
         assert rf_h == 1
         assert rf_w == 1
 
+    def test_kernel_inferred_from_weight_when_shape_absent(self):
+        """A Conv omitting kernel_shape recovers its 3x3 kernel from the weight.
+
+        Mirrors the emitter's inference so a recomputing chain that drops the
+        attribute is not silently treated as a 1x1 kernel (understated halo).
+        """
+        op = OpNode(name="c", op_type="Conv", inputs=["x", "w"], outputs=["y"],
+                    attrs={"strides": [1, 1]})
+        # ONNX Conv weight is [out_ch, in_ch/group, kH, kW].
+        rf_h, rf_w = compute_receptive_field([op], {"w": (8, 4, 3, 3)})
+        assert rf_h == 3
+        assert rf_w == 3
+
+    def test_kernel_shape_absent_without_weights_falls_back_to_1(self):
+        """Negative control: no weight_shapes keeps the prior 1x1 fallback."""
+        op = OpNode(name="c", op_type="Conv", inputs=["x", "w"], outputs=["y"],
+                    attrs={"strides": [1, 1]})
+        rf_h, rf_w = compute_receptive_field([op])
+        assert rf_h == 1
+        assert rf_w == 1
+
 
 # Integration: full pipeline with ONNX fixtures
 
