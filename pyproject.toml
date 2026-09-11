@@ -44,7 +44,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://tigris-ml.dev"
-Documentation = "https://tigris-ml.dev/docs"
+Documentation = "https://tigris-ml.dev/getting-started/quickstart/"
 Repository = "https://github.com/raws-labs/tigris"
 Issues = "https://github.com/raws-labs/tigris/issues"
 

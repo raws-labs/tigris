@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/tigris-ml)](https://pypi.org/project/tigris-ml/)
-[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/docs)
+[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/getting-started/quickstart/)
 
 **Tiled Graph Inference Scheduler.** An ahead-of-time compiler that tiles ML models to fit embedded devices with hard memory budgets.
 
@@ -58,7 +58,7 @@ The `.tgrs` plan is target-agnostic: it is the same file whether you run it on a
 
 Several kernel backends are available (portable C99, ESP32 family, Cortex-M
 family). The generated [operator/backend capability
-matrix](https://tigris-ml.dev/docs/runtime/operator-and-backend-support/)
+matrix](https://tigris-ml.dev/runtime/operator-support/)
 shows which operators are native, use an explicit fallback, or are rejected.
 Switching between them is a `--backend` flag, not a rewrite.
 
@@ -104,10 +104,10 @@ instrumentation without introducing a hardware-specific codegen target.
 
 ## Further reading
 
-- [Getting started](https://tigris-ml.dev/docs): installation, first compile, deploying to ESP32
+- [Getting started](https://tigris-ml.dev/getting-started/quickstart/): installation, first compile, deploying to ESP32
 - [Core compatibility data](compatibility.json): exact compiler/runtime releases and plan schemas
 - [Introducing TiGrIS](https://tigris-ml.dev/blog/introducing-tigris): design, benchmarks, how tiling works
-- [CLI reference](https://tigris-ml.dev/docs/cli): every flag, every subcommand
+- [CLI reference](https://tigris-ml.dev/toolchain/analyze/): every flag, every subcommand
 
 ## Maintainer
 
