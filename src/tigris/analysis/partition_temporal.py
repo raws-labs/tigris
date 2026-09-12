@@ -152,7 +152,7 @@ def _build_stage(
     if peak > budget:
         warnings.append(
             f"Stage {stage_id} peak ({peak:,} bytes) exceeds budget "
-            f"({budget:,} bytes). Needs tiled streaming (Phase 2)."
+            f"({budget:,} bytes). Needs tiled streaming."
         )
 
     return Stage(

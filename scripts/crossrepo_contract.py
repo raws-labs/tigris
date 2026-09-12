@@ -1794,7 +1794,7 @@ def _2d_tiled_conv_sigmoid_case() -> ContractCase:
     (full-width) chain streamer cannot fit even one row, so Conv and Sigmoid
     stay as two independent stages, each solving its own 4x5 HW tile; the
     Sigmoid stage exercises the 2D executor running a pointwise op on a
-    packed (non-full-width) tile, closing the Task 7 coverage gap.
+    packed (non-full-width) tile, which no other contract case covers.
     """
     h = w = 66
     c = 64
@@ -1852,8 +1852,8 @@ def _cotiled_concat_2d_case() -> ContractCase:
     up and skip are both NCHW [1, 32, 66, 66]. A channel-axis Concat builds
     cat [1, 64, 66, 66], which a 3x3 stride-1 pad-1 Conv maps to output
     [1, 32, 66, 66]. At this budget the greedy temporal partition keeps the
-    Concat and the Conv as separate over-budget stages. Task 1's eligibility
-    change is what lets the multi-input Concat stage tile on both axes at all
+    Concat and the Conv as separate over-budget stages. The 2D eligibility
+    rules are what let the multi-input Concat stage tile on both axes at all
     (any Concat stage was previously excluded from HW tiling); both the
     Concat and the Conv stage now solve a TILE_AXIS_HW tile with tiles_h > 1
     and tiles_w > 1, so the plan's first tile-plan record proves 2D. This is
@@ -2068,8 +2068,8 @@ def _cotiled_add_2d_case() -> ContractCase:
     x and skip are both NCHW [1, 64, 66, 66]; Add produces added
     [1, 64, 66, 66], which a 3x3 stride-1 pad-1 Conv maps to output
     [1, 64, 66, 66]. Like the Concat sibling, the greedy temporal partition
-    keeps the Add and the Conv as separate over-budget stages; Task 1's
-    change lets the multi-input Add stage tile on both axes (Add was
+    keeps the Add and the Conv as separate over-budget stages; the 2D
+    eligibility rules let the multi-input Add stage tile on both axes (Add was
     previously excluded from HW tiling). Both stages solve a TILE_AXIS_HW
     tile with tiles_h > 1 and tiles_w > 1, and the runtime loads x and skip
     at the same tile rectangle.
@@ -2342,8 +2342,8 @@ def _convtranspose_2d_partial_edge_case() -> ContractCase:
     last tile row, the last tile column, and the bottom-right corner tile are all
     partial (and generally differently sized). The runtime must place every
     partial edge and corner tile at the correct output offset and still match ORT
-    bit-exact, which is the geometry (inverted rect plus effective pads) that
-    Task 3 added.
+    bit-exact, which is the geometry (inverted rect plus effective pads) the
+    ConvTranspose tiling support introduced.
     """
     model, inputs = _build_convtranspose_2d(
         c_in=32, c_out=24, h_in=15, w_in=15, seed=23
