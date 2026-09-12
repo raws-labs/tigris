@@ -409,8 +409,8 @@ def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
     "Audited pointwise" reuses the same set _stage_2d_eligible admits: the
     POINTWISE category minus _BINARY_OPS and Concat. Those take an independent
     second operand that the shared input-halo rectangle load does not co-tile,
-    so they are excluded here for the same reason. This bounds Phase 1.3c to a
-    ConvTranspose plus optional unary pointwise.
+    so they are excluded here for the same reason. A 2D-tiled ConvTranspose stage
+    is therefore the ConvTranspose plus optional unary pointwise, nothing else.
     """
     convtranspose = [op for op in stage_ops if op.op_type == "ConvTranspose"]
     if len(convtranspose) != 1:
