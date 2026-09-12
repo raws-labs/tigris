@@ -54,53 +54,15 @@ tigris compile model.onnx -m 256K -f 16M --xip -o model.tgrs
 tigris codegen model.tgrs --backend esp-nn -o model.c
 ```
 
-The `.tgrs` plan is target-agnostic: it is the same file whether you run it on an ESP32, a Cortex-M, or a POSIX host for testing. The choice of kernel backend happens at `codegen` time and decides which kernel library the generated C calls into.
-
-Several kernel backends are available (portable C99, ESP32 family, Cortex-M
-family). The generated [operator/backend capability
-matrix](https://tigris-ml.dev/runtime/operator-support/)
-shows which operators are native, use an explicit fallback, or are rejected.
-Switching between them is a `--backend` flag, not a rewrite.
+The `.tgrs` plan is target-agnostic: the same file runs on an ESP32, a Cortex-M, or a POSIX host. The kernel backend is chosen at `codegen` time and decides which kernel library the generated C calls into. The [operator and backend matrix](https://tigris-ml.dev/runtime/operator-support/) shows which operators are native, which fall back, and which are rejected.
 
 ## What you get
 
-`tigris compile` writes a single `.tgrs` file that contains the operator schedule, tile parameters, quantization tables, and the weights. This file goes on flash at deployment time.
+`tigris compile` writes a single `.tgrs` file holding the operator schedule, tile parameters, quantization tables, and the weights.
 
-`tigris codegen` produces a small C harness that locates the plan on flash at runtime and hands it to the runtime:
+`tigris codegen` produces a C harness that loads the plan and hands it to the runtime: buffer and arena declarations, a target entry point, and the glue for reaching the plan bytes. `--format app` emits a standalone program. `--format core` emits a source and header for firmware that already owns its entry point, arenas, and input source, so several generated cores can coexist in one binary. The [`codegen` reference](https://tigris-ml.dev/toolchain/codegen/) documents the flags.
 
-- declarations for the input/output buffers and the arena
-- a target entry point (`app_main()` for ESP-IDF, `main()` for POSIX/Cortex-M examples) that sets up memory and calls the runtime
-- backend-specific glue for finding the plan: partition mmap on ESP-IDF, an `extern` flash symbol on Cortex-M, a file path on POSIX
-
-Link the harness against [tigris-runtime](https://github.com/raws-labs/tigris-runtime) and your chosen kernel library, flash the `.tgrs` alongside the firmware, and you have a working inference binary.
-
-### Embedding in an existing application
-
-The default `--format app` emits that standalone example program. Use
-`--format core` when your firmware already owns its entry point, plan placement,
-arenas, input source, or observability:
-
-```bash
-tigris codegen model.tgrs --backend cmsis-nn --format core \
-  -o generated/tigris_codegen_core.c \
-  --header generated/tigris_codegen_core.h \
-  --name model_codegen
-```
-
-Core output is backend-specific but platform-neutral. It produces a C source and
-header that load the plan, reset runtime memory, prepare the selected backend,
-and run the generated dispatcher. Initialize the core once, then reset it before
-each subsequent inference. The embedding application supplies the plan
-bytes, arena buffers, and an optional input-initialization callback. If
-`--header` is omitted, codegen writes a sibling `.h` file next to `--output`.
-`--name` prefixes the public C symbols, so multiple generated cores can coexist
-in one firmware. The header also exports the model's tensor-table capacity,
-plan budget, and compressed-weight reserve for static allocation decisions.
-It also exports a plan-sized executor-workspace constant and buffer entry point,
-so generated integrations reserve only the metadata this model needs without
-manual limit tuning.
-This is suitable for bare-metal firmware, RTOS applications, and custom
-instrumentation without introducing a hardware-specific codegen target.
+Link the harness against [tigris-runtime](https://github.com/raws-labs/tigris-runtime) and your kernel library, and you have a working inference binary.
 
 ## Further reading
 
