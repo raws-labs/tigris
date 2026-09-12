@@ -22,7 +22,7 @@ Ahead-of-time compiler that tiles ONNX models to fit a memory budget and emits `
 - `src/tigris/analysis/`: lifetime, memory model, temporal partition (stages), spatial partition (tiles, chains, 2D tiling), validation.
 - `src/tigris/emitters/binary/`: wire format; `defs.py` is the schema source, `writer.py` and `reader.py` the codecs. `emitters/codegen.py` generates C, `emitters/yaml.py` the plan YAML.
 - `src/tigris/capabilities.py`: per-operator backend routes, constraints and conditional fallbacks; the public matrix JSON is generated from it.
-- `src/tigris/__init__.py`: `SCHEMA_VERSION` and `SUPPORTED_SCHEMA_VERSIONS` live here. `compatibility.json` records the compiler/runtime release pairing and accepted schema ranges; `tests/schema_compat/` holds a frozen plan for every supported schema version.
+- `src/tigris/__init__.py`: `SCHEMA_VERSION` and `SUPPORTED_SCHEMA_VERSIONS` live here. `compatibility.json` records compiler and runtime releases with the schemas each emits or accepts, and an entry names whichever component was cut, since the two release independently. `tests/schema_compat/` holds a frozen plan for every supported schema version.
 
 ## Gotchas
 - Normalize pass order is fixed in `normalize()`: constant fold, QDQ fold, BN fold, SiLU decompose, depthwise relabel, Conv1D relabel, Clip(0,6) to Relu6, ReduceMean to GlobalAveragePool, shape-op fold, Resize scale extraction, Concat axis, transpose validation, activation absorption last. Constant folding must run before QDQ folding because scale and zero-point inputs arrive as Constant ops.
