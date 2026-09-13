@@ -9,6 +9,7 @@ import numpy as np
 from tigris import (
     SCHEMA_VERSION,
     TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_HW,
     TILE_AXIS_NONE,
 )
 from tigris.graph.ir import AnalyzedGraph, OpNode
@@ -51,6 +52,7 @@ from .defs import (
     SECTION_ENTRY_SIZE,
     SECTION_ENTRY_STRUCT,
     SPATIAL_ATTRS_STRUCT,
+    STAGE_FLAG_LINE_BUFFERED,
     STAGE_SIZE,
     STAGE_STRUCT,
     STAGE_TILE_PLAN_INDEX_OFFSET,
@@ -675,8 +677,17 @@ def _build_tensors(
 
         qp_idx = quant_idx_map.get(name, no_qp) if quant_idx_map else no_qp
 
+        # The dtype the model file declares for this boundary, where folding the
+        # quantization into the tensor changed it. 0 says the tensor's own dtype
+        # is what the caller hands over.
+        iface_dtype = 0
+        declared = _declared_interface_dtype(ag, name)
+        if declared is not None and declared != info.dtype:
+            iface_dtype = declared
+
         # tigris_tensor_t: 16 bytes
-        # name_str(u32) size_bytes(u32) shape_off(u16) ndim(u8) dtype(u8) flags(u8) quant_param_idx(u16) pad(1)
+        # name_str(u32) size_bytes(u32) shape_off(u16) ndim(u8) dtype(u8)
+        # flags(u8) quant_param_idx(u16) iface_dtype(u8)
         buf.extend(TENSOR_STRUCT.pack(
             name_off,
             info.size_bytes,
@@ -685,9 +696,28 @@ def _build_tensors(
             info.dtype,
             flags,
             qp_idx,
+            iface_dtype,
         ))
 
     return bytes(buf), tensor_idx
+
+
+def _declared_interface_dtype(ag: AnalyzedGraph, name: str) -> int | None:
+    """The dtype the model file states for this input or output, if it is one.
+
+    Positional rather than by name: folding a terminal DequantizeLinear moves a
+    model output onto the tensor feeding it, which has a different name but the
+    same place in the list.
+    """
+    for names, dtypes in (
+        (ag.model_inputs, ag.model_input_dtypes),
+        (ag.model_outputs, ag.model_output_dtypes),
+    ):
+        if name in names:
+            index = names.index(name)
+            if index < len(dtypes):
+                return dtypes[index]
+    return None
 
 
 def _serialized_axis_map(rank: int, preserve_layout: bool = False) -> list[int]:
@@ -941,6 +971,7 @@ def _build_stages(
         # tile_plan_idx(u16) pad(u16)
         # chain_id(u16) chain_len(u16)
         # chain_tile_h(u16) _reserved1(u16)
+        reserved1 = STAGE_FLAG_LINE_BUFFERED if stage.line_buffered else 0
         buf.extend(STAGE_STRUCT.pack(
             stage.peak_bytes,
             ops_off, ops_count,
@@ -950,7 +981,7 @@ def _build_stages(
             stage.chain_id,
             stage.chain_len,
             stage.chain_tile_h,
-            0,  # _reserved1
+            reserved1,
         ))
 
     return bytes(buf)
@@ -969,7 +1000,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
 
         stage_to_tile[stage.stage_id] = idx
         idx += 1
-        if tp.tileable and tp.axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+        if tp.tileable and tp.axis not in (TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW):
             raise ValueError(
                 f"stage {stage.stage_id} has unsupported tile axis {tp.axis}"
             )
@@ -984,7 +1015,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
         # receptive_field(u16) original_height(u16)
         # tiled_peak_bytes(u32)
         # overhead_bytes(u32)
-        # reserved(u32)
+        # reserved(u32): tile_width packed into the low 16 bits
         buf.extend(TILE_PLAN_STRUCT.pack(
             1 if tp.tileable else 0,
             tp.axis,
@@ -995,7 +1026,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
             tp.original_height,
             tp.tiled_peak_bytes,
             tp.overhead_bytes,
-            0,  # reserved
+            tp.tile_width & 0xFFFF,
         ))
 
     return bytes(buf), stage_to_tile
@@ -1041,8 +1072,8 @@ def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
     weights) are not included - they keep their raw tensor scale.
     """
     effective: dict[str, np.ndarray] = {}
-    weight_ops = {"Conv", "ConvInteger", "DepthwiseConv", "MatMul", "Gemm",
-                  "QLinearConv", "QLinearMatMul"}
+    weight_ops = {"Conv", "ConvTranspose", "ConvInteger", "DepthwiseConv",
+                  "MatMul", "Gemm", "QLinearConv", "QLinearMatMul"}
 
     for op in ag.ops:
         if op.op_type not in weight_ops:

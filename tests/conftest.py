@@ -10,11 +10,14 @@ from onnx import TensorProto, helper, numpy_helper
 def linear_3op_path(tmp_path):
     """A -> B -> C -> D  (3 ops, linear chain, float32, batch=1).
 
-    Op0: Add(input, w0) -> t0        shape [1, 64]
-    Op1: Relu(t0) -> t1              shape [1, 64]
+    Op0: Relu(input) -> t0           shape [1, 64]
+    Op1: Add(t0, w0) -> t1           shape [1, 64]
     Op2: Add(t1, w1) -> output       shape [1, 64]
 
     Activation sizes: input=256B, t0=256B, t1=256B, output=256B
+
+    The Relu leads so the chain keeps three operators: an activation that
+    follows a fusable producer is absorbed into it.
     """
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 64])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 64])
@@ -22,11 +25,11 @@ def linear_3op_path(tmp_path):
     w0 = helper.make_tensor("w0", TensorProto.FLOAT, [1, 64], np.zeros((1, 64), dtype=np.float32).flatten().tolist())
     w1 = helper.make_tensor("w1", TensorProto.FLOAT, [1, 64], np.zeros((1, 64), dtype=np.float32).flatten().tolist())
 
-    add0 = helper.make_node("Add", ["input", "w0"], ["t0"], name="add0")
-    relu = helper.make_node("Relu", ["t0"], ["t1"], name="relu0")
+    relu = helper.make_node("Relu", ["input"], ["t0"], name="relu0")
+    add0 = helper.make_node("Add", ["t0", "w0"], ["t1"], name="add0")
     add1 = helper.make_node("Add", ["t1", "w1"], ["output"], name="add1")
 
-    graph = helper.make_graph([add0, relu, add1], "linear_3op", [X], [Y], initializer=[w0, w1])
+    graph = helper.make_graph([relu, add0, add1], "linear_3op", [X], [Y], initializer=[w0, w1])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
     model.ir_version = 8
 

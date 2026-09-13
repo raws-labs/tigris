@@ -1,6 +1,7 @@
 """Tests for C harness generation and XIP plan metadata."""
 
 import struct
+from unittest.mock import patch
 
 import numpy as np
 import onnx
@@ -12,6 +13,7 @@ from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import partition_spatial
 from tigris.analysis.partition_temporal import partition_temporal
+from tigris.analysis.validation import OperatorSupportValidation
 from tigris.cli import cli
 from tigris.emitters.binary.defs import (
     FLAG_XIP,
@@ -31,17 +33,20 @@ from tigris.loaders import load_model
 
 @pytest.fixture
 def quantized_matmul_plan(tmp_path):
-    """A QDQ MatMul plan: schema-known, but unsupported by every dispatcher."""
+    """A QDQ MatMul plan: schema-known, but unsupported by every dispatcher.
+
+    The second operand is a model input rather than a constant, so it stays a
+    MatMul: a constant-weight product is relabeled to Gemm and would be
+    supported.
+    """
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 4]
     )
+    weight_input = helper.make_tensor_value_info(
+        "weight", TensorProto.FLOAT, [4, 3]
+    )
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 3]
-    )
-
-    weight = numpy_helper.from_array(
-        np.arange(12, dtype=np.float32).reshape(4, 3) / 16.0,
-        name="weight",
     )
     input_scale = numpy_helper.from_array(
         np.array([0.05], dtype=np.float32), "input_scale"
@@ -100,10 +105,9 @@ def quantized_matmul_plan(tmp_path):
     graph = helper.make_graph(
         nodes,
         "quantized_matmul",
-        [model_input],
+        [model_input, weight_input],
         [model_output],
         initializer=[
-            weight,
             input_scale,
             input_zp,
             weight_scale,
@@ -125,7 +129,19 @@ def quantized_matmul_plan(tmp_path):
     assert [op.op_type for op in analyzed.ops] == ["MatMul"]
 
     plan_path = tmp_path / "quantized_matmul.tgrs"
-    plan_path.write_bytes(emit_binary_bytes(analyzed))
+    # MatMul has no runtime route on any backend, so validate_operator_support
+    # now correctly rejects it at compile time (the fail-closed gate this
+    # fixture predates). This fixture exists to exercise codegen's own,
+    # separate defense-in-depth capability check against an already-serialized
+    # plan (the same check that also guards a plan compiled by an older
+    # toolchain version), so bypass only the compile-time gate to construct
+    # the plan bytes; codegen's check below is untouched and still runs for
+    # real.
+    with patch(
+        "tigris.analysis.validation.validate_operator_support",
+        return_value=OperatorSupportValidation(issues=()),
+    ):
+        plan_path.write_bytes(emit_binary_bytes(analyzed))
     return plan_path
 
 
@@ -219,14 +235,17 @@ def test_quantized_esp_codegen_has_valid_includes(qdq_conv_path):
     assert 'tigris_kernels_s8.h\\"' not in source
 
 
-def test_quantized_reference_codegen_prints_int8_outputs(qdq_conv_path):
+def test_quantized_codegen_reads_the_declared_interface(qdq_conv_path):
+    """The harness prints what the model declares, not what the plan stores."""
     ag = _full_pipeline(qdq_conv_path, budget=4096)
 
     source = generate_c(emit_binary_bytes(ag), "reference")
 
     assert "tigris_dispatch_kernel_s8" in source
-    assert "int8_t *out = (int8_t *)ptr" in source
-    assert "float *out = (float *)ptr" not in source
+    assert "tigris_output_read(&plan, &mem, tidx, staging, iface_bytes)" in source
+    # Nothing reads the arena pointer as a typed array any more.
+    assert "*out = (int8_t *)ptr" not in source
+    assert "*out = (float *)ptr" not in source
 
 
 @pytest.mark.parametrize(

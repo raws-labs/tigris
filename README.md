@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/tigris-ml)](https://pypi.org/project/tigris-ml/)
-[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/docs)
+[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/getting-started/quickstart/)
 
 **Tiled Graph Inference Scheduler.** An ahead-of-time compiler that tiles ML models to fit embedded devices with hard memory budgets.
 
@@ -24,20 +24,38 @@ tigris analyze mobilenetv2.onnx -m 256K -f 16M
 ```
 
 ```text
+warning: input axis 0 (batch_size) has no fixed size; using 1
+  pass --input-shape NAME:1x3x224x224 to compile for another shape
 ╭──────────────────────── TiGrIS - mobilenetv2 ────────────────────────╮
 │ Operators            65                                              │
-│ Peak memory (naive)  4.59 MiB                                        │
+│ Tensors              244 (66 activations)                            │
+│ Peak memory (naive)  5.74 MiB                                        │
 │ Largest tensor       1x96x112x112 (4.59 MiB)                         │
+│ Dtype                float32                                         │
+│ Input                input 1x3x224x224 float32                       │
+│ Output               output 1x1000 float32                           │
 ╰──────────────────────────────────────────────────────────────────────╯
 ╭──────────────────────────────── SRAM ────────────────────────────────╮
 │ Budget              256.00 KiB                                       │
-│ Scheduled peak      254.62 KiB (5.4% of naive peak)                  │
-│ Stages              42                                               │
-│ Need tiling         31 of 42 stages                                  │
+│ Scheduled peak      252.00 KiB (4.3% of naive peak)                  │
+│ Stages              58                                               │
+│ Spill / reload I/O  26.21 MiB / 27.55 MiB                            │
+│                                                                      │
+│ Need tiling         47 of 58 stages                                  │
+│   tileable          11 (138 tiles, max halo 2)                       │
 ╰────────────────  PASS - tiling resolves all stages  ─────────────────╯
+╭─────────────────────────────── Flash ────────────────────────────────╮
+│ Budget            16.00 MiB                                          │
+│ Weight data       13.30 MiB                                          │
+│ Plan overhead      0.01 MiB                                          │
+│ Plan (est.)       13.31 MiB                                          │
+│ Plan INT8 (est.)   3.34 MiB                                          │
+╰─────────────────────────  PASS - plan fits  ─────────────────────────╯
 ```
 
-The naive peak is 4.59 MiB. TiGrIS schedules it into 256 KiB through temporal partitioning and spatial tiling. `analyze` runs on your laptop; no hardware required.
+The naive peak is 5.74 MiB. TiGrIS schedules it into 256 KiB through temporal partitioning and spatial tiling. `analyze` runs on your laptop; no hardware required.
+
+That model is a stock export with a free batch dimension. TiGrIS binds a dimension the model leaves open to 1 and says so; pass `--input-shape input:4x3x224x224` to compile for a different one.
 
 ## From ONNX to embedded
 
@@ -54,60 +72,22 @@ tigris compile model.onnx -m 256K -f 16M --xip -o model.tgrs
 tigris codegen model.tgrs --backend esp-nn -o model.c
 ```
 
-The `.tgrs` plan is target-agnostic: it is the same file whether you run it on an ESP32, a Cortex-M, or a POSIX host for testing. The choice of kernel backend happens at `codegen` time and decides which kernel library the generated C calls into.
-
-Several kernel backends are available (portable C99, ESP32 family, Cortex-M
-family). The generated [operator/backend capability
-matrix](https://tigris-ml.dev/docs/runtime/operator-and-backend-support/)
-shows which operators are native, use an explicit fallback, or are rejected.
-Switching between them is a `--backend` flag, not a rewrite.
+The `.tgrs` plan is target-agnostic: the same file runs on an ESP32, a Cortex-M, or a POSIX host. The kernel backend is chosen at `codegen` time and decides which kernel library the generated C calls into. The [operator and backend matrix](https://tigris-ml.dev/runtime/operator-support/) shows which operators are native, which fall back, and which are rejected.
 
 ## What you get
 
-`tigris compile` writes a single `.tgrs` file that contains the operator schedule, tile parameters, quantization tables, and the weights. This file goes on flash at deployment time.
+`tigris compile` writes a single `.tgrs` file holding the operator schedule, tile parameters, quantization tables, and the weights.
 
-`tigris codegen` produces a small C harness that locates the plan on flash at runtime and hands it to the runtime:
+`tigris codegen` produces a C harness that loads the plan and hands it to the runtime: buffer and arena declarations, a target entry point, and the glue for reaching the plan bytes. `--format app` emits a standalone program. `--format core` emits a source and header for firmware that already owns its entry point, arenas, and input source, so several generated cores can coexist in one binary. The [`codegen` reference](https://tigris-ml.dev/toolchain/codegen/) documents the flags.
 
-- declarations for the input/output buffers and the arena
-- a target entry point (`app_main()` for ESP-IDF, `main()` for POSIX/Cortex-M examples) that sets up memory and calls the runtime
-- backend-specific glue for finding the plan: partition mmap on ESP-IDF, an `extern` flash symbol on Cortex-M, a file path on POSIX
-
-Link the harness against [tigris-runtime](https://github.com/raws-labs/tigris-runtime) and your chosen kernel library, flash the `.tgrs` alongside the firmware, and you have a working inference binary.
-
-### Embedding in an existing application
-
-The default `--format app` emits that standalone example program. Use
-`--format core` when your firmware already owns its entry point, plan placement,
-arenas, input source, or observability:
-
-```bash
-tigris codegen model.tgrs --backend cmsis-nn --format core \
-  -o generated/tigris_codegen_core.c \
-  --header generated/tigris_codegen_core.h \
-  --name model_codegen
-```
-
-Core output is backend-specific but platform-neutral. It produces a C source and
-header that load the plan, reset runtime memory, prepare the selected backend,
-and run the generated dispatcher. Initialize the core once, then reset it before
-each subsequent inference. The embedding application supplies the plan
-bytes, arena buffers, and an optional input-initialization callback. If
-`--header` is omitted, codegen writes a sibling `.h` file next to `--output`.
-`--name` prefixes the public C symbols, so multiple generated cores can coexist
-in one firmware. The header also exports the model's tensor-table capacity,
-plan budget, and compressed-weight reserve for static allocation decisions.
-It also exports a plan-sized executor-workspace constant and buffer entry point,
-so generated integrations reserve only the metadata this model needs without
-manual limit tuning.
-This is suitable for bare-metal firmware, RTOS applications, and custom
-instrumentation without introducing a hardware-specific codegen target.
+Link the harness against [tigris-runtime](https://github.com/raws-labs/tigris-runtime) and your kernel library, and you have a working inference binary.
 
 ## Further reading
 
-- [Getting started](https://tigris-ml.dev/docs): installation, first compile, deploying to ESP32
+- [Getting started](https://tigris-ml.dev/getting-started/quickstart/): installation, first compile, deploying to ESP32
 - [Core compatibility data](compatibility.json): exact compiler/runtime releases and plan schemas
 - [Introducing TiGrIS](https://tigris-ml.dev/blog/introducing-tigris): design, benchmarks, how tiling works
-- [CLI reference](https://tigris-ml.dev/docs/cli): every flag, every subcommand
+- [CLI reference](https://tigris-ml.dev/toolchain/analyze/): every flag, every subcommand
 
 ## Maintainer
 

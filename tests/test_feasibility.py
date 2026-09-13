@@ -1,5 +1,7 @@
 """Fail-closed validation for deployment memory budgets."""
 
+from dataclasses import replace
+
 import numpy as np
 import onnx
 import pytest
@@ -100,17 +102,21 @@ def test_compile_refuses_unsafe_height_tiling_but_keeps_untiled_support(
 
 
 def test_minimum_tile_that_exceeds_budget_is_infeasible(conv_relu_chain_path):
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("1K",))
+    # 300 bytes is below the 1x1 2D core for either stage (halo 2x2), so a
+    # 2D tile solve is attempted once the 1D single-row tile also overflows
+    # and reports its own distinct "minimum 2D tile" reason, not the generic
+    # 1D "minimum spatial tile" fallback.
+    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
 
     validation = validate_memory_plan(graph)
 
     assert not validation.feasible
     assert validation.scheduled_peak_bytes > graph.mem_budget
-    assert any(issue.reason == "minimum spatial tile" for issue in validation.issues)
+    assert any(issue.reason == "minimum 2D tile" for issue in validation.issues)
 
 
 def test_findings_never_pass_when_scheduled_peak_exceeds_budget(conv_relu_chain_path):
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("1K",))
+    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
 
     findings = compute_findings(graph)
 
@@ -126,7 +132,9 @@ def test_compile_refuses_infeasible_plan_without_creating_output(
 
     result = CliRunner().invoke(
         cli,
-        ["compile", str(conv_relu_chain_path), "-m", "1K", "-o", str(output)],
+        # 300 bytes stays below the 1x1 2D core too; see
+        # test_minimum_tile_that_exceeds_budget_is_infeasible.
+        ["compile", str(conv_relu_chain_path), "-m", "300", "-o", str(output)],
     )
 
     assert result.exit_code != 0
@@ -173,7 +181,7 @@ def test_compile_rejects_budget_above_plan_format_limit(
 
 
 def test_writer_defensively_rejects_infeasible_graph(conv_relu_chain_path):
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("1K",))
+    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
 
     with pytest.raises(ValueError, match="Cannot emit an infeasible memory plan"):
         emit_binary_bytes(graph)
@@ -183,7 +191,7 @@ def test_writer_defensively_rejects_budget_above_plan_format_limit(
     linear_3op_path,
 ):
     graph, _ = _run_pipeline(str(linear_3op_path), ("4K",))
-    graph.mem_budget = 0x1_0000_0000
+    graph.budget = replace(graph.budget, fast=0x1_0000_0000)
 
     with pytest.raises(ValueError, match="uint32 plan-format limit"):
         emit_binary_bytes(graph)
@@ -204,9 +212,102 @@ def test_feasible_plan_still_compiles(conv_relu_chain_path, tmp_path):
 def test_analyze_displays_failing_verdict(conv_relu_chain_path):
     result = CliRunner().invoke(
         cli,
-        ["analyze", str(conv_relu_chain_path), "-m", "1K"],
+        ["analyze", str(conv_relu_chain_path), "-m", "300"],
     )
 
     assert result.exit_code == 0
     assert "FAIL" in result.output
     assert "Infeasible" in result.output
+
+
+def test_run_pipeline_records_slow_tier(conv_relu_chain_path):
+    ag, total = _run_pipeline(str(conv_relu_chain_path), ("64K", "8M"))
+    assert ag.budget.slow == 8 * 1024 * 1024
+    assert ag.budget.fast + ag.budget.fast_reserve == total
+
+
+def test_run_pipeline_no_slow_tier_is_zero(conv_relu_chain_path):
+    ag, _ = _run_pipeline(str(conv_relu_chain_path), ("64K",))
+    assert ag.budget.slow == 0
+
+
+def test_compile_rejects_nonpositive_slow_tier(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "out.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K", "-m", "0",
+               "-o", str(output)])
+    assert result.exit_code != 0
+    assert "Slow-memory budget must be greater than zero" in result.output
+    assert not output.exists()
+
+
+def test_compile_refuses_slow_overflow_without_output(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "should-not-exist.tgrs"
+    # 16K is below the naive peak (52.6K) so stages need tiling and are
+    # still fast-feasible; 1K is a slow tier the stage in+out cannot fit.
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "16K", "-m", "1K",
+               "-o", str(output)])
+    assert result.exit_code != 0
+    assert "overflow slow memory" in result.output
+    assert not output.exists()
+
+
+def test_slow_within_budget_compiles(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "out.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "16K", "-m", "64M",
+               "-o", str(output)])
+    assert result.exit_code == 0
+    assert output.exists()
+
+
+def test_compile_refuses_flash_overflow_without_output(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "should-not-exist.tgrs"
+    # -f far below any real plan size.
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
+               "-f", "1", "-o", str(output)])
+    assert result.exit_code != 0
+    assert "exceeds the flash budget" in result.output
+    assert not output.exists()
+
+
+def test_compile_refuses_flash_overflow_compressed(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "should-not-exist.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
+               "--compress", "lz4", "-f", "1", "-o", str(output)])
+    assert result.exit_code != 0
+    assert "exceeds the flash budget" in result.output
+    assert not output.exists()
+
+
+def test_analyze_allows_nonpositive_slow_tier(conv_relu_chain_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    result = CliRunner().invoke(
+        cli, ["analyze", str(conv_relu_chain_path), "-m", "256K", "-m", "0"])
+    assert result.exit_code == 0
+    assert "Slow-memory budget must be greater than zero" not in result.output
+
+
+def test_flash_within_budget_compiles(conv_relu_chain_path, tmp_path):
+    from click.testing import CliRunner
+    from tigris.cli import cli
+    output = tmp_path / "out.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
+               "-f", "16M", "-o", str(output)])
+    assert result.exit_code == 0
+    assert output.exists()

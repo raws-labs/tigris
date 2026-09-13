@@ -11,7 +11,7 @@ tensors can stay in fast memory as tiles, avoiding full-size slow allocation.
 import math
 from enum import Enum
 
-from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_NONE
+from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.graph.ir import (
     AnalyzedGraph,
     OpNode,
@@ -52,6 +52,16 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 }
 
 
+# Dynamic binary ops (Add, Mul) whose second operand is an independent
+# tensor. Neither the rank-3 axis-1 executor nor the rank-4 HW (2D) executor
+# guarantees that operand is co-tiled with a spatial op's output: both load
+# every stage input using the spatial op's own tile geometry (length stripe
+# or HW halo rectangle), so a binary op combined with a spatial op can read
+# the wrong region or size from its second operand. Safe only in stages with
+# no spatial op. Shared between the rank-3 and rank-4 eligibility checks
+# below since the hazard is the same in both.
+_BINARY_OPS = frozenset({"Add", "Mul"})
+
 # Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
 # NHWC stages.  Unary pointwise operators preserve the current length and may
 # surround one Conv1D.  Dynamic binary operators are safe only in a
@@ -63,8 +73,16 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Sigmoid",
     "Tanh",
 })
-_RANK3_AXIS1_BINARY_OPS = frozenset({"Add", "Mul"})
-_RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _RANK3_AXIS1_BINARY_OPS | {"Conv1D"}
+_RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
+
+# Conservative per-tile allocation alignment for the backend-agnostic tiled
+# working-set model. The runtime rounds every fast-arena tile allocation up to
+# its target's TIGRIS_TENSOR_ALIGN (Xtensa 8, aarch64 16, x86_64 32, default 4);
+# 32 is the maximum of that standard set, so aligning the compiler's estimate to
+# it never under-counts against any of them (align_up is monotonic in the
+# alignment). Under-counting would let the solver emit a tile the runtime's
+# stage_2d_fast_bytes check rejects, which is exactly the bug this guards.
+_CONSERVATIVE_TENSOR_ALIGN = 32
 
 
 def classify_op(op_type: str) -> TileCategory:
@@ -75,37 +93,95 @@ def classify_op(op_type: str) -> TileCategory:
 # Receptive field computation
 
 
-def compute_receptive_field(ops: list[OpNode]) -> tuple[int, int]:
-    """Compute the receptive field and total stride for a sequence of ops.
+def compute_receptive_field(
+    ops: list[OpNode],
+    weight_shapes: dict[str, tuple[int, ...]] | None = None,
+) -> tuple[int, int]:
+    """Compute the height and width receptive fields for a sequence of ops.
 
-    Walks the ops in reverse, accumulating RF and jump (cumulative stride).
-    Returns (receptive_field, total_jump).
+    Walks the ops in reverse once, accumulating RF and jump (cumulative
+    stride) independently for the height and width axes.
+    Returns (rf_h, rf_w).
 
-    For pointwise ops, RF and jump are unchanged.
+    For pointwise ops, RF and jump are unchanged on both axes.
     For conv/pool ops, RF grows based on effective kernel size.
+
+    ``weight_shapes`` (constant tensor name -> shape) lets a Conv that omits
+    the ONNX ``kernel_shape`` attribute recover its kernel from the weight,
+    matching the emitter; without it such ops fall back to a 1x1 kernel.
     """
-    rf = 1
-    jump = 1
+    rf_h = 1
+    jump_h = 1
+    rf_w = 1
+    jump_w = 1
 
     for op in reversed(ops):
         cat = classify_op(op.op_type)
         if cat in (TileCategory.CONV, TileCategory.POOL):
-            kernel = _get_kernel_h(op)
-            stride = _get_stride_h(op)
-            dilation = _get_dilation_h(op)
+            kernel_h = _get_kernel_h(op, weight_shapes)
+            stride_h = _get_stride_h(op)
+            dilation_h = _get_dilation_h(op)
 
-            effective_k = dilation * (kernel - 1) + 1
-            rf = rf + (effective_k - 1) * jump
-            jump = jump * stride
+            effective_kh = dilation_h * (kernel_h - 1) + 1
+            rf_h = rf_h + (effective_kh - 1) * jump_h
+            jump_h = jump_h * stride_h
 
-    return rf, jump
+            kernel_w = _get_kernel_w(op, weight_shapes)
+            stride_w = _get_stride_w(op)
+            dilation_w = _get_dilation_w(op)
+
+            effective_kw = dilation_w * (kernel_w - 1) + 1
+            rf_w = rf_w + (effective_kw - 1) * jump_w
+            jump_w = jump_w * stride_w
+
+    return rf_h, rf_w
 
 
-def _get_kernel_h(op: OpNode) -> int:
-    """Get the height dimension of the kernel (first element of kernel_shape)."""
+# Ops whose kernel extent the emitter infers from the weight tensor when the
+# optional ONNX ``kernel_shape`` attribute is absent (emitters/binary/writer.py).
+_KERNEL_INFERRABLE_OPS = {"Conv", "Conv1D", "DepthwiseConv", "ConvTranspose"}
+
+
+def _infer_kernel_shape(
+    op: OpNode, weight_shapes: dict[str, tuple[int, ...]] | None
+) -> tuple[int, ...]:
+    """kernel_shape inferred from the first constant weight operand.
+
+    Mirrors the emitter (emitters/binary/writer.py): a Conv may omit the
+    optional ONNX ``kernel_shape``, in which case the spatial extent is the
+    last one or two dims of its constant weight tensor ([kH, kW] for a 2D
+    weight, [kH] for a 1D-as-height weight). Returns () when nothing can be
+    inferred, so callers keep their prior fallback.
+    """
+    if weight_shapes is None or op.op_type not in _KERNEL_INFERRABLE_OPS:
+        return ()
+    for input_name in op.inputs:
+        shape = weight_shapes.get(input_name)
+        if shape is None:
+            continue
+        if len(shape) >= 4:
+            return (int(shape[-2]), int(shape[-1]))
+        if len(shape) == 3:
+            return (int(shape[-1]),)
+        return ()
+    return ()
+
+
+def _get_kernel_h(
+    op: OpNode, weight_shapes: dict[str, tuple[int, ...]] | None = None
+) -> int:
+    """Get the height dimension of the kernel (first element of kernel_shape).
+
+    Falls back to the constant weight shape when ``kernel_shape`` is absent,
+    matching the emitter, so a recomputing chain that omits the attribute is
+    not silently treated as a 1x1 kernel.
+    """
     ks = op.attrs.get("kernel_shape")
-    if ks and len(ks) >= 1:
+    if ks:
         return int(ks[0])
+    inferred = _infer_kernel_shape(op, weight_shapes)
+    if len(inferred) >= 1:
+        return int(inferred[0])
     return 1
 
 
@@ -125,7 +201,393 @@ def _get_dilation_h(op: OpNode) -> int:
     return 1
 
 
+def _get_kernel_w(
+    op: OpNode, weight_shapes: dict[str, tuple[int, ...]] | None = None
+) -> int:
+    """Get the width dimension of the kernel (second element of kernel_shape).
+
+    Falls back to the constant weight shape when ``kernel_shape`` is absent,
+    matching the emitter. A present-but-1D ``kernel_shape`` keeps width 1.
+    """
+    ks = op.attrs.get("kernel_shape")
+    if ks:
+        return int(ks[1]) if len(ks) >= 2 else 1
+    inferred = _infer_kernel_shape(op, weight_shapes)
+    if len(inferred) >= 2:
+        return int(inferred[1])
+    return 1
+
+
+def _get_stride_w(op: OpNode) -> int:
+    """Get the width dimension of the stride."""
+    strides = op.attrs.get("strides")
+    if strides and len(strides) >= 2:
+        return int(strides[1])
+    return 1
+
+
+def _get_dilation_w(op: OpNode) -> int:
+    """Get the width dimension of the dilation."""
+    dilations = op.attrs.get("dilations")
+    if dilations and len(dilations) >= 2:
+        return int(dilations[1])
+    return 1
+
+
+def _ag_weight_shapes(ag: AnalyzedGraph) -> dict[str, tuple[int, ...]]:
+    """Constant weight tensor shapes keyed by name, for kernel_shape inference."""
+    return {name: tuple(arr.shape) for name, arr in ag.weight_data.items()}
+
+
 # Tile solver
+
+
+def solve_2d_tile(
+    budget: int,
+    peak: int,
+    input_h: int,
+    input_w: int,
+    halo_h: int,
+    halo_w: int,
+) -> tuple[int, int] | None:
+    """Largest square-ish (tile_h, tile_w) whose proportional working set fits budget.
+
+    Mirrors the 1D proportional model already used for HEIGHT_OR_LENGTH in
+    partition_spatial(): ``tile_h = floor(budget*input_h/peak) - halo`` and
+    ``tiled_peak = int(peak * (tile_h + halo) / input_h)``. ``peak`` is the
+    stage's activation-only peak_bytes (compute_lifetimes skips constant
+    tensors, so weights/bias are never counted there); it is scaled by the
+    fraction of the haloed input area the tile covers:
+
+        tiled_peak(th, tw) = int(peak * (th + halo_h) * (tw + halo_w)
+                                  / (input_h * input_w))
+
+    Neither this solver nor the 1D one models resident weight/scratch bytes
+    against the tiled budget; that is a known pre-existing gap, and the
+    runtime backstops it by validating the emitted tile shape against the
+    real fast arena and failing closed.
+
+    Returns None if even a 1x1 core tile does not fit.
+    """
+    if input_h <= 0 or input_w <= 0:
+        return None
+
+    def tiled_peak(th: int, tw: int) -> int:
+        return int(peak * (th + halo_h) * (tw + halo_w) / (input_h * input_w))
+
+    if tiled_peak(1, 1) > budget:
+        return None
+
+    th = tw = max(min(input_h, input_w), 1)
+
+    # Shrink the larger side first, keeping the core roughly square, until it fits.
+    while tiled_peak(th, tw) > budget:
+        if th >= tw and th > 1:
+            th -= 1
+        elif tw > 1:
+            tw -= 1
+        else:
+            th = tw = 1
+            break
+
+    th = min(th, input_h)
+    tw = min(tw, input_w)
+    return (max(th, 1), max(tw, 1))
+
+
+def _cotileable_skip_operands(
+    ag: AnalyzedGraph, stage: Stage, op: OpNode
+) -> bool:
+    """Every stage-external operand of a pre-spatial Concat/Add/Mul must be a
+    rank-4 tensor at the same H/W as the op output, so the executor's shared
+    input-halo rectangle load co-tiles it correctly. Intra-stage operands
+    (produced by an earlier op in the stage) are fine - they are not loaded.
+
+    A rank-4 CONSTANT operand (an initializer, e.g. a Concat against a baked
+    tensor) is never a stage input, so it escapes the external same-H/W check;
+    but the 2D executor would still have to co-tile it against the spatial
+    op's input-halo rectangle and cannot tile-offset a full-size constant.
+    Fail closed on any such operand rather than silently emit a wrong result.
+    """
+    out = ag.tensors.get(op.outputs[0])
+    if out is None or len(out.shape) != 4:
+        return False
+    out_hw = tuple(out.shape[2:4])
+    external = set(stage.input_tensors)
+    for name in op.inputs:
+        info = ag.tensors.get(name)
+        if info is not None and info.is_constant and len(info.shape) == 4:
+            return False
+        if name in external:
+            if info is None or len(info.shape) != 4 or tuple(info.shape[2:4]) != out_hw:
+                return False
+    return True
+
+
+def _has_post_spatial_binary(stage_ops: list[OpNode]) -> bool:
+    """True if a Concat/Add/Mul is consumed at or after the stage's spatial op.
+
+    Both tiled executors (the 1D-height exec_stage_tiled and the 2D
+    exec_stage_tiled_2d) load every stage input at the spatial op's INPUT-halo
+    rectangle. A post-spatial binary/Concat operand lives at the spatial op's
+    OUTPUT resolution, so a strided spatial op would make the executor read that
+    operand at stride*out_start rows -- the wrong rows, and past the operand's
+    height -- on interior tiles. Both tile paths must fail closed on this shape
+    and run the stage untiled. Shared by _stage_2d_eligible and _stage_tile_axis
+    so the height and HW paths reject in lockstep.
+    """
+    spatial_idx = next(
+        (i for i, o in enumerate(stage_ops)
+         if classify_op(o.op_type) in (TileCategory.CONV, TileCategory.POOL)),
+        None,
+    )
+    if spatial_idx is None:
+        return False
+    return any(
+        (op.op_type in _BINARY_OPS or op.op_type == "Concat") and i >= spatial_idx
+        for i, op in enumerate(stage_ops)
+    )
+
+
+def _stage_2d_eligible(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """A stage may attempt HW tiling only if it is a standalone rank-4 stage
+    with at most one spatial op, and all of whose ops implement the HW tile
+    contract. Multi-spatial-op stages are excluded: the runtime executor's
+    2D contract is audited only for a single composed spatial op per stage.
+
+    Add/Mul/Concat are admitted only when they are consumed strictly BEFORE
+    the spatial op (their operands then sit at the spatial op's input
+    resolution, which is exactly the halo rectangle exec_stage_tiled_2d
+    loads every stage input at) and every stage-external operand is a
+    same-H/W co-tileable skip (see _cotileable_skip_operands). A stage like
+    [Add(input, skip), Conv] is admitted this way. Post-spatial occurrences
+    (e.g. [Conv, Add(conv_out, skip)]) and different-resolution operands
+    keep the fail-closed rejection: exec_stage_tiled_2d loads every stage
+    input using the spatial op's own input-halo rectangle, and a post-spatial
+    or different-resolution operand is not guaranteed to be co-tiled with
+    that rectangle. Admitting such a stage as 2D would load the operand with
+    the wrong region and size and silently produce a wrong result.
+    """
+    if _stage_io_ranks(ag, stage) != {4}:
+        return False
+    spatial_count = sum(
+        1
+        for op in stage_ops
+        if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL)
+    )
+    if spatial_count > 1:
+        return False
+    # Concat/Add/Mul are admitted only when consumed strictly BEFORE the spatial
+    # op (so their operands sit at the spatial op's input resolution = the halo
+    # rectangle the executor loads every stage input at) and every stage-external
+    # operand is a same-resolution skip. Post-spatial operands fail closed via the
+    # shared _has_post_spatial_binary check; different-resolution or constant
+    # pre-spatial operands fail closed via _cotileable_skip_operands.
+    if _has_post_spatial_binary(stage_ops):
+        return False
+    for op in stage_ops:
+        if op.op_type in _BINARY_OPS or op.op_type == "Concat":
+            if not _cotileable_skip_operands(ag, stage, op):
+                return False
+    return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
+
+
+def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
+    """A stage qualifies for the dedicated ConvTranspose 2D solve iff exactly
+    one op is a ConvTranspose (group == 1, unit dilation) and every other op is
+    an audited unary pointwise wrapper.
+
+    ConvTranspose is deliberately kept UNTILEABLE in _OP_CATEGORY, so it never
+    reaches the height (1D), HW-conv, or chain paths; this predicate gates the
+    isolated 2D-output-extent branch that replaces them for it. The group and
+    dilation checks are defense in depth: validate_operator_support already
+    rejects group != 1 or non-unit dilation, but a not-yet-rejected op must
+    never fall into the 2D solve.
+
+    "Audited pointwise" reuses the same set _stage_2d_eligible admits: the
+    POINTWISE category minus _BINARY_OPS and Concat. Those take an independent
+    second operand that the shared input-halo rectangle load does not co-tile,
+    so they are excluded here for the same reason. A 2D-tiled ConvTranspose stage
+    is therefore the ConvTranspose plus optional unary pointwise, nothing else.
+    """
+    convtranspose = [op for op in stage_ops if op.op_type == "ConvTranspose"]
+    if len(convtranspose) != 1:
+        return False
+    ct = convtranspose[0]
+    if int(ct.attrs.get("group", 1)) != 1:
+        return False
+    if _get_dilation_h(ct) != 1 or _get_dilation_w(ct) != 1:
+        return False
+    for op in stage_ops:
+        if op is ct:
+            continue
+        if op.op_type in _BINARY_OPS or op.op_type == "Concat":
+            return False
+        if classify_op(op.op_type) != TileCategory.POINTWISE:
+            return False
+    return True
+
+
+def _stage_rank4_input_infos(ag: AnalyzedGraph, stage: Stage) -> list:
+    """The stage's external activation inputs that are rank-4 tensors.
+
+    Mirrors the runtime's stage_inputs (tigris_stage_inputs): only the declared
+    external activation inputs, never an op's weight/bias operands. No fallback
+    to op inputs, which would wrongly pull in the ConvTranspose weight tensor.
+    """
+    infos = []
+    for name in stage.input_tensors:
+        info = ag.tensors.get(name)
+        if info and len(info.shape) == 4:
+            infos.append(info)
+    return infos
+
+
+def _solve_convtranspose_2d(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Emit a 2D (HW) tile plan for an over-budget ConvTranspose stage.
+
+    The tile grid is normalized over the expanded OUTPUT extent, but the
+    per-tile working set is sized the SAME way the runtime does in
+    stage_2d_fast_bytes (tigris_executor.c): a resident packed INPUT tile plus
+    every op's packed output tile, all live at once. This matters because a
+    ConvTranspose's input tile does NOT shrink by the output-area ratio - it
+    inverts to a fixed-halo rectangle
+    ``in_tile = (out_tile + eff_k + stride - 1)//stride + 2`` (clamped to the
+    full input), which a proportional peak model under-counts. Under-counting
+    made the runtime reject every emitted tile (ERR_TILE); this models the real
+    working set so every emitted tile fits.
+
+    Fails closed (a non-tileable TilePlan) when the output/input extent cannot
+    be determined, or when no output tile - not even a 1x1 core - fits budget.
+    """
+    ct = next((op for op in stage_ops if op.op_type == "ConvTranspose"), None)
+    if ct is None:  # guarded by _stage_is_convtranspose_2d; defensive
+        return TilePlan(
+            tileable=False,
+            warnings=[f"Stage {stage.stage_id}: no ConvTranspose op in stage"],
+        )
+
+    out_h = _find_output_extent(ag, stage)
+    out_w = _find_output_extent_width(ag, stage)
+    if out_h <= 0 or out_w <= 0:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine ConvTranspose "
+                f"output extent"
+            ],
+        )
+
+    in_infos = _stage_rank4_input_infos(ag, stage)
+    if not in_infos:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine ConvTranspose "
+                f"input extent"
+            ],
+        )
+    full_in_h = int(in_infos[0].shape[2])  # NCHW: H at dim 2
+    full_in_w = int(in_infos[0].shape[3])  # NCHW: W at dim 3
+
+    # group == 1 and unit dilation are enforced by _stage_is_convtranspose_2d;
+    # compute eff_k with dilation folded in anyway to match the runtime exactly.
+    weight_shapes = _ag_weight_shapes(ag)
+    eff_kh = _get_dilation_h(ct) * (_get_kernel_h(ct, weight_shapes) - 1) + 1
+    eff_kw = _get_dilation_w(ct) * (_get_kernel_w(ct, weight_shapes) - 1) + 1
+    stride_h = _get_stride_h(ct)
+    stride_w = _get_stride_w(ct)
+    if full_in_h <= 0 or full_in_w <= 0 or stride_h <= 0 or stride_w <= 0:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: malformed ConvTranspose geometry"
+            ],
+        )
+
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+
+    def working_set(th: int, tw: int) -> int:
+        """Runtime stage_2d_fast_bytes for one (th, tw) output tile."""
+        # ConvTranspose input tile: inverts to a smaller fixed-halo rectangle,
+        # clamped to the full input, exactly as the runtime computes it.
+        in_tile_h = min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h)
+        in_tile_w = min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w)
+        total = 0
+        for info in in_infos:
+            total += _align_up(
+                int(info.shape[0]) * in_tile_h * in_tile_w
+                * int(info.shape[1]) * info.elem_size,
+                align,
+            )
+        # Walk the op sequence tracking the running tile extent: it starts at
+        # the input tile, the single spatial op resizes it to the output tile,
+        # pointwise ops preserve it. Matches the runtime's cur_h/cur_w walk.
+        cur_h, cur_w = in_tile_h, in_tile_w
+        for op in stage_ops:
+            is_spatial = op is ct
+            ah = th if is_spatial else cur_h
+            aw = tw if is_spatial else cur_w
+            for name in op.outputs:
+                info = ag.tensors.get(name)
+                if info and len(info.shape) == 4:
+                    total += _align_up(
+                        int(info.shape[0]) * ah * aw
+                        * int(info.shape[1]) * info.elem_size,
+                        align,
+                    )
+            if is_spatial:
+                cur_h, cur_w = th, tw
+        return total
+
+    # Fail closed if even a 1x1 output tile overflows the budget.
+    if working_set(1, 1) > budget:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum 2D ConvTranspose tile still "
+                f"exceeds budget ({budget:,} bytes)"
+            ],
+        )
+
+    # Largest output tile whose runtime working set fits, maximizing tile area
+    # (fewest tiles). working_set is monotonic non-decreasing in both th and tw,
+    # so per th the largest feasible tw is a binary search, and once th at tw==1
+    # overflows no larger th can fit at any width.
+    best_th, best_tw, best_area = 1, 1, 1
+    for th in range(1, out_h + 1):
+        if working_set(th, 1) > budget:
+            break
+        lo, hi, tw_for_th = 1, out_w, 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if working_set(th, mid) <= budget:
+                tw_for_th = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        area = th * tw_for_th
+        if area > best_area:
+            best_area, best_th, best_tw = area, th, tw_for_th
+
+    th, tw = best_th, best_tw
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HW,
+        tile_height=th,
+        tile_width=tw,
+        num_tiles=math.ceil(out_h / th) * math.ceil(out_w / tw),
+        halo=0,
+        receptive_field=1,
+        original_height=out_h,
+        tiled_peak_bytes=working_set(th, tw),
+        overhead_bytes=0,
+        warnings=[],
+    )
 
 
 def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -144,6 +606,16 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue  # fits, no tiling needed
 
         stage_ops = [ag.ops[i] for i in stage.op_indices]
+
+        # ConvTranspose stays UNTILEABLE in _OP_CATEGORY on purpose (so it is
+        # auto-excluded from chains, the 1D height solve, and receptive-field
+        # composition). Its 2D tiling is handled here by a dedicated isolated
+        # branch that grids the expanded OUTPUT extent. Every other stage falls
+        # through to the existing byte-identical path below.
+        if _stage_is_convtranspose_2d(stage_ops):
+            stage.tile_plan = _solve_convtranspose_2d(ag, stage, stage_ops, budget)
+            continue
+
         tile_axis = _stage_tile_axis(ag, stage, stage_ops)
 
         # Check if all ops are tileable
@@ -168,8 +640,8 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         # Compute receptive field
-        rf, _jump = compute_receptive_field(stage_ops)
-        halo = rf - 1
+        rf_h, rf_w = compute_receptive_field(stage_ops, _ag_weight_shapes(ag))
+        halo = rf_h - 1
 
         # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.
         input_h = _find_input_extent(ag, stage, tile_axis)
@@ -190,13 +662,70 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
         # Estimate tiled peak memory
         tiled_peak = int(peak * (tile_h + halo) / input_h)
 
+        # A single-row height tile that still overflows the budget cannot be
+        # rescued by any smaller height-only tile: height is already at its
+        # floor. If the stage is eligible for 2D (HW) tiling, try shrinking
+        # both axes together before falling back to the 1D infeasible
+        # warning below.
+        min_2d_tile_infeasible = False
+        if (
+            tile_h == 1
+            and tiled_peak > budget
+            and _stage_2d_eligible(ag, stage, stage_ops)
+        ):
+            input_w = _find_input_extent_width(ag, stage)
+            if input_w > 0:
+                halo_w = rf_w - 1
+                shape = solve_2d_tile(
+                    budget=budget,
+                    peak=peak,
+                    input_h=input_h,
+                    input_w=input_w,
+                    halo_h=halo,
+                    halo_w=halo_w,
+                )
+                if shape is not None:
+                    tile_h_2d, tile_w_2d = shape
+                    tiled_peak_2d = int(
+                        peak
+                        * (tile_h_2d + halo)
+                        * (tile_w_2d + halo_w)
+                        / (input_h * input_w)
+                    )
+                    stage.tile_plan = TilePlan(
+                        tileable=True,
+                        axis=TILE_AXIS_HW,
+                        tile_height=tile_h_2d,
+                        tile_width=tile_w_2d,
+                        num_tiles=math.ceil(input_h / tile_h_2d)
+                        * math.ceil(input_w / tile_w_2d),
+                        halo=halo,
+                        receptive_field=rf_h,
+                        original_height=input_h,
+                        tiled_peak_bytes=tiled_peak_2d,
+                        overhead_bytes=0,
+                        warnings=[],
+                    )
+                    continue
+
+                # solve_2d_tile was attempted and even a 1x1 core tile does
+                # not fit the budget. Mark this stage distinctly so the
+                # surfaced diagnostic names the 2D tile instead of falling
+                # back to the generic 1D minimum-tile message below.
+                min_2d_tile_infeasible = True
+
         # Overhead: extra halo reads per tile boundary
         # Each internal tile boundary reads halo rows extra from the input
         halo_tensor_bytes = _estimate_halo_bytes(ag, stage, halo, input_h)
         overhead = halo_tensor_bytes * max(num_tiles - 1, 0)
 
         warnings: list[str] = []
-        if tiled_peak > budget:
+        if min_2d_tile_infeasible:
+            warnings.append(
+                f"Stage {stage.stage_id} minimum 2D tile still exceeds "
+                f"budget ({budget:,} bytes)"
+            )
+        elif tiled_peak > budget:
             warnings.append(
                 f"Stage {stage.stage_id} tiled peak ({tiled_peak:,} bytes) "
                 f"still exceeds budget ({budget:,} bytes)"
@@ -208,11 +737,12 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             tile_height=tile_h,
             num_tiles=num_tiles,
             halo=halo,
-            receptive_field=rf,
+            receptive_field=rf_h,
             original_height=input_h,
             tiled_peak_bytes=tiled_peak,
             overhead_bytes=overhead,
             warnings=warnings,
+            min_2d_tile_infeasible=min_2d_tile_infeasible,
         )
 
     return ag
@@ -238,6 +768,12 @@ def _stage_tile_axis(
     """Select an audited serialized activation axis for a standalone stage."""
     ranks = _stage_io_ranks(ag, stage)
     if ranks == {4} and all(op.op_type != "Conv1D" for op in stage_ops):
+        # A post-spatial binary/Concat with a stage-external operand mis-tiles on
+        # the height path exactly as on the 2D path (the skip is loaded at the
+        # spatial op's input rows, not its output rows). Fail closed so the stage
+        # runs untiled via exec_stage_normal, matching _stage_2d_eligible.
+        if _has_post_spatial_binary(stage_ops):
+            return TILE_AXIS_NONE
         return TILE_AXIS_HEIGHT_OR_LENGTH
     if ranks == {3} and stage_ops:
         op_types = [op.op_type for op in stage_ops]
@@ -248,7 +784,7 @@ def _stage_tile_axis(
             and not (
                 conv_count == 1
                 and any(
-                    op_type in _RANK3_AXIS1_BINARY_OPS
+                    op_type in _BINARY_OPS
                     for op_type in op_types
                 )
             )
@@ -259,17 +795,41 @@ def _stage_tile_axis(
 
 def _op_supports_axis(op: OpNode, axis: int) -> bool:
     """Fail closed unless an operator implements the selected tile contract."""
-    if axis != TILE_AXIS_HEIGHT_OR_LENGTH:
-        return False
-    if op.op_type == "Conv1D":
-        return True
-    return op.op_type in _OP_CATEGORY
+    if axis == TILE_AXIS_HEIGHT_OR_LENGTH:
+        if op.op_type == "Conv1D":
+            return True
+        return op.op_type in _OP_CATEGORY
+    if axis == TILE_AXIS_HW:
+        # Rank-4 spatial/pointwise/channel-Concat set only; Conv1D is rank-3
+        # and has no width axis to tile, even though it shares the CONV
+        # category with Conv in _OP_CATEGORY, so it must be excluded here
+        # explicitly rather than relying on the membership check alone.
+        if op.op_type == "Conv1D":
+            return False
+        return op.op_type in _OP_CATEGORY
+    return False
 
 
 def _find_input_extent(ag: AnalyzedGraph, stage: Stage, axis: int) -> int:
     """Find the H/L extent that serializes as axis 1 (source NCHW/NCL dim 2)."""
-    if axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+    if axis not in (TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW):
         return 0
+    return _find_source_dim_extent(ag, stage, dim=2, ranks={3, 4})
+
+
+def _find_input_extent_width(ag: AnalyzedGraph, stage: Stage) -> int:
+    """Find the W extent that serializes as axis 2 (source NCHW dim 3).
+
+    Only rank-4 tensors carry a width dimension; HW tiling never applies to
+    the rank-3 NCL layout.
+    """
+    return _find_source_dim_extent(ag, stage, dim=3, ranks={4})
+
+
+def _find_source_dim_extent(
+    ag: AnalyzedGraph, stage: Stage, dim: int, ranks: set[int]
+) -> int:
+    """Find a stage's source-shape extent at ``dim`` among candidate tensors."""
     # Check stage input tensors first, then look at first op's inputs
     candidates = stage.input_tensors.copy()
     if not candidates:
@@ -278,8 +838,44 @@ def _find_input_extent(ag: AnalyzedGraph, stage: Stage, axis: int) -> int:
 
     for name in candidates:
         info = ag.tensors.get(name)
-        if info and len(info.shape) in {3, 4}:
-            return int(info.shape[2])  # NCHW/NCL -> serialized H/L is dim 1
+        if info and len(info.shape) in ranks:
+            return int(info.shape[dim])
+
+    return 0
+
+
+def _find_output_extent(ag: AnalyzedGraph, stage: Stage) -> int:
+    """Find the H extent of the stage OUTPUT (source NCHW/NCL dim 2)."""
+    return _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
+
+
+def _find_output_extent_width(ag: AnalyzedGraph, stage: Stage) -> int:
+    """Find the W extent of the stage OUTPUT (source NCHW dim 3).
+
+    Only rank-4 tensors carry a width dimension, so this mirrors the rank
+    restriction of _find_input_extent_width.
+    """
+    return _find_output_dim_extent(ag, stage, dim=3, ranks={4})
+
+
+def _find_output_dim_extent(
+    ag: AnalyzedGraph, stage: Stage, dim: int, ranks: set[int]
+) -> int:
+    """Find a stage's OUTPUT-shape extent at ``dim`` among candidate tensors.
+
+    Mirrors _find_source_dim_extent but reads the stage's output tensors
+    (falling back to the last op's outputs), so ConvTranspose tiling grids over
+    the expanded output extent rather than the pre-upsample input.
+    """
+    candidates = stage.output_tensors.copy()
+    if not candidates:
+        last_op = ag.ops[stage.op_indices[-1]]
+        candidates = [n for n in last_op.outputs if n in ag.tensors]
+
+    for name in candidates:
+        info = ag.tensors.get(name)
+        if info and len(info.shape) in ranks:
+            return int(info.shape[dim])
 
     return 0
 
@@ -585,5 +1181,18 @@ def detect_and_solve_chains(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         # Store tile height on the head stage
         ag.stages[head_id].chain_tile_h = tile_h
+
+        # A chain recomputes iff any member stage has a positive composed
+        # halo (eff_kh - stride > 0). Mark the head so the runtime can later
+        # keep the shared boundary rows in a line buffer instead of
+        # redundantly recomputing them per tile. Memory-neutral, no threshold.
+        recomputes = any(
+            (eff_kh - stride) > 0
+            for eff_kh, stride, _dh in (
+                _get_stage_spatial_params(ag, ag.stages[s_idx]) for s_idx in chain
+            )
+        )
+        if recomputes:
+            ag.stages[head_id].line_buffered = True
 
     return ag

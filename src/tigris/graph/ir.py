@@ -99,6 +99,7 @@ class TilePlan:
     tileable: bool
     axis: int = TILE_AXIS_NONE
     tile_height: int = 0
+    tile_width: int = 0
     num_tiles: int = 0
     halo: int = 0
     receptive_field: int = 1
@@ -107,6 +108,11 @@ class TilePlan:
     overhead_bytes: int = 0
     untileable_ops: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Set when a stage was eligible for 2D (HW) tiling and solve_2d_tile
+    # attempted the search but even a 1x1 core tile did not fit the budget.
+    # Distinguishes this case from the generic 1D minimum-tile shortfall so
+    # the compiler can surface a diagnostic naming the 2D tile explicitly.
+    min_2d_tile_infeasible: bool = False
 
 
 @dataclass
@@ -125,6 +131,27 @@ class Stage:
     chain_id: int = 0xFFFF   # stage index of chain head, or 0xFFFF = standalone
     chain_len: int = 0       # number of stages in chain (0 = not in chain)
     chain_tile_h: int = 0    # output tile height for last stage (set on head only)
+    line_buffered: bool = False  # chain recomputes (set on head only, by detect_and_solve_chains)
+
+
+@dataclass(frozen=True)
+class MemoryBudget:
+    """Deployment memory budget across tiers, in bytes.
+
+    ``fast`` is the activation arena represented in the binary plan (the total
+    fast pool minus ``fast_reserve``); the total fast pool the caller supplied
+    is ``fast + fast_reserve``. ``slow`` and ``flash`` are 0 when unconstrained.
+    """
+
+    fast: int = 0
+    slow: int = 0
+    flash: int = 0
+    # Bytes deliberately held outside the activation arena by the deployment
+    # harness, so ``fast`` is always exactly the arena represented in the
+    # binary plan. The compiler currently uses this for compressed-weight
+    # blocks; it also makes an explicit target scratch reservation possible
+    # without making activation feasibility ambiguous.
+    fast_reserve: int = 0
 
 
 @dataclass
@@ -138,8 +165,20 @@ class AnalyzedGraph:
     model_inputs: list[str] = field(default_factory=list)
     model_outputs: list[str] = field(default_factory=list)
 
+    # Populated by loader - the dtype the model file declares for each input
+    # and output, positionally. Normalization folds the quantization at the
+    # boundary into the tensor, so the tensor's own dtype stops being what the
+    # caller hands over; these keep the declared contract recoverable.
+    model_input_dtypes: list[int] = field(default_factory=list)
+    model_output_dtypes: list[int] = field(default_factory=list)
+
     # Populated by loader - raw weight arrays keyed by initializer name
     weight_data: dict[str, np.ndarray] = field(default_factory=dict)
+
+    # Populated by loader - one line per input dimension that had no concrete
+    # extent in the model file and was given one, so the caller can report
+    # which shape the plan was actually built for.
+    shape_bindings: list[str] = field(default_factory=list)
 
     # Populated by lifetime analysis
     lifetimes: dict[str, TensorLifetime] = field(default_factory=dict)
@@ -150,14 +189,9 @@ class AnalyzedGraph:
 
     # Populated by partitioner
     stages: list[Stage] = field(default_factory=list)
-    mem_budget: int = 0  # primary (fastest) memory pool size in bytes
 
-    # Bytes deliberately held outside ``mem_budget`` by the deployment
-    # harness.  ``mem_budget`` is consequently always the activation arena
-    # represented in the binary plan.  The compiler currently uses this for
-    # compressed-weight blocks; it also makes an explicit target scratch
-    # reservation possible without making activation feasibility ambiguous.
-    fast_memory_reserve_bytes: int = 0
+    # Populated by partitioner / CLI. Single source of truth for all tiers.
+    budget: MemoryBudget = field(default_factory=MemoryBudget)
 
     # Physical allocation alignment used by the deployment memory model.
     # 32 bytes is conservative for the currently supported Cortex-M, ESP32-S3,
@@ -168,3 +202,13 @@ class AnalyzedGraph:
 
     # Quantization
     is_quantized: bool = False
+
+    @property
+    def mem_budget(self) -> int:
+        """Activation arena (fast tier). Compatibility accessor over ``budget``."""
+        return self.budget.fast
+
+    @property
+    def fast_memory_reserve_bytes(self) -> int:
+        """Bytes held outside the activation arena. Compat accessor over ``budget``."""
+        return self.budget.fast_reserve

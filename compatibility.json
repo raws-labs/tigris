@@ -4,20 +4,42 @@
     "repository_model": "separate-repositories",
     "schema_owner": "raws-labs/tigris",
     "schema_source": "src/tigris/emitters/binary/defs.py",
-    "schema_artifact": "src/tigris/schema/tigris-plan-v5.json",
+    "schema_artifact": "src/tigris/schema/tigris-plan-v6.json",
     "schema_versioning": "wire-format",
     "capability_growth": "same-schema with fail-closed runtime validation",
     "runtime_dependency": "vendored-wire-contract",
-    "integration_branch": "develop"
+    "integration_branch": "develop",
+    "release_cadence": "independent-per-component"
   },
   "integration": {
     "compiler_branch": "develop",
     "runtime_branch": "develop",
-    "compiler_emits_schema": 5,
-    "runtime_accepts_schemas": [2, 3, 4, 5],
+    "compiler_emits_schema": 6,
+    "runtime_accepts_schemas": [2, 3, 4, 5, 6],
     "contract_gate": "python scripts/crossrepo_contract.py --runtime ../tigris-runtime"
   },
   "releases": [
+    {
+      "status": "supported",
+      "runtime": {
+        "tag": "v0.7.0",
+        "commit": "7adcd70768756cdec8aa79e7ccdf60e30184e557",
+        "accepts_schemas": [2, 3, 4, 5]
+      }
+    },
+    {
+      "status": "supported",
+      "compiler": {
+        "tag": "v0.6.0",
+        "commit": "21e25a3380d0bdea479d08de4f39d66566c74721",
+        "emits_schema": 5
+      },
+      "runtime": {
+        "tag": "v0.6.0",
+        "commit": "bc088ad661dfb7bd03069261caa9363a14510518",
+        "accepts_schemas": [2, 3, 4, 5]
+      }
+    },
     {
       "status": "supported",
       "compiler": {

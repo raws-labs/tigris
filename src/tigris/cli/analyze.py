@@ -1,12 +1,21 @@
 """``tigris analyze`` command."""
 
+from dataclasses import replace
+
 import click
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from tigris.cli import cli, console, _parse_size, _run_pipeline
-from tigris.utils import fmt_bytes
+from tigris.cli import (
+    cli,
+    console,
+    _expand_mem,
+    _parse_input_shape,
+    _parse_size,
+    _run_pipeline,
+)
+from tigris.utils import describe_interface, fmt_bytes
 
 
 def _side_by_side(*panels):
@@ -32,20 +41,29 @@ def _side_by_side(*panels):
 
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
-@click.option("--mem", "-m", multiple=True, help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K -m 8M)")
+@click.option("--mem", "-m", multiple=True, callback=_expand_mem,
+              help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 @click.option("--flash", "-f", default=None, help="Flash size for plan fit check (e.g. 4M)")
 @click.option("--verbose", "-v", is_flag=True, help="Show per-stage and tiling tables")
-def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
+@click.option("--input-shape", "input_shape", multiple=True,
+              callback=_parse_input_shape,
+              help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
+def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
+            input_shape: dict[str, tuple[int, ...]]):
     """Analyze an ONNX model for memory-constrained deployment."""
     from tigris.analysis.findings import compute_findings
 
     mem_pools = [_parse_size(m) for m in mem]
     flash_budget = _parse_size(flash) if flash else 0
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
-    ag, budget = _run_pipeline(model, mem)
+    # Only forward the fast tier to _run_pipeline: analyze interprets the slow
+    # tier itself below and stays display-only, so a non-positive slow tier
+    # must be reported as unconstrained rather than raised.
+    ag, budget = _run_pipeline(model, mem[:1], input_shapes=input_shape)
+    ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
 
     with console.status("Computing findings..."):
-        findings = compute_findings(ag, flash_budget=flash_budget, slow_budget=slow_budget)
+        findings = compute_findings(ag, flash_budget=flash_budget)
 
     # Model
     model_grid = Table.grid(padding=(0, 2))
@@ -60,6 +78,8 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool):
         model_grid.add_row("Quantization", "INT8 (QDQ)")
     elif findings.is_float32:
         model_grid.add_row("Dtype", "float32")
+    for label, text in describe_interface(ag):
+        model_grid.add_row(label, text)
     if findings.unsupported_operators:
         model_grid.add_row(
             "[red]Unsupported operators[/]",

@@ -159,8 +159,13 @@ def test_gemm_relu_fused(tmp_path):
 # Cases that should NOT fuse
 
 
-def test_add_relu_not_fused(tmp_path):
-    """Add followed by Relu should NOT be fused (Add not in fusable set)."""
+def test_add_relu_is_fused(tmp_path):
+    """Relu following Add is absorbed into the Add.
+
+    A quantizer writes a residual block's activation after the sum, on an edge
+    the sum's own output requantization already covers, so the Add has to carry
+    it.
+    """
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 64])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 64])
 
@@ -173,9 +178,10 @@ def test_add_relu_not_fused(tmp_path):
     model = _make_model([add, relu], "add_relu", X, Y, [w])
     ag = _save_and_load(model, tmp_path)
 
-    assert len(ag.ops) == 2
+    assert len(ag.ops) == 1
     assert ag.ops[0].op_type == "Add"
-    assert ag.ops[1].op_type == "Relu"
+    assert ag.ops[0].attrs["fused_activation"] == "Relu"
+    assert ag.ops[0].outputs == ["output"]
 
 
 def test_conv_two_consumers_not_fused(tmp_path):
@@ -274,3 +280,80 @@ def test_binary_roundtrip_preserves_fused_act(tmp_path):
     assert conv_op["fused_act"] == ACT_RELU
     assert conv_op["act_min"] == -128
     assert conv_op["act_max"] == 127
+
+
+def test_quantized_intermediate_blocks_fusion(tmp_path):
+    """An intermediate carrying its own scale is a quantization step of its own.
+
+    Folding the activation past it would drop that rounding, so the pass leaves
+    both operators in place.
+    """
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 64])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 64])
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "zero_point"),
+        numpy_helper.from_array(
+            np.zeros((1, 64), dtype=np.float32), "bias"
+        ),
+    ]
+    nodes = [
+        helper.make_node("Add", ["input", "bias"], ["summed"]),
+        # The sum is quantized before the activation reads it.
+        helper.make_node(
+            "QuantizeLinear", ["summed", "scale", "zero_point"], ["summed_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["summed_q", "scale", "zero_point"], ["summed_dq"]
+        ),
+        helper.make_node("Relu", ["summed_dq"], ["activated"]),
+        helper.make_node(
+            "QuantizeLinear", ["activated", "scale", "zero_point"], ["out_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["out_q", "scale", "zero_point"], ["output"]
+        ),
+    ]
+    ag = _save_and_load(_make_model(nodes, "quantized_edge", X, Y, initializers), tmp_path)
+
+    assert [op.op_type for op in ag.ops] == ["Add", "Relu"]
+    assert "fused_activation" not in ag.ops[0].attrs
+
+
+def test_quantized_add_relu_carries_the_output_scale(tmp_path):
+    """The fused Add takes the activation's output quantization.
+
+    quantize(Relu(x)) == max(quantize(x), zero_point), so the plan encodes the
+    clamp as a lower bound at the output zero point.
+    """
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 64])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 64])
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "in_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "in_zp"),
+        numpy_helper.from_array(np.array([0.5], dtype=np.float32), "out_scale"),
+        numpy_helper.from_array(np.array([-8], dtype=np.int8), "out_zp"),
+        numpy_helper.from_array(np.zeros((1, 64), dtype=np.float32), "bias"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "in_scale", "in_zp"], ["in_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["in_q", "in_scale", "in_zp"], ["in_dq"]
+        ),
+        helper.make_node("Add", ["in_dq", "bias"], ["summed"]),
+        helper.make_node("Relu", ["summed"], ["activated"]),
+        helper.make_node(
+            "QuantizeLinear", ["activated", "out_scale", "out_zp"], ["out_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["out_q", "out_scale", "out_zp"], ["output"]
+        ),
+    ]
+    ag = _save_and_load(_make_model(nodes, "qdq_add_relu", X, Y, initializers), tmp_path)
+
+    add = next(op for op in ag.ops if op.op_type == "Add")
+    assert add.attrs["fused_activation"] == "Relu"
+    quant = ag.tensors[add.outputs[0]].quant
+    assert quant is not None
+    assert float(quant.scale[0]) == 0.5
+    assert int(quant.zero_point[0]) == -8

@@ -52,6 +52,7 @@ def validate(root: Path, runtime: Path | None = None) -> list[str]:
         "capability_growth": "same-schema with fail-closed runtime validation",
         "runtime_dependency": "vendored-wire-contract",
         "integration_branch": "develop",
+        "release_cadence": "independent-per-component",
     }
     for key, expected in expected_policy.items():
         if policy.get(key) != expected:
@@ -102,43 +103,70 @@ def validate(root: Path, runtime: Path | None = None) -> list[str]:
     if not isinstance(releases, list) or not releases:
         errors.append("releases must be a non-empty list")
         return errors
-    compiler_tags: set[str] = set()
+    # Compiler and runtime release on independent cadences, so an entry names
+    # whichever component was cut. Schema compatibility is the contract.
+    seen_tags: dict[str, set[str]] = {"compiler": set(), "runtime": set()}
+    emitted_schemas: set[int] = set()
+    accepted_schema_sets: list[list[int]] = []
     for index, release in enumerate(releases):
         label = f"releases[{index}]"
         if not isinstance(release, dict):
             errors.append(f"{label} must be an object")
             continue
-        if release.get("status") not in {"supported", "retired"}:
+        status = release.get("status")
+        if status not in {"supported", "retired"}:
             errors.append(f"{label}.status must be supported or retired")
-        compiler = release.get("compiler")
-        runtime_release = release.get("runtime")
-        if not isinstance(compiler, dict) or not isinstance(runtime_release, dict):
-            errors.append(f"{label} must name compiler and runtime objects")
+        components = {
+            name: release[name]
+            for name in ("compiler", "runtime")
+            if release.get(name) is not None
+        }
+        if not components:
+            errors.append(f"{label} must name a compiler or a runtime object")
             continue
-        compiler_tag = compiler.get("tag")
-        runtime_tag = runtime_release.get("tag")
-        if not isinstance(compiler_tag, str) or not _TAG_RE.fullmatch(compiler_tag):
-            errors.append(f"{label}.compiler.tag is not a release tag")
-        elif compiler_tag in compiler_tags:
-            errors.append(f"duplicate compiler release {compiler_tag}")
-        else:
-            compiler_tags.add(compiler_tag)
-        if not isinstance(runtime_tag, str) or not _TAG_RE.fullmatch(runtime_tag):
-            errors.append(f"{label}.runtime.tag is not a release tag")
-        for component, data in (("compiler", compiler), ("runtime", runtime_release)):
+        if any(not isinstance(data, dict) for data in components.values()):
+            errors.append(f"{label} compiler and runtime must be objects")
+            continue
+        for name, data in components.items():
+            tag = data.get("tag")
+            if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+                errors.append(f"{label}.{name}.tag is not a release tag")
+            elif tag in seen_tags[name]:
+                errors.append(f"duplicate {name} release {tag}")
+            else:
+                seen_tags[name].add(tag)
             commit = data.get("commit")
             if not isinstance(commit, str) or not _COMMIT_RE.fullmatch(commit):
-                errors.append(f"{label}.{component}.commit must be a full Git SHA")
-        release_emitted = compiler.get("emits_schema")
-        release_accepted = _positive_schema_list(
-            runtime_release.get("accepts_schemas"),
-            f"{label}.runtime.accepts_schemas",
-            errors,
-        )
-        if not isinstance(release_emitted, int) or release_emitted < 1:
-            errors.append(f"{label}.compiler.emits_schema must be positive")
-        elif release_emitted not in release_accepted:
+                errors.append(f"{label}.{name}.commit must be a full Git SHA")
+        release_emitted = None
+        if "compiler" in components:
+            release_emitted = components["compiler"].get("emits_schema")
+            if not isinstance(release_emitted, int) or release_emitted < 1:
+                errors.append(f"{label}.compiler.emits_schema must be positive")
+                release_emitted = None
+            elif status == "supported":
+                emitted_schemas.add(release_emitted)
+        release_accepted: list[int] = []
+        if "runtime" in components:
+            release_accepted = _positive_schema_list(
+                components["runtime"].get("accepts_schemas"),
+                f"{label}.runtime.accepts_schemas",
+                errors,
+            )
+            if release_accepted and status == "supported":
+                accepted_schema_sets.append(release_accepted)
+        if (
+            release_emitted is not None
+            and release_accepted
+            and release_emitted not in release_accepted
+        ):
             errors.append(f"{label} pairs an incompatible compiler and runtime")
+
+    for schema in sorted(emitted_schemas):
+        if not any(schema in accepted for accepted in accepted_schema_sets):
+            errors.append(
+                f"no supported runtime release accepts compiler schema {schema}"
+            )
 
     if runtime is not None:
         header = runtime / "include" / "tigris.h"

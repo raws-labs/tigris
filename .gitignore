@@ -6,6 +6,7 @@ dist/
 build/
 venv/
 *.onnx
+*.pt
 *.html
 !examples/*.html
 *.plan.yaml

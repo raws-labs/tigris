@@ -68,7 +68,7 @@
   "operators": [
     {
       "conditional_fallbacks": {
-        "cmsis-nn": "falls back when tiled; non-tiled dilation remains native",
+        "cmsis-nn": "falls back for dilation other than 1",
         "esp-nn": "falls back for dilation other than 1; asymmetric padding falls back when its preparation-time workspace is insufficient"
       },
       "opcode": 1,
@@ -82,7 +82,7 @@
     },
     {
       "conditional_fallbacks": {
-        "cmsis-nn": "falls back when tiled; non-tiled dilation remains native",
+        "cmsis-nn": "falls back for dilation other than 1",
         "esp-nn": "falls back for dilation other than 1"
       },
       "opcode": 2,
@@ -350,10 +350,10 @@
       "opcode": 24,
       "operator": "ConvTranspose",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
-        "reference": "unsupported",
-        "s8_ref": "unsupported"
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
       }
     },
     {
@@ -446,7 +446,7 @@
       }
     }
   ],
-  "schema_version": 5,
+  "schema_version": 6,
   "scope": "post-normalization operator dispatch; model-specific shape, attribute, quantization, memory, and tiling validation still applies",
   "source": "tigris.capabilities"
 }

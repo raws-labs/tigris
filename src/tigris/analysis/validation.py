@@ -2,11 +2,13 @@
 
 from dataclasses import dataclass
 
+from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.partition_spatial import (
     _back_propagate_tile_heights,
     _chain_fast_bytes,
     _get_stage_spatial_params,
 )
+from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.graph.ir import AnalyzedGraph, Stage
 
@@ -114,13 +116,39 @@ class OperatorSupportValidation:
         return ", ".join(issue.describe() for issue in self.issues)
 
 
+def _routed_operators() -> frozenset[str]:
+    """Operators reachable through some runtime dispatcher, any backend.
+
+    Wire-encodability (OP_TYPE_MAP) and runtime routing (capabilities) are
+    two separate contracts. An op can be added to the binary schema before a
+    kernel exists for it; without this check the compiler would accept such
+    an op and only fail once the plan reaches a device.
+    """
+    return frozenset().union(
+        *(effective_operators(backend) for backend in KERNEL_CAPABILITIES)
+    )
+
+
 def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
     """Return operators or attributes not representable by the plan/runtime."""
     issues: list[UnsupportedOperatorIssue] = []
+    routed_operators = _routed_operators()
     for op in ag.ops:
         if op.op_type not in OP_TYPE_MAP:
             issues.append(
                 UnsupportedOperatorIssue(op_name=op.name, op_type=op.op_type)
+            )
+            continue
+
+        if op.op_type not in routed_operators:
+            issues.append(
+                UnsupportedOperatorIssue(
+                    op_name=op.name,
+                    op_type=op.op_type,
+                    reason=(
+                        f"{op.op_type} is wire-encodable but has no runtime kernel"
+                    ),
+                )
             )
             continue
 
@@ -135,6 +163,14 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             "AveragePool",
         } and auto_pad not in ("", "NOTSET"):
             reasons.append(f"auto_pad={auto_pad!r} requires explicit pads")
+
+        if op.op_type == "ConvTranspose":
+            group = int(op.attrs.get("group", 1))
+            if group != 1:
+                reasons.append(f"group={group} is not implemented (group=1 only)")
+            dilations = [int(value) for value in op.attrs.get("dilations", [1, 1])]
+            if any(value != 1 for value in dilations):
+                reasons.append("ConvTranspose dilation is not implemented")
 
         if op.op_type in {"MaxPool", "AveragePool"}:
             if int(op.attrs.get("ceil_mode", 0)) != 0:
@@ -423,6 +459,101 @@ def _execution_unit_requirement(
             return stage.peak_bytes, reason, True
         if tile_plan.tiled_peak_bytes <= 0:
             return stage.peak_bytes, "tile solver produced no positive working set", True
+        if tile_plan.min_2d_tile_infeasible:
+            return tile_plan.tiled_peak_bytes, "minimum 2D tile", False
         return tile_plan.tiled_peak_bytes, "minimum spatial tile", False
 
     return stage.peak_bytes, "untiled stage", False
+
+
+@dataclass(frozen=True)
+class SlowMemoryUsage:
+    slow_peak_bytes: int
+    slow_budget: int
+    overflow_stage_ids: tuple[int, ...]
+
+    @property
+    def fits(self) -> bool:
+        return not self.overflow_stage_ids
+
+    def describe(self) -> str:
+        from tigris.utils import fmt_bytes
+        return (
+            f"{len(self.overflow_stage_ids)} stage(s) overflow slow memory "
+            f"({fmt_bytes(self.slow_peak_bytes)} needed, "
+            f"{fmt_bytes(self.slow_budget)} available)"
+        )
+
+
+def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
+    """Slow/PSRAM residency for tiled stages. Empty overflow_stage_ids == fits.
+
+    A stage needs tiling when its peak exceeds the TOTAL fast pool
+    (fast + reserve), so compressed and uncompressed compiles gate identically
+    and match analyze (where reserve is 0).
+
+    The slow-resident set is every tensor that crosses a stage boundary (a
+    stage's input or output tensor). PSRAM is freed at STAGE granularity, not
+    at per-op granularity, so residency is measured per tiled stage over that
+    stage's whole op-step INTERVAL, never sampled at individual op steps.
+
+    For a tiled stage S, let its op-step interval be
+    [first, last] = [min(op_indices), max(op_indices)]. A boundary tensor is
+    slow-resident during S iff its lifetime interval overlaps that interval:
+    birth_step <= last and death_step >= first. The stage's residency is the
+    sum of those tensors' sizes; the peak is the max over tiled stages, and a
+    stage overflows when its sum exceeds slow_budget.
+
+    Interval overlap counts a stage's own inputs AND outputs concurrently
+    (both always overlap S) as well as a long-lived skip that spans S (its
+    interval still overlaps). A per-op-step sample under-counts a MULTI-OP
+    stage whose input dies at an early op step and whose output is born at a
+    later op step to max(input, output): no single sampled step sees both,
+    even though both occupy slow memory for the whole stage. Interval overlap
+    upper-bounds true concurrent residency, the conservative choice for a
+    fail-closed budget check.
+    """
+    slow_budget = ag.budget.slow
+    if slow_budget <= 0 or not ag.stages:
+        return SlowMemoryUsage(0, slow_budget, ())
+    fast_total = ag.budget.fast + ag.budget.fast_reserve
+    ag = compute_lifetimes(ag)
+
+    # Slow-resident set: every tensor that crosses a stage boundary.
+    slow_names: set[str] = set()
+    for s in ag.stages:
+        slow_names.update(s.input_tensors)
+        slow_names.update(s.output_tensors)
+    slow_lifetimes = [ag.lifetimes[n] for n in slow_names if n in ag.lifetimes]
+
+    def interval_bytes(first: int, last: int) -> int:
+        return sum(
+            lt.size_bytes
+            for lt in slow_lifetimes
+            if lt.birth_step <= last and lt.death_step >= first
+        )
+
+    peak = 0
+    overflow: list[int] = []
+    for s in ag.stages:
+        if s.peak_bytes <= fast_total or not s.op_indices:
+            continue
+        stage_peak = interval_bytes(min(s.op_indices), max(s.op_indices))
+        peak = max(peak, stage_peak)
+        if stage_peak > slow_budget:
+            overflow.append(s.stage_id)
+    return SlowMemoryUsage(peak, slow_budget, tuple(overflow))
+
+
+@dataclass(frozen=True)
+class BudgetValidation:
+    fast: MemoryPlanValidation
+    slow: SlowMemoryUsage
+
+    @property
+    def feasible(self) -> bool:
+        return self.fast.feasible and self.slow.fits
+
+
+def validate_budget(ag: AnalyzedGraph) -> BudgetValidation:
+    return BudgetValidation(fast=validate_memory_plan(ag), slow=slow_pool_usage(ag))
