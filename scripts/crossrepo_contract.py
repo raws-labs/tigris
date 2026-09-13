@@ -1247,6 +1247,222 @@ def _qdq_gemm_bias_add_case() -> ContractCase:
     )
 
 
+def _matmul_case() -> ContractCase:
+    """A rank-2 MatMul against a constant weight.
+
+    ONNX states the product with the weight as [K, N] while the kernels index
+    it as [OC, IC], so the compiler transposes the constant and relabels the
+    operator. A deliberately asymmetric weight makes a missed transpose change
+    the result rather than hide in a symmetric matrix.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3]
+    )
+    weight = numpy_helper.from_array(
+        np.array(
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+            dtype=np.float32,
+        ),
+        "weight",
+    )
+    model = _model(
+        "matmul",
+        [helper.make_node("MatMul", ["input", "weight"], ["output"])],
+        [model_input],
+        [model_output],
+        [weight],
+    )
+    return ContractCase(
+        "float_matmul",
+        model,
+        model,
+        {"input": np.array([[0.5, -1.0, 2.0, -0.25]], dtype=np.float32)},
+        ("Gemm",),
+    )
+
+
+def _gemm_no_transpose_case() -> ContractCase:
+    """A Gemm that leaves transB at its default.
+
+    The weight is then [K, N] like MatMul's, so it needs the same transpose
+    before it means what the kernels compute.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3]
+    )
+    initializers = [
+        numpy_helper.from_array(
+            np.array(
+                [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0],
+                 [10.0, 11.0, 12.0]],
+                dtype=np.float32,
+            ),
+            "weight",
+        ),
+        numpy_helper.from_array(
+            np.array([0.5, -1.5, 2.0], dtype=np.float32), "bias"
+        ),
+    ]
+    model = _model(
+        "gemm_no_transpose",
+        [helper.make_node("Gemm", ["input", "weight", "bias"], ["output"])],
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    return ContractCase(
+        "float_gemm_no_transpose",
+        model,
+        model,
+        {"input": np.array([[0.5, -1.0, 2.0, -0.25]], dtype=np.float32)},
+        ("Gemm",),
+    )
+
+
+def _qdq_matmul_case() -> ContractCase:
+    """A quantized rank-2 MatMul, the shape an int8 classifier head takes."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3]
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, [1, 3]
+    )
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "io_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "io_zp"),
+        numpy_helper.from_array(np.array([0.5], dtype=np.float32), "w_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "w_zp"),
+        numpy_helper.from_array(
+            np.array(
+                [[0.5, 1.0, 1.5], [2.0, -0.5, 1.0], [-1.0, 0.5, 2.0],
+                 [1.5, -2.0, 0.5]],
+                dtype=np.float32,
+            ),
+            "weight",
+        ),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "io_scale", "io_zp"], ["in_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["in_q", "io_scale", "io_zp"], ["in_dq"]
+        ),
+        helper.make_node("QuantizeLinear", ["weight", "w_scale", "w_zp"], ["w_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["w_q", "w_scale", "w_zp"], ["w_dq"]
+        ),
+        helper.make_node("MatMul", ["in_dq", "w_dq"], ["product"]),
+        helper.make_node(
+            "QuantizeLinear", ["product", "io_scale", "io_zp"], ["output_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["output_q", "io_scale", "io_zp"], ["output"]
+        ),
+    ]
+    compile_model = _model(
+        "qdq_matmul", nodes, [model_input], [model_output], initializers
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+    return ContractCase(
+        "int8_matmul",
+        compile_model,
+        reference_model,
+        {"input": np.array([[0.5, -1.0, 2.0, -0.25]], dtype=np.float32)},
+        ("Gemm",),
+    )
+
+
+def _quint8_activation_case() -> ContractCase:
+    """A QDQ Conv whose activations are quantized as uint8.
+
+    That is what the ONNX Runtime quantizer emits by default: uint8
+    activations with int8 weights. uint8 value v and int8 value v - 128 denote
+    the same real number under zero points that differ by the same 128, so the
+    compiler restates the activation in the signed domain the kernels work in.
+    The final QuantizeLinear stays int8 so the plan and the reference compare
+    on the same footing; every interior activation exercises the shift.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 1, 4, 4]
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, [1, 1, 4, 4]
+    )
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "u8_scale"),
+        numpy_helper.from_array(np.array([128], dtype=np.uint8), "u8_zp"),
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "s8_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "s8_zp"),
+        numpy_helper.from_array(np.array([[[[0.5]]]], dtype=np.float32), "weight"),
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "w_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "w_zp"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "u8_scale", "u8_zp"], ["in_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["in_q", "u8_scale", "u8_zp"], ["in_dq"]
+        ),
+        helper.make_node("QuantizeLinear", ["weight", "w_scale", "w_zp"], ["w_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["w_q", "w_scale", "w_zp"], ["w_dq"]
+        ),
+        helper.make_node("Conv", ["in_dq", "w_dq"], ["conv"]),
+        # An interior uint8 activation between the two operators.
+        helper.make_node("QuantizeLinear", ["conv", "u8_scale", "u8_zp"], ["conv_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["conv_q", "u8_scale", "u8_zp"], ["conv_dq"]
+        ),
+        helper.make_node("Relu", ["conv_dq"], ["activated"]),
+        helper.make_node(
+            "QuantizeLinear", ["activated", "s8_scale", "s8_zp"], ["output_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["output_q", "s8_scale", "s8_zp"], ["output"]
+        ),
+    ]
+    compile_model = _model(
+        "quint8_activation", nodes, [model_input], [model_output], initializers
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+    input_data = np.array(
+        [
+            [
+                [
+                    [-1.0, -0.75, -0.5, -0.25],
+                    [0.0, 0.25, 0.5, 0.75],
+                    [1.0, 1.25, 1.5, 1.75],
+                    [2.0, 2.25, 2.5, 2.75],
+                ]
+            ]
+        ],
+        dtype=np.float32,
+    )
+    return ContractCase(
+        "quint8_activation",
+        compile_model,
+        reference_model,
+        {"input": input_data},
+        ("Conv", "Relu"),
+    )
+
+
 def _convtranspose_case() -> ContractCase:
     """A standalone float ConvTranspose upsampler (stride 2, kernel 2, pad 0).
 
@@ -3220,6 +3436,10 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _qdq_case("AveragePool"),
         _qdq_add_relu_case(),
         _qdq_gemm_bias_add_case(),
+        _matmul_case(),
+        _gemm_no_transpose_case(),
+        _qdq_matmul_case(),
+        _quint8_activation_case(),
         _convtranspose_case(),
         _conv_then_convtranspose_case(),
         _convtranspose_overlap_case(),
