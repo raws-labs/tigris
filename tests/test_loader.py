@@ -122,3 +122,29 @@ def test_runtime_computed_metadata_operand_is_kept(tmp_path):
 
     reshape = next(op for op in ag.ops if op.op_type == "Reshape")
     assert reshape.inputs == ["act", "target_shape"]
+
+
+def test_orphan_value_info_is_not_a_tensor(tmp_path):
+    """A graph optimizer leaves value_info behind for tensors its fusion removed.
+
+    Those entries describe nothing the graph computes. Carrying them into the
+    IR makes a fully quantized model look mixed-dtype and be rejected.
+    """
+    path = _save_model(
+        tmp_path,
+        "orphan_value_info",
+        [helper.make_node("Relu", ["input"], ["output"])],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])],
+        [],
+    )
+    model = onnx.load(str(path))
+    model.graph.value_info.append(
+        helper.make_tensor_value_info("fused_away", TensorProto.FLOAT, [1, 4])
+    )
+    onnx.save(model, path)
+
+    ag = load_model(path)
+
+    assert "fused_away" not in ag.tensors
+    assert set(ag.tensors) == {"input", "output"}
