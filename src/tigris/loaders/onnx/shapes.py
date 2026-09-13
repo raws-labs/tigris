@@ -31,8 +31,8 @@ class DimBinding:
     def describe(self) -> str:
         name = self.symbol or "unknown"
         return (
-            f"{self.tensor} axis {self.axis} ({name}) "
-            f"has no fixed size; using {self.value}"
+            f"{self.tensor} axis {self.axis} ({name}) is unset; "
+            f"using {self.value} (--input-shape overrides)"
         )
 
 

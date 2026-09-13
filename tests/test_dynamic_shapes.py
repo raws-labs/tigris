@@ -64,7 +64,7 @@ def test_free_batch_dimension_is_bound_to_one(tmp_path):
     assert graph.tensors["input"].shape == (1, 64)
     assert graph.tensors["output"].shape == (1, 64)
     assert graph.shape_bindings == [
-        "input axis 0 (batch) has no fixed size; using 1"
+        "input axis 0 (batch) is unset; using 1 (--input-shape overrides)"
     ]
 
 
@@ -75,7 +75,7 @@ def test_unknown_dimension_is_bound_to_one(tmp_path):
 
     assert graph.tensors["input"].shape == (1, 64)
     assert graph.shape_bindings == [
-        "input axis 0 (unknown) has no fixed size; using 1"
+        "input axis 0 (unknown) is unset; using 1 (--input-shape overrides)"
     ]
 
 
@@ -116,7 +116,7 @@ def test_binding_is_reported_for_an_input_no_override_names(tmp_path):
 
     assert ag.tensors["input"].shape == (4, 64)
     assert ag.shape_bindings == [
-        "other axis 0 (batch) has no fixed size; using 1"
+        "other axis 0 (batch) is unset; using 1 (--input-shape overrides)"
     ]
 
 
@@ -156,7 +156,7 @@ def test_shape_subgraph_is_folded(tmp_path):
 
     bindings = resolve_shapes(model)
 
-    assert bindings == ["input axis 0 (batch) has no fixed size; using 1"]
+    assert bindings == ["input axis 0 (batch) is unset; using 1 (--input-shape overrides)"]
     remaining = {node.op_type for node in model.graph.node}
     assert remaining == {"Relu", "Reshape"}
     shapes = {vi.name: vi for vi in list(model.graph.value_info) + list(model.graph.output)}
@@ -190,7 +190,7 @@ def test_cli_warns_about_a_bound_dimension(tmp_path):
     result = CliRunner().invoke(cli, ["analyze", str(path), "-m", "4K"])
 
     assert result.exit_code == 0, result.output
-    assert "input axis 0 (batch) has no fixed size; using 1" in result.output
+    assert "input axis 0 (batch) is unset; using 1 (--input-shape overrides)" in result.output
     assert "--input-shape" in result.output
 
 
@@ -217,7 +217,7 @@ def test_cli_does_not_warn_when_an_override_pins_a_concrete_shape(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "input 8x64 float32" in result.output
-    assert "has no fixed size" not in result.output
+    assert "is unset" not in result.output
 
 
 def test_cli_rejects_a_malformed_input_shape(tmp_path):
