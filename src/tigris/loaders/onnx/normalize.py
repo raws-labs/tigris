@@ -52,9 +52,61 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _reduce_mean_to_gap(ag)
     ag = _fold_shape_ops(ag)
     ag = _extract_resize_scales(ag)
+    ag = _strip_metadata_inputs(ag)
     ag = _normalize_concat_axis(ag)
     ag = _validate_transposes(ag)
     ag = _absorb_activations(ag)
+    ag = _drop_unreferenced_weights(ag)
+    return ag
+
+
+# Operand positions that carry shape or bound metadata rather than tensor data.
+# Earlier passes lift these into op attributes and into the output shape, so by
+# this point they describe the plan the compiler already emitted. Leaving them
+# on the op makes the emitter bind an index vector as the operator's weight.
+_METADATA_INPUTS: dict[str, int] = {
+    "Clip": 1,
+    "Pad": 1,
+    "ReduceMean": 1,
+    "Reshape": 1,
+    "Resize": 1,
+    "Squeeze": 1,
+    "Unsqueeze": 1,
+}
+
+
+def _strip_metadata_inputs(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Drop shape and bound operands the runtime never reads.
+
+    A model can supply a Reshape target shape, Resize scales or Clip bounds
+    either as a computed subgraph or as a plain initializer. Both forms mean
+    the same thing to the compiler, so trim them to the data operands and let
+    the resolved shapes and attributes carry the information.
+    """
+    for op in ag.ops:
+        first = _METADATA_INPUTS.get(op.op_type)
+        if first is None or len(op.inputs) <= first:
+            continue
+        for name in op.inputs[first:]:
+            if name and name not in ag.weight_data:
+                # A computed operand that no pass resolved is not metadata the
+                # compiler can drop; leave the operator intact so validation
+                # reports it.
+                break
+        else:
+            del op.inputs[first:]
+    return ag
+
+
+def _drop_unreferenced_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Forget constants no remaining operator consumes.
+
+    Folded subgraphs and absorbed activations leave their operands behind, and
+    the emitter writes every entry of ``weight_data`` into the plan blob.
+    """
+    referenced = {name for op in ag.ops for name in op.inputs if name}
+    for name in [n for n in ag.weight_data if n not in referenced]:
+        del ag.weight_data[name]
     return ag
 
 

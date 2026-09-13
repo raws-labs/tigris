@@ -32,8 +32,47 @@ def _expand_mem(ctx, param, value: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(expanded)
 
 
+def _parse_input_shape(ctx, param, value: tuple[str, ...]):
+    """Parse ``--input-shape name:1x3x224x224`` into a name to shape mapping."""
+    shapes: dict[str, tuple[int, ...]] = {}
+    for token in value:
+        name, sep, extents = token.rpartition(":")
+        if not sep or not name:
+            raise click.BadParameter(
+                f"invalid input shape {token!r}: expected name:1x3x224x224"
+            )
+        try:
+            dims = tuple(int(part) for part in extents.split("x"))
+        except ValueError:
+            raise click.BadParameter(
+                f"invalid input shape {token!r}: dimensions must be integers"
+            ) from None
+        if not dims or any(dim <= 0 for dim in dims):
+            raise click.BadParameter(
+                f"invalid input shape {token!r}: dimensions must be positive"
+            )
+        shapes[name] = dims
+    return shapes
+
+
+def _report_shape_bindings(ag) -> None:
+    """Say which input dimensions the model did not pin down."""
+    for binding in ag.shape_bindings:
+        console.print(f"[yellow]warning:[/] {binding}")
+    if ag.shape_bindings:
+        console.print(
+            "  pass --input-shape NAME:1x3x224x224 to compile for another shape",
+            style="dim",
+        )
+
+
 def _run_pipeline(
-    model: str, mem: tuple[str, ...], *, fast_reserve_bytes: int = 0
+    model: str,
+    mem: tuple[str, ...],
+    *,
+    fast_reserve_bytes: int = 0,
+    input_shapes: dict[str, tuple[int, ...]] | None = None,
+    report_bindings: bool = True,
 ):
     """Run the shared planning pipeline.
 
@@ -59,11 +98,14 @@ def _run_pipeline(
 
     try:
         with console.status("Loading model..."):
-            ag = load_model(model_path)
+            ag = load_model(model_path, input_shapes)
             ag = compute_lifetimes(ag)
             ag = compute_memory_timeline(ag, capture_live_tensors=False)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    if report_bindings:
+        _report_shape_bindings(ag)
 
     if not 0 <= ag.peak_memory_bytes <= 0xFFFFFFFF:
         raise click.ClickException(

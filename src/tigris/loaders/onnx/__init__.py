@@ -4,6 +4,6 @@ from tigris.loaders.onnx.loader import load_model as _load_raw
 from tigris.loaders.onnx.normalize import normalize
 
 
-def load_model(path):
-    ag = _load_raw(path)
+def load_model(path, input_shapes=None):
+    ag = _load_raw(path, input_shapes)
     return normalize(ag)

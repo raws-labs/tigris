@@ -11,10 +11,15 @@ _EXTENSION_MAP = {
 }
 
 
-def load_model(path: str | Path) -> AnalyzedGraph:
+def load_model(
+    path: str | Path,
+    input_shapes: dict[str, tuple[int, ...]] | None = None,
+) -> AnalyzedGraph:
     """Load a model file and return an AnalyzedGraph.
 
     Dispatches to the appropriate loader based on file extension.
+    ``input_shapes`` maps a model input name to the full shape to compile for,
+    overriding whatever the file declares.
     """
     path = Path(path)
     suffix = path.suffix.lower()
@@ -28,4 +33,4 @@ def load_model(path: str | Path) -> AnalyzedGraph:
 
     import importlib
     module = importlib.import_module(module_name)
-    return module.load_model(path)
+    return module.load_model(path, input_shapes)
