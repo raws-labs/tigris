@@ -32,6 +32,8 @@ warning: input axis 0 (batch_size) has no fixed size; using 1
 │ Peak memory (naive)  5.74 MiB                                        │
 │ Largest tensor       1x96x112x112 (4.59 MiB)                         │
 │ Dtype                float32                                         │
+│ Input                input 1x3x224x224 float32                       │
+│ Output               output 1x1000 float32                           │
 ╰──────────────────────────────────────────────────────────────────────╯
 ╭──────────────────────────────── SRAM ────────────────────────────────╮
 │ Budget              256.00 KiB                                       │

@@ -677,8 +677,17 @@ def _build_tensors(
 
         qp_idx = quant_idx_map.get(name, no_qp) if quant_idx_map else no_qp
 
+        # The dtype the model file declares for this boundary, where folding the
+        # quantization into the tensor changed it. 0 says the tensor's own dtype
+        # is what the caller hands over.
+        iface_dtype = 0
+        declared = _declared_interface_dtype(ag, name)
+        if declared is not None and declared != info.dtype:
+            iface_dtype = declared
+
         # tigris_tensor_t: 16 bytes
-        # name_str(u32) size_bytes(u32) shape_off(u16) ndim(u8) dtype(u8) flags(u8) quant_param_idx(u16) pad(1)
+        # name_str(u32) size_bytes(u32) shape_off(u16) ndim(u8) dtype(u8)
+        # flags(u8) quant_param_idx(u16) iface_dtype(u8)
         buf.extend(TENSOR_STRUCT.pack(
             name_off,
             info.size_bytes,
@@ -687,9 +696,28 @@ def _build_tensors(
             info.dtype,
             flags,
             qp_idx,
+            iface_dtype,
         ))
 
     return bytes(buf), tensor_idx
+
+
+def _declared_interface_dtype(ag: AnalyzedGraph, name: str) -> int | None:
+    """The dtype the model file states for this input or output, if it is one.
+
+    Positional rather than by name: folding a terminal DequantizeLinear moves a
+    model output onto the tensor feeding it, which has a different name but the
+    same place in the list.
+    """
+    for names, dtypes in (
+        (ag.model_inputs, ag.model_input_dtypes),
+        (ag.model_outputs, ag.model_output_dtypes),
+    ):
+        if name in names:
+            index = names.index(name)
+            if index < len(dtypes):
+                return dtypes[index]
+    return None
 
 
 def _serialized_axis_map(rank: int, preserve_layout: bool = False) -> list[int]:

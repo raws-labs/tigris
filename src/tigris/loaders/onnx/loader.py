@@ -122,6 +122,12 @@ def load_model(
         inp.name for inp in graph.input if inp.name not in initializer_names
     ]
     ag.model_outputs = [out.name for out in graph.output]
+    ag.model_input_dtypes = [
+        _extract_dtype(inp.type)
+        for inp in graph.input
+        if inp.name not in initializer_names
+    ]
+    ag.model_output_dtypes = [_extract_dtype(out.type) for out in graph.output]
 
     # --- Build OpNodes ----------------------------------------------------
     nodes_by_output: dict[str, int] = {}  # tensor_name -> node index

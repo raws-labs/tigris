@@ -95,7 +95,7 @@ STAGE_FLAG_LINE_BUFFERED = 0x0001
 # using a stale hand-maintained byte count.
 HEADER_STRUCT = struct.Struct("<4sIIIHHHHIIIHBBHHI")
 SECTION_ENTRY_STRUCT = struct.Struct("<II")
-TENSOR_STRUCT = struct.Struct("<IIHBBBHx")
+TENSOR_STRUCT = struct.Struct("<IIHBBBHB")
 
 # An operator is emitted in four pieces because its spatial fields are built by
 # a dedicated validator.  Their combined size is the packed tigris_op_t size.

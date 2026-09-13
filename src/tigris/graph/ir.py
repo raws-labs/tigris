@@ -165,6 +165,13 @@ class AnalyzedGraph:
     model_inputs: list[str] = field(default_factory=list)
     model_outputs: list[str] = field(default_factory=list)
 
+    # Populated by loader - the dtype the model file declares for each input
+    # and output, positionally. Normalization folds the quantization at the
+    # boundary into the tensor, so the tensor's own dtype stops being what the
+    # caller hands over; these keep the declared contract recoverable.
+    model_input_dtypes: list[int] = field(default_factory=list)
+    model_output_dtypes: list[int] = field(default_factory=list)
+
     # Populated by loader - raw weight arrays keyed by initializer name
     weight_data: dict[str, np.ndarray] = field(default_factory=dict)
 
@@ -172,10 +179,6 @@ class AnalyzedGraph:
     # extent in the model file and was given one, so the caller can report
     # which shape the plan was actually built for.
     shape_bindings: list[str] = field(default_factory=list)
-
-    # Populated by normalization - one line per rewrite that changes what the
-    # caller sees, such as a model output whose encoding the plan changed.
-    normalization_notes: list[str] = field(default_factory=list)
 
     # Populated by lifetime analysis
     lifetimes: dict[str, TensorLifetime] = field(default_factory=dict)
