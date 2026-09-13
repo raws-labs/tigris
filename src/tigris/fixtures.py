@@ -13,17 +13,21 @@ from onnx import TensorProto, helper, numpy_helper
 
 
 def build_linear_3op() -> onnx.ModelProto:
-    """Add -> ReLU -> Add.  Input/output: [1, 64]."""
+    """ReLU -> Add -> Add.  Input/output: [1, 64].
+
+    The activation leads so the chain keeps three operators: a Relu that
+    follows a fusable producer is absorbed into it.
+    """
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 64])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 64])
     w0 = helper.make_tensor("w0", TensorProto.FLOAT, [1, 64],
                             np.zeros((1, 64), dtype=np.float32).flatten().tolist())
     w1 = helper.make_tensor("w1", TensorProto.FLOAT, [1, 64],
                             np.zeros((1, 64), dtype=np.float32).flatten().tolist())
-    add0 = helper.make_node("Add", ["input", "w0"], ["t0"], name="add0")
-    relu = helper.make_node("Relu", ["t0"], ["t1"], name="relu0")
+    relu = helper.make_node("Relu", ["input"], ["t0"], name="relu0")
+    add0 = helper.make_node("Add", ["t0", "w0"], ["t1"], name="add0")
     add1 = helper.make_node("Add", ["t1", "w1"], ["output"], name="add1")
-    graph = helper.make_graph([add0, relu, add1], "linear_3op", [X], [Y], initializer=[w0, w1])
+    graph = helper.make_graph([relu, add0, add1], "linear_3op", [X], [Y], initializer=[w0, w1])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
     model.ir_version = 8
     return model

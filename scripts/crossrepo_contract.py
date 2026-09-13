@@ -93,6 +93,12 @@ def _model(
 
 
 def _constant_add_case() -> ContractCase:
+    """A constant-operand Add, with the Relu ahead of it so it stays its own op.
+
+    An activation that follows a fusable producer is absorbed into that
+    producer, so leading with the Relu is what keeps a standalone Relu in the
+    reference corpus. ``_add_relu_fusion_case`` covers the absorbed form.
+    """
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 4]
     )
@@ -105,8 +111,8 @@ def _constant_add_case() -> ContractCase:
     model = _model(
         "constant_add",
         [
-            helper.make_node("Add", ["input", "constant"], ["shifted"]),
-            helper.make_node("Relu", ["shifted"], ["output"]),
+            helper.make_node("Relu", ["input"], ["gated"]),
+            helper.make_node("Add", ["gated", "constant"], ["output"]),
         ],
         [model_input],
         [model_output],
@@ -121,7 +127,46 @@ def _constant_add_case() -> ContractCase:
                 [[0.25, -1.0, 5.0, -4.0]], dtype=np.float32
             )
         },
-        ("Add", "Relu"),
+        ("Relu", "Add"),
+    )
+
+
+def _add_relu_fusion_case() -> ContractCase:
+    """A float Add whose trailing Relu is absorbed into the Add itself.
+
+    The plan carries one operator, so the runtime's elementwise kernel has to
+    apply the fused activation. The constant shifts half the lanes negative,
+    which is what makes the clamp observable in the output.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 4]
+    )
+    constant = numpy_helper.from_array(
+        np.array([[1.0, -2.0, 0.5, 3.0]], dtype=np.float32), "constant"
+    )
+    model = _model(
+        "add_relu_fusion",
+        [
+            helper.make_node("Add", ["input", "constant"], ["shifted"]),
+            helper.make_node("Relu", ["shifted"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        [constant],
+    )
+    return ContractCase(
+        "float_add_relu_fusion",
+        model,
+        model,
+        {
+            "input": np.array(
+                [[0.25, -1.0, 5.0, -4.0]], dtype=np.float32
+            )
+        },
+        ("Add",),
     )
 
 
@@ -1020,6 +1065,185 @@ def _qdq_case(operator: str) -> ContractCase:
         reference_model,
         {"input": input_data},
         (operator,),
+    )
+
+
+def _qdq_add_relu_case() -> ContractCase:
+    """A QDQ residual Add whose Relu sits between the Add and its QuantizeLinear.
+
+    This is how an ONNX quantizer writes a ResNet residual block: both Add
+    operands arrive from DequantizeLinear, the sum stays on an unquantized edge,
+    and the only QuantizeLinear comes after the Relu. The activation therefore
+    belongs to the Add's output requantization, and the compiler has to fuse it
+    to give the sum a dtype at all. The output zero point is non-zero so the
+    fused lower bound is the zero point rather than the natural int8 floor, and
+    the input reaches negative sums so the clamp is observable.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 1, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 1, 4, 4]
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, [1, 1, 4, 4]
+    )
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "io_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "io_zero_point"),
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "out_scale"),
+        numpy_helper.from_array(np.array([-8], dtype=np.int8), "out_zero_point"),
+        numpy_helper.from_array(np.array([[[[0.5]]]], dtype=np.float32), "weight"),
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "weight_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "weight_zero_point"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["input", "io_scale", "io_zero_point"], ["input_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["input_q", "io_scale", "io_zero_point"], ["input_dq"]
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["weight", "weight_scale", "weight_zero_point"],
+            ["weight_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["weight_q", "weight_scale", "weight_zero_point"],
+            ["weight_dq"],
+        ),
+        helper.make_node("Conv", ["input_dq", "weight_dq"], ["branch"]),
+        helper.make_node(
+            "QuantizeLinear", ["branch", "io_scale", "io_zero_point"], ["branch_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["branch_q", "io_scale", "io_zero_point"],
+            ["branch_dq"],
+        ),
+        helper.make_node("Add", ["input_dq", "branch_dq"], ["sum"]),
+        helper.make_node("Relu", ["sum"], ["activated"]),
+        helper.make_node(
+            "QuantizeLinear",
+            ["activated", "out_scale", "out_zero_point"],
+            ["output_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["output_q", "out_scale", "out_zero_point"],
+            ["output"],
+        ),
+    ]
+    compile_model = _model(
+        "qdq_add_relu", nodes, [model_input], [model_output], initializers
+    )
+    reference_model = copy.deepcopy(compile_model)
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+    input_data = np.array(
+        [
+            [
+                [
+                    [-2.0, -1.75, -1.5, -1.25],
+                    [-1.0, -0.75, -0.5, -0.25],
+                    [0.0, 0.25, 0.5, 0.75],
+                    [1.0, 1.25, 1.5, 1.75],
+                ]
+            ]
+        ],
+        dtype=np.float32,
+    )
+    return ContractCase(
+        "int8_add_relu",
+        compile_model,
+        reference_model,
+        {"input": input_data},
+        ("Conv", "Add"),
+    )
+
+
+def _qdq_gemm_bias_add_case() -> ContractCase:
+    """A quantized Gemm whose bias arrives as an unfused float Add.
+
+    A quantizer that does not fuse the classifier bias writes it as an Add on
+    the dequantized product, which the runtime cannot execute: a constant
+    operand carries no scale or zero point. The compiler requantizes the
+    constant into the product's int32 accumulator domain and hands it to the
+    operator as a bias, so the plan ends at the product's own int8 encoding
+    rather than the float the ONNX graph declares. The reference model
+    quantizes its float result with the same scale to compare on that footing.
+    Bias values are exact multiples of the bias scale, so the fold itself
+    introduces no rounding.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 2]
+    )
+    int8_output = helper.make_tensor_value_info(
+        "output_q", TensorProto.INT8, [1, 2]
+    )
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "io_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "io_zero_point"),
+        numpy_helper.from_array(
+            np.array([[0.5, -0.25, 0.75, 0.25], [-0.5, 0.25, 0.5, -0.75]],
+                     dtype=np.float32),
+            "weight",
+        ),
+        # 0.25 * 0.25 = 0.0625 is the bias scale; both values are multiples.
+        numpy_helper.from_array(np.array([0.5, -0.25], dtype=np.float32), "bias"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["input", "io_scale", "io_zero_point"], ["input_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["input_q", "io_scale", "io_zero_point"], ["input_dq"]
+        ),
+        helper.make_node(
+            "QuantizeLinear", ["weight", "io_scale", "io_zero_point"], ["weight_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["weight_q", "io_scale", "io_zero_point"],
+            ["weight_dq"],
+        ),
+        helper.make_node(
+            "Gemm", ["input_dq", "weight_dq"], ["product"], transB=1
+        ),
+        helper.make_node(
+            "QuantizeLinear", ["product", "io_scale", "io_zero_point"], ["product_q"]
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["product_q", "io_scale", "io_zero_point"],
+            ["product_dq"],
+        ),
+        helper.make_node("Add", ["product_dq", "bias"], ["output"]),
+    ]
+    compile_model = _model(
+        "qdq_gemm_bias_add", nodes, [model_input], [model_output], initializers
+    )
+    reference_model = copy.deepcopy(compile_model)
+    reference_model.graph.node.append(
+        helper.make_node(
+            "QuantizeLinear", ["output", "io_scale", "io_zero_point"], ["output_q"]
+        )
+    )
+    del reference_model.graph.output[:]
+    reference_model.graph.output.extend([int8_output])
+    onnx.checker.check_model(reference_model)
+    return ContractCase(
+        "int8_gemm_bias_add",
+        compile_model,
+        reference_model,
+        {"input": np.array([[1.0, -2.0, 0.5, 3.0]], dtype=np.float32)},
+        ("Gemm",),
     )
 
 
@@ -2975,6 +3199,7 @@ def _assert_runtime_rejects_incompatible_plan(
 def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
         _constant_add_case(),
+        _add_relu_fusion_case(),
         _residual_case(),
         _output_transpose_case(),
         _dilated_conv_case(),
@@ -2993,6 +3218,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_chain_case(xip=True),
         _qdq_case("Conv"),
         _qdq_case("AveragePool"),
+        _qdq_add_relu_case(),
+        _qdq_gemm_bias_add_case(),
         _convtranspose_case(),
         _conv_then_convtranspose_case(),
         _convtranspose_overlap_case(),

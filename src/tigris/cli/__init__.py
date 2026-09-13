@@ -66,6 +66,8 @@ def _report_shape_bindings(
     for name, shape in sorted((input_shapes or {}).items()):
         extents = "x".join(str(dim) for dim in shape)
         console.print(f"{name} compiled for {extents}", style="dim")
+    for note in ag.normalization_notes:
+        console.print(f"[yellow]note:[/] {note}")
     for binding in ag.shape_bindings:
         console.print(f"[yellow]warning:[/] {binding}")
     if ag.shape_bindings:

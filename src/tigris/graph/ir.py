@@ -173,6 +173,10 @@ class AnalyzedGraph:
     # which shape the plan was actually built for.
     shape_bindings: list[str] = field(default_factory=list)
 
+    # Populated by normalization - one line per rewrite that changes what the
+    # caller sees, such as a model output whose encoding the plan changed.
+    normalization_notes: list[str] = field(default_factory=list)
+
     # Populated by lifetime analysis
     lifetimes: dict[str, TensorLifetime] = field(default_factory=dict)
 

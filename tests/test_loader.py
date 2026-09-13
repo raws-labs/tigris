@@ -21,8 +21,8 @@ def test_linear_topo_order(linear_3op_path):
 
     # Steps should be 0, 1, 2 in a valid topological order
     op_types = [op.op_type for op in ag.ops]
-    # add0 must come before relu0, relu0 before add1
-    assert op_types.index("Relu") > op_types.index("Add")
+    # relu0 must come before add0, add0 before add1
+    assert op_types == ["Relu", "Add", "Add"]
 
 
 def test_diamond_load(diamond_path):
