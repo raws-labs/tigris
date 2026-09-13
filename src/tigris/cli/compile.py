@@ -5,11 +5,23 @@ from pathlib import Path
 
 import click
 
-from tigris.cli import cli, console, _expand_mem, _parse_size, _run_pipeline
+from tigris.cli import (
+    cli,
+    console,
+    _expand_mem,
+    _parse_input_shape,
+    _parse_size,
+    _report_shape_bindings,
+    _run_pipeline,
+)
 from tigris.utils import fmt_bytes
 
 
-def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
+def _run_compressed_pipeline(
+    model: str,
+    mem: tuple[str, ...],
+    input_shapes: dict[str, tuple[int, ...]] | None = None,
+):
     """Plan a compressed model against its actual activation capacity.
 
     Weight blocks depend on stage boundaries, while stage boundaries depend on
@@ -26,8 +38,14 @@ def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
     # compiler error instead of an unbounded command.
     max_attempts = 64
     for _ in range(max_attempts):
+        # The loop re-plans the same model, so only the final pass reports
+        # the bound input dimensions.
         ag, total_budget = _run_pipeline(
-            model, mem, fast_reserve_bytes=reserve
+            model,
+            mem,
+            fast_reserve_bytes=reserve,
+            input_shapes=input_shapes,
+            report_bindings=False,
         )
         required = compressed_weight_reserve_bytes(ag)
         if required <= reserve:
@@ -54,7 +72,11 @@ def _run_compressed_pipeline(model: str, mem: tuple[str, ...]):
               help="Weight compression (default: none)")
 @click.option("--xip", is_flag=True, default=False,
               help="Execute-in-place: weights read directly from flash at runtime")
-def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None, compress: str, xip: bool):
+@click.option("--input-shape", "input_shape", multiple=True,
+              callback=_parse_input_shape,
+              help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
+def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None,
+            compress: str, xip: bool, input_shape: dict[str, tuple[int, ...]]):
     """Compile an ONNX model to binary deployment format."""
     from tigris.analysis.validation import (
         validate_budget,
@@ -66,10 +88,11 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     compress_arg = compress if compress != "none" else None
     if compress_arg:
         ag, budget, reserved_budget, weight_reserve = _run_compressed_pipeline(
-            model, mem
+            model, mem, input_shape
         )
+        _report_shape_bindings(ag, input_shape)
     else:
-        ag, budget = _run_pipeline(model, mem)
+        ag, budget = _run_pipeline(model, mem, input_shapes=input_shape)
         reserved_budget = 0
         weight_reserve = 0
 

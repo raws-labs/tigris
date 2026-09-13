@@ -7,14 +7,21 @@ from onnx import helper as onnx_helper
 from onnx import numpy_helper, shape_inference
 
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
+from tigris.loaders.onnx.shapes import bind_free_dims, fold_shape_subgraph
+
+# One binding pass plus one fold usually resolves a stock export.  A fold can
+# expose shapes that let the next fold proceed, so iterate a few times and stop
+# as soon as a round changes nothing.
+_MAX_RESOLVE_ROUNDS = 4
 
 
 def _extract_shape(type_proto: onnx.TypeProto, tensor_name: str) -> tuple[int, ...]:
     """Extract a fully concrete deployment shape from an ONNX TypeProto.
 
     Memory planning cannot safely guess symbolic or otherwise unresolved
-    dimensions.  Reject them before they enter the IR rather than silently
-    treating them as one and understating the required arena size.
+    dimensions.  ``resolve_shapes`` binds the free input dimensions first, so
+    anything still unresolved here is a shape the compiler could not derive;
+    reject it rather than understate the required arena size.
     """
     tensor_type = type_proto.tensor_type
     if not tensor_type.HasField("shape"):
@@ -39,22 +46,52 @@ def _extract_dtype(type_proto: onnx.TypeProto) -> int:
     return type_proto.tensor_type.elem_type
 
 
-def load_model(path: str | Path) -> AnalyzedGraph:
-    """Load an ONNX model and return a partially populated AnalyzedGraph.
-
-    Runs shape inference, extracts operators and tensor metadata,
-    performs a DFS topological sort favouring early tensor consumption.
-    """
-    model = onnx.load(str(path))
+def _infer(model: onnx.ModelProto) -> onnx.ModelProto:
     try:
-        model = shape_inference.infer_shapes(model, data_prop=True)
+        return shape_inference.infer_shapes(model, data_prop=True)
     except Exception:
         # Some models fail full data propagation; try without
-        model = shape_inference.infer_shapes(model)
+        return shape_inference.infer_shapes(model)
+
+
+def resolve_shapes(
+    model: onnx.ModelProto,
+    input_shapes: dict[str, tuple[int, ...]] | None = None,
+) -> list[str]:
+    """Give the model concrete deployment shapes, in place.
+
+    A stock export leaves the batch dimension free and computes the classifier
+    reshape from ``Shape`` at runtime.  Binding the free input dimensions is
+    not enough on its own: the shape subgraph keeps everything downstream of
+    it at unknown rank until it is folded to the constants it evaluates to.
+    Returns one description per bound dimension.
+    """
+    bindings = bind_free_dims(model, input_shapes)
+    model.CopyFrom(_infer(model))
+    for _ in range(_MAX_RESOLVE_ROUNDS):
+        if fold_shape_subgraph(model) == 0:
+            break
+        model.CopyFrom(_infer(model))
+    return [binding.describe() for binding in bindings]
+
+
+def load_model(
+    path: str | Path,
+    input_shapes: dict[str, tuple[int, ...]] | None = None,
+) -> AnalyzedGraph:
+    """Load an ONNX model and return a partially populated AnalyzedGraph.
+
+    Resolves deployment shapes, extracts operators and tensor metadata,
+    performs a DFS topological sort favouring early tensor consumption.
+    ``input_shapes`` maps a model input name to the full shape to compile for.
+    """
+    model = onnx.load(str(path))
+    bindings = resolve_shapes(model, input_shapes)
 
     graph = model.graph
     ag = AnalyzedGraph()
     ag.model_name = Path(path).stem
+    ag.shape_bindings = bindings
 
     # --- Collect initializers (constants / weights) -----------------------
     initializer_names: set[str] = set()

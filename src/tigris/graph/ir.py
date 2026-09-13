@@ -168,6 +168,11 @@ class AnalyzedGraph:
     # Populated by loader - raw weight arrays keyed by initializer name
     weight_data: dict[str, np.ndarray] = field(default_factory=dict)
 
+    # Populated by loader - one line per input dimension that had no concrete
+    # extent in the model file and was given one, so the caller can report
+    # which shape the plan was actually built for.
+    shape_bindings: list[str] = field(default_factory=list)
+
     # Populated by lifetime analysis
     lifetimes: dict[str, TensorLifetime] = field(default_factory=dict)
 
