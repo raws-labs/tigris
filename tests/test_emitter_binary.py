@@ -421,6 +421,13 @@ def test_immutable_supported_schema_fixtures():
             0,
             0,
         ),
+        (
+            6,
+            "schema-v6-interface-dtype.tgrs",
+            "1af3f363eb98db197898f89d1e1d70b4174b5cbb2356cd54778fce590a5276a9",
+            3,
+            0,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -435,6 +442,13 @@ def test_immutable_supported_schema_fixtures():
         if version == 5:
             assert plan["tile_plans"][0]["axis"] == 1
             assert plan["tile_plans"][0]["num_tiles"] > 1
+        if version == 6:
+            # A quantized boundary states the float interface the model
+            # declares, which is what schema 6 added.
+            for index in plan["model_inputs"] + plan["model_outputs"]:
+                tensor = plan["tensors"][index]
+                assert tensor["dtype"] == 3
+                assert tensor["iface_dtype"] == 1
 
 
 @pytest.mark.parametrize("version", [0, 1, *SUPPORTED_SCHEMA_VERSIONS, 99])

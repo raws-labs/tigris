@@ -229,6 +229,7 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
 
 #include "tigris.h"
 #include "tigris_executor.h"
+#include "tigris_iface.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 
@@ -448,6 +449,7 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
 #include <string.h>
 
 #include "tigris.h"
+#include "tigris_iface.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"
@@ -575,19 +577,37 @@ int main(int argc, char **argv)
     printf("OK  normal=%u tiled=%u chain=%u\\n",
            stats.stages_normal, stats.stages_tiled, stats.stages_chain);
 
-    /* 6. Print outputs */
+    /* 6. Print outputs in the dtype the model declares, which the runtime
+     *    converts to from whatever the plan executes on. */
     for (uint8_t i = 0; i < plan.header->num_model_outputs; i++) {{
         uint16_t tidx = plan.model_outputs[i];
         const tigris_tensor_t *t = &plan.tensors[tidx];
-        void *ptr = mem.tensor_ptrs[tidx];
-        if (!ptr) continue;
-        printf("Output '%s': %u bytes\\n", tigris_tensor_name(&plan, t), t->size_bytes);
-        {"int8_t" if is_quantized else "float"} *out = ({"int8_t" if is_quantized else "float"} *)ptr;
-        uint32_t n = t->size_bytes / {"1" if is_quantized else "sizeof(float)"};
-        uint32_t show = n < 10 ? n : 10;
-        for (uint32_t j = 0; j < show; j++)
-            printf("  [%u] {"% d" if is_quantized else "%.6f"}\\n", j, {"(int)" if is_quantized else ""}out[j]);
-        if (n > show) printf("  ... (%u more)\\n", n - show);
+        uint32_t iface_bytes = tigris_iface_bytes(&plan, tidx);
+        void *staging;
+        if (iface_bytes == 0u) continue;
+        staging = malloc(iface_bytes);
+        if (!staging) continue;
+        if (tigris_output_read(&plan, &mem, tidx, staging, iface_bytes) != TIGRIS_OK) {{
+            free(staging);
+            continue;
+        }}
+        printf("Output '%s': %u bytes\\n", tigris_tensor_name(&plan, t), iface_bytes);
+        if (t->iface_dtype == 0u && t->dtype == 3u) {{
+            const int8_t *out = (const int8_t *)staging;
+            uint32_t n = iface_bytes;
+            uint32_t show = n < 10 ? n : 10;
+            for (uint32_t j = 0; j < show; j++)
+                printf("  [%u] % d\\n", j, (int)out[j]);
+            if (n > show) printf("  ... (%u more)\\n", n - show);
+        }} else {{
+            const float *out = (const float *)staging;
+            uint32_t n = iface_bytes / (uint32_t)sizeof(float);
+            uint32_t show = n < 10 ? n : 10;
+            for (uint32_t j = 0; j < show; j++)
+                printf("  [%u] %.6f\\n", j, out[j]);
+            if (n > show) printf("  ... (%u more)\\n", n - show);
+        }}
+        free(staging);
     }}
 
     free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
@@ -630,6 +650,7 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
 #include "esp_log.h"
 
 #include "tigris.h"
+#include "tigris_iface.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"
@@ -857,6 +878,7 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
 #include <string.h>
 
 #include "tigris.h"
+#include "tigris_iface.h"
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"

@@ -918,21 +918,18 @@ def _qdq_case(operator: str) -> ContractCase:
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, output_shape
     )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, output_shape
-    )
 
     input_scale = numpy_helper.from_array(
-        np.array([0.25], dtype=np.float32), "input_scale"
+        np.array(0.25, dtype=np.float32), "input_scale"
     )
     input_zero_point = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "input_zero_point"
+        np.array(0, dtype=np.int8), "input_zero_point"
     )
     output_scale = numpy_helper.from_array(
-        np.array([0.25], dtype=np.float32), "output_scale"
+        np.array(0.25, dtype=np.float32), "output_scale"
     )
     output_zero_point = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "output_zero_point"
+        np.array(0, dtype=np.int8), "output_zero_point"
     )
     initializers = [
         input_scale,
@@ -957,10 +954,10 @@ def _qdq_case(operator: str) -> ContractCase:
             np.array([[[[0.5]]]], dtype=np.float32), "weight"
         )
         weight_scale = numpy_helper.from_array(
-            np.array([0.25], dtype=np.float32), "weight_scale"
+            np.array(0.25, dtype=np.float32), "weight_scale"
         )
         weight_zero_point = numpy_helper.from_array(
-            np.array([0], dtype=np.int8), "weight_zero_point"
+            np.array(0, dtype=np.int8), "weight_zero_point"
         )
         initializers.extend([weight, weight_scale, weight_zero_point])
         nodes.extend(
@@ -986,10 +983,10 @@ def _qdq_case(operator: str) -> ContractCase:
             np.array([[[[0.5, -0.25], [0.25, 0.75]]]], dtype=np.float32), "weight"
         )
         weight_scale = numpy_helper.from_array(
-            np.array([0.25], dtype=np.float32), "weight_scale"
+            np.array(0.25, dtype=np.float32), "weight_scale"
         )
         weight_zero_point = numpy_helper.from_array(
-            np.array([0], dtype=np.int8), "weight_zero_point"
+            np.array(0, dtype=np.int8), "weight_zero_point"
         )
         initializers.extend([weight, weight_scale, weight_zero_point])
         nodes.extend(
@@ -1043,8 +1040,6 @@ def _qdq_case(operator: str) -> ContractCase:
         f"qdq_{operator.lower()}", nodes, [model_input], [model_output], initializers
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
     input_data = np.array(
         [
@@ -1084,9 +1079,6 @@ def _qdq_add_relu_case() -> ContractCase:
     )
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 1, 4, 4]
-    )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, [1, 1, 4, 4]
     )
     initializers = [
         numpy_helper.from_array(np.array([0.25], dtype=np.float32), "io_scale"),
@@ -1140,8 +1132,6 @@ def _qdq_add_relu_case() -> ContractCase:
         "qdq_add_relu", nodes, [model_input], [model_output], initializers
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
     input_data = np.array(
         [
@@ -1183,9 +1173,6 @@ def _qdq_gemm_bias_add_case() -> ContractCase:
     )
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 2]
-    )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, [1, 2]
     )
     initializers = [
         numpy_helper.from_array(np.array([0.25], dtype=np.float32), "io_scale"),
@@ -1235,8 +1222,6 @@ def _qdq_gemm_bias_add_case() -> ContractCase:
             "QuantizeLinear", ["output", "io_scale", "io_zero_point"], ["output_q"]
         )
     )
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
     return ContractCase(
         "int8_gemm_bias_add",
@@ -1333,9 +1318,6 @@ def _qdq_matmul_case() -> ContractCase:
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 3]
     )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, [1, 3]
-    )
     initializers = [
         numpy_helper.from_array(np.array([0.25], dtype=np.float32), "io_scale"),
         numpy_helper.from_array(np.array([0], dtype=np.int8), "io_zp"),
@@ -1371,8 +1353,6 @@ def _qdq_matmul_case() -> ContractCase:
         "qdq_matmul", nodes, [model_input], [model_output], initializers
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
     return ContractCase(
         "int8_matmul",
@@ -1398,9 +1378,6 @@ def _quint8_activation_case() -> ContractCase:
     )
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 1, 4, 4]
-    )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, [1, 1, 4, 4]
     )
     initializers = [
         numpy_helper.from_array(np.array([0.25], dtype=np.float32), "u8_scale"),
@@ -1438,8 +1415,6 @@ def _quint8_activation_case() -> ContractCase:
         "quint8_activation", nodes, [model_input], [model_output], initializers
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
     input_data = np.array(
         [
@@ -1739,9 +1714,6 @@ def _qdq_convtranspose_per_channel_case() -> ContractCase:
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, output_shape
     )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, output_shape
-    )
 
     rng = np.random.default_rng(31)
     input_scale = numpy_helper.from_array(
@@ -1827,8 +1799,6 @@ def _qdq_convtranspose_per_channel_case() -> ContractCase:
         initializers,
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
     return ContractCase(
         "int8_convtranspose_per_channel",
@@ -1915,9 +1885,6 @@ def _qdq_conv_chain_case() -> ContractCase:
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, output_shape
     )
-    int8_output = helper.make_tensor_value_info(
-        "act_q2", TensorProto.INT8, output_shape
-    )
 
     initializers: list[onnx.TensorProto] = [
         numpy_helper.from_array(np.array([0.25], dtype=np.float32), "act_scale"),
@@ -1995,8 +1962,6 @@ def _qdq_conv_chain_case() -> ContractCase:
         "qdq_conv_chain", nodes, [model_input], [model_output], initializers
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
     return ContractCase(
         "int8_linebuffer_conv_chain",
@@ -2125,9 +2090,6 @@ def _qdq_2d_tiled_conv_case() -> ContractCase:
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, c, out_h, out_w]
     )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, [1, c, out_h, out_w]
-    )
 
     rng = np.random.default_rng(3)
     input_scale = numpy_helper.from_array(
@@ -2208,8 +2170,6 @@ def _qdq_2d_tiled_conv_case() -> ContractCase:
         "qdq_2d_tiled_conv", nodes, [model_input], [model_output], initializers
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
 
     input_data = rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32)
@@ -2378,9 +2338,6 @@ def _qdq_cotiled_concat_2d_case() -> ContractCase:
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, c, h, w]
     )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, [1, c, h, w]
-    )
 
     def _scalar(value: float, name: str, dtype=np.float32) -> onnx.TensorProto:
         return numpy_helper.from_array(np.array([value], dtype=dtype), name)
@@ -2481,8 +2438,6 @@ def _qdq_cotiled_concat_2d_case() -> ContractCase:
         initializers,
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
 
     inputs = {
@@ -2670,9 +2625,6 @@ def _qdq_convtranspose_2d_tiled_case() -> ContractCase:
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, c_out, out_h, out_w]
     )
-    int8_output = helper.make_tensor_value_info(
-        "output_q", TensorProto.INT8, [1, c_out, out_h, out_w]
-    )
     rng = np.random.default_rng(7)
     input_scale = numpy_helper.from_array(
         np.array([0.02], dtype=np.float32), "input_scale"
@@ -2754,8 +2706,6 @@ def _qdq_convtranspose_2d_tiled_case() -> ContractCase:
         initializers,
     )
     reference_model = copy.deepcopy(compile_model)
-    del reference_model.graph.output[:]
-    reference_model.graph.output.extend([int8_output])
     onnx.checker.check_model(reference_model)
     input_data = rng.uniform(-1.0, 1.0, size=(1, c_in, h_in, w_in)).astype(
         np.float32
@@ -2878,24 +2828,37 @@ def _quantize_input(value: Array, plan: dict, tensor: dict) -> Array:
     return np.clip(quantized, -128, 127).astype(np.int8)
 
 
+def _declared_dtype(tensor: dict) -> int:
+    """The dtype the model states for this boundary, which the runner converts."""
+    return tensor["iface_dtype"] or tensor["dtype"]
+
+
 def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
     chunks: list[bytes] = []
     for tensor_index in plan["model_inputs"]:
         tensor = plan["tensors"][tensor_index]
         source = inputs[tensor["name"]]
-        if tensor["dtype"] == TensorProto.FLOAT:
+        # The runner is handed the dtype the model declares and converts it,
+        # so the plan is exercised through the interface the model states.
+        declared = _declared_dtype(tensor)
+        if declared == TensorProto.FLOAT:
             encoded = source.astype(np.float32, copy=False)
-        elif tensor["dtype"] == TensorProto.INT8:
+        elif declared == TensorProto.INT8:
             encoded = _quantize_input(source, plan, tensor)
         else:
             raise AssertionError(
-                f"unsupported contract input dtype {tensor['dtype']}"
+                f"unsupported contract input dtype {declared}"
             )
         encoded = _to_runtime_layout(encoded)
-        if encoded.nbytes != tensor["size_bytes"]:
+        expected = tensor["size_bytes"]
+        if declared != tensor["dtype"]:
+            expected = (
+                tensor["size_bytes"] // np.dtype(_DTYPE_BY_ONNX_CODE[tensor["dtype"]]).itemsize
+            ) * np.dtype(_DTYPE_BY_ONNX_CODE[declared]).itemsize
+        if encoded.nbytes != expected:
             raise AssertionError(
                 f"input {tensor['name']!r} has {encoded.nbytes} bytes, "
-                f"plan expects {tensor['size_bytes']}"
+                f"the declared interface expects {expected}"
             )
         chunks.append(encoded.tobytes())
     return b"".join(chunks)
@@ -2917,12 +2880,17 @@ def _decode_outputs(
     }
     for tensor_index, reference in zip(plan["model_outputs"], reference_outputs):
         tensor = plan["tensors"][tensor_index]
-        dtype = _DTYPE_BY_ONNX_CODE.get(tensor["dtype"])
+        declared = _declared_dtype(tensor)
+        dtype = _DTYPE_BY_ONNX_CODE.get(declared)
         if dtype is None:
             raise AssertionError(
-                f"unsupported contract output dtype {tensor['dtype']}"
+                f"unsupported contract output dtype {declared}"
             )
-        end = offset + tensor["size_bytes"]
+        stored = _DTYPE_BY_ONNX_CODE[tensor["dtype"]]
+        size_bytes = (
+            tensor["size_bytes"] // np.dtype(stored).itemsize
+        ) * np.dtype(dtype).itemsize
+        end = offset + size_bytes
         if end > len(raw):
             raise AssertionError("runtime output file is truncated")
         value = np.frombuffer(raw[offset:end], dtype=dtype).copy()
@@ -3094,7 +3062,9 @@ def _run_metric_case(
         actual_outputs = _decode_outputs(
             plan, outputs_path.read_bytes(), reference_outputs
         )
-        _assert_output_parity(actual_outputs, reference_outputs)
+        _assert_output_parity(
+        actual_outputs, reference_outputs, _output_scales(plan)
+    )
         return _parse_rows(case, completed.stdout)
 
     rows_on = _execute([], "linebuffered")
@@ -3180,22 +3150,55 @@ def _run_case(
     actual_outputs = _decode_outputs(
         plan, outputs_path.read_bytes(), reference_outputs
     )
-    _assert_output_parity(actual_outputs, reference_outputs)
+    _assert_output_parity(
+        actual_outputs, reference_outputs, _output_scales(plan)
+    )
     print(f"PASS {case.name} memory-contract")
     return plan_path
 
 
+def _output_scales(plan: dict) -> list[float]:
+    """Quantization step of each model output, or 0 where the plan is not quantized.
+
+    A float interface over a quantized plan is compared after dequantization.
+    Both sides are then multiples of this step, so the comparison stays in
+    whole steps rather than in floats that cannot represent the step exactly.
+    """
+    scales: list[float] = []
+    for tensor_index in plan["model_outputs"]:
+        tensor = plan["tensors"][tensor_index]
+        if _declared_dtype(tensor) == tensor["dtype"]:
+            scales.append(0.0)
+            continue
+        quant = plan["quant_params"][tensor["quant_param_idx"]]
+        scales.append(float(quant["scale"]))
+    return scales
+
+
 def _assert_output_parity(
-    actual_outputs: list[Array], reference_outputs: list[Array]
+    actual_outputs: list[Array],
+    reference_outputs: list[Array],
+    output_scales: list[float] | None = None,
 ) -> None:
-    for actual, expected in zip(actual_outputs, reference_outputs):
-        if np.issubdtype(expected.dtype, np.floating):
-            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
-        else:
+    output_scales = output_scales or [0.0] * len(actual_outputs)
+    for actual, expected, scale in zip(
+        actual_outputs, reference_outputs, output_scales
+    ):
+        if scale > 0.0:
             # The runtime uses integer half-away-from-zero quantization while
             # this ONNX Runtime QDQ reference follows a different half-tie
             # rule. Keep the same one-LSB acceptance bound used by benchmark
             # validation, while rejecting any larger contract drift.
+            steps = np.abs(np.rint((actual - expected) / scale))
+            worst = float(steps.max()) if steps.size else 0.0
+            if worst > _INT8_LSB_TOLERANCE:
+                raise AssertionError(
+                    f"dequantized output differs by {worst:.0f} quantization "
+                    f"steps, bound is {_INT8_LSB_TOLERANCE}"
+                )
+        elif np.issubdtype(expected.dtype, np.floating):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        else:
             np.testing.assert_allclose(
                 actual, expected, rtol=0, atol=_INT8_LSB_TOLERANCE
             )

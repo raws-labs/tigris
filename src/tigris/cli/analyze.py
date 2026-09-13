@@ -15,7 +15,7 @@ from tigris.cli import (
     _parse_size,
     _run_pipeline,
 )
-from tigris.utils import fmt_bytes
+from tigris.utils import describe_interface, fmt_bytes
 
 
 def _side_by_side(*panels):
@@ -78,6 +78,8 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
         model_grid.add_row("Quantization", "INT8 (QDQ)")
     elif findings.is_float32:
         model_grid.add_row("Dtype", "float32")
+    for label, text in describe_interface(ag):
+        model_grid.add_row(label, text)
     if findings.unsupported_operators:
         model_grid.add_row(
             "[red]Unsupported operators[/]",

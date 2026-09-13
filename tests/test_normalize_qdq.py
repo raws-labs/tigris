@@ -243,7 +243,8 @@ def test_constant_add_becomes_the_operator_bias(tmp_path):
     assert bias.tolist() == [8, -4]
     assert ag.tensors["output"].dtype == 3
     assert ag.tensors["output"].quant is not None
-    assert len(ag.normalization_notes) == 1
+    # The model declares a float output, which the plan still presents.
+    assert ag.model_output_dtypes == [1]
 
 
 def test_shared_scale_initializer_still_folds_activations(tmp_path):
@@ -280,7 +281,7 @@ def test_float_constant_add_is_left_alone(tmp_path):
     ag = load_model(path)
 
     assert [op.op_type for op in ag.ops] == ["Gemm", "Add"]
-    assert ag.normalization_notes == []
+    assert ag.tensors["output"].dtype == 1
 
 
 # MatMul relabeling
@@ -500,14 +501,12 @@ def test_unsigned_weight_data_moves_with_its_zero_point(tmp_path):
     assert int(info.quant.zero_point[0]) == 128 - 128
 
 
-def test_unsigned_model_input_is_reported(tmp_path):
-    """The caller feeds the plan, so a changed input encoding has to be said."""
+def test_unsigned_model_input_keeps_its_declared_interface(tmp_path):
+    """The caller hands over what the model declares, whatever the plan stores."""
     ag = load_model(_quint8_model(tmp_path))
 
-    assert any(
-        "model input input was stated as uint8" in note
-        for note in ag.normalization_notes
-    )
+    assert ag.model_input_dtypes == [1]  # float32, as the model states
+    assert ag.tensors["input"].dtype == 3  # int8, as the plan executes
 
 
 def test_signed_activations_are_untouched(tmp_path):
@@ -547,4 +546,3 @@ def test_signed_activations_are_untouched(tmp_path):
 
     assert int(ag.tensors["input"].quant.zero_point[0]) == -14
     assert ag.weight_data["weight_q"].ravel().tolist() == [72]
-    assert ag.normalization_notes == []

@@ -239,7 +239,6 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         """Restate uint8 storage in the signed domain its zero point moved to."""
         return (arr.astype(np.int16) - 128).astype(np.int8)
 
-    unsigned_tensors: set[str] = set()
 
     # Pass 1: Process DequantizeLinear on weight inputs.
     # Pattern: weight_init -> QuantizeLinear -> int8 -> DequantizeLinear -> fake_float
@@ -263,7 +262,6 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
 
             if unsigned:
                 ag.weight_data[dql_input] = _to_signed(ag.weight_data[dql_input])
-                unsigned_tensors.add(dql_input)
 
             # Store QuantParam on the weight tensor
             if dql_input in ag.tensors:
@@ -292,8 +290,6 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 qp, unsigned = _get_quant_param(op)
                 if qp is None:
                     continue
-                if unsigned:
-                    unsigned_tensors.add(original_weight)
 
                 # Quantize the float weight to int8
                 scale = qp.scale
@@ -357,8 +353,6 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         qp, unsigned = _get_quant_param(op)
         if qp is None:
             continue
-        if unsigned:
-            unsigned_tensors.add(ql_input)
 
         # Store quant param on the activation tensor and set dtype to INT8
         if ql_input in ag.tensors:
@@ -406,18 +400,6 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         for inp_name in op.inputs[1:]:
             if inp_name:
                 deferred_cleanup.add(inp_name)
-
-    for name in sorted(unsigned_tensors):
-        if name in ag.model_inputs:
-            ag.normalization_notes.append(
-                f"model input {name} was stated as uint8 and is int8 in the "
-                "plan; feed each sample as its uint8 value minus 128"
-            )
-        elif name in ag.model_outputs:
-            ag.normalization_notes.append(
-                f"model output {name} was stated as uint8 and is int8 in the "
-                "plan; add 128 to each value to read it as uint8"
-            )
 
     # Now clean up all deferred scale/zp constants
     for name in deferred_cleanup:
@@ -743,11 +725,6 @@ def _fold_constant_add_into_bias(ag: AnalyzedGraph) -> AnalyzedGraph:
         producer.outputs = [result]
         del ag.tensors[product]
         removed.add(i)
-        ag.normalization_notes.append(
-            f"{result} is int8 at scale {float(product_info.quant.scale[0]):.6g}, "
-            f"zero point {int(product_info.quant.zero_point[0])}; "
-            "the model's float bias add was folded into the operator"
-        )
 
     if removed:
         ag.ops = [op for idx, op in enumerate(ag.ops) if idx not in removed]

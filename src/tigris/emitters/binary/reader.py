@@ -156,7 +156,7 @@ def read_binary_plan(data: bytes) -> dict:
     t_base = sections[SEC_TENSORS]
     for i in range(num_tensors):
         pos = t_base + i * TENSOR_SIZE
-        name_off, size_bytes, shape_off, ndim, dtype, t_flags, qp_idx = (
+        name_off, size_bytes, shape_off, ndim, dtype, t_flags, qp_idx, iface = (
             TENSOR_STRUCT.unpack_from(data, pos)
         )
         tensors.append({
@@ -167,6 +167,7 @@ def read_binary_plan(data: bytes) -> dict:
             "dtype": dtype,
             "flags": t_flags,
             "quant_param_idx": qp_idx,
+            "iface_dtype": iface,
         })
 
     # Parse ops

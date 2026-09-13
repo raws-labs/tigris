@@ -446,7 +446,7 @@
       }
     }
   ],
-  "schema_version": 5,
+  "schema_version": 6,
   "scope": "post-normalization operator dispatch; model-specific shape, attribute, quantization, memory, and tiling validation still applies",
   "source": "tigris.capabilities"
 }

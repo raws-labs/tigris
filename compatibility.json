@@ -4,7 +4,7 @@
     "repository_model": "separate-repositories",
     "schema_owner": "raws-labs/tigris",
     "schema_source": "src/tigris/emitters/binary/defs.py",
-    "schema_artifact": "src/tigris/schema/tigris-plan-v5.json",
+    "schema_artifact": "src/tigris/schema/tigris-plan-v6.json",
     "schema_versioning": "wire-format",
     "capability_growth": "same-schema with fail-closed runtime validation",
     "runtime_dependency": "vendored-wire-contract",
@@ -14,8 +14,8 @@
   "integration": {
     "compiler_branch": "develop",
     "runtime_branch": "develop",
-    "compiler_emits_schema": 5,
-    "runtime_accepts_schemas": [2, 3, 4, 5],
+    "compiler_emits_schema": 6,
+    "runtime_accepts_schemas": [2, 3, 4, 5, 6],
     "contract_gate": "python scripts/crossrepo_contract.py --runtime ../tigris-runtime"
   },
   "releases": [

@@ -14,7 +14,7 @@ from tigris.cli import (
     _report_shape_bindings,
     _run_pipeline,
 )
-from tigris.utils import fmt_bytes
+from tigris.utils import describe_interface, fmt_bytes
 
 
 def _run_compressed_pipeline(
@@ -164,3 +164,5 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         console.print(f"[bold green]Binary plan written to {out}[/]")
         console.print(f"  {len(ag.ops)} ops, {len(ag.stages)} stages @ {fmt_bytes(budget)} budget", style="dim")
         console.print(f"  plan size: {fmt_bytes(plan_bytes)}", style="dim")
+    for label, text in describe_interface(ag):
+        console.print(f"  {label.lower()}: {text}", style="dim")

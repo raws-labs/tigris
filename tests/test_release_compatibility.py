@@ -20,13 +20,13 @@ RUNTIME = ROOT.parent / "tigris-runtime"
 
 def test_schema_package_matches_compiler_definitions():
     artifact = json.loads(
-        (ROOT / "src/tigris/schema/tigris-plan-v5.json").read_text()
+        (ROOT / "src/tigris/schema/tigris-plan-v6.json").read_text()
     )
     assert artifact == schema_package()
 
 
 def test_schema_package_is_installed_package_data():
-    artifact = files("tigris").joinpath("schema/tigris-plan-v5.json")
+    artifact = files("tigris").joinpath("schema/tigris-plan-v6.json")
     assert json.loads(artifact.read_text()) == schema_package()
 
 
@@ -78,7 +78,7 @@ def _document():
 def _validated_copy(tmp_path, document):
     (tmp_path / "compatibility.json").write_text(json.dumps(document))
     for relative in (
-        "src/tigris/schema/tigris-plan-v5.json",
+        "src/tigris/schema/tigris-plan-v6.json",
         "src/tigris/emitters/binary/defs.py",
     ):
         target = tmp_path / relative

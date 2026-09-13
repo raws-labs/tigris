@@ -235,14 +235,17 @@ def test_quantized_esp_codegen_has_valid_includes(qdq_conv_path):
     assert 'tigris_kernels_s8.h\\"' not in source
 
 
-def test_quantized_reference_codegen_prints_int8_outputs(qdq_conv_path):
+def test_quantized_codegen_reads_the_declared_interface(qdq_conv_path):
+    """The harness prints what the model declares, not what the plan stores."""
     ag = _full_pipeline(qdq_conv_path, budget=4096)
 
     source = generate_c(emit_binary_bytes(ag), "reference")
 
     assert "tigris_dispatch_kernel_s8" in source
-    assert "int8_t *out = (int8_t *)ptr" in source
-    assert "float *out = (float *)ptr" not in source
+    assert "tigris_output_read(&plan, &mem, tidx, staging, iface_bytes)" in source
+    # Nothing reads the arena pointer as a typed array any more.
+    assert "*out = (int8_t *)ptr" not in source
+    assert "*out = (float *)ptr" not in source
 
 
 @pytest.mark.parametrize(
