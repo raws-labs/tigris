@@ -24,20 +24,36 @@ tigris analyze mobilenetv2.onnx -m 256K -f 16M
 ```
 
 ```text
+warning: input axis 0 (batch_size) has no fixed size; using 1
+  pass --input-shape NAME:1x3x224x224 to compile for another shape
 ╭──────────────────────── TiGrIS - mobilenetv2 ────────────────────────╮
 │ Operators            65                                              │
-│ Peak memory (naive)  4.59 MiB                                        │
+│ Tensors              244 (66 activations)                            │
+│ Peak memory (naive)  5.74 MiB                                        │
 │ Largest tensor       1x96x112x112 (4.59 MiB)                         │
+│ Dtype                float32                                         │
 ╰──────────────────────────────────────────────────────────────────────╯
 ╭──────────────────────────────── SRAM ────────────────────────────────╮
 │ Budget              256.00 KiB                                       │
-│ Scheduled peak      254.62 KiB (5.4% of naive peak)                  │
-│ Stages              42                                               │
-│ Need tiling         31 of 42 stages                                  │
+│ Scheduled peak      252.00 KiB (4.3% of naive peak)                  │
+│ Stages              58                                               │
+│ Spill / reload I/O  26.21 MiB / 27.55 MiB                            │
+│                                                                      │
+│ Need tiling         47 of 58 stages                                  │
+│   tileable          11 (138 tiles, max halo 2)                       │
 ╰────────────────  PASS - tiling resolves all stages  ─────────────────╯
+╭─────────────────────────────── Flash ────────────────────────────────╮
+│ Budget            16.00 MiB                                          │
+│ Weight data       13.30 MiB                                          │
+│ Plan overhead      0.01 MiB                                          │
+│ Plan (est.)       13.31 MiB                                          │
+│ Plan INT8 (est.)   3.34 MiB                                          │
+╰─────────────────────────  PASS - plan fits  ─────────────────────────╯
 ```
 
-The naive peak is 4.59 MiB. TiGrIS schedules it into 256 KiB through temporal partitioning and spatial tiling. `analyze` runs on your laptop; no hardware required.
+The naive peak is 5.74 MiB. TiGrIS schedules it into 256 KiB through temporal partitioning and spatial tiling. `analyze` runs on your laptop; no hardware required.
+
+That model is a stock export with a free batch dimension. TiGrIS binds a dimension the model leaves open to 1 and says so; pass `--input-shape input:4x3x224x224` to compile for a different one.
 
 ## From ONNX to embedded
 

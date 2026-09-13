@@ -17,7 +17,11 @@ from onnx import numpy_helper
 
 @dataclass(frozen=True)
 class DimBinding:
-    """A free dimension that was given a concrete extent."""
+    """A free dimension the compiler gave a concrete extent of its own choice.
+
+    A dimension the caller named is not a binding: the shape is what was asked
+    for, so there is nothing to report about it.
+    """
 
     tensor: str
     axis: int
@@ -38,14 +42,16 @@ def bind_free_dims(
 ) -> list[DimBinding]:
     """Give every free graph-input dimension a concrete extent.
 
-    Unbound dimensions become 1, the deployment case for embedded inference.
-    ``overrides`` maps an input name to its full shape and wins where given.
-    Inferred shapes downstream are dropped so they are recomputed from the
-    bound inputs rather than kept at their symbolic extents.
+    An input named in ``overrides`` takes the shape given there, whatever the
+    model declared. Every other free dimension becomes 1, the deployment case
+    for embedded inference. Inferred shapes downstream are dropped so they are
+    recomputed from the bound inputs rather than kept at their symbolic extents.
+    Only the dimensions this function chose itself are returned.
     """
     overrides = overrides or {}
     initializers = {init.name for init in model.graph.initializer}
     bindings: list[DimBinding] = []
+    changed = False
 
     for value_info in model.graph.input:
         if value_info.name in initializers:
@@ -58,11 +64,8 @@ def bind_free_dims(
                     f"Input {value_info.name!r} has rank {len(dims)}, "
                     f"but the given shape has rank {len(override)}"
                 )
-            for axis, (dim, extent) in enumerate(zip(dims, override)):
-                if dim.dim_value != extent:
-                    bindings.append(
-                        DimBinding(value_info.name, axis, dim.dim_param, extent)
-                    )
+            for dim, extent in zip(dims, override):
+                changed = changed or dim.dim_value != extent
                 dim.ClearField("dim_param")
                 dim.dim_value = extent
             continue
@@ -72,6 +75,7 @@ def bind_free_dims(
             bindings.append(DimBinding(value_info.name, axis, dim.dim_param, 1))
             dim.ClearField("dim_param")
             dim.dim_value = 1
+            changed = True
 
     unknown = set(overrides) - {vi.name for vi in model.graph.input}
     if unknown:
@@ -79,7 +83,7 @@ def bind_free_dims(
             "No such model input: " + ", ".join(sorted(unknown))
         )
 
-    if bindings:
+    if changed:
         del model.graph.value_info[:]
         for value_info in model.graph.output:
             value_info.type.tensor_type.ClearField("shape")

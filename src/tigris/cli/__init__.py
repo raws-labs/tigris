@@ -55,8 +55,17 @@ def _parse_input_shape(ctx, param, value: tuple[str, ...]):
     return shapes
 
 
-def _report_shape_bindings(ag) -> None:
-    """Say which input dimensions the model did not pin down."""
+def _report_shape_bindings(
+    ag, input_shapes: dict[str, tuple[int, ...]] | None = None
+) -> None:
+    """Say which shape the plan was built for.
+
+    A dimension the compiler picked itself is a warning, since the plan is
+    sized for a guess. A shape the caller named is echoed, not warned about.
+    """
+    for name, shape in sorted((input_shapes or {}).items()):
+        extents = "x".join(str(dim) for dim in shape)
+        console.print(f"{name} compiled for {extents}", style="dim")
     for binding in ag.shape_bindings:
         console.print(f"[yellow]warning:[/] {binding}")
     if ag.shape_bindings:
@@ -105,7 +114,7 @@ def _run_pipeline(
         raise click.ClickException(str(exc)) from exc
 
     if report_bindings:
-        _report_shape_bindings(ag)
+        _report_shape_bindings(ag, input_shapes)
 
     if not 0 <= ag.peak_memory_bytes <= 0xFFFFFFFF:
         raise click.ClickException(

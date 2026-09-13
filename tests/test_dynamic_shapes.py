@@ -79,16 +79,15 @@ def test_unknown_dimension_is_bound_to_one(tmp_path):
     ]
 
 
-def test_input_shape_overrides_the_binding(tmp_path):
+def test_input_shape_is_not_reported_as_a_binding(tmp_path):
+    """A shape the caller named is not a dimension the compiler guessed."""
     path = _save_relu_model(tmp_path, ["batch", 64], ["batch", 64])
 
     graph = load_model(path, {"input": (4, 64)})
 
     assert graph.tensors["input"].shape == (4, 64)
     assert graph.tensors["output"].shape == (4, 64)
-    assert graph.shape_bindings == [
-        "input axis 0 (batch) has no fixed size; using 4"
-    ]
+    assert graph.shape_bindings == []
 
 
 def test_input_shape_overrides_a_concrete_dimension(tmp_path):
@@ -98,6 +97,27 @@ def test_input_shape_overrides_a_concrete_dimension(tmp_path):
 
     assert graph.tensors["input"].shape == (8, 64)
     assert graph.tensors["output"].shape == (8, 64)
+    assert graph.shape_bindings == []
+
+
+def test_binding_is_reported_for_an_input_no_override_names(tmp_path):
+    """One input named on the command line does not silence another."""
+    inp = helper.make_tensor_value_info("input", TensorProto.FLOAT, ["batch", 64])
+    other = helper.make_tensor_value_info("other", TensorProto.FLOAT, ["batch", 64])
+    out = helper.make_tensor_value_info("output", TensorProto.FLOAT, None)
+    nodes = [helper.make_node("Add", ["input", "other"], ["output"], name="add")]
+    graph = helper.make_graph(nodes, "two_inputs", [inp, other], [out])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    path = tmp_path / "two_inputs.onnx"
+    onnx.save(model, path)
+
+    ag = load_model(path, {"input": (4, 64)})
+
+    assert ag.tensors["input"].shape == (4, 64)
+    assert ag.shape_bindings == [
+        "other axis 0 (batch) has no fixed size; using 1"
+    ]
 
 
 def test_input_shape_of_wrong_rank_is_rejected(tmp_path):
@@ -174,7 +194,7 @@ def test_cli_warns_about_a_bound_dimension(tmp_path):
     assert "--input-shape" in result.output
 
 
-def test_cli_accepts_an_input_shape_override(tmp_path):
+def test_cli_echoes_an_input_shape_override_without_warning(tmp_path):
     path = _save_relu_model(tmp_path, ["batch", 64], ["batch", 64])
 
     result = CliRunner().invoke(
@@ -182,7 +202,21 @@ def test_cli_accepts_an_input_shape_override(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert "using 4" in result.output
+    assert "input compiled for 4x64" in result.output
+    assert "warning" not in result.output
+    assert "--input-shape" not in result.output
+
+
+def test_cli_does_not_warn_when_an_override_pins_a_concrete_shape(tmp_path):
+    path = _save_relu_model(tmp_path, [1, 64], [1, 64])
+
+    result = CliRunner().invoke(
+        cli, ["analyze", str(path), "-m", "4K", "--input-shape", "input:8x64"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "input compiled for 8x64" in result.output
+    assert "has no fixed size" not in result.output
 
 
 def test_cli_rejects_a_malformed_input_shape(tmp_path):

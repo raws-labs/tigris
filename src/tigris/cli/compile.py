@@ -90,7 +90,7 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         ag, budget, reserved_budget, weight_reserve = _run_compressed_pipeline(
             model, mem, input_shape
         )
-        _report_shape_bindings(ag)
+        _report_shape_bindings(ag, input_shape)
     else:
         ag, budget = _run_pipeline(model, mem, input_shapes=input_shape)
         reserved_budget = 0
