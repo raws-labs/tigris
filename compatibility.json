@@ -21,6 +21,19 @@
   "releases": [
     {
       "status": "supported",
+      "compiler": {
+        "tag": "v0.7.0",
+        "commit": "6fb8b7a7438eeb8416c3d1d5c5151bb9a1ef74b5",
+        "emits_schema": 6
+      },
+      "runtime": {
+        "tag": "v0.8.0",
+        "commit": "a467a2c9ac2bf8a8310ab055adce2cd32f398c49",
+        "accepts_schemas": [2, 3, 4, 5, 6]
+      }
+    },
+    {
+      "status": "supported",
       "runtime": {
         "tag": "v0.7.0",
         "commit": "7adcd70768756cdec8aa79e7ccdf60e30184e557",
