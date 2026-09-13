@@ -194,7 +194,8 @@ def test_cli_warns_about_a_bound_dimension(tmp_path):
     assert "--input-shape" in result.output
 
 
-def test_cli_echoes_an_input_shape_override_without_warning(tmp_path):
+def test_cli_reports_an_input_shape_override_without_warning(tmp_path):
+    """The interface row states the shape, so the override needs no echo."""
     path = _save_relu_model(tmp_path, ["batch", 64], ["batch", 64])
 
     result = CliRunner().invoke(
@@ -202,7 +203,7 @@ def test_cli_echoes_an_input_shape_override_without_warning(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert "input compiled for 4x64" in result.output
+    assert "input 4x64 float32" in result.output
     assert "warning" not in result.output
     assert "--input-shape" not in result.output
 
@@ -215,7 +216,7 @@ def test_cli_does_not_warn_when_an_override_pins_a_concrete_shape(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert "input compiled for 8x64" in result.output
+    assert "input 8x64 float32" in result.output
     assert "has no fixed size" not in result.output
 
 
