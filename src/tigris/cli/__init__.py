@@ -64,11 +64,6 @@ def _report_shape_bindings(ag) -> None:
     """
     for binding in ag.shape_bindings:
         console.print(f"[yellow]warning:[/] {binding}")
-    if ag.shape_bindings:
-        console.print(
-            "  pass --input-shape NAME:1x3x224x224 to compile for another shape",
-            style="dim",
-        )
 
 
 def _run_pipeline(
