@@ -44,6 +44,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
     ag = _fold_constant_ops(ag)
     ag = _fold_qdq(ag)
+    ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
     ag = _fold_constant_add_into_bias(ag)
     ag = _decompose_silu(ag)
@@ -196,29 +197,49 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
     # both passes have run.
     deferred_cleanup: set[str] = set()
 
-    def _get_quant_param(op: OpNode) -> QuantParam | None:
+    def _get_quant_param(op: OpNode) -> tuple[QuantParam | None, bool]:
         """Extract QuantParam from a QuantizeLinear or DequantizeLinear op.
 
         Inputs: x, y_scale, y_zero_point (optional).
         For DQL: x, x_scale, x_zero_point (optional).
+
+        Returns the parameters in the signed domain the kernels work in, and
+        whether the model stated them as unsigned. uint8 value ``v`` and int8
+        value ``v - 128`` denote the same real number under zero points that
+        differ by the same 128, so shifting both is exact rather than a
+        reinterpretation. The caller shifts stored data to match.
         """
         if len(op.inputs) < 2:
-            return None
+            return None, False
         scale_name = op.inputs[1]
         if scale_name not in ag.weight_data:
-            return None
+            return None, False
         scale = ag.weight_data[scale_name].astype(np.float32).flatten()
 
+        unsigned = False
         if len(op.inputs) >= 3 and op.inputs[2] and op.inputs[2] in ag.weight_data:
             zp = ag.weight_data[op.inputs[2]].flatten()
+            unsigned = zp.dtype == np.uint8
         else:
+            # An omitted zero point means zero in the operator's own output
+            # type, which ONNX defaults to uint8.
+            produced = ag.tensors.get(op.outputs[0])
+            unsigned = produced is not None and produced.dtype == 2
             zp = np.zeros_like(scale, dtype=np.int8)
+        if unsigned:
+            zp = (zp.astype(np.int32) - 128).astype(np.int32)
 
         axis = op.attrs.get("axis", 1)
         if scale.size == 1:
             axis = -1  # per-tensor
 
-        return QuantParam(scale=scale, zero_point=zp, axis=axis)
+        return QuantParam(scale=scale, zero_point=zp, axis=axis), unsigned
+
+    def _to_signed(arr: np.ndarray) -> np.ndarray:
+        """Restate uint8 storage in the signed domain its zero point moved to."""
+        return (arr.astype(np.int16) - 128).astype(np.int8)
+
+    unsigned_tensors: set[str] = set()
 
     # Pass 1: Process DequantizeLinear on weight inputs.
     # Pattern: weight_init -> QuantizeLinear -> int8 -> DequantizeLinear -> fake_float
@@ -236,13 +257,18 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         # Case 1: int8 initializer -> DequantizeLinear
         if dql_input in ag.weight_data:
             is_weight_dql = True
-            qp = _get_quant_param(op)
+            qp, unsigned = _get_quant_param(op)
             if qp is None:
                 continue
+
+            if unsigned:
+                ag.weight_data[dql_input] = _to_signed(ag.weight_data[dql_input])
+                unsigned_tensors.add(dql_input)
 
             # Store QuantParam on the weight tensor
             if dql_input in ag.tensors:
                 ag.tensors[dql_input].quant = qp
+                ag.tensors[dql_input].dtype = 3  # INT8
 
             # Rewire: all consumers of DQL output now read the weight directly
             for cons_idx, pos in input_to_consumers.get(dql_output, []):
@@ -263,9 +289,11 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 original_weight = ql_op.inputs[0]
 
                 # Get quant params from the DQL op
-                qp = _get_quant_param(op)
+                qp, unsigned = _get_quant_param(op)
                 if qp is None:
                     continue
+                if unsigned:
+                    unsigned_tensors.add(original_weight)
 
                 # Quantize the float weight to int8
                 scale = qp.scale
@@ -326,9 +354,11 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         # Get quant params from this QL op
-        qp = _get_quant_param(op)
+        qp, unsigned = _get_quant_param(op)
         if qp is None:
             continue
+        if unsigned:
+            unsigned_tensors.add(ql_input)
 
         # Store quant param on the activation tensor and set dtype to INT8
         if ql_input in ag.tensors:
@@ -376,6 +406,18 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         for inp_name in op.inputs[1:]:
             if inp_name:
                 deferred_cleanup.add(inp_name)
+
+    for name in sorted(unsigned_tensors):
+        if name in ag.model_inputs:
+            ag.normalization_notes.append(
+                f"model input {name} was stated as uint8 and is int8 in the "
+                "plan; feed each sample as its uint8 value minus 128"
+            )
+        elif name in ag.model_outputs:
+            ag.normalization_notes.append(
+                f"model output {name} was stated as uint8 and is int8 in the "
+                "plan; add 128 to each value to read it as uint8"
+            )
 
     # Now clean up all deferred scale/zp constants
     for name in deferred_cleanup:
@@ -549,9 +591,68 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 # Producers whose kernels read an optional bias operand after the weight.
-_BIAS_PRODUCERS = frozenset(
-    {"Conv", "DepthwiseConv", "Conv1D", "Gemm", "MatMul"}
-)
+# MatMul is absent because a relabelable one is already a Gemm by this point.
+_BIAS_PRODUCERS = frozenset({"Conv", "DepthwiseConv", "Conv1D", "Gemm"})
+
+
+def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Put a constant-weight matrix product in the layout the kernels read.
+
+    The fully-connected kernels index the weight as ``W[oc * IC + ic]``, which
+    is ONNX ``Gemm`` with ``transB=1``. An ONNX ``MatMul`` states the same
+    product with the weight the other way round, and so does a ``Gemm`` that
+    leaves ``transB`` at its default, so both need the constant transposed
+    before they mean what the kernels compute.
+
+    A product whose second operand is not a constant matrix is left alone: the
+    runtime has no kernel for it and rejects the plan rather than guessing.
+    """
+    consumers: dict[str, int] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            consumers[name] = consumers.get(name, 0) + 1
+
+    for op in ag.ops:
+        if op.op_type == "MatMul":
+            pass
+        elif op.op_type == "Gemm" and int(op.attrs.get("transB", 0)) != 1:
+            pass
+        else:
+            continue
+        if op.attrs.get("transA"):
+            continue
+        if float(op.attrs.get("alpha", 1.0)) != 1.0:
+            continue
+        if float(op.attrs.get("beta", 1.0)) != 1.0:
+            continue
+        if len(op.inputs) < 2:
+            continue
+
+        weight_name = op.inputs[1]
+        weight = ag.weight_data.get(weight_name)
+        if weight is None or weight.ndim != 2:
+            continue
+        # Transposing in place would misstate the weight for any other reader.
+        if consumers.get(weight_name, 0) != 1:
+            continue
+        data_info = ag.tensors.get(op.inputs[0])
+        if data_info is None or len(data_info.shape) != 2:
+            continue
+
+        ag.weight_data[weight_name] = np.ascontiguousarray(weight.T)
+        info = ag.tensors.get(weight_name)
+        if info is not None:
+            info.shape = tuple(reversed(info.shape))
+            quant = info.quant
+            if quant is not None and quant.axis in (0, 1):
+                info.quant = QuantParam(
+                    scale=quant.scale,
+                    zero_point=quant.zero_point,
+                    axis=1 - quant.axis,
+                )
+        op.op_type = "Gemm"
+        op.attrs["transB"] = 1
+    return ag
 
 
 def _fold_constant_add_into_bias(ag: AnalyzedGraph) -> AnalyzedGraph:

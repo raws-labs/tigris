@@ -33,17 +33,20 @@ from tigris.loaders import load_model
 
 @pytest.fixture
 def quantized_matmul_plan(tmp_path):
-    """A QDQ MatMul plan: schema-known, but unsupported by every dispatcher."""
+    """A QDQ MatMul plan: schema-known, but unsupported by every dispatcher.
+
+    The second operand is a model input rather than a constant, so it stays a
+    MatMul: a constant-weight product is relabeled to Gemm and would be
+    supported.
+    """
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 4]
     )
+    weight_input = helper.make_tensor_value_info(
+        "weight", TensorProto.FLOAT, [4, 3]
+    )
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 3]
-    )
-
-    weight = numpy_helper.from_array(
-        np.arange(12, dtype=np.float32).reshape(4, 3) / 16.0,
-        name="weight",
     )
     input_scale = numpy_helper.from_array(
         np.array([0.05], dtype=np.float32), "input_scale"
@@ -102,10 +105,9 @@ def quantized_matmul_plan(tmp_path):
     graph = helper.make_graph(
         nodes,
         "quantized_matmul",
-        [model_input],
+        [model_input, weight_input],
         [model_output],
         initializer=[
-            weight,
             input_scale,
             input_zp,
             weight_scale,
