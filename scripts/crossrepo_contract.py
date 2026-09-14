@@ -554,6 +554,221 @@ def _reduce_mean_case() -> ContractCase:
     )
 
 
+def _inference_identity_case() -> ContractCase:
+    """Dropout and Identity must vanish, and Squeeze must execute as Reshape.
+
+    The reference model keeps all three so ONNX Runtime evaluates the graph an
+    exporter actually emits; TiGrIS must reach the same values with them gone.
+    The Squeeze here drops the two trailing unit axes of a pooled [1, C, 1, 1]
+    tensor, which leaves the runtime's element order untouched.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 3, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3]
+    )
+    axes = numpy_helper.from_array(np.array([2, 3], dtype=np.int64), "axes")
+    model = _model(
+        "inference_identity",
+        [
+            helper.make_node("Identity", ["input"], ["same"]),
+            helper.make_node("Dropout", ["same"], ["kept"]),
+            helper.make_node("GlobalAveragePool", ["kept"], ["pooled"]),
+            helper.make_node("Squeeze", ["pooled", "axes"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        [axes],
+    )
+    return ContractCase(
+        "float_inference_identity",
+        model,
+        model,
+        {
+            "input": np.arange(48, dtype=np.float32).reshape(1, 3, 4, 4)
+        },
+        ("GlobalAveragePool", "Reshape"),
+    )
+
+
+def _channel_bias_add_case(*, producer_has_bias: bool) -> ContractCase:
+    """A per-channel constant Add must reach the same values as its own graph.
+
+    The reference model keeps the standalone Add, so ONNX Runtime evaluates the
+    broadcast exactly as an exporter wrote it; TiGrIS folds it into the Conv
+    bias and must land on the same numbers either way.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 3, 3]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, 3, 3]
+    )
+    weight = numpy_helper.from_array(
+        np.linspace(-0.4, 0.4, 3 * 2 * 3 * 3, dtype=np.float32).reshape(3, 2, 3, 3),
+        "weight",
+    )
+    channel = numpy_helper.from_array(
+        np.array([[[[0.5]], [[-1.25]], [[2.0]]]], dtype=np.float32), "channel"
+    )
+    conv_inputs = ["input", "weight"]
+    initializers = [weight, channel]
+    if producer_has_bias:
+        initializers.append(
+            numpy_helper.from_array(
+                np.array([0.125, -0.25, 0.75], dtype=np.float32), "bias"
+            )
+        )
+        conv_inputs.append("bias")
+    model = _model(
+        "channel_bias_add",
+        [
+            helper.make_node(
+                "Conv", conv_inputs, ["product"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1],
+            ),
+            helper.make_node("Add", ["product", "channel"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    suffix = "onto_bias" if producer_has_bias else "as_bias"
+    return ContractCase(
+        f"float_channel_bias_add_{suffix}",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -1.0, 1.0, 18, dtype=np.float32
+            ).reshape(1, 2, 3, 3)
+        },
+        ("Conv",),
+    )
+
+
+def _float_gemm_bias_add_case() -> ContractCase:
+    """A float Gemm whose bias arrives as a separate Add, the rank-2 form.
+
+    The operand is per-channel against a [1, C] product, so the Add kernel
+    cannot take it as written; the bias slot can. ONNX Runtime evaluates the
+    two-op graph and TiGrIS must match it with one op.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 2]
+    )
+    initializers = [
+        numpy_helper.from_array(
+            np.array([[0.5, -0.25, 0.75, 0.25], [-0.5, 0.25, 0.5, -0.75]],
+                     dtype=np.float32),
+            "weight",
+        ),
+        numpy_helper.from_array(
+            np.array([0.5, -0.25], dtype=np.float32), "bias"),
+    ]
+    model = _model(
+        "float_gemm_bias_add",
+        [
+            helper.make_node("Gemm", ["input", "weight"], ["product"], transB=1),
+            helper.make_node("Add", ["product", "bias"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    return ContractCase(
+        "float_gemm_bias_add",
+        model,
+        model,
+        {"input": np.array([[1.0, -2.0, 0.5, 3.0]], dtype=np.float32)},
+        ("Gemm",),
+    )
+
+
+def _batched_matmul_case() -> ContractCase:
+    """A rank-3 constant-weight MatMul, the per-position linear layer.
+
+    ONNX Runtime evaluates the batched product directly. TiGrIS makes the
+    operand linear, collapses its leading axes and runs the fully-connected
+    kernel, so this checks the layout conversion and the lowering together.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 5, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 5, 3]
+    )
+    weight = numpy_helper.from_array(
+        np.linspace(-0.5, 0.5, 12, dtype=np.float32).reshape(4, 3), "weight"
+    )
+    model = _model(
+        "batched_matmul",
+        [helper.make_node("MatMul", ["input", "weight"], ["output"])],
+        [model_input],
+        [model_output],
+        [weight],
+    )
+    return ContractCase(
+        "float_batched_matmul",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -1.0, 1.0, 20, dtype=np.float32
+            ).reshape(1, 5, 4)
+        },
+        # Model boundaries keep the channels-last convention callers rely on,
+        # so reaching a linear operand costs a conversion at each end. Those
+        # Transposes are the layout change made explicit.
+        ("Transpose", "Reshape", "Gemm", "Reshape", "Transpose"),
+    )
+
+
+def _dynamic_matmul_case(*, batched: bool) -> ContractCase:
+    """A matrix product of two activations, which has no constant to fold.
+
+    Neither operand is a weight, so this is the form the fully-connected kernel
+    cannot express and the MatMul kernel exists for. The batched variant also
+    exercises the layout conversion: rank-3 model boundaries keep the
+    channels-last convention, so reaching the model's own axis order costs a
+    Transpose on each operand and one on the result.
+    """
+    lhs_shape = [2, 3, 4] if batched else [3, 4]
+    rhs_shape = [2, 4, 2] if batched else [4, 2]
+    out_shape = [2, 3, 2] if batched else [3, 2]
+    model = _model(
+        "dynamic_matmul",
+        [helper.make_node("MatMul", ["lhs", "rhs"], ["output"])],
+        [
+            helper.make_tensor_value_info("lhs", TensorProto.FLOAT, lhs_shape),
+            helper.make_tensor_value_info("rhs", TensorProto.FLOAT, rhs_shape),
+        ],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, out_shape)],
+    )
+    lhs = np.linspace(
+        -1.0, 1.0, int(np.prod(lhs_shape)), dtype=np.float32
+    ).reshape(lhs_shape)
+    rhs = np.linspace(
+        0.5, -0.5, int(np.prod(rhs_shape)), dtype=np.float32
+    ).reshape(rhs_shape)
+    operators = (
+        ("Transpose", "Transpose", "MatMul", "Transpose")
+        if batched else ("MatMul",)
+    )
+    return ContractCase(
+        f"float_dynamic_matmul{'_batched' if batched else ''}",
+        model,
+        model,
+        {"lhs": lhs, "rhs": rhs},
+        operators,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -2864,6 +3079,10 @@ def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
     return b"".join(chunks)
 
 
+_TENSOR_FLAG_LINEAR = 0x08
+"""Axes are stored in the order the model states them, not channels-last."""
+
+
 def _decode_outputs(
     plan: dict, raw: bytes, reference_outputs: list[Array]
 ) -> list[Array]:
@@ -2871,13 +3090,6 @@ def _decode_outputs(
     offset = 0
     if len(plan["model_outputs"]) != len(reference_outputs):
         raise AssertionError("plan and ONNX Runtime output counts differ")
-    terminal_transpose_outputs = {
-        plan["ops"][attr["op_index"]]["outputs"][0]
-        for attr in plan["op_attributes"]
-        if attr["type"] == 1
-        and plan["ops"][attr["op_index"]]["op_type"] == 29
-        and len(plan["ops"][attr["op_index"]]["outputs"]) == 1
-    }
     for tensor_index, reference in zip(plan["model_outputs"], reference_outputs):
         tensor = plan["tensors"][tensor_index]
         declared = _declared_dtype(tensor)
@@ -2895,7 +3107,12 @@ def _decode_outputs(
             raise AssertionError("runtime output file is truncated")
         value = np.frombuffer(raw[offset:end], dtype=dtype).copy()
         value = value.reshape(tensor["shape"])
-        if tensor_index not in terminal_transpose_outputs:
+        # Schema 7 records the order a tensor is stored in, so the harness reads
+        # it instead of inferring it from the shape of the producing graph. That
+        # guess could not tell a model's own terminal Transpose from a layout
+        # conversion the compiler inserted, since both are a Transpose writing a
+        # model output.
+        if not tensor["flags"] & _TENSOR_FLAG_LINEAR:
             value = _from_runtime_layout(value, reference.ndim)
         decoded.append(value)
         offset = end
@@ -3429,6 +3646,13 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _many_stage_case(),
         _tcn_16k_case(),
         _reduce_mean_case(),
+        _inference_identity_case(),
+        _channel_bias_add_case(producer_has_bias=False),
+        _channel_bias_add_case(producer_has_bias=True),
+        _float_gemm_bias_add_case(),
+        _batched_matmul_case(),
+        _dynamic_matmul_case(batched=False),
+        _dynamic_matmul_case(batched=True),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

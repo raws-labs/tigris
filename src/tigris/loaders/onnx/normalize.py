@@ -37,27 +37,38 @@ Passes applied in sequence (matches ``normalize()`` call order):
 
 import numpy as np
 
-from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, TensorInfo
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    Layout,
+    OpNode,
+    QuantParam,
+    TensorInfo,
+)
 
 
 def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
+    ag = _drop_inference_identities(ag)
     ag = _fold_constant_ops(ag)
     ag = _fold_qdq(ag)
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
     ag = _fold_constant_add_into_bias(ag)
+    ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
     ag = _relabel_depthwise(ag)
     ag = _relabel_conv1d(ag)
     ag = _clip_to_relu6(ag)
     ag = _reduce_mean_to_gap(ag)
     ag = _fold_shape_ops(ag)
+    ag = _relabel_shape_ops_to_reshape(ag)
     ag = _extract_resize_scales(ag)
     ag = _strip_metadata_inputs(ag)
     ag = _normalize_concat_axis(ag)
     ag = _validate_transposes(ag)
     ag = _absorb_activations(ag)
+    ag = _assign_tensor_layouts(ag)
+    ag = _lower_linear_matmul(ag)
     ag = _drop_unreferenced_weights(ag)
     return ag
 
@@ -100,6 +111,239 @@ def _strip_metadata_inputs(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+
+# Operators whose activation operands are spatial pictures: the runtime holds
+# them channels-last and the kernels index them that way.
+_SPATIAL_LAYOUT_OPS = frozenset({
+    "Conv",
+    "DepthwiseConv",
+    "Conv1D",
+    "ConvTranspose",
+    "MaxPool",
+    "AveragePool",
+    "GlobalAveragePool",
+    "Resize",
+})
+
+# Operators whose operands already list their axes in storage order. A matrix
+# product reduces over its last axis, so permuting it channels-last would move
+# the reduction axis and compute something else.
+_LINEAR_LAYOUT_OPS = frozenset({
+    "MatMul",
+})
+
+
+def _required_layout(op: OpNode) -> Layout | None:
+    """The layout an operator needs, or None when it works in either."""
+    if op.op_type in _SPATIAL_LAYOUT_OPS:
+        return Layout.SPATIAL
+    if op.op_type in _LINEAR_LAYOUT_OPS:
+        return Layout.LINEAR
+    return None
+
+
+def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Give every tensor a layout and convert where producer and consumer differ.
+
+    Layout only has consequences at rank 3 and rank 4, where ONNX axis order
+    and storage order disagree. An operator either requires one of the two or
+    works in whichever it is handed, and a tensor carries whatever its producer
+    wrote. Where a consumer needs the other one, an explicit Transpose converts
+    it: the emitter turns an identity permutation across differing layouts into
+    the physical permutation, so the conversion costs no new machinery.
+
+    A terminal Transpose stays linear for the reason it always did: its output
+    is a model-output boundary that keeps the observable ONNX shape and order.
+    """
+    converted: dict[tuple[str, Layout], str] = {}
+    rewritten: list[OpNode] = []
+    counter = 0
+
+    for op in ag.ops:
+        required = _required_layout(op)
+        if required is not None:
+            for position, name in enumerate(op.inputs):
+                if not name:
+                    continue
+                info = ag.tensors.get(name)
+                if info is None or info.is_constant:
+                    continue
+                # Rank 2 and below cannot disagree, so never pay for a copy.
+                if len(info.shape) < 3 or info.layout is required:
+                    continue
+
+                key = (name, required)
+                target = converted.get(key)
+                if target is None:
+                    counter += 1
+                    target = f"{name}_to_{required.value}_{counter}"
+                    ag.tensors[target] = TensorInfo(
+                        name=target,
+                        shape=info.shape,
+                        dtype=info.dtype,
+                        quant=info.quant,
+                        layout=required,
+                    )
+                    rewritten.append(OpNode(
+                        name=f"layout_{counter}",
+                        op_type="Transpose",
+                        inputs=[name],
+                        outputs=[target],
+                        attrs={"perm": list(range(len(info.shape)))},
+                    ))
+                    converted[key] = target
+                op.inputs[position] = target
+
+        produced = required
+        if produced is None:
+            produced = Layout.SPATIAL
+            for name in op.inputs:
+                info = ag.tensors.get(name) if name else None
+                if info is not None and not info.is_constant:
+                    produced = info.layout
+                    break
+        for name in op.outputs:
+            info = ag.tensors.get(name)
+            if info is not None:
+                info.layout = produced
+
+        rewritten.append(op)
+
+    ag.ops = rewritten
+
+    # Model inputs and outputs keep the convention callers already rely on, so
+    # a boundary that ended up linear is converted back. Internal tensors are
+    # free to be either; the interface is not.
+    terminal_transpose = {
+        op.outputs[0]
+        for op in ag.ops
+        if op.op_type == "Transpose" and len(op.outputs) == 1
+        and op.outputs[0] in ag.model_outputs
+    }
+    for name in list(ag.model_outputs):
+        info = ag.tensors.get(name)
+        if info is None or name in terminal_transpose:
+            continue
+        if info.layout is Layout.SPATIAL or len(info.shape) < 3:
+            continue
+        counter += 1
+        produced = f"{name}_linear_{counter}"
+        ag.tensors[produced] = TensorInfo(
+            name=produced, shape=info.shape, dtype=info.dtype,
+            quant=info.quant, layout=info.layout)
+        for op in ag.ops:
+            op.outputs = [produced if out == name else out for out in op.outputs]
+            op.inputs = [produced if inp == name else inp for inp in op.inputs]
+        info.layout = Layout.SPATIAL
+        ag.ops.append(OpNode(
+            name=f"layout_out_{counter}",
+            op_type="Transpose",
+            inputs=[produced],
+            outputs=[name],
+            attrs={"perm": list(range(len(info.shape)))},
+        ))
+
+    # A terminal Transpose is an explicit model-output boundary.
+    for name in terminal_transpose:
+        info = ag.tensors.get(name)
+        if info is not None:
+            info.layout = Layout.LINEAR
+
+    for step, op in enumerate(ag.ops):
+        op.step = step
+    return ag
+
+
+
+def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Express a batched constant-weight matrix product with the FC kernel.
+
+    ONNX MatMul reduces over the last axis and batches over everything before
+    it. Once the operand is linear its rows are contiguous, so collapsing the
+    leading axes is a pure reshape and the product becomes the rank-2 Gemm the
+    fully-connected kernel already computes. Reshaping the result back restores
+    the shape the model declares.
+
+    Runs after layouts are assigned, because the collapse is only free on a
+    linear tensor; on a spatial one the rows are interleaved. A product whose
+    second operand is not a constant matrix is left alone: it needs a kernel
+    that multiplies two activations, which the runtime does not have.
+    """
+    consumers: dict[str, int] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            consumers[name] = consumers.get(name, 0) + 1
+
+    rewritten: list[OpNode] = []
+    counter = 0
+
+    for op in ag.ops:
+        if (op.op_type != "MatMul" or len(op.inputs) != 2
+                or len(op.outputs) != 1):
+            rewritten.append(op)
+            continue
+
+        weight_name = op.inputs[1]
+        weight = ag.weight_data.get(weight_name)
+        data_info = ag.tensors.get(op.inputs[0])
+        out_info = ag.tensors.get(op.outputs[0])
+        if (weight is None or weight.ndim != 2 or data_info is None
+                or out_info is None or len(data_info.shape) < 3
+                or data_info.layout is not Layout.LINEAR
+                or consumers.get(weight_name, 0) != 1):
+            rewritten.append(op)
+            continue
+
+        reduction = int(data_info.shape[-1])
+        if reduction != int(weight.shape[0]):
+            rewritten.append(op)
+            continue
+        rows = 1
+        for extent in data_info.shape[:-1]:
+            rows *= int(extent)
+        columns = int(weight.shape[1])
+
+        counter += 1
+        flat_in = f"{op.inputs[0]}_rows_{counter}"
+        flat_out = f"{op.outputs[0]}_rows_{counter}"
+        ag.tensors[flat_in] = TensorInfo(
+            name=flat_in, shape=(rows, reduction), dtype=data_info.dtype,
+            quant=data_info.quant, layout=Layout.LINEAR)
+        ag.tensors[flat_out] = TensorInfo(
+            name=flat_out, shape=(rows, columns), dtype=out_info.dtype,
+            quant=out_info.quant, layout=Layout.LINEAR)
+
+        # The FC kernel indexes the weight as W[oc * IC + ic], which is Gemm
+        # with transB=1; ONNX MatMul states it the other way round.
+        ag.weight_data[weight_name] = np.ascontiguousarray(weight.T)
+        weight_info = ag.tensors.get(weight_name)
+        if weight_info is not None:
+            weight_info.shape = tuple(reversed(weight_info.shape))
+            quant = weight_info.quant
+            if quant is not None and quant.axis in (0, 1):
+                weight_info.quant = QuantParam(
+                    scale=quant.scale,
+                    zero_point=quant.zero_point,
+                    axis=1 - quant.axis,
+                )
+
+        rewritten.append(OpNode(
+            name=f"{op.name}_rows", op_type="Reshape",
+            inputs=[op.inputs[0]], outputs=[flat_in]))
+        rewritten.append(OpNode(
+            name=op.name, op_type="Gemm",
+            inputs=[flat_in, weight_name], outputs=[flat_out],
+            attrs={"transB": 1}))
+        rewritten.append(OpNode(
+            name=f"{op.name}_shape", op_type="Reshape",
+            inputs=[flat_out], outputs=[op.outputs[0]]))
+
+    ag.ops = rewritten
+    for step, op in enumerate(ag.ops):
+        op.step = step
+    return ag
+
+
 def _drop_unreferenced_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Forget constants no remaining operator consumes.
 
@@ -109,6 +353,111 @@ def _drop_unreferenced_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
     referenced = {name for op in ag.ops for name in op.inputs if name}
     for name in [n for n in ag.weight_data if n not in referenced]:
         del ag.weight_data[name]
+    return ag
+
+
+# Inference-time identities and shape relabels
+
+
+_INFERENCE_IDENTITY_OPS = frozenset({"Dropout", "Identity"})
+
+
+def _drop_inference_identities(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Remove operators that are the identity at inference.
+
+    Dropout scales nothing once training_mode is false, and Identity never did.
+    Exporters leave both in place, and neither has a plan opcode, so a stock
+    export is rejected for operators that would compute nothing. Dropout's
+    optional second output is a mask that only training consumes; an op whose
+    mask is actually read is left alone rather than silently dropped.
+    """
+    consumed = {name for op in ag.ops for name in op.inputs if name}
+    outputs_kept = set(ag.model_outputs)
+
+    surviving: list[OpNode] = []
+    rename: dict[str, str] = {}
+    for op in ag.ops:
+        if op.op_type not in _INFERENCE_IDENTITY_OPS:
+            surviving.append(op)
+            continue
+        if len(op.outputs) > 1 and any(
+            out in consumed or out in outputs_kept for out in op.outputs[1:]
+        ):
+            surviving.append(op)
+            continue
+        source = op.inputs[0]
+        rename[op.outputs[0]] = rename.get(source, source)
+        for stale in op.outputs[1:]:
+            ag.tensors.pop(stale, None)
+
+    if not rename:
+        return ag
+
+    def resolve(name: str) -> str:
+        seen: set[str] = set()
+        while name in rename and name not in seen:
+            seen.add(name)
+            name = rename[name]
+        return name
+
+    for op in surviving:
+        op.inputs = [resolve(n) if n else n for n in op.inputs]
+    ag.model_outputs = [resolve(n) for n in ag.model_outputs]
+
+    # A removed op's output tensor keeps the graph's declared name when it is a
+    # model output, so only drop tensors nothing refers to any more.
+    live = {n for op in surviving for n in op.inputs + op.outputs if n}
+    live |= set(ag.model_inputs) | set(ag.model_outputs)
+    for name in [n for n in rename if n not in live]:
+        ag.tensors.pop(name, None)
+
+    ag.ops = surviving
+    return ag
+
+
+def _stored_extent(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Non-unit axis sizes in the order the runtime serializes them.
+
+    The IR keeps ONNX NCHW/NCL while the runtime stores NHWC/NLC, so the same
+    element sequence is described by different axis orders at different ranks.
+    Axes of size 1 contribute no stride, so dropping them leaves exactly the
+    sequence the runtime walks. Two shapes with equal results hold their
+    elements in the same order.
+    """
+    rank = len(shape)
+    if rank == 4:
+        order = (0, 2, 3, 1)   # N, H, W, C
+    elif rank == 3:
+        order = (0, 2, 1)      # N, L, C
+    else:
+        order = tuple(range(rank))
+    return tuple(shape[axis] for axis in order if shape[axis] != 1)
+
+
+def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Relabel Squeeze and Unsqueeze to Reshape where element order survives.
+
+    Both only add or drop axes of size 1, which is what Reshape does, and
+    Reshape has a kernel while they do not. The relabel is only sound when the
+    runtime layout walks the elements in the same order on both sides: a rank-4
+    to rank-3 squeeze that removes the channel axis turns NHWC (h, w) order into
+    NLC (w, h) order, which would transpose the data silently. Anything that
+    fails the check keeps its original op type and is reported as unsupported.
+    """
+    for op in ag.ops:
+        if op.op_type not in ("Squeeze", "Unsqueeze"):
+            continue
+        src = ag.tensors.get(op.inputs[0])
+        dst = ag.tensors.get(op.outputs[0])
+        if src is None or dst is None:
+            continue
+        if _stored_extent(tuple(src.shape)) != _stored_extent(tuple(dst.shape)):
+            continue
+        op.op_type = "Reshape"
+        # Squeeze and Unsqueeze carry their axes as a second input or an
+        # attribute; the plan takes the output shape from the tensor table.
+        op.inputs = op.inputs[:1]
+        op.attrs.pop("axes", None)
     return ag
 
 
@@ -722,6 +1071,126 @@ def _fold_constant_add_into_bias(ag: AnalyzedGraph) -> AnalyzedGraph:
         if result_info is not None:
             result_info.dtype = product_info.dtype
             result_info.quant = product_info.quant
+        producer.outputs = [result]
+        del ag.tensors[product]
+        removed.add(i)
+
+    if removed:
+        ag.ops = [op for idx, op in enumerate(ag.ops) if idx not in removed]
+        for step, op in enumerate(ag.ops):
+            op.step = step
+
+    return ag
+
+
+def _channel_broadcast_size(
+    constant_shape: tuple[int, ...], reference_shape: tuple[int, ...]
+) -> int | None:
+    """Channel count when a constant broadcasts only along the channel axis.
+
+    ONNX right-aligns operands, so ``(C,)``, ``(C, 1, 1)`` and ``(1, C, 1, 1)``
+    all address the channel axis of an NCHW activation while ``(1, 1, 1, W)``
+    addresses width. Size alone cannot tell those apart when C equals W, so the
+    aligned position is what decides.
+    """
+    if len(reference_shape) < 2 or len(constant_shape) > len(reference_shape):
+        return None
+    channels = reference_shape[1]
+    if channels <= 0:
+        return None
+    offset = len(reference_shape) - len(constant_shape)
+    for axis, extent in enumerate(constant_shape):
+        aligned = axis + offset
+        if aligned == 1:
+            if extent != channels:
+                return None
+        elif extent != 1:
+            return None
+    # A constant shorter than the reference must still reach the channel axis.
+    if offset > 1:
+        return None
+    return channels
+
+
+def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Fold a float per-channel constant Add into its producer's bias.
+
+    Exporters emit a per-channel bias as a standalone Add whenever they do not
+    fuse it, and a decomposed BatchNorm leaves the same shape behind. The Add
+    kernel takes two operands of one shape, so such a graph is rejected for
+    broadcasting it cannot do, even though the producer already has a bias slot
+    holding exactly this quantity. Adding into that slot is exact for float.
+
+    The quantized form is handled by _fold_constant_add_into_bias, which has to
+    requantize into the accumulator domain. Here the bias is already float.
+    """
+    output_to_op: dict[str, int] = {}
+    for i, op in enumerate(ag.ops):
+        for out in op.outputs:
+            output_to_op[out] = i
+
+    consumers: dict[str, list[int]] = {}
+    for i, op in enumerate(ag.ops):
+        for inp in op.inputs:
+            consumers.setdefault(inp, []).append(i)
+
+    removed: set[int] = set()
+
+    for i, op in enumerate(ag.ops):
+        if op.op_type != "Add" or len(op.inputs) != 2 or len(op.outputs) != 1:
+            continue
+        constants = [n for n in op.inputs if n in ag.weight_data]
+        if len(constants) != 1:
+            continue
+        const_name = constants[0]
+        product = next(n for n in op.inputs if n != const_name)
+
+        producer_idx = output_to_op.get(product)
+        if producer_idx is None or producer_idx in removed:
+            continue
+        producer = ag.ops[producer_idx]
+        if producer.op_type not in _BIAS_PRODUCERS:
+            continue
+        if len(producer.inputs) not in (2, 3):
+            continue
+        # Folding past another consumer would change what that consumer reads.
+        if consumers.get(product, []) != [i]:
+            continue
+
+        product_info = ag.tensors.get(product)
+        if product_info is None or product_info.quant is not None:
+            continue
+
+        constant = ag.weight_data[const_name]
+        if constant.dtype != np.float32:
+            continue
+        channels = _channel_broadcast_size(
+            tuple(constant.shape), tuple(product_info.shape)
+        )
+        if channels is None or constant.size != channels:
+            continue
+
+        addend = constant.reshape(-1).astype(np.float32)
+        if len(producer.inputs) == 3:
+            existing = ag.weight_data.get(producer.inputs[2])
+            if existing is None or existing.dtype != np.float32:
+                continue
+            if existing.reshape(-1).size != channels:
+                continue
+            ag.weight_data[producer.inputs[2]] = (
+                existing.reshape(-1).astype(np.float32) + addend
+            )
+        else:
+            ag.weight_data[const_name] = addend
+            if const_name in ag.tensors:
+                ag.tensors[const_name].shape = (channels,)
+            producer.inputs.append(const_name)
+
+        # Keep the Add's output name so the plan still names what the model did.
+        result = op.outputs[0]
+        result_info = ag.tensors.get(result)
+        if result_info is not None:
+            result_info.dtype = product_info.dtype
         producer.outputs = [result]
         del ag.tensors[product]
         removed.add(i)

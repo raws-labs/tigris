@@ -12,7 +12,7 @@ from tigris import (
     TILE_AXIS_HW,
     TILE_AXIS_NONE,
 )
-from tigris.graph.ir import AnalyzedGraph, OpNode
+from tigris.graph.ir import AnalyzedGraph, Layout, OpNode
 
 from .defs import (
     ACT_NONE,
@@ -57,6 +57,7 @@ from .defs import (
     STAGE_STRUCT,
     STAGE_TILE_PLAN_INDEX_OFFSET,
     TENSOR_FLAG_CONSTANT,
+    TENSOR_FLAG_LINEAR,
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
     TENSOR_STRUCT,
@@ -637,7 +638,6 @@ def _build_tensors(
     strings: _StringTable,
     shapes: _ShapePool,
     quant_idx_map: dict[str, int] | None = None,
-    preserve_layout_names: set[str] | None = None,
 ) -> tuple[bytes, dict[str, int]]:
     """Build tensor table. Returns (bytes, name->index map)."""
     buf = bytearray()
@@ -654,16 +654,14 @@ def _build_tensors(
 
         name_off = strings.add(name)
 
-        # Internal tensors use NHWC/NLC layout. A terminal Transpose is an
-        # explicit model-output boundary, so its output keeps the observable
-        # ONNX shape and element ordering instead.
+        # The tensor states how its axes map onto storage order. A spatial
+        # activation is held NHWC/NLC; a linear one is already in that order.
         shape = info.shape
-        if preserve_layout_names and name in preserve_layout_names:
-            pass
-        elif len(shape) == 4:
-            shape = (shape[0], shape[2], shape[3], shape[1])
-        elif len(shape) == 3:
-            shape = (shape[0], shape[2], shape[1])
+        if info.layout is Layout.SPATIAL:
+            if len(shape) == 4:
+                shape = (shape[0], shape[2], shape[3], shape[1])
+            elif len(shape) == 3:
+                shape = (shape[0], shape[2], shape[1])
 
         shape_off, ndim = shapes.add(shape)
 
@@ -674,6 +672,8 @@ def _build_tensors(
             flags |= TENSOR_FLAG_MODEL_INPUT
         if name in ag.model_outputs:
             flags |= TENSOR_FLAG_MODEL_OUTPUT
+        if info.layout is Layout.LINEAR:
+            flags |= TENSOR_FLAG_LINEAR
 
         qp_idx = quant_idx_map.get(name, no_qp) if quant_idx_map else no_qp
 
@@ -720,9 +720,11 @@ def _declared_interface_dtype(ag: AnalyzedGraph, name: str) -> int | None:
     return None
 
 
-def _serialized_axis_map(rank: int, preserve_layout: bool = False) -> list[int]:
+def _serialized_axis_map(
+    rank: int, layout: Layout = Layout.SPATIAL
+) -> list[int]:
     """Map an ONNX axis to its serialized tensor axis."""
-    if preserve_layout:
+    if layout is Layout.LINEAR:
         return list(range(rank))
     if rank == 4:
         return [0, 3, 1, 2]  # NCHW -> NHWC
@@ -732,7 +734,7 @@ def _serialized_axis_map(rank: int, preserve_layout: bool = False) -> list[int]:
 
 
 def _build_op_attributes(
-    ag: AnalyzedGraph, tensor_idx: dict[str, int], preserve_layout_names: set[str]
+    ag: AnalyzedGraph, tensor_idx: dict[str, int]
 ) -> bytes:
     """Build optional, typed per-operator attributes.
 
@@ -748,12 +750,11 @@ def _build_op_attributes(
         if input_name not in tensor_idx or output_name not in tensor_idx:
             raise ValueError(f"Transpose '{op.name}' must use runtime tensors")
         input_info = ag.tensors[input_name]
+        output_info = ag.tensors[output_name]
         rank = len(input_info.shape)
         raw_perm = [int(axis) for axis in op.attrs["perm"]]
-        input_axes = _serialized_axis_map(rank)
-        output_axes = _serialized_axis_map(
-            rank, output_name in preserve_layout_names
-        )
+        input_axes = _serialized_axis_map(rank, input_info.layout)
+        output_axes = _serialized_axis_map(rank, output_info.layout)
         output_raw_by_serialized = [0] * rank
         for raw_axis, serialized_axis in enumerate(output_axes):
             output_raw_by_serialized[serialized_axis] = raw_axis
@@ -1108,6 +1109,22 @@ def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
                 w_name = inp
                 break
         if not w_name:
+            # A matrix product of two activations has no constant to read the
+            # second scale from; the other operand carries it, per-tensor.
+            if op.op_type == "MatMul" and len(op.inputs) == 2:
+                other = ag.tensors.get(
+                    op.inputs[1] if op.inputs[0] == in_name else op.inputs[0]
+                )
+                if other is not None and other.quant is not None:
+                    out0 = float(out_scale[0])
+                    effective[out_name] = np.array(
+                        [
+                            in_scale * float(other.quant.scale[0]) / out0
+                            if out0 != 0
+                            else 0.0
+                        ],
+                        dtype=np.float64,
+                    )
             continue
 
         w_info = ag.tensors.get(w_name)
@@ -1351,14 +1368,8 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     quant_data, quant_idx_map = _build_quant_params(ag)
 
     # Add model I/O to index pool
-    preserve_output_layouts = {
-        op.outputs[0]
-        for op in ag.ops
-        if op.op_type == "Transpose" and len(op.outputs) == 1 and
-        op.outputs[0] in ag.model_outputs
-    }
     tensor_data, tensor_idx = _build_tensors(
-        ag, strings, shapes, quant_idx_map or None, preserve_output_layouts
+        ag, strings, shapes, quant_idx_map or None
     )
 
     model_inp_indices = [tensor_idx[n] for n in ag.model_inputs if n in tensor_idx]
@@ -1367,7 +1378,7 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
     op_attributes_data = _build_op_attributes(
-        ag, tensor_idx, preserve_output_layouts
+        ag, tensor_idx
     )
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
     tile_data, stage_to_tile = _build_tile_plans(ag)

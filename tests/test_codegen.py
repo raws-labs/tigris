@@ -32,21 +32,22 @@ from tigris.loaders import load_model
 
 
 @pytest.fixture
-def quantized_matmul_plan(tmp_path):
-    """A QDQ MatMul plan: schema-known, but unsupported by every dispatcher.
+def unsupported_operator_plan(tmp_path):
+    """A QDQ plan holding an operator no dispatcher can execute.
 
-    The second operand is a model input rather than a constant, so it stays a
-    MatMul: a constant-weight product is relabeled to Gemm and would be
-    supported.
+    Sub has a schema opcode and no kernel on any backend, and normalization
+    leaves it alone, so it reaches the plan intact. The operator itself is not
+    the point: this fixture exists so codegen's capability check has something
+    to refuse.
     """
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 4]
     )
     weight_input = helper.make_tensor_value_info(
-        "weight", TensorProto.FLOAT, [4, 3]
+        "weight", TensorProto.FLOAT, [1, 4]
     )
     model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 3]
+        "output", TensorProto.FLOAT, [1, 4]
     )
     input_scale = numpy_helper.from_array(
         np.array([0.05], dtype=np.float32), "input_scale"
@@ -89,11 +90,11 @@ def quantized_matmul_plan(tmp_path):
             ["weight_dq"],
         ),
         helper.make_node(
-            "MatMul", ["input_dq", "weight_dq"], ["matmul_out"], name="matmul"
+            "Sub", ["input_dq", "weight_dq"], ["sub_out"], name="unsupported"
         ),
         helper.make_node(
             "QuantizeLinear",
-            ["matmul_out", "output_scale", "output_zp"],
+            ["sub_out", "output_scale", "output_zp"],
             ["output_q"],
         ),
         helper.make_node(
@@ -104,7 +105,7 @@ def quantized_matmul_plan(tmp_path):
     ]
     graph = helper.make_graph(
         nodes,
-        "quantized_matmul",
+        "quantized_unsupported",
         [model_input, weight_input],
         [model_output],
         initializer=[
@@ -122,14 +123,14 @@ def quantized_matmul_plan(tmp_path):
     model.ir_version = 8
     onnx.checker.check_model(model)
 
-    model_path = tmp_path / "quantized_matmul.onnx"
+    model_path = tmp_path / "quantized_unsupported.onnx"
     onnx.save(model, model_path)
     analyzed = _full_pipeline(model_path, budget=4096)
     assert analyzed.is_quantized
-    assert [op.op_type for op in analyzed.ops] == ["MatMul"]
+    assert [op.op_type for op in analyzed.ops] == ["Sub"]
 
-    plan_path = tmp_path / "quantized_matmul.tgrs"
-    # MatMul has no runtime route on any backend, so validate_operator_support
+    plan_path = tmp_path / "quantized_unsupported.tgrs"
+    # Sub has no runtime route on any backend, so validate_operator_support
     # now correctly rejects it at compile time (the fail-closed gate this
     # fixture predates). This fixture exists to exercise codegen's own,
     # separate defense-in-depth capability check against an already-serialized
@@ -511,16 +512,16 @@ def test_float_accelerated_backend_declares_reference_fallback(
 
 
 @pytest.mark.parametrize("backend", ["reference", "esp-nn", "cmsis-nn"])
-def test_quantized_matmul_codegen_fails_before_output(
-    quantized_matmul_plan, tmp_path, backend
+def test_unsupported_operator_codegen_fails_before_output(
+    unsupported_operator_plan, tmp_path, backend
 ):
-    output = tmp_path / f"matmul-{backend}.c"
+    output = tmp_path / f"unsupported-{backend}.c"
 
     result = CliRunner().invoke(
         cli,
         [
             "codegen",
-            str(quantized_matmul_plan),
+            str(unsupported_operator_plan),
             "--backend",
             backend,
             "--output",
@@ -530,12 +531,12 @@ def test_quantized_matmul_codegen_fails_before_output(
 
     assert result.exit_code != 0
     assert f"Backend '{backend}' cannot execute this int8 plan" in result.output
-    assert "matmul (MatMul)" in result.output
+    assert "unsupported (Sub)" in result.output
     assert not output.exists()
 
 
 def test_codegen_preserves_existing_output_on_capability_failure(
-    quantized_matmul_plan, tmp_path
+    unsupported_operator_plan, tmp_path
 ):
     output = tmp_path / "existing.c"
     output.write_text("sentinel")
@@ -544,7 +545,7 @@ def test_codegen_preserves_existing_output_on_capability_failure(
         cli,
         [
             "codegen",
-            str(quantized_matmul_plan),
+            str(unsupported_operator_plan),
             "--backend",
             "reference",
             "--output",

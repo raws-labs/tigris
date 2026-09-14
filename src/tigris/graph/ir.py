@@ -1,6 +1,7 @@
 """Core dataclasses for the tigris graph IR."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import numpy as np
@@ -35,6 +36,24 @@ class QuantParam:
     axis: int = -1          # channel axis for per-channel (-1 = per-tensor)
 
 
+class Layout(Enum):
+    """How a tensor's IR axes map onto the order the runtime stores them.
+
+    The IR states shapes the way ONNX does. The runtime stores activations
+    channels-last, so the two disagree at rank 3 and rank 4 and the emitter has
+    to permute. Which permutation is right is a property of the tensor, not of
+    its rank: a convolution activation is spatial and must be permuted, while a
+    matrix operand already lists its axes in storage order and must not be.
+    Recording it per tensor is what lets both live in one graph.
+    """
+
+    SPATIAL = "spatial"
+    """Rank 4 is NCHW stored NHWC, rank 3 is NCL stored NLC."""
+
+    LINEAR = "linear"
+    """Axes are already in storage order; the emitter permutes nothing."""
+
+
 @dataclass
 class TensorInfo:
     """Static metadata for a single tensor in the graph."""
@@ -44,6 +63,7 @@ class TensorInfo:
     dtype: int  # ONNX TensorProto.DataType enum value
     is_constant: bool = False  # weights / initializers
     quant: QuantParam | None = None
+    layout: Layout = Layout.SPATIAL
 
     @property
     def elem_size(self) -> int:
