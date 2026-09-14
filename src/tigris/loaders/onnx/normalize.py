@@ -111,29 +111,145 @@ def _strip_metadata_inputs(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 
+# Operators whose activation operands are spatial pictures: the runtime holds
+# them channels-last and the kernels index them that way.
+_SPATIAL_LAYOUT_OPS = frozenset({
+    "Conv",
+    "DepthwiseConv",
+    "Conv1D",
+    "ConvTranspose",
+    "MaxPool",
+    "AveragePool",
+    "GlobalAveragePool",
+    "Resize",
+})
+
+# Operators whose operands already list their axes in storage order. A matrix
+# product reduces over its last axis, so permuting it channels-last would move
+# the reduction axis and compute something else.
+_LINEAR_LAYOUT_OPS: frozenset[str] = frozenset()
+
+
+def _required_layout(op: OpNode) -> Layout | None:
+    """The layout an operator needs, or None when it works in either."""
+    if op.op_type in _SPATIAL_LAYOUT_OPS:
+        return Layout.SPATIAL
+    if op.op_type in _LINEAR_LAYOUT_OPS:
+        return Layout.LINEAR
+    return None
+
+
 def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Record how each tensor's axes map onto the order the runtime stores them.
+    """Give every tensor a layout and convert where producer and consumer differ.
 
-    Every operator the compiler routes today works on spatial activations, so
-    the answer is Layout.SPATIAL nearly everywhere and TensorInfo already
-    defaults to it. The exception is a terminal Transpose: its output is an
-    explicit model-output boundary that keeps the observable ONNX shape and
-    element order, which is exactly Layout.LINEAR.
+    Layout only has consequences at rank 3 and rank 4, where ONNX axis order
+    and storage order disagree. An operator either requires one of the two or
+    works in whichever it is handed, and a tensor carries whatever its producer
+    wrote. Where a consumer needs the other one, an explicit Transpose converts
+    it: the emitter turns an identity permutation across differing layouts into
+    the physical permutation, so the conversion costs no new machinery.
 
-    Stating it on the tensor is what lets the emitter stop inferring the
-    permutation from rank, and is the seam an operator with different needs
-    plugs into.
+    A terminal Transpose stays linear for the reason it always did: its output
+    is a model-output boundary that keeps the observable ONNX shape and order.
     """
+    converted: dict[tuple[str, Layout], str] = {}
+    rewritten: list[OpNode] = []
+    counter = 0
+
     for op in ag.ops:
-        if op.op_type != "Transpose" or len(op.outputs) != 1:
+        required = _required_layout(op)
+        if required is not None:
+            for position, name in enumerate(op.inputs):
+                if not name:
+                    continue
+                info = ag.tensors.get(name)
+                if info is None or info.is_constant:
+                    continue
+                # Rank 2 and below cannot disagree, so never pay for a copy.
+                if len(info.shape) < 3 or info.layout is required:
+                    continue
+
+                key = (name, required)
+                target = converted.get(key)
+                if target is None:
+                    counter += 1
+                    target = f"{name}_to_{required.value}_{counter}"
+                    ag.tensors[target] = TensorInfo(
+                        name=target,
+                        shape=info.shape,
+                        dtype=info.dtype,
+                        quant=info.quant,
+                        layout=required,
+                    )
+                    rewritten.append(OpNode(
+                        name=f"layout_{counter}",
+                        op_type="Transpose",
+                        inputs=[name],
+                        outputs=[target],
+                        attrs={"perm": list(range(len(info.shape)))},
+                    ))
+                    converted[key] = target
+                op.inputs[position] = target
+
+        produced = required
+        if produced is None:
+            produced = Layout.SPATIAL
+            for name in op.inputs:
+                info = ag.tensors.get(name) if name else None
+                if info is not None and not info.is_constant:
+                    produced = info.layout
+                    break
+        for name in op.outputs:
+            info = ag.tensors.get(name)
+            if info is not None:
+                info.layout = produced
+
+        rewritten.append(op)
+
+    ag.ops = rewritten
+
+    # Model inputs and outputs keep the convention callers already rely on, so
+    # a boundary that ended up linear is converted back. Internal tensors are
+    # free to be either; the interface is not.
+    terminal_transpose = {
+        op.outputs[0]
+        for op in ag.ops
+        if op.op_type == "Transpose" and len(op.outputs) == 1
+        and op.outputs[0] in ag.model_outputs
+    }
+    for name in list(ag.model_outputs):
+        info = ag.tensors.get(name)
+        if info is None or name in terminal_transpose:
             continue
-        name = op.outputs[0]
-        if name not in ag.model_outputs:
+        if info.layout is Layout.SPATIAL or len(info.shape) < 3:
             continue
+        counter += 1
+        produced = f"{name}_linear_{counter}"
+        ag.tensors[produced] = TensorInfo(
+            name=produced, shape=info.shape, dtype=info.dtype,
+            quant=info.quant, layout=info.layout)
+        for op in ag.ops:
+            op.outputs = [produced if out == name else out for out in op.outputs]
+            op.inputs = [produced if inp == name else inp for inp in op.inputs]
+        info.layout = Layout.SPATIAL
+        ag.ops.append(OpNode(
+            name=f"layout_out_{counter}",
+            op_type="Transpose",
+            inputs=[produced],
+            outputs=[name],
+            attrs={"perm": list(range(len(info.shape)))},
+        ))
+
+    # A terminal Transpose is an explicit model-output boundary.
+    for name in terminal_transpose:
         info = ag.tensors.get(name)
         if info is not None:
             info.layout = Layout.LINEAR
+
+    for step, op in enumerate(ag.ops):
+        op.step = step
     return ag
+
 
 
 def _drop_unreferenced_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
