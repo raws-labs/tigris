@@ -49,6 +49,13 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     "Add": TileCategory.POINTWISE,
     "Mul": TileCategory.POINTWISE,
     "Concat": TileCategory.POINTWISE,
+    # Softmax normalizes along the final stored dimension, which is the channel
+    # axis in both NHWC and NLC. Neither tile axis cuts it: the height/length
+    # axis and the width axis are both ahead of it, so a tile always holds
+    # whole normalization rows and the kernel needs nothing from its
+    # neighbours. Shape-preserving and halo-free, which is what POINTWISE means
+    # here, even though the operator itself is a reduction.
+    "Softmax": TileCategory.POINTWISE,
 }
 
 
@@ -72,6 +79,7 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Relu6",
     "Sigmoid",
     "Tanh",
+    "Softmax",
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
