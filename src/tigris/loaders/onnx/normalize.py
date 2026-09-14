@@ -42,6 +42,7 @@ from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, TensorInfo
 
 def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
+    ag = _drop_inference_identities(ag)
     ag = _fold_constant_ops(ag)
     ag = _fold_qdq(ag)
     ag = _relabel_matmul_to_gemm(ag)
@@ -53,6 +54,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _clip_to_relu6(ag)
     ag = _reduce_mean_to_gap(ag)
     ag = _fold_shape_ops(ag)
+    ag = _relabel_shape_ops_to_reshape(ag)
     ag = _extract_resize_scales(ag)
     ag = _strip_metadata_inputs(ag)
     ag = _normalize_concat_axis(ag)
@@ -109,6 +111,111 @@ def _drop_unreferenced_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
     referenced = {name for op in ag.ops for name in op.inputs if name}
     for name in [n for n in ag.weight_data if n not in referenced]:
         del ag.weight_data[name]
+    return ag
+
+
+# Inference-time identities and shape relabels
+
+
+_INFERENCE_IDENTITY_OPS = frozenset({"Dropout", "Identity"})
+
+
+def _drop_inference_identities(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Remove operators that are the identity at inference.
+
+    Dropout scales nothing once training_mode is false, and Identity never did.
+    Exporters leave both in place, and neither has a plan opcode, so a stock
+    export is rejected for operators that would compute nothing. Dropout's
+    optional second output is a mask that only training consumes; an op whose
+    mask is actually read is left alone rather than silently dropped.
+    """
+    consumed = {name for op in ag.ops for name in op.inputs if name}
+    outputs_kept = set(ag.model_outputs)
+
+    surviving: list[OpNode] = []
+    rename: dict[str, str] = {}
+    for op in ag.ops:
+        if op.op_type not in _INFERENCE_IDENTITY_OPS:
+            surviving.append(op)
+            continue
+        if len(op.outputs) > 1 and any(
+            out in consumed or out in outputs_kept for out in op.outputs[1:]
+        ):
+            surviving.append(op)
+            continue
+        source = op.inputs[0]
+        rename[op.outputs[0]] = rename.get(source, source)
+        for stale in op.outputs[1:]:
+            ag.tensors.pop(stale, None)
+
+    if not rename:
+        return ag
+
+    def resolve(name: str) -> str:
+        seen: set[str] = set()
+        while name in rename and name not in seen:
+            seen.add(name)
+            name = rename[name]
+        return name
+
+    for op in surviving:
+        op.inputs = [resolve(n) if n else n for n in op.inputs]
+    ag.model_outputs = [resolve(n) for n in ag.model_outputs]
+
+    # A removed op's output tensor keeps the graph's declared name when it is a
+    # model output, so only drop tensors nothing refers to any more.
+    live = {n for op in surviving for n in op.inputs + op.outputs if n}
+    live |= set(ag.model_inputs) | set(ag.model_outputs)
+    for name in [n for n in rename if n not in live]:
+        ag.tensors.pop(name, None)
+
+    ag.ops = surviving
+    return ag
+
+
+def _stored_extent(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Non-unit axis sizes in the order the runtime serializes them.
+
+    The IR keeps ONNX NCHW/NCL while the runtime stores NHWC/NLC, so the same
+    element sequence is described by different axis orders at different ranks.
+    Axes of size 1 contribute no stride, so dropping them leaves exactly the
+    sequence the runtime walks. Two shapes with equal results hold their
+    elements in the same order.
+    """
+    rank = len(shape)
+    if rank == 4:
+        order = (0, 2, 3, 1)   # N, H, W, C
+    elif rank == 3:
+        order = (0, 2, 1)      # N, L, C
+    else:
+        order = tuple(range(rank))
+    return tuple(shape[axis] for axis in order if shape[axis] != 1)
+
+
+def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Relabel Squeeze and Unsqueeze to Reshape where element order survives.
+
+    Both only add or drop axes of size 1, which is what Reshape does, and
+    Reshape has a kernel while they do not. The relabel is only sound when the
+    runtime layout walks the elements in the same order on both sides: a rank-4
+    to rank-3 squeeze that removes the channel axis turns NHWC (h, w) order into
+    NLC (w, h) order, which would transpose the data silently. Anything that
+    fails the check keeps its original op type and is reported as unsupported.
+    """
+    for op in ag.ops:
+        if op.op_type not in ("Squeeze", "Unsqueeze"):
+            continue
+        src = ag.tensors.get(op.inputs[0])
+        dst = ag.tensors.get(op.outputs[0])
+        if src is None or dst is None:
+            continue
+        if _stored_extent(tuple(src.shape)) != _stored_extent(tuple(dst.shape)):
+            continue
+        op.op_type = "Reshape"
+        # Squeeze and Unsqueeze carry their axes as a second input or an
+        # attribute; the plan takes the output shape from the tensor table.
+        op.inputs = op.inputs[:1]
+        op.attrs.pop("axes", None)
     return ag
 
 

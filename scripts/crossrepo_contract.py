@@ -554,6 +554,44 @@ def _reduce_mean_case() -> ContractCase:
     )
 
 
+def _inference_identity_case() -> ContractCase:
+    """Dropout and Identity must vanish, and Squeeze must execute as Reshape.
+
+    The reference model keeps all three so ONNX Runtime evaluates the graph an
+    exporter actually emits; TiGrIS must reach the same values with them gone.
+    The Squeeze here drops the two trailing unit axes of a pooled [1, C, 1, 1]
+    tensor, which leaves the runtime's element order untouched.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 3, 4, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3]
+    )
+    axes = numpy_helper.from_array(np.array([2, 3], dtype=np.int64), "axes")
+    model = _model(
+        "inference_identity",
+        [
+            helper.make_node("Identity", ["input"], ["same"]),
+            helper.make_node("Dropout", ["same"], ["kept"]),
+            helper.make_node("GlobalAveragePool", ["kept"], ["pooled"]),
+            helper.make_node("Squeeze", ["pooled", "axes"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        [axes],
+    )
+    return ContractCase(
+        "float_inference_identity",
+        model,
+        model,
+        {
+            "input": np.arange(48, dtype=np.float32).reshape(1, 3, 4, 4)
+        },
+        ("GlobalAveragePool", "Reshape"),
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3429,6 +3467,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _many_stage_case(),
         _tcn_16k_case(),
         _reduce_mean_case(),
+        _inference_identity_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
