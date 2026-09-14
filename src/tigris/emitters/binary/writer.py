@@ -1109,6 +1109,22 @@ def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
                 w_name = inp
                 break
         if not w_name:
+            # A matrix product of two activations has no constant to read the
+            # second scale from; the other operand carries it, per-tensor.
+            if op.op_type == "MatMul" and len(op.inputs) == 2:
+                other = ag.tensors.get(
+                    op.inputs[1] if op.inputs[0] == in_name else op.inputs[0]
+                )
+                if other is not None and other.quant is not None:
+                    out0 = float(out_scale[0])
+                    effective[out_name] = np.array(
+                        [
+                            in_scale * float(other.quant.scale[0]) / out0
+                            if out0 != 0
+                            else 0.0
+                        ],
+                        dtype=np.float64,
+                    )
             continue
 
         w_info = ag.tensors.get(w_name)

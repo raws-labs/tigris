@@ -689,6 +689,86 @@ def _float_gemm_bias_add_case() -> ContractCase:
     )
 
 
+def _batched_matmul_case() -> ContractCase:
+    """A rank-3 constant-weight MatMul, the per-position linear layer.
+
+    ONNX Runtime evaluates the batched product directly. TiGrIS makes the
+    operand linear, collapses its leading axes and runs the fully-connected
+    kernel, so this checks the layout conversion and the lowering together.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 5, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 5, 3]
+    )
+    weight = numpy_helper.from_array(
+        np.linspace(-0.5, 0.5, 12, dtype=np.float32).reshape(4, 3), "weight"
+    )
+    model = _model(
+        "batched_matmul",
+        [helper.make_node("MatMul", ["input", "weight"], ["output"])],
+        [model_input],
+        [model_output],
+        [weight],
+    )
+    return ContractCase(
+        "float_batched_matmul",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -1.0, 1.0, 20, dtype=np.float32
+            ).reshape(1, 5, 4)
+        },
+        # Model boundaries keep the channels-last convention callers rely on,
+        # so reaching a linear operand costs a conversion at each end. Those
+        # Transposes are the layout change made explicit.
+        ("Transpose", "Reshape", "Gemm", "Reshape", "Transpose"),
+    )
+
+
+def _dynamic_matmul_case(*, batched: bool) -> ContractCase:
+    """A matrix product of two activations, which has no constant to fold.
+
+    Neither operand is a weight, so this is the form the fully-connected kernel
+    cannot express and the MatMul kernel exists for. The batched variant also
+    exercises the layout conversion: rank-3 model boundaries keep the
+    channels-last convention, so reaching the model's own axis order costs a
+    Transpose on each operand and one on the result.
+    """
+    lhs_shape = [2, 3, 4] if batched else [3, 4]
+    rhs_shape = [2, 4, 2] if batched else [4, 2]
+    out_shape = [2, 3, 2] if batched else [3, 2]
+    model = _model(
+        "dynamic_matmul",
+        [helper.make_node("MatMul", ["lhs", "rhs"], ["output"])],
+        [
+            helper.make_tensor_value_info("lhs", TensorProto.FLOAT, lhs_shape),
+            helper.make_tensor_value_info("rhs", TensorProto.FLOAT, rhs_shape),
+        ],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, out_shape)],
+    )
+    lhs = np.linspace(
+        -1.0, 1.0, int(np.prod(lhs_shape)), dtype=np.float32
+    ).reshape(lhs_shape)
+    rhs = np.linspace(
+        0.5, -0.5, int(np.prod(rhs_shape)), dtype=np.float32
+    ).reshape(rhs_shape)
+    operators = (
+        ("Transpose", "Transpose", "MatMul", "Transpose")
+        if batched else ("MatMul",)
+    )
+    return ContractCase(
+        f"float_dynamic_matmul{'_batched' if batched else ''}",
+        model,
+        model,
+        {"lhs": lhs, "rhs": rhs},
+        operators,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3570,6 +3650,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _channel_bias_add_case(producer_has_bias=False),
         _channel_bias_add_case(producer_has_bias=True),
         _float_gemm_bias_add_case(),
+        _batched_matmul_case(),
+        _dynamic_matmul_case(batched=False),
+        _dynamic_matmul_case(batched=True),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
