@@ -37,7 +37,13 @@ Passes applied in sequence (matches ``normalize()`` call order):
 
 import numpy as np
 
-from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, TensorInfo
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    Layout,
+    OpNode,
+    QuantParam,
+    TensorInfo,
+)
 
 
 def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -61,6 +67,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _normalize_concat_axis(ag)
     ag = _validate_transposes(ag)
     ag = _absorb_activations(ag)
+    ag = _assign_tensor_layouts(ag)
     ag = _drop_unreferenced_weights(ag)
     return ag
 
@@ -100,6 +107,32 @@ def _strip_metadata_inputs(ag: AnalyzedGraph) -> AnalyzedGraph:
                 break
         else:
             del op.inputs[first:]
+    return ag
+
+
+
+def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Record how each tensor's axes map onto the order the runtime stores them.
+
+    Every operator the compiler routes today works on spatial activations, so
+    the answer is Layout.SPATIAL nearly everywhere and TensorInfo already
+    defaults to it. The exception is a terminal Transpose: its output is an
+    explicit model-output boundary that keeps the observable ONNX shape and
+    element order, which is exactly Layout.LINEAR.
+
+    Stating it on the tensor is what lets the emitter stop inferring the
+    permutation from rank, and is the seam an operator with different needs
+    plugs into.
+    """
+    for op in ag.ops:
+        if op.op_type != "Transpose" or len(op.outputs) != 1:
+            continue
+        name = op.outputs[0]
+        if name not in ag.model_outputs:
+            continue
+        info = ag.tensors.get(name)
+        if info is not None:
+            info.layout = Layout.LINEAR
     return ag
 
 
