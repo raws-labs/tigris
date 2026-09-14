@@ -16,6 +16,46 @@ from tigris.graph.ir import AnalyzedGraph, Stage
 _FLOAT32 = 1
 _INT8 = 3
 
+# ONNX expresses static quantization two ways. QDQ keeps float operators and
+# brackets them with QuantizeLinear/DequantizeLinear pairs, which normalize.py
+# folds into the operator. QOperator replaces the operator itself with a fused
+# integer one, and carries the scales as operator inputs, so there is nothing
+# to fold and the graph never becomes quantized as far as the rest of the
+# compiler is concerned. Naming them is what turns "unsupported operator" into
+# an instruction the user can act on.
+QOPERATOR_OP_TYPES = frozenset({
+    "QLinearConv",
+    "QLinearMatMul",
+    "QGemm",
+    "QLinearAdd",
+    "QLinearMul",
+    "QLinearAveragePool",
+    "QLinearGlobalAveragePool",
+    "QLinearConcat",
+    "QLinearLeakyRelu",
+    "QLinearSigmoid",
+    "QLinearSoftmax",
+    "ConvInteger",
+    "MatMulInteger",
+    "DynamicQuantizeLinear",
+    "DynamicQuantizeMatMul",
+    "DynamicQuantizeLSTM",
+})
+
+_QOPERATOR_ADVICE = (
+    "ONNX QOperator format; TiGrIS ingests QDQ. Re-export with "
+    "quant_format=QuantFormat.QDQ"
+)
+
+
+def _qoperator_op_types(ag: AnalyzedGraph) -> list[str]:
+    """QOperator operator types present, in first-seen order."""
+    seen: list[str] = []
+    for op in ag.ops:
+        if op.op_type in QOPERATOR_OP_TYPES and op.op_type not in seen:
+            seen.append(op.op_type)
+    return seen
+
 
 @dataclass(frozen=True)
 class ExecutionDTypeValidation:
@@ -75,6 +115,14 @@ def validate_execution_dtype(ag: AnalyzedGraph) -> ExecutionDTypeValidation:
     tensor_dtype = next(iter(by_dtype))
     expected_dtype = _INT8 if ag.is_quantized else _FLOAT32
     if tensor_dtype != expected_dtype:
+        # A QOperator graph always lands here: its operators carry the scales,
+        # so nothing folds and is_quantized stays False while the tensors are
+        # int8. That is the format, not a second defect, and
+        # validate_operator_support already fails the model with the advice
+        # attached. Reporting it twice, in contradictory terms, is what sent a
+        # reader looking for a dtype problem that does not exist.
+        if _qoperator_op_types(ag):
+            return ExecutionDTypeValidation(dtype=None, issues=())
         actual = labels[tensor_dtype]
         expected = labels[expected_dtype]
         return ExecutionDTypeValidation(
@@ -136,7 +184,15 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
     for op in ag.ops:
         if op.op_type not in OP_TYPE_MAP:
             issues.append(
-                UnsupportedOperatorIssue(op_name=op.name, op_type=op.op_type)
+                UnsupportedOperatorIssue(
+                    op_name=op.name,
+                    op_type=op.op_type,
+                    reason=(
+                        _QOPERATOR_ADVICE
+                        if op.op_type in QOPERATOR_OP_TYPES
+                        else ""
+                    ),
+                )
             )
             continue
 
