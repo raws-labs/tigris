@@ -801,6 +801,36 @@ def _softmax_axis_case(*, rank: int, last_axis: bool) -> ContractCase:
     )
 
 
+def _tiled_softmax_case() -> ContractCase:
+    """Softmax on a stage the solver has to tile.
+
+    Normalization runs along the final stored dimension and the tile cuts
+    stored axis 1, so each tile holds whole rows. The budget is set well below
+    the tensor so the plan cannot be a single tile: if the kernel ignored its
+    tile geometry it would normalize the wrong span and the values would not
+    match ONNX Runtime.
+    """
+    shape = [1, 6, 512]
+    model = _model(
+        "tiled_softmax",
+        [helper.make_node("Softmax", ["input"], ["output"], axis=1)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    data = np.linspace(
+        -3.0, 3.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_tiled_softmax",
+        model,
+        model,
+        {"input": data},
+        ("Softmax",),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3689,6 +3719,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _softmax_axis_case(rank=3, last_axis=False),
         _softmax_axis_case(rank=4, last_axis=True),
         _softmax_axis_case(rank=4, last_axis=False),
+        _tiled_softmax_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
