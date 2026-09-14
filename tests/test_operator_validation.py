@@ -518,3 +518,63 @@ def test_equal_numel_different_shape_constant_is_rejected():
 
     assert not validation.supported
     assert "requires unsupported broadcasting" in validation.describe()
+
+
+def test_qoperator_model_names_the_format_and_the_fix(tmp_path):
+    """A QOperator graph must say what it is and how to re-export it."""
+    from tigris.analysis.validation import QOPERATOR_OP_TYPES
+    from tigris.loaders.onnx.loader import load_model
+    from tigris.loaders.onnx.normalize import normalize
+
+    init = [
+        numpy_helper.from_array(np.float32(0.02), "x_scale"),
+        numpy_helper.from_array(np.int8(0), "x_zp"),
+        numpy_helper.from_array(np.zeros((8, 4, 3, 3), np.int8), "W"),
+        numpy_helper.from_array(np.float32(0.01), "w_scale"),
+        numpy_helper.from_array(np.int8(0), "w_zp"),
+        numpy_helper.from_array(np.float32(0.03), "y_scale"),
+        numpy_helper.from_array(np.int8(0), "y_zp"),
+        numpy_helper.from_array(np.zeros(8, np.int32), "B"),
+    ]
+    node = helper.make_node(
+        "QLinearConv",
+        ["x", "x_scale", "x_zp", "W", "w_scale", "w_zp", "y_scale", "y_zp", "B"],
+        ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1], name="qconv1")
+    graph = helper.make_graph(
+        [node], "qop",
+        [helper.make_tensor_value_info("x", TensorProto.INT8, [1, 4, 16, 16])],
+        [helper.make_tensor_value_info("y", TensorProto.INT8, [1, 8, 16, 16])],
+        init)
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    path = tmp_path / "qoperator.onnx"
+    onnx.save(model, str(path))
+
+    ag = normalize(load_model(str(path)))
+    assert "QLinearConv" in QOPERATOR_OP_TYPES
+
+    support = validate_operator_support(ag)
+    assert not support.supported
+    described = support.describe()
+    assert "QOperator" in described
+    assert "QuantFormat.QDQ" in described
+
+    # The dtype check must not also report a contradictory float32-vs-int8
+    # complaint: on a QOperator graph that is a symptom of the same cause.
+    assert validate_execution_dtype(ag).issues == ()
+
+
+def test_non_qoperator_dtype_mismatch_is_still_reported():
+    """Suppression is scoped to QOperator graphs, not to dtype mismatch."""
+    ag = AnalyzedGraph(
+        ops=[OpNode(name="relu1", op_type="Relu", inputs=["a"], outputs=["b"])],
+        tensors={
+            "a": TensorInfo(name="a", shape=(1, 4), dtype=3),
+            "b": TensorInfo(name="b", shape=(1, 4), dtype=3),
+        },
+        model_inputs=["a"],
+        model_outputs=["b"],
+    )
+    ag.is_quantized = False
+    issues = validate_execution_dtype(ag).issues
+    assert issues and "quantization metadata" in issues[0]
