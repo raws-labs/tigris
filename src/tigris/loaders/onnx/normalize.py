@@ -133,12 +133,42 @@ _LINEAR_LAYOUT_OPS = frozenset({
 })
 
 
-def _required_layout(op: OpNode) -> Layout | None:
+def _softmax_required_layout(
+    ag: AnalyzedGraph, op: OpNode
+) -> Layout | None:
+    """The layout that puts Softmax's axis where the kernel reduces.
+
+    The kernel normalizes along the final stored dimension, so which ONNX axis
+    that is depends on how the tensor is held. Spatial storage puts the channel
+    axis last, which is ONNX axis 1; the model's own order puts the last ONNX
+    axis last. A Softmax over either one is expressible, and the layout is what
+    says which. Anything else has no layout that helps and stays unsupported.
+    """
+    if len(op.inputs) != 1:
+        return None
+    info = ag.tensors.get(op.inputs[0])
+    if info is None or not info.shape:
+        return None
+    rank = len(info.shape)
+    if rank < 3:
+        return None
+    axis = int(op.attrs.get("axis", -1))
+    axis = axis + rank if axis < 0 else axis
+    if axis == rank - 1:
+        return Layout.LINEAR
+    if axis == 1:
+        return Layout.SPATIAL
+    return None
+
+
+def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     """The layout an operator needs, or None when it works in either."""
     if op.op_type in _SPATIAL_LAYOUT_OPS:
         return Layout.SPATIAL
     if op.op_type in _LINEAR_LAYOUT_OPS:
         return Layout.LINEAR
+    if op.op_type == "Softmax":
+        return _softmax_required_layout(ag, op)
     return None
 
 
@@ -160,7 +190,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
     counter = 0
 
     for op in ag.ops:
-        required = _required_layout(op)
+        required = _required_layout(ag, op)
         if required is not None:
             for position, name in enumerate(op.inputs):
                 if not name:

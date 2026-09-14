@@ -10,7 +10,7 @@ from tigris.analysis.partition_spatial import (
 )
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
-from tigris.graph.ir import AnalyzedGraph, Stage
+from tigris.graph.ir import AnalyzedGraph, Layout, Stage
 
 
 _FLOAT32 = 1
@@ -256,13 +256,19 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 rank = len(input_tensor.shape)
                 axis = int(op.attrs.get("axis", -1))
                 normalized_axis = axis + rank if axis < 0 else axis
-                # Rank-3/4 activations are converted from NCL/NCHW to NLC/NHWC;
-                # their channel axis becomes the runtime's final dimension.
-                runtime_final_axis = 1 if rank in {3, 4} else rank - 1
+                # The kernel reduces along the final stored dimension. Spatial
+                # storage puts the channel axis there, the model's own order
+                # puts the last ONNX axis there, so which axis is reducible is
+                # a property of the tensor rather than of its rank.
+                if rank in {3, 4} and input_tensor.layout is Layout.SPATIAL:
+                    runtime_final_axis = 1
+                else:
+                    runtime_final_axis = rank - 1
                 if normalized_axis != runtime_final_axis:
                     reasons.append(
                         "Softmax axis must map to the runtime's final dimension "
-                        f"(axis {runtime_final_axis} for rank {rank})"
+                        f"(axis {runtime_final_axis} for rank {rank} in "
+                        f"{input_tensor.layout.value} layout)"
                     )
 
         if op.op_type == "Concat":

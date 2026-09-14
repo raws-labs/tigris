@@ -769,6 +769,38 @@ def _dynamic_matmul_case(*, batched: bool) -> ContractCase:
     )
 
 
+def _softmax_axis_case(*, rank: int, last_axis: bool) -> ContractCase:
+    """Softmax over the axis the layout puts where the kernel reduces.
+
+    The kernel normalizes along the final stored dimension. Spatial storage puts
+    the channel axis there and the model's own order puts the last ONNX axis
+    there, so both are expressible and the layout is what selects between them.
+    ONNX Runtime evaluates the axis as written either way.
+    """
+    shape = [1, 4, 3, 5] if rank == 4 else [1, 4, 6]
+    axis = -1 if last_axis else 1
+    model = _model(
+        "softmax_axis",
+        [helper.make_node("Softmax", ["input"], ["output"], axis=axis)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    count = int(np.prod(shape))
+    data = np.linspace(-2.0, 2.0, count, dtype=np.float32).reshape(shape)
+    # Reaching the model's own order costs a conversion at each end, because
+    # boundaries keep the channels-last convention.
+    operators = (
+        ("Transpose", "Softmax", "Transpose") if last_axis else ("Softmax",)
+    )
+    return ContractCase(
+        f"float_softmax_rank{rank}_{'last' if last_axis else 'channel'}_axis",
+        model,
+        model,
+        {"input": data},
+        operators,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3653,6 +3685,10 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _batched_matmul_case(),
         _dynamic_matmul_case(batched=False),
         _dynamic_matmul_case(batched=True),
+        _softmax_axis_case(rank=3, last_axis=True),
+        _softmax_axis_case(rank=3, last_axis=False),
+        _softmax_axis_case(rank=4, last_axis=True),
+        _softmax_axis_case(rank=4, last_axis=False),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
