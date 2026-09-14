@@ -592,6 +592,103 @@ def _inference_identity_case() -> ContractCase:
     )
 
 
+def _channel_bias_add_case(*, producer_has_bias: bool) -> ContractCase:
+    """A per-channel constant Add must reach the same values as its own graph.
+
+    The reference model keeps the standalone Add, so ONNX Runtime evaluates the
+    broadcast exactly as an exporter wrote it; TiGrIS folds it into the Conv
+    bias and must land on the same numbers either way.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 2, 3, 3]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 3, 3, 3]
+    )
+    weight = numpy_helper.from_array(
+        np.linspace(-0.4, 0.4, 3 * 2 * 3 * 3, dtype=np.float32).reshape(3, 2, 3, 3),
+        "weight",
+    )
+    channel = numpy_helper.from_array(
+        np.array([[[[0.5]], [[-1.25]], [[2.0]]]], dtype=np.float32), "channel"
+    )
+    conv_inputs = ["input", "weight"]
+    initializers = [weight, channel]
+    if producer_has_bias:
+        initializers.append(
+            numpy_helper.from_array(
+                np.array([0.125, -0.25, 0.75], dtype=np.float32), "bias"
+            )
+        )
+        conv_inputs.append("bias")
+    model = _model(
+        "channel_bias_add",
+        [
+            helper.make_node(
+                "Conv", conv_inputs, ["product"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1],
+            ),
+            helper.make_node("Add", ["product", "channel"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    suffix = "onto_bias" if producer_has_bias else "as_bias"
+    return ContractCase(
+        f"float_channel_bias_add_{suffix}",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -1.0, 1.0, 18, dtype=np.float32
+            ).reshape(1, 2, 3, 3)
+        },
+        ("Conv",),
+    )
+
+
+def _float_gemm_bias_add_case() -> ContractCase:
+    """A float Gemm whose bias arrives as a separate Add, the rank-2 form.
+
+    The operand is per-channel against a [1, C] product, so the Add kernel
+    cannot take it as written; the bias slot can. ONNX Runtime evaluates the
+    two-op graph and TiGrIS must match it with one op.
+    """
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 4]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 2]
+    )
+    initializers = [
+        numpy_helper.from_array(
+            np.array([[0.5, -0.25, 0.75, 0.25], [-0.5, 0.25, 0.5, -0.75]],
+                     dtype=np.float32),
+            "weight",
+        ),
+        numpy_helper.from_array(
+            np.array([0.5, -0.25], dtype=np.float32), "bias"),
+    ]
+    model = _model(
+        "float_gemm_bias_add",
+        [
+            helper.make_node("Gemm", ["input", "weight"], ["product"], transB=1),
+            helper.make_node("Add", ["product", "bias"], ["output"]),
+        ],
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    return ContractCase(
+        "float_gemm_bias_add",
+        model,
+        model,
+        {"input": np.array([[1.0, -2.0, 0.5, 3.0]], dtype=np.float32)},
+        ("Gemm",),
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3468,6 +3565,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tcn_16k_case(),
         _reduce_mean_case(),
         _inference_identity_case(),
+        _channel_bias_add_case(producer_has_bias=False),
+        _channel_bias_add_case(producer_has_bias=True),
+        _float_gemm_bias_add_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

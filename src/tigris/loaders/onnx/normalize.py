@@ -48,6 +48,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
     ag = _fold_constant_add_into_bias(ag)
+    ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
     ag = _relabel_depthwise(ag)
     ag = _relabel_conv1d(ag)
@@ -829,6 +830,126 @@ def _fold_constant_add_into_bias(ag: AnalyzedGraph) -> AnalyzedGraph:
         if result_info is not None:
             result_info.dtype = product_info.dtype
             result_info.quant = product_info.quant
+        producer.outputs = [result]
+        del ag.tensors[product]
+        removed.add(i)
+
+    if removed:
+        ag.ops = [op for idx, op in enumerate(ag.ops) if idx not in removed]
+        for step, op in enumerate(ag.ops):
+            op.step = step
+
+    return ag
+
+
+def _channel_broadcast_size(
+    constant_shape: tuple[int, ...], reference_shape: tuple[int, ...]
+) -> int | None:
+    """Channel count when a constant broadcasts only along the channel axis.
+
+    ONNX right-aligns operands, so ``(C,)``, ``(C, 1, 1)`` and ``(1, C, 1, 1)``
+    all address the channel axis of an NCHW activation while ``(1, 1, 1, W)``
+    addresses width. Size alone cannot tell those apart when C equals W, so the
+    aligned position is what decides.
+    """
+    if len(reference_shape) < 2 or len(constant_shape) > len(reference_shape):
+        return None
+    channels = reference_shape[1]
+    if channels <= 0:
+        return None
+    offset = len(reference_shape) - len(constant_shape)
+    for axis, extent in enumerate(constant_shape):
+        aligned = axis + offset
+        if aligned == 1:
+            if extent != channels:
+                return None
+        elif extent != 1:
+            return None
+    # A constant shorter than the reference must still reach the channel axis.
+    if offset > 1:
+        return None
+    return channels
+
+
+def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Fold a float per-channel constant Add into its producer's bias.
+
+    Exporters emit a per-channel bias as a standalone Add whenever they do not
+    fuse it, and a decomposed BatchNorm leaves the same shape behind. The Add
+    kernel takes two operands of one shape, so such a graph is rejected for
+    broadcasting it cannot do, even though the producer already has a bias slot
+    holding exactly this quantity. Adding into that slot is exact for float.
+
+    The quantized form is handled by _fold_constant_add_into_bias, which has to
+    requantize into the accumulator domain. Here the bias is already float.
+    """
+    output_to_op: dict[str, int] = {}
+    for i, op in enumerate(ag.ops):
+        for out in op.outputs:
+            output_to_op[out] = i
+
+    consumers: dict[str, list[int]] = {}
+    for i, op in enumerate(ag.ops):
+        for inp in op.inputs:
+            consumers.setdefault(inp, []).append(i)
+
+    removed: set[int] = set()
+
+    for i, op in enumerate(ag.ops):
+        if op.op_type != "Add" or len(op.inputs) != 2 or len(op.outputs) != 1:
+            continue
+        constants = [n for n in op.inputs if n in ag.weight_data]
+        if len(constants) != 1:
+            continue
+        const_name = constants[0]
+        product = next(n for n in op.inputs if n != const_name)
+
+        producer_idx = output_to_op.get(product)
+        if producer_idx is None or producer_idx in removed:
+            continue
+        producer = ag.ops[producer_idx]
+        if producer.op_type not in _BIAS_PRODUCERS:
+            continue
+        if len(producer.inputs) not in (2, 3):
+            continue
+        # Folding past another consumer would change what that consumer reads.
+        if consumers.get(product, []) != [i]:
+            continue
+
+        product_info = ag.tensors.get(product)
+        if product_info is None or product_info.quant is not None:
+            continue
+
+        constant = ag.weight_data[const_name]
+        if constant.dtype != np.float32:
+            continue
+        channels = _channel_broadcast_size(
+            tuple(constant.shape), tuple(product_info.shape)
+        )
+        if channels is None or constant.size != channels:
+            continue
+
+        addend = constant.reshape(-1).astype(np.float32)
+        if len(producer.inputs) == 3:
+            existing = ag.weight_data.get(producer.inputs[2])
+            if existing is None or existing.dtype != np.float32:
+                continue
+            if existing.reshape(-1).size != channels:
+                continue
+            ag.weight_data[producer.inputs[2]] = (
+                existing.reshape(-1).astype(np.float32) + addend
+            )
+        else:
+            ag.weight_data[const_name] = addend
+            if const_name in ag.tensors:
+                ag.tensors[const_name].shape = (channels,)
+            producer.inputs.append(const_name)
+
+        # Keep the Add's output name so the plan still names what the model did.
+        result = op.outputs[0]
+        result_info = ag.tensors.get(result)
+        if result_info is not None:
+            result_info.dtype = product_info.dtype
         producer.outputs = [result]
         del ag.tensors[product]
         removed.add(i)

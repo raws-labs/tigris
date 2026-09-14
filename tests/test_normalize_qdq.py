@@ -256,8 +256,14 @@ def test_shared_scale_initializer_still_folds_activations(tmp_path):
     assert ag.tensors["output"].dtype == 3
 
 
-def test_float_constant_add_is_left_alone(tmp_path):
-    """A float graph executes the Add as written, so nothing is folded."""
+def test_float_constant_add_becomes_the_gemm_bias(tmp_path):
+    """A float bias Add folds into Gemm's bias slot, as the quantized one does.
+
+    The two paths reach it differently: the quantized fold has to requantize
+    into the accumulator domain, while this one just moves float data. Leaving
+    the Add standing made the graph uncompilable, because its operand is
+    per-channel and the Add kernel takes two operands of one shape.
+    """
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2])
     initializers = [
@@ -280,7 +286,11 @@ def test_float_constant_add_is_left_alone(tmp_path):
 
     ag = load_model(path)
 
-    assert [op.op_type for op in ag.ops] == ["Gemm", "Add"]
+    assert [op.op_type for op in ag.ops] == ["Gemm"]
+    gemm = ag.ops[0]
+    assert len(gemm.inputs) == 3
+    assert np.allclose(ag.weight_data[gemm.inputs[2]], [0.5, -0.25])
+    assert gemm.outputs == ["output"]
     assert ag.tensors["output"].dtype == 1
 
 
