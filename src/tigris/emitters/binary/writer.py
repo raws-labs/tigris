@@ -57,6 +57,7 @@ from .defs import (
     STAGE_STRUCT,
     STAGE_TILE_PLAN_INDEX_OFFSET,
     TENSOR_FLAG_CONSTANT,
+    TENSOR_FLAG_LINEAR,
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
     TENSOR_STRUCT,
@@ -671,6 +672,8 @@ def _build_tensors(
             flags |= TENSOR_FLAG_MODEL_INPUT
         if name in ag.model_outputs:
             flags |= TENSOR_FLAG_MODEL_OUTPUT
+        if info.layout is Layout.LINEAR:
+            flags |= TENSOR_FLAG_LINEAR
 
         qp_idx = quant_idx_map.get(name, no_qp) if quant_idx_map else no_qp
 

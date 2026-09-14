@@ -2999,6 +2999,10 @@ def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
     return b"".join(chunks)
 
 
+_TENSOR_FLAG_LINEAR = 0x08
+"""Axes are stored in the order the model states them, not channels-last."""
+
+
 def _decode_outputs(
     plan: dict, raw: bytes, reference_outputs: list[Array]
 ) -> list[Array]:
@@ -3006,13 +3010,6 @@ def _decode_outputs(
     offset = 0
     if len(plan["model_outputs"]) != len(reference_outputs):
         raise AssertionError("plan and ONNX Runtime output counts differ")
-    terminal_transpose_outputs = {
-        plan["ops"][attr["op_index"]]["outputs"][0]
-        for attr in plan["op_attributes"]
-        if attr["type"] == 1
-        and plan["ops"][attr["op_index"]]["op_type"] == 29
-        and len(plan["ops"][attr["op_index"]]["outputs"]) == 1
-    }
     for tensor_index, reference in zip(plan["model_outputs"], reference_outputs):
         tensor = plan["tensors"][tensor_index]
         declared = _declared_dtype(tensor)
@@ -3030,7 +3027,12 @@ def _decode_outputs(
             raise AssertionError("runtime output file is truncated")
         value = np.frombuffer(raw[offset:end], dtype=dtype).copy()
         value = value.reshape(tensor["shape"])
-        if tensor_index not in terminal_transpose_outputs:
+        # Schema 7 records the order a tensor is stored in, so the harness reads
+        # it instead of inferring it from the shape of the producing graph. That
+        # guess could not tell a model's own terminal Transpose from a layout
+        # conversion the compiler inserted, since both are a Transpose writing a
+        # model output.
+        if not tensor["flags"] & _TENSOR_FLAG_LINEAR:
             value = _from_runtime_layout(value, reference.ndim)
         decoded.append(value)
         offset = end
