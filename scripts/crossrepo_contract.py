@@ -970,6 +970,27 @@ def _sub_constant_case() -> ContractCase:
     )
 
 
+def _clip_as_relu_case() -> ContractCase:
+    """Clip with a zero floor and no ceiling, which an exporter writes for Relu."""
+    shape = [1, 6]
+    lower = numpy_helper.from_array(np.float32(0.0), "lower")
+    model = _model(
+        "clip_as_relu",
+        [helper.make_node("Clip", ["input", "lower"], ["output"])],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        [lower],
+    )
+    return ContractCase(
+        "float_clip_as_relu",
+        model,
+        model,
+        {"input": np.array([[-3.0, -0.5, 0.0, 0.5, 2.0, 9.0]],
+                           dtype=np.float32)},
+        ("Relu",),
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3863,6 +3884,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _qdq_subtract_case(),
         _global_max_pool_case(),
         _sub_constant_case(),
+        _clip_as_relu_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

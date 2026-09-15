@@ -35,6 +35,7 @@ Passes applied in sequence (matches ``normalize()`` call order):
     Runs last so all relabeling and rewiring is already done.
 """
 
+import math
 import numpy as np
 
 from tigris.graph.ir import (
@@ -1364,7 +1365,13 @@ def _relabel_conv1d(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Replace Clip(min=0, max=6) with Relu6."""
+    """Replace a Clip that states an activation the runtime already has.
+
+    Clip(0, 6) is Relu6. Clip(0, unbounded) is Relu, which exporters emit in
+    place of a Relu often enough to be worth recognizing: an absent upper bound,
+    an infinite one, or one at the float maximum all mean the same thing.
+    Anything else keeps its bounds and has no kernel to run on.
+    """
     for op in ag.ops:
         if op.op_type != "Clip":
             continue
@@ -1388,12 +1395,24 @@ def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
             if arr.size == 1:
                 max_val = float(arr.flat[0])
 
-        if min_val is not None and max_val is not None:
-            if abs(min_val) < 1e-6 and abs(max_val - 6.0) < 1e-6:
-                op.op_type = "Relu6"
-                # Keep only the data input, drop min/max constant inputs
-                op.inputs = [op.inputs[0]]
-                op.attrs = {}
+        if min_val is None or abs(min_val) >= 1e-6:
+            continue
+
+        unbounded_above = (
+            max_val is None
+            or math.isinf(max_val)
+            or max_val >= np.finfo(np.float32).max
+        )
+        if max_val is not None and abs(max_val - 6.0) < 1e-6:
+            op.op_type = "Relu6"
+        elif unbounded_above:
+            op.op_type = "Relu"
+        else:
+            continue
+
+        # Keep only the data input, drop min/max constant inputs
+        op.inputs = [op.inputs[0]]
+        op.attrs = {}
 
     return ag
 
