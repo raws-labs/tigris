@@ -922,6 +922,26 @@ def _qdq_subtract_case() -> ContractCase:
     )
 
 
+def _global_max_pool_case() -> ContractCase:
+    """GlobalMaxPool, the counterpart of GlobalAveragePool."""
+    model = _model(
+        "global_max_pool",
+        [helper.make_node("GlobalMaxPool", ["input"], ["output"])],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, 3, 2, 4])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, 3, 1, 1])],
+    )
+    data = np.linspace(-1.5, 1.5, 24, dtype=np.float32).reshape(1, 3, 2, 4)
+    return ContractCase(
+        "float_global_max_pool",
+        model,
+        model,
+        {"input": data},
+        ("GlobalMaxPool",),
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3813,6 +3833,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_softmax_case(),
         _subtract_case(),
         _qdq_subtract_case(),
+        _global_max_pool_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

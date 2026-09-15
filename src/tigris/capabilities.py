@@ -45,6 +45,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Mul",
     "Conv1D",
     "GlobalAveragePool",
+    "GlobalMaxPool",
     "AveragePool",
     "Gemm",
     "MatMul",
