@@ -8,6 +8,7 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
+from tigris import SCHEMA_VERSION
 from scripts.generate_capability_matrix import capability_matrix
 from scripts.generate_schema_package import schema_package
 from scripts.validate_compatibility import validate
@@ -16,17 +17,18 @@ from scripts.validate_runtime_capabilities import validate as validate_capabilit
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT.parent / "tigris-runtime"
+# Derived, so a schema bump does not quietly leave these tests checking the
+# previous version's artifact.
+SCHEMA_ARTIFACT = f"schema/tigris-plan-v{SCHEMA_VERSION}.json"
 
 
 def test_schema_package_matches_compiler_definitions():
-    artifact = json.loads(
-        (ROOT / "src/tigris/schema/tigris-plan-v6.json").read_text()
-    )
+    artifact = json.loads((ROOT / "src/tigris" / SCHEMA_ARTIFACT).read_text())
     assert artifact == schema_package()
 
 
 def test_schema_package_is_installed_package_data():
-    artifact = files("tigris").joinpath("schema/tigris-plan-v6.json")
+    artifact = files("tigris").joinpath(SCHEMA_ARTIFACT)
     assert json.loads(artifact.read_text()) == schema_package()
 
 

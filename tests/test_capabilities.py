@@ -38,8 +38,12 @@ def test_accelerated_fallbacks_are_explicit():
     assert operator_route("s8_ref", "AveragePool") == "s8_ref"
     assert operator_route("esp-nn", "Relu") == "s8_ref"
     assert operator_route("cmsis-nn", "MaxPool") == "s8_ref"
-    assert operator_route("esp-nn", "MatMul") is None
-    assert "MatMul" not in effective_operators("cmsis-nn")
+    assert operator_route("esp-nn", "Sub") is None
+    assert operator_route("esp-nn", "MatMul") == "s8_ref"
+    # Reachable everywhere, but never through a vendor adapter: MatMul is in
+    # the effective set because the portable int8 path carries it.
+    assert "MatMul" in effective_operators("cmsis-nn")
+    assert "Sub" not in effective_operators("cmsis-nn")
 
 
 def test_capability_rows_are_stable_and_docs_ready():
@@ -62,10 +66,18 @@ def test_capability_rows_are_stable_and_docs_ready():
     assert by_operator["GlobalAveragePool"]["cmsis-nn"] == "native"
     assert by_operator["Softmax"]["reference"] == "native"
     assert by_operator["Softmax"]["s8_ref"] == "native"
+    # Sub has a schema opcode and no kernel anywhere, so it is the row that
+    # proves an operator can be wire-encodable and still unroutable.
     assert all(
-        by_operator["MatMul"][backend] == "unsupported"
+        by_operator["Sub"][backend] == "unsupported"
         for backend in KERNEL_CAPABILITIES
     )
+    # MatMul multiplies two activations, which no vendor adapter covers, so the
+    # accelerated backends reach it through the portable int8 path.
+    assert by_operator["MatMul"]["reference"] == "native"
+    assert by_operator["MatMul"]["s8_ref"] == "native"
+    assert by_operator["MatMul"]["esp-nn"] == "fallback:s8_ref"
+    assert by_operator["MatMul"]["cmsis-nn"] == "fallback:s8_ref"
 
 
 def test_public_qualifications_reference_real_native_routes():

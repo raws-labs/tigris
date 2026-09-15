@@ -158,6 +158,18 @@ def load_model(
     # --- DFS topological sort (prefer early consumption) ------------------
     ag.ops = _topo_sort(raw_nodes, nodes_by_output, initializer_names, ag.model_inputs)
 
+    # A graph optimizer can leave value_info behind for a tensor its fusion
+    # removed. Those entries describe nothing the graph computes, and carrying
+    # them into the IR makes a fully quantized model look mixed-dtype.
+    referenced = {name for op in ag.ops for name in op.inputs + op.outputs if name}
+    boundary = set(ag.model_inputs) | set(ag.model_outputs)
+    for name in [
+        n
+        for n, info in ag.tensors.items()
+        if not info.is_constant and n not in referenced and n not in boundary
+    ]:
+        del ag.tensors[name]
+
     return ag
 
 

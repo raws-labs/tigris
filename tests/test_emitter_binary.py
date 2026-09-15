@@ -18,6 +18,9 @@ from tigris.emitters.binary.defs import (
     HEADER_SIZE,
     MAGIC,
     OP_TYPE_MAP,
+    TENSOR_FLAG_LINEAR,
+    TENSOR_FLAG_MODEL_INPUT,
+    TENSOR_FLAG_MODEL_OUTPUT,
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import _build_quant_params, emit_binary, emit_binary_bytes
@@ -428,6 +431,13 @@ def test_immutable_supported_schema_fixtures():
             3,
             0,
         ),
+        (
+            7,
+            "schema-v7-tensor-layout.tgrs",
+            "6657ccd48dafa81e1f9eeada700d705621a62f3adf61bcbf64b6af943857540f",
+            0,
+            2,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -442,6 +452,17 @@ def test_immutable_supported_schema_fixtures():
         if version == 5:
             assert plan["tile_plans"][0]["axis"] == 1
             assert plan["tile_plans"][0]["num_tiles"] > 1
+        if version == 7:
+            # Schema 7 records storage order per tensor. The batched matrix
+            # product this fixture holds converts its operand to the model's
+            # own axis order and converts the result back, so the linear
+            # tensors are internal and the boundaries are not.
+            linear = [
+                t for t in plan["tensors"] if t["flags"] & TENSOR_FLAG_LINEAR
+            ]
+            assert linear
+            boundary = TENSOR_FLAG_MODEL_INPUT | TENSOR_FLAG_MODEL_OUTPUT
+            assert not any(t["flags"] & boundary for t in linear)
         if version == 6:
             # A quantized boundary states the float interface the model
             # declares, which is what schema 6 added.

@@ -4,7 +4,7 @@
     "repository_model": "separate-repositories",
     "schema_owner": "raws-labs/tigris",
     "schema_source": "src/tigris/emitters/binary/defs.py",
-    "schema_artifact": "src/tigris/schema/tigris-plan-v6.json",
+    "schema_artifact": "src/tigris/schema/tigris-plan-v7.json",
     "schema_versioning": "wire-format",
     "capability_growth": "same-schema with fail-closed runtime validation",
     "runtime_dependency": "vendored-wire-contract",
@@ -14,17 +14,48 @@
   "integration": {
     "compiler_branch": "develop",
     "runtime_branch": "develop",
-    "compiler_emits_schema": 6,
-    "runtime_accepts_schemas": [2, 3, 4, 5, 6],
+    "compiler_emits_schema": 7,
+    "runtime_accepts_schemas": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
     "contract_gate": "python scripts/crossrepo_contract.py --runtime ../tigris-runtime"
   },
   "releases": [
     {
       "status": "supported",
+      "compiler": {
+        "tag": "v0.7.0",
+        "commit": "6fb8b7a7438eeb8416c3d1d5c5151bb9a1ef74b5",
+        "emits_schema": 6
+      },
+      "runtime": {
+        "tag": "v0.8.0",
+        "commit": "a467a2c9ac2bf8a8310ab055adce2cd32f398c49",
+        "accepts_schemas": [
+          2,
+          3,
+          4,
+          5,
+          6
+        ]
+      }
+    },
+    {
+      "status": "supported",
       "runtime": {
         "tag": "v0.7.0",
         "commit": "7adcd70768756cdec8aa79e7ccdf60e30184e557",
-        "accepts_schemas": [2, 3, 4, 5]
+        "accepts_schemas": [
+          2,
+          3,
+          4,
+          5
+        ]
       }
     },
     {
@@ -37,7 +68,12 @@
       "runtime": {
         "tag": "v0.6.0",
         "commit": "bc088ad661dfb7bd03069261caa9363a14510518",
-        "accepts_schemas": [2, 3, 4, 5]
+        "accepts_schemas": [
+          2,
+          3,
+          4,
+          5
+        ]
       }
     },
     {
@@ -50,7 +86,11 @@
       "runtime": {
         "tag": "v0.5.0",
         "commit": "3af3afe2c39313928594c73b0cbf486a43797c42",
-        "accepts_schemas": [2, 3, 4]
+        "accepts_schemas": [
+          2,
+          3,
+          4
+        ]
       }
     },
     {
@@ -63,7 +103,11 @@
       "runtime": {
         "tag": "v0.4.0",
         "commit": "73bd717e3455fd4ef01d42620655fbbbe7b8be00",
-        "accepts_schemas": [2, 3, 4]
+        "accepts_schemas": [
+          2,
+          3,
+          4
+        ]
       }
     }
   ]

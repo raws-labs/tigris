@@ -67,9 +67,12 @@ jobs:
           cc -std=c99 -Wall -Wextra -Werror -fsyntax-only
           -Itigris-runtime/include /tmp/tigris-smoke.c
       - name: Verify generated plan-schema package
+        # Named from SCHEMA_VERSION so a bump cannot leave this step checking
+        # the previous version's artifact while the current one goes unverified.
         run: >-
-          python scripts/generate_schema_package.py
-          --check src/tigris/schema/tigris-plan-v6.json
+          python scripts/generate_schema_package.py --check
+          "src/tigris/schema/tigris-plan-v$(python -c
+          'import tigris; print(tigris.SCHEMA_VERSION)').json"
       - name: Verify generated operator/backend capability package
         run: >-
           python scripts/generate_capability_matrix.py

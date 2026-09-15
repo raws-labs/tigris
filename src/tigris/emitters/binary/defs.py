@@ -86,6 +86,11 @@ OP_TYPE_UNKNOWN = 255
 TENSOR_FLAG_CONSTANT = 0x01
 TENSOR_FLAG_MODEL_INPUT = 0x02
 TENSOR_FLAG_MODEL_OUTPUT = 0x04
+# Axes are stored in the order the model states them rather than channels-last.
+# Without this the order a boundary tensor arrives in is not recoverable from
+# the plan: a model output written by a terminal Transpose keeps ONNX order
+# while every other output is channels-last, and nothing said which.
+TENSOR_FLAG_LINEAR = 0x08
 
 # Stage flags - packed into the head stage's _reserved1 field.
 STAGE_FLAG_LINE_BUFFERED = 0x0001
