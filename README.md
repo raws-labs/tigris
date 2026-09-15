@@ -24,8 +24,7 @@ tigris analyze mobilenetv2.onnx -m 256K -f 16M
 ```
 
 ```text
-warning: input axis 0 (batch_size) has no fixed size; using 1
-  pass --input-shape NAME:1x3x224x224 to compile for another shape
+warning: input axis 0 (batch_size) is unset; using 1 (--input-shape overrides)
 ╭──────────────────────── TiGrIS - mobilenetv2 ────────────────────────╮
 │ Operators            65                                              │
 │ Tensors              244 (66 activations)                            │
