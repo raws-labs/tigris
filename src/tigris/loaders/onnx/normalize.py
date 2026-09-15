@@ -53,6 +53,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_qdq(ag)
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
+    ag = _fold_sub_constant_to_add(ag)
     ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
@@ -1013,6 +1014,31 @@ def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
                 )
         op.op_type = "Gemm"
         op.attrs["transB"] = 1
+    return ag
+
+
+
+def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite a constant subtrahend as an added negation.
+
+    Sub does not commute and the plan records only that an operand is constant,
+    not which side it was on, so the runtime takes two tensor operands. A
+    constant on the right has an exact commutative equivalent, x + (-c), which
+    the Add path already carries, including folding it into a producer's bias.
+    A constant on the left has no such equivalent and is left for validation to
+    reject.
+    """
+    for op in ag.ops:
+        if op.op_type != "Sub" or len(op.inputs) != 2:
+            continue
+        subtrahend = op.inputs[1]
+        if subtrahend not in ag.weight_data or op.inputs[0] in ag.weight_data:
+            continue
+        constant = ag.weight_data[subtrahend]
+        if constant.dtype != np.float32:
+            continue
+        ag.weight_data[subtrahend] = np.ascontiguousarray(-constant)
+        op.op_type = "Add"
     return ag
 
 

@@ -942,6 +942,34 @@ def _global_max_pool_case() -> ContractCase:
     )
 
 
+def _sub_constant_case() -> ContractCase:
+    """Sub against a constant, which compiles as an added negation.
+
+    ONNX Runtime evaluates the subtraction as written, so a sign error in the
+    rewrite shows up here.
+    """
+    shape = [1, 4]
+    constant = numpy_helper.from_array(
+        np.array([[0.5, -1.0, 2.0, 0.25]], dtype=np.float32), "constant")
+    model = _model(
+        "sub_constant",
+        [
+            helper.make_node("Relu", ["input"], ["gated"]),
+            helper.make_node("Sub", ["gated", "constant"], ["output"]),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        [constant],
+    )
+    return ContractCase(
+        "float_sub_constant",
+        model,
+        model,
+        {"input": np.array([[0.25, -1.0, 5.0, -4.0]], dtype=np.float32)},
+        ("Relu", "Add"),
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3834,6 +3862,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _subtract_case(),
         _qdq_subtract_case(),
         _global_max_pool_case(),
+        _sub_constant_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
