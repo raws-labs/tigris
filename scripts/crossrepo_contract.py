@@ -831,6 +831,97 @@ def _tiled_softmax_case() -> ContractCase:
     )
 
 
+def _subtract_case() -> ContractCase:
+    """Sub of two activations, the form whose operand order is unambiguous."""
+    shape = [1, 3, 4]
+    model = _model(
+        "subtract",
+        [helper.make_node("Sub", ["left", "right"], ["output"])],
+        [
+            helper.make_tensor_value_info("left", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("right", TensorProto.FLOAT, shape),
+        ],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    count = int(np.prod(shape))
+    return ContractCase(
+        "float_subtract",
+        model,
+        model,
+        {
+            "left": np.linspace(-2.0, 2.0, count, dtype=np.float32).reshape(shape),
+            "right": np.linspace(1.0, -1.0, count, dtype=np.float32).reshape(shape),
+        },
+        ("Sub",),
+    )
+
+
+def _qdq_subtract_case() -> ContractCase:
+    """A QDQ Sub of two quantized activations.
+
+    Both operands arrive from DequantizeLinear, so the difference is taken in
+    the integer domain and requantized the way TFLite does it. The reference
+    evaluates the same graph, so a sign or scale error in the shared Add/Sub
+    path shows up here rather than in the float case.
+    """
+    shape = [1, 1, 4, 4]
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, shape)
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, shape)
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "io_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "io_zero_point"),
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "out_scale"),
+        numpy_helper.from_array(np.array([-8], dtype=np.int8), "out_zero_point"),
+        numpy_helper.from_array(np.array([[[[0.5]]]], dtype=np.float32), "weight"),
+        numpy_helper.from_array(
+            np.array([0.25], dtype=np.float32), "weight_scale"),
+        numpy_helper.from_array(
+            np.array([0], dtype=np.int8), "weight_zero_point"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["input", "io_scale", "io_zero_point"], ["input_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["input_q", "io_scale", "io_zero_point"],
+            ["input_dq"]),
+        helper.make_node(
+            "QuantizeLinear", ["weight", "weight_scale", "weight_zero_point"],
+            ["weight_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["weight_q", "weight_scale", "weight_zero_point"],
+            ["weight_dq"]),
+        helper.make_node("Conv", ["input_dq", "weight_dq"], ["branch"]),
+        helper.make_node(
+            "QuantizeLinear", ["branch", "io_scale", "io_zero_point"],
+            ["branch_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["branch_q", "io_scale", "io_zero_point"],
+            ["branch_dq"]),
+        helper.make_node("Sub", ["input_dq", "branch_dq"], ["difference"]),
+        helper.make_node(
+            "QuantizeLinear", ["difference", "out_scale", "out_zero_point"],
+            ["output_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["output_q", "out_scale", "out_zero_point"],
+            ["output"]),
+    ]
+    compile_model = _model(
+        "qdq_subtract", nodes, [model_input], [model_output], initializers)
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    input_data = np.linspace(
+        -2.0, 1.75, 16, dtype=np.float32).reshape(shape)
+    return ContractCase(
+        "int8_subtract",
+        compile_model,
+        reference_model,
+        {"input": input_data},
+        ("Conv", "Sub"),
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3720,6 +3811,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _softmax_axis_case(rank=4, last_axis=True),
         _softmax_axis_case(rank=4, last_axis=False),
         _tiled_softmax_case(),
+        _subtract_case(),
+        _qdq_subtract_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

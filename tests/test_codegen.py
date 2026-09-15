@@ -35,16 +35,20 @@ from tigris.loaders import load_model
 def unsupported_operator_plan(tmp_path):
     """A QDQ plan holding an operator no dispatcher can execute.
 
-    Sub has a schema opcode and no kernel on any backend, and normalization
+    Pad has a schema opcode and no kernel on any backend, and normalization
     leaves it alone, so it reaches the plan intact. The operator itself is not
     the point: this fixture exists so codegen's capability check has something
-    to refuse.
+    to refuse. The assertion below says so, because three earlier exemplars
+    were chosen and then implemented.
     """
+    from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
+
+    routed = frozenset().union(
+        *(effective_operators(backend) for backend in KERNEL_CAPABILITIES))
+    assert "Pad" not in routed, (
+        "Pad now has a kernel; pick another unrouted operator for this fixture")
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 4]
-    )
-    weight_input = helper.make_tensor_value_info(
-        "weight", TensorProto.FLOAT, [1, 4]
     )
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 4]
@@ -55,11 +59,8 @@ def unsupported_operator_plan(tmp_path):
     input_zp = numpy_helper.from_array(
         np.array([0], dtype=np.int8), "input_zp"
     )
-    weight_scale = numpy_helper.from_array(
-        np.array([0.02], dtype=np.float32), "weight_scale"
-    )
-    weight_zp = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "weight_zp"
+    pads = numpy_helper.from_array(
+        np.array([0, 0, 0, 0], dtype=np.int64), "pads"
     )
     output_scale = numpy_helper.from_array(
         np.array([0.1], dtype=np.float32), "output_scale"
@@ -80,21 +81,11 @@ def unsupported_operator_plan(tmp_path):
             ["input_dq"],
         ),
         helper.make_node(
-            "QuantizeLinear",
-            ["weight", "weight_scale", "weight_zp"],
-            ["weight_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["weight_q", "weight_scale", "weight_zp"],
-            ["weight_dq"],
-        ),
-        helper.make_node(
-            "Sub", ["input_dq", "weight_dq"], ["sub_out"], name="unsupported"
+            "Pad", ["input_dq", "pads"], ["padded"], name="unsupported"
         ),
         helper.make_node(
             "QuantizeLinear",
-            ["sub_out", "output_scale", "output_zp"],
+            ["padded", "output_scale", "output_zp"],
             ["output_q"],
         ),
         helper.make_node(
@@ -106,13 +97,12 @@ def unsupported_operator_plan(tmp_path):
     graph = helper.make_graph(
         nodes,
         "quantized_unsupported",
-        [model_input, weight_input],
+        [model_input],
         [model_output],
         initializer=[
             input_scale,
             input_zp,
-            weight_scale,
-            weight_zp,
+            pads,
             output_scale,
             output_zp,
         ],
@@ -127,10 +117,10 @@ def unsupported_operator_plan(tmp_path):
     onnx.save(model, model_path)
     analyzed = _full_pipeline(model_path, budget=4096)
     assert analyzed.is_quantized
-    assert [op.op_type for op in analyzed.ops] == ["Sub"]
+    assert [op.op_type for op in analyzed.ops] == ["Pad"]
 
     plan_path = tmp_path / "quantized_unsupported.tgrs"
-    # Sub has no runtime route on any backend, so validate_operator_support
+    # Pad has no runtime route on any backend, so validate_operator_support
     # now correctly rejects it at compile time (the fail-closed gate this
     # fixture predates). This fixture exists to exercise codegen's own,
     # separate defense-in-depth capability check against an already-serialized
@@ -531,7 +521,7 @@ def test_unsupported_operator_codegen_fails_before_output(
 
     assert result.exit_code != 0
     assert f"Backend '{backend}' cannot execute this int8 plan" in result.output
-    assert "unsupported (Sub)" in result.output
+    assert "unsupported (Pad)" in result.output
     assert not output.exists()
 
 

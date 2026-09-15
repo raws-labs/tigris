@@ -41,6 +41,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Sigmoid",
     "Tanh",
     "Add",
+    "Sub",
     "Mul",
     "Conv1D",
     "GlobalAveragePool",
