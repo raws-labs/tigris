@@ -519,19 +519,21 @@ def _tcn_16k_case() -> ContractCase:
     )
 
 
-def _reduce_mean_case() -> ContractCase:
-    """ReduceMean over spatial axes must execute as GlobalAveragePool."""
+def _reduce_case(*, maximum: bool) -> ContractCase:
+    """A spatial ReduceMean or ReduceMax must execute as its global pool."""
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 3, 2, 3]
     )
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 3, 1, 1]
     )
+    operator = "ReduceMax" if maximum else "ReduceMean"
+    pool = "GlobalMaxPool" if maximum else "GlobalAveragePool"
     model = _model(
-        "reduce_mean_to_gap",
+        f"{operator.lower()}_to_pool",
         [
             helper.make_node(
-                "ReduceMean",
+                operator,
                 ["input"],
                 ["output"],
                 axes=[2, 3],
@@ -542,7 +544,7 @@ def _reduce_mean_case() -> ContractCase:
         [model_output],
     )
     return ContractCase(
-        "float_reduce_mean_to_gap",
+        f"float_{operator.lower()}_to_pool",
         model,
         model,
         {
@@ -550,7 +552,7 @@ def _reduce_mean_case() -> ContractCase:
                 18, dtype=np.float32
             ).reshape(1, 3, 2, 3)
         },
-        ("GlobalAveragePool",),
+        (pool,),
     )
 
 
@@ -3867,7 +3869,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _rank3_pointwise_case(),
         _many_stage_case(),
         _tcn_16k_case(),
-        _reduce_mean_case(),
+        _reduce_case(maximum=False),
+        _reduce_case(maximum=True),
         _inference_identity_case(),
         _channel_bias_add_case(producer_has_bias=False),
         _channel_bias_add_case(producer_has_bias=True),

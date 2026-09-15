@@ -1418,7 +1418,7 @@ def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Replace ReduceMean(axes=[2,3]) with GlobalAveragePool.
+    """Replace a spatial ReduceMean or ReduceMax with its global pool.
 
     Newer ONNX exporters (PyTorch >= 2.x) emit ReduceMean over spatial
     dimensions instead of GlobalAveragePool.  They are semantically
@@ -1428,8 +1428,10 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
     Handles both attribute-based axes (opset < 18) and input-based axes
     (opset >= 18).
     """
+    reductions = {"ReduceMean": "GlobalAveragePool", "ReduceMax": "GlobalMaxPool"}
+
     for op in ag.ops:
-        if op.op_type != "ReduceMean":
+        if op.op_type not in reductions:
             continue
 
         # Try axes from attribute first (opset < 18)
@@ -1451,7 +1453,7 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
         if axes_norm not in ({2, 3}, {1, 2}):
             continue
 
-        op.op_type = "GlobalAveragePool"
+        op.op_type = reductions[op.op_type]
         op.attrs = {}
 
         # Remove axes input and clean up axes tensor
