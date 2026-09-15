@@ -993,6 +993,27 @@ def _clip_as_relu_case() -> ContractCase:
     )
 
 
+def _negate_case() -> ContractCase:
+    """Neg has no opcode; it compiles as a multiplication by minus one."""
+    shape = [1, 5]
+    model = _model(
+        "negate",
+        [
+            helper.make_node("Relu", ["input"], ["gated"]),
+            helper.make_node("Neg", ["gated"], ["output"]),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    return ContractCase(
+        "float_negate",
+        model,
+        model,
+        {"input": np.array([[-2.0, -0.5, 0.0, 1.5, 3.0]], dtype=np.float32)},
+        ("Relu", "Mul"),
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3888,6 +3909,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _global_max_pool_case(),
         _sub_constant_case(),
         _clip_as_relu_case(),
+        _negate_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

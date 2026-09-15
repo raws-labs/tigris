@@ -54,6 +54,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_qdq(ag)
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
+    ag = _neg_to_scalar_mul(ag)
     ag = _fold_sub_constant_to_add(ag)
     ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
@@ -1017,6 +1018,32 @@ def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
         op.attrs["transB"] = 1
     return ag
 
+
+
+
+def _neg_to_scalar_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite Neg as a multiplication by minus one.
+
+    Neg has no opcode, so a graph holding one is rejected outright, yet it is
+    exactly the scalar-constant Mul the kernels already carry. The scalar is a
+    float, so this applies before quantization folding, where a quantized graph
+    still states its operands in float.
+    """
+    for index, op in enumerate(ag.ops):
+        if op.op_type != "Neg" or len(op.inputs) != 1:
+            continue
+        info = ag.tensors.get(op.inputs[0])
+        if info is None or info.dtype != 1:
+            continue
+
+        scalar = f"{op.outputs[0]}_minus_one_{index}"
+        ag.weight_data[scalar] = np.array([-1.0], dtype=np.float32)
+        ag.tensors[scalar] = TensorInfo(
+            name=scalar, shape=(1,), dtype=1, is_constant=True)
+        op.op_type = "Mul"
+        op.inputs = [op.inputs[0], scalar]
+        op.attrs = {}
+    return ag
 
 
 def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:

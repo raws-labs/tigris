@@ -61,3 +61,16 @@ def test_constant_minuend_is_refused(tmp_path):
     support = validate_operator_support(ag)
     assert not support.supported
     assert "does not commute" in support.describe()
+
+
+def test_neg_becomes_a_scalar_multiplication(tmp_path):
+    """Neg has no opcode; it is the scalar-constant Mul the kernels carry."""
+    ag = _normalized(
+        tmp_path,
+        [helper.make_node("Neg", ["x"], ["y"], name="neg1")],
+        [_vi("x", [1, 4])], [_vi("y", [1, 4])])
+
+    assert [op.op_type for op in ag.ops] == ["Mul"]
+    scalar = ag.ops[0].inputs[1]
+    assert np.allclose(ag.weight_data[scalar], [-1.0])
+    assert validate_operator_support(ag).supported
