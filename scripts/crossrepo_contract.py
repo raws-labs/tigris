@@ -1014,6 +1014,37 @@ def _negate_case() -> ContractCase:
     )
 
 
+def _gemm_scaled_case() -> ContractCase:
+    """A Gemm carrying alpha and beta, folded into the constants they scale.
+
+    The plan has no field for either and the kernel computes Y = X * W^T + B,
+    so before the fold this compiled and returned a silently wrong answer.
+    ONNX Runtime applies both, which is what makes this case decisive.
+    """
+    weight = numpy_helper.from_array(
+        np.linspace(-0.5, 0.5, 12, dtype=np.float32).reshape(4, 3), "weight")
+    bias = numpy_helper.from_array(
+        np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32), "bias")
+    model = _model(
+        "gemm_scaled",
+        [
+            helper.make_node(
+                "Gemm", ["input", "weight", "bias"], ["output"],
+                alpha=2.0, beta=3.0, transB=1),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])],
+        [weight, bias],
+    )
+    return ContractCase(
+        "float_gemm_scaled",
+        model,
+        model,
+        {"input": np.array([[1.0, -2.0, 0.5]], dtype=np.float32)},
+        ("Gemm",),
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -3910,6 +3941,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _sub_constant_case(),
         _clip_as_relu_case(),
         _negate_case(),
+        _gemm_scaled_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

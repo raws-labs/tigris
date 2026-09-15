@@ -52,6 +52,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _drop_inference_identities(ag)
     ag = _fold_constant_ops(ag)
     ag = _fold_qdq(ag)
+    ag = _fold_gemm_scalars(ag)
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
     ag = _neg_to_scalar_mul(ag)
@@ -957,6 +958,43 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
 # Producers whose kernels read an optional bias operand after the weight.
 # MatMul is absent because a relabelable one is already a Gemm by this point.
 _BIAS_PRODUCERS = frozenset({"Conv", "DepthwiseConv", "Conv1D", "Gemm"})
+
+
+
+def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Fold Gemm's alpha and beta into the constants they scale.
+
+    The plan has no field for either, and the fully-connected kernel computes
+    Y = X * W^T + B, so a Gemm carrying them used to compile and return a
+    silently wrong answer. Scaling a constant weight by alpha and a constant
+    bias by beta is exact and leaves nothing for the plan to express. transA
+    transposes an activation, which no constant can absorb; validation refuses
+    it.
+    """
+    for op in ag.ops:
+        if op.op_type != "Gemm" or len(op.inputs) < 2:
+            continue
+
+        alpha = float(op.attrs.get("alpha", 1.0))
+        if alpha != 1.0:
+            weight = ag.weight_data.get(op.inputs[1])
+            if weight is not None and weight.dtype == np.float32:
+                ag.weight_data[op.inputs[1]] = np.ascontiguousarray(
+                    weight * np.float32(alpha))
+                op.attrs["alpha"] = 1.0
+
+        beta = float(op.attrs.get("beta", 1.0))
+        if beta != 1.0:
+            if len(op.inputs) < 3:
+                # beta scales C; with no C there is no term for it to scale.
+                op.attrs["beta"] = 1.0
+            else:
+                bias = ag.weight_data.get(op.inputs[2])
+                if bias is not None and bias.dtype == np.float32:
+                    ag.weight_data[op.inputs[2]] = np.ascontiguousarray(
+                        bias * np.float32(beta))
+                    op.attrs["beta"] = 1.0
+    return ag
 
 
 def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:

@@ -271,6 +271,17 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         f"{input_tensor.layout.value} layout)"
                     )
 
+        if op.op_type == "Gemm":
+            if int(op.attrs.get("transA", 0)) != 0:
+                reasons.append(
+                    "transA transposes an activation, which the plan has no "
+                    "field for and no constant can absorb")
+            for name in ("alpha", "beta"):
+                if float(op.attrs.get(name, 1.0)) != 1.0:
+                    reasons.append(
+                        f"{name} is not 1 and could not be folded into a "
+                        "constant, and the plan has no field for it")
+
         if op.op_type == "Sub":
             dynamic = [
                 name for name in op.inputs
