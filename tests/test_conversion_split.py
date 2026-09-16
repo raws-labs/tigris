@@ -79,3 +79,34 @@ def test_an_untileable_stage_without_a_conversion_is_left_alone(tmp_path):
                [ag.ops[i].op_type for i in st.op_indices])
     assert not gap.tile_plan.tileable
     assert conversion_cut_points(ag) == frozenset()
+
+
+def test_an_isolated_conversion_tiles_along_its_longer_axis(tmp_path):
+    """Splitting is only useful if the conversion stages tile afterwards."""
+    ag = _planned(
+        tmp_path, _SOFTMAX_NODES, (_SOFTMAX_SHAPE, _SOFTMAX_SHAPE), 32_000
+    )
+
+    assert _stage_op_types(ag) == [["Transpose"], ["Softmax"], ["Transpose"]]
+    for stage in ag.stages:
+        assert stage.tile_plan is not None and stage.tile_plan.tileable
+        assert stage.tile_plan.num_tiles > 1
+
+    # Both conversions band the 4096 axis, whichever side of the permutation
+    # it sits on.
+    assert ag.stages[0].tile_plan.original_height == 4096
+    assert ag.stages[2].tile_plan.original_height == 4096
+
+
+def test_a_conversion_whose_narrow_slice_does_not_fit_stays_untileable(tmp_path):
+    """The smallest band is one column of the short axis on each side."""
+    ag = _planned(
+        tmp_path, _SOFTMAX_NODES, (_SOFTMAX_SHAPE, _SOFTMAX_SHAPE), 40
+    )
+
+    conversions = [
+        stage for stage in ag.stages
+        if [ag.ops[i].op_type for i in stage.op_indices] == ["Transpose"]
+    ]
+    assert conversions
+    assert all(not st.tile_plan.tileable for st in conversions)

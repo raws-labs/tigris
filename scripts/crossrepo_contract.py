@@ -1131,6 +1131,36 @@ def _tiled_softmax_rank4_case() -> ContractCase:
     )
 
 
+
+def _tiled_last_axis_softmax_case() -> ContractCase:
+    """Softmax over the last axis on a stage the solver has to tile.
+
+    Normalization runs along the model's own final axis, which is not the axis
+    the runtime stores last, so the graph compiles to a conversion, the
+    Softmax, and a conversion back. At this budget all three have to tile, and
+    the two conversions tile along opposite transfers.
+    """
+    shape = [1, 512, 6]
+    model = _model(
+        "tiled_last_axis_softmax",
+        [helper.make_node("Softmax", ["input"], ["output"], axis=-1)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    data = np.linspace(
+        -3.0, 3.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_tiled_last_axis_softmax",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Softmax", "Transpose"),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -4030,6 +4060,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _negate_case(),
         _gemm_scaled_case(),
         _tiled_softmax_rank4_case(),
+        _tiled_last_axis_softmax_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
