@@ -418,6 +418,65 @@ def _conv1d_case() -> ContractCase:
     )
 
 
+def _qdq_conv1d_case() -> ContractCase:
+    """An int8 Conv1D, whose kernel requantizes its int32 accumulator.
+
+    The scales are chosen so the effective scale (0.03125) and the raw output
+    scale (0.5) differ by a factor of sixteen: an output requantized with the
+    wrong one of the two is off by tens of quantization steps, not by rounding.
+    """
+    shape = [1, 1, 8]
+    initializers = [
+        numpy_helper.from_array(np.array(0.25, dtype=np.float32), "in_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "in_zero_point"),
+        numpy_helper.from_array(np.array(0.5, dtype=np.float32), "out_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "out_zero_point"),
+        numpy_helper.from_array(
+            np.full((1, 1, 3), 0.5, dtype=np.float32), "weight"),
+        numpy_helper.from_array(
+            np.array(0.0625, dtype=np.float32), "weight_scale"),
+        numpy_helper.from_array(
+            np.array(0, dtype=np.int8), "weight_zero_point"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["input", "in_scale", "in_zero_point"], ["iq"]),
+        helper.make_node(
+            "DequantizeLinear", ["iq", "in_scale", "in_zero_point"], ["idq"]),
+        helper.make_node(
+            "QuantizeLinear",
+            ["weight", "weight_scale", "weight_zero_point"], ["wq"]),
+        helper.make_node(
+            "DequantizeLinear",
+            ["wq", "weight_scale", "weight_zero_point"], ["wdq"]),
+        helper.make_node(
+            "Conv", ["idq", "wdq"], ["raw"], kernel_shape=[3], pads=[1, 1]),
+        helper.make_node(
+            "QuantizeLinear", ["raw", "out_scale", "out_zero_point"], ["oq"]),
+        helper.make_node(
+            "DequantizeLinear",
+            ["oq", "out_scale", "out_zero_point"], ["output"]),
+    ]
+    compile_model = _model(
+        "qdq_conv1d",
+        nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    return ContractCase(
+        "int8_conv1d",
+        compile_model,
+        reference_model,
+        {"input": np.array(
+            [[[-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5]]],
+            dtype=np.float32)},
+        ("Conv1D",),
+    )
+
+
 def _rank3_pointwise_case() -> ContractCase:
     """Rank-3 unary and exact-shape binary ops tile along NLC length."""
     length = 256
@@ -3918,6 +3977,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _depthwise_conv_case(),
         _math_normalization_case(),
         _conv1d_case(),
+        _qdq_conv1d_case(),
         _rank3_pointwise_case(),
         _many_stage_case(),
         _tcn_16k_case(),
