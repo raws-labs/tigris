@@ -12,6 +12,7 @@ import math
 from enum import Enum
 
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
+from tigris.analysis.partition_temporal import partition_temporal
 from tigris.graph.ir import (
     AnalyzedGraph,
     OpNode,
@@ -599,12 +600,79 @@ def _solve_convtranspose_2d(
     )
 
 
+
+def _is_layout_conversion(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """A Transpose that only restates a tensor's axis order.
+
+    The normalizer inserts one where a producer and a consumer disagree about
+    layout, with an identity permutation: the tensors differ in layout, not in
+    the order their axes are named.
+    """
+    if op.op_type != "Transpose" or len(op.inputs) != 1 or len(op.outputs) != 1:
+        return False
+    perm = op.attrs.get("perm")
+    if perm is None or list(perm) != list(range(len(perm))):
+        return False
+    source = ag.tensors.get(op.inputs[0])
+    result = ag.tensors.get(op.outputs[0])
+    return (
+        source is not None
+        and result is not None
+        and source.layout is not result.layout
+    )
+
+
+def conversion_cut_points(ag: AnalyzedGraph) -> frozenset[int]:
+    """Op indices that must start a stage for an oversized stage to tile.
+
+    A layout conversion swaps the two axes on either side of it, so a stage
+    holding one wants different tile axes for its input and its interior and
+    cannot tile on either. Isolating the conversion lets each side tile on its
+    own axis. Only stages that are both oversized and untileable are split:
+    a conversion that fits keeps its intermediates in the fast arena, which
+    splitting would force out to slow.
+    """
+    if not ag.stages or ag.mem_budget <= 0:
+        return frozenset()
+
+    cuts: set[int] = set()
+    for stage in ag.stages:
+        if stage.peak_bytes <= ag.mem_budget:
+            continue
+        if stage.tile_plan is not None and stage.tile_plan.tileable:
+            continue
+        for position, op_index in enumerate(stage.op_indices):
+            if not _is_layout_conversion(ag, ag.ops[op_index]):
+                continue
+            # Isolate it: cut before it, and after it when it is not last.
+            cuts.add(op_index)
+            if position + 1 < len(stage.op_indices):
+                cuts.add(stage.op_indices[position + 1])
+    return frozenset(cuts)
+
+
 def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Analyze each stage and attach a TilePlan where needed.
 
     Only stages whose peak_bytes exceed mem_budget are analyzed.
     Stages that fit within budget get no tile_plan (None).
+
+    A stage that stays untileable because it fuses a layout conversion is
+    given a second chance: the graph is re-partitioned with the conversion
+    on its own stage, then re-analyzed. Stages that tiled the first time are
+    unaffected, so a graph without such a stage takes the single pass.
     """
+    _assign_tile_plans(ag)
+
+    cuts = conversion_cut_points(ag)
+    if cuts:
+        partition_temporal(ag, ag.mem_budget, forced_cuts=cuts)
+        _assign_tile_plans(ag)
+    return ag
+
+
+def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """One pass of tile analysis over the current stage list."""
     if not ag.stages or ag.mem_budget <= 0:
         return ag
 

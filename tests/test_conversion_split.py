@@ -1,0 +1,81 @@
+"""A stage that cannot tile because it fuses a layout conversion is re-cut."""
+
+import onnx
+from onnx import TensorProto, helper
+
+from tigris.analysis.lifetime import compute_lifetimes
+from tigris.analysis.memory import compute_memory_timeline
+from tigris.analysis.partition_spatial import (
+    conversion_cut_points,
+    partition_spatial,
+)
+from tigris.analysis.partition_temporal import partition_temporal
+from tigris.loaders import load_model
+
+
+def _planned(tmp_path, nodes, shapes, budget, name="split"):
+    graph = helper.make_graph(
+        nodes,
+        name,
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shapes[0])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shapes[1])],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)]
+    )
+    path = tmp_path / f"{name}.onnx"
+    onnx.save(model, str(path))
+
+    ag = load_model(path)
+    ag = compute_lifetimes(ag)
+    ag = compute_memory_timeline(ag, capture_live_tensors=False)
+    ag = partition_temporal(ag, budget)
+    return partition_spatial(ag)
+
+
+def _stage_op_types(ag):
+    return [[ag.ops[i].op_type for i in st.op_indices] for st in ag.stages]
+
+
+# A rank-3 last-axis Softmax: the normalizer converts to linear order, reduces,
+# and converts back. 1 x 4096 x 8 floats is 128 KiB per tensor.
+_SOFTMAX_SHAPE = [1, 4096, 8]
+_SOFTMAX_NODES = [
+    helper.make_node("Softmax", ["x"], ["y"], axis=-1, name="sm1")
+]
+
+
+def test_an_oversized_conversion_stage_is_split_so_its_interior_tiles(tmp_path):
+    ag = _planned(
+        tmp_path, _SOFTMAX_NODES, (_SOFTMAX_SHAPE, _SOFTMAX_SHAPE), 32_000
+    )
+
+    assert _stage_op_types(ag) == [["Transpose"], ["Softmax"], ["Transpose"]]
+    interior = ag.stages[1].tile_plan
+    assert interior is not None and interior.tileable
+    assert interior.num_tiles > 1
+
+
+def test_a_conversion_that_fits_is_left_fused(tmp_path):
+    """Splitting a stage that fits would push its interior out to slow memory."""
+    ag = _planned(
+        tmp_path, _SOFTMAX_NODES, (_SOFTMAX_SHAPE, _SOFTMAX_SHAPE), 4_000_000
+    )
+
+    assert _stage_op_types(ag) == [["Transpose", "Softmax", "Transpose"]]
+    assert ag.stages[0].tile_plan is None
+
+
+def test_an_untileable_stage_without_a_conversion_is_left_alone(tmp_path):
+    """The fallback only answers the disagreement a conversion creates."""
+    shape = [1, 8, 64, 64]
+    nodes = [
+        helper.make_node("Relu", ["x"], ["h"], name="relu1"),
+        helper.make_node("GlobalAveragePool", ["h"], ["y"], name="gap1"),
+    ]
+    ag = _planned(tmp_path, nodes, (shape, [1, 8, 1, 1]), 32_000)
+
+    gap = next(st for st in ag.stages if "GlobalAveragePool" in
+               [ag.ops[i].op_type for i in st.op_indices])
+    assert not gap.tile_plan.tileable
+    assert conversion_cut_points(ag) == frozenset()
