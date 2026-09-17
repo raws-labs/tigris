@@ -12,8 +12,10 @@ import math
 from enum import Enum
 
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
+from tigris.analysis.partition_temporal import partition_temporal
 from tigris.graph.ir import (
     AnalyzedGraph,
+    Layout,
     OpNode,
     Stage,
     TilePlan,
@@ -439,6 +441,47 @@ def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
     return True
 
 
+def _serialized_shape(info) -> tuple[int, ...]:
+    """The extents in the order the runtime stores them.
+
+    The IR keeps ONNX NCHW/NCL. A SPATIAL tensor serializes with its channel
+    axis last; a LINEAR one is already in storage order. Tile geometry for a
+    conversion stage has to be read in that storage order, because the
+    conversion is a permutation of exactly those axes.
+    """
+    shape = tuple(int(dim) for dim in info.shape)
+    if info.layout is Layout.LINEAR:
+        return shape
+    if len(shape) == 4:
+        return (shape[0], shape[2], shape[3], shape[1])
+    if len(shape) == 3:
+        return (shape[0], shape[2], shape[1])
+    return shape
+
+
+def _conversion_extents(info) -> tuple[int, int, int] | None:
+    """The batch and the two extents a conversion of this tensor transposes.
+
+    A conversion moves the channel axis past the spatial ones and leaves those
+    in their relative order, so once the axes that travel together are read as
+    one it is a plain matrix transpose. In storage order a SPATIAL tensor has
+    its channels last, a LINEAR one has them at position 1.
+    """
+    stored = _serialized_shape(info)
+    if len(stored) not in (3, 4):
+        return None
+    batch = stored[0]
+    if info.layout is Layout.SPATIAL:
+        rows = math.prod(stored[1:-1])
+        cols = stored[-1]
+    else:
+        rows = stored[1]
+        cols = math.prod(stored[2:])
+    if batch <= 0 or rows <= 0 or cols <= 0:
+        return None
+    return batch, rows, cols
+
+
 def _stage_is_global_reduction(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -537,6 +580,107 @@ def _solve_global_reduction(
         receptive_field=1,
         original_height=full_h,
         tiled_peak_bytes=working_set(rows),
+        overhead_bytes=0,
+        warnings=[],
+    )
+
+def _stage_is_layout_conversion(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """A stage that is one conversion between the two storage orders.
+
+    Transpose stays UNTILEABLE in _OP_CATEGORY because it swaps the two axes
+    the stripe contract propagates. The runtime instead walks the conversion's
+    output rows, gathering the input columns each band transposes, which only
+    works when the conversion is the whole stage.
+    """
+    if len(stage_ops) != 1 or stage_ops[0].op_type != "Transpose":
+        return False
+    op = stage_ops[0]
+    if len(op.inputs) != 1 or len(op.outputs) != 1:
+        return False
+    if stage.input_tensors != op.inputs or stage.output_tensors != op.outputs:
+        return False
+
+    source = ag.tensors.get(op.inputs[0])
+    result = ag.tensors.get(op.outputs[0])
+    if source is None or result is None:
+        return False
+    if source.layout is result.layout:
+        return False
+    if len(source.shape) != len(result.shape):
+        return False
+
+    perm = op.attrs.get("perm")
+    if perm is None or list(perm) != list(range(len(source.shape))):
+        return False
+
+    from_side = _conversion_extents(source)
+    to_side = _conversion_extents(result)
+    if from_side is None or to_side is None:
+        return False
+    # The conversion transposes the pair, so the other side reads reversed.
+    return (
+        from_side[0] == to_side[0]
+        and from_side[1] == to_side[2]
+        and from_side[2] == to_side[1]
+    )
+
+
+def _solve_layout_conversion(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Size the band a conversion transposes at a time.
+
+    Mirrors the runtime: the band runs along the longer of the two permuted
+    axes, and the two slices hold the same element count but are separate
+    allocations, so each is aligned on its own.
+    """
+    source = ag.tensors[stage_ops[0].inputs[0]]
+    extents = _conversion_extents(source)
+    if extents is None:  # guarded by _stage_is_layout_conversion; defensive
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine conversion extents"
+            ],
+        )
+    batch, rows, cols = extents
+    banded = max(rows, cols)
+    other = min(rows, cols)
+
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+
+    def working_set(band: int) -> int:
+        return 2 * _align_up(batch * other * band * source.elem_size, align)
+
+    if working_set(1) > budget:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum conversion band still "
+                f"exceeds budget ({budget:,} bytes)"
+            ],
+        )
+
+    low, high, band = 1, banded, 1
+    while low <= high:
+        candidate = low + (high - low) // 2
+        if working_set(candidate) <= budget:
+            band = candidate
+            low = candidate + 1
+        else:
+            high = candidate - 1
+
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+        tile_height=band,
+        num_tiles=math.ceil(banded / band),
+        halo=0,
+        receptive_field=1,
+        original_height=banded,
+        tiled_peak_bytes=working_set(band),
         overhead_bytes=0,
         warnings=[],
     )
@@ -702,12 +846,79 @@ def _solve_convtranspose_2d(
     )
 
 
+
+def _is_layout_conversion(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """A Transpose that only restates a tensor's axis order.
+
+    The normalizer inserts one where a producer and a consumer disagree about
+    layout, with an identity permutation: the tensors differ in layout, not in
+    the order their axes are named.
+    """
+    if op.op_type != "Transpose" or len(op.inputs) != 1 or len(op.outputs) != 1:
+        return False
+    perm = op.attrs.get("perm")
+    if perm is None or list(perm) != list(range(len(perm))):
+        return False
+    source = ag.tensors.get(op.inputs[0])
+    result = ag.tensors.get(op.outputs[0])
+    return (
+        source is not None
+        and result is not None
+        and source.layout is not result.layout
+    )
+
+
+def conversion_cut_points(ag: AnalyzedGraph) -> frozenset[int]:
+    """Op indices that must start a stage for an oversized stage to tile.
+
+    A layout conversion swaps the two axes on either side of it, so a stage
+    holding one wants different tile axes for its input and its interior and
+    cannot tile on either. Isolating the conversion lets each side tile on its
+    own axis. Only stages that are both oversized and untileable are split:
+    a conversion that fits keeps its intermediates in the fast arena, which
+    splitting would force out to slow.
+    """
+    if not ag.stages or ag.mem_budget <= 0:
+        return frozenset()
+
+    cuts: set[int] = set()
+    for stage in ag.stages:
+        if stage.peak_bytes <= ag.mem_budget:
+            continue
+        if stage.tile_plan is not None and stage.tile_plan.tileable:
+            continue
+        for position, op_index in enumerate(stage.op_indices):
+            if not _is_layout_conversion(ag, ag.ops[op_index]):
+                continue
+            # Isolate it: cut before it, and after it when it is not last.
+            cuts.add(op_index)
+            if position + 1 < len(stage.op_indices):
+                cuts.add(stage.op_indices[position + 1])
+    return frozenset(cuts)
+
+
 def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Analyze each stage and attach a TilePlan where needed.
 
     Only stages whose peak_bytes exceed mem_budget are analyzed.
     Stages that fit within budget get no tile_plan (None).
+
+    A stage that stays untileable because it fuses a layout conversion is
+    given a second chance: the graph is re-partitioned with the conversion
+    on its own stage, then re-analyzed. Stages that tiled the first time are
+    unaffected, so a graph without such a stage takes the single pass.
     """
+    _assign_tile_plans(ag)
+
+    cuts = conversion_cut_points(ag)
+    if cuts:
+        partition_temporal(ag, ag.mem_budget, forced_cuts=cuts)
+        _assign_tile_plans(ag)
+    return ag
+
+
+def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """One pass of tile analysis over the current stage list."""
     if not ag.stages or ag.mem_budget <= 0:
         return ag
 
@@ -733,6 +944,13 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
         # _OP_CATEGORY and reaches its execution path only through this branch.
         if _stage_is_global_reduction(ag, stage, stage_ops):
             stage.tile_plan = _solve_global_reduction(
+                ag, stage, stage_ops, budget)
+            continue
+
+        # A conversion permutes the two axes the stripe contract propagates,
+        # so it reaches its own execution path the same way.
+        if _stage_is_layout_conversion(ag, stage, stage_ops):
+            stage.tile_plan = _solve_layout_conversion(
                 ag, stage, stage_ops, budget)
             continue
 
