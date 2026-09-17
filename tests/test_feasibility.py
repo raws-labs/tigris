@@ -56,10 +56,8 @@ def _write_oversized_height_op_model(tmp_path, op_type):
     return path
 
 
-@pytest.mark.parametrize("op_type", ["GlobalAveragePool", "Resize"])
-def test_height_changing_or_reducing_stage_cannot_claim_height_tiling(
-    tmp_path, op_type
-):
+@pytest.mark.parametrize("op_type", ["Resize"])
+def test_height_changing_stage_cannot_claim_height_tiling(tmp_path, op_type):
     model_path = _write_oversized_height_op_model(tmp_path, op_type)
 
     graph, _ = _run_pipeline(str(model_path), ("4K",))
@@ -77,7 +75,39 @@ def test_height_changing_or_reducing_stage_cannot_claim_height_tiling(
     assert not validate_memory_plan(graph).feasible
 
 
-@pytest.mark.parametrize("op_type", ["GlobalAveragePool", "Resize"])
+def test_a_global_reduction_tiles_along_its_input(tmp_path):
+    """It has no output axis to tile, so the band count comes from the input."""
+    model_path = _write_oversized_height_op_model(
+        tmp_path, "GlobalAveragePool")
+
+    graph, _ = _run_pipeline(str(model_path), ("4K",))
+    tile_plans = [
+        stage.tile_plan for stage in graph.stages if stage.tile_plan is not None
+    ]
+
+    assert tile_plans
+    assert all(tile_plan.tileable for tile_plan in tile_plans)
+    assert all(tile_plan.num_tiles > 1 for tile_plan in tile_plans)
+    assert all(tile_plan.original_height == 64 for tile_plan in tile_plans)
+    assert validate_memory_plan(graph).feasible
+
+
+def test_a_global_reduction_too_wide_for_one_row_stays_untileable(tmp_path):
+    """One row of a 64-wide plane needs more than the budget allows."""
+    model_path = _write_oversized_height_op_model(
+        tmp_path, "GlobalAveragePool")
+
+    graph, _ = _run_pipeline(str(model_path), ("1K",))
+    tile_plans = [
+        stage.tile_plan for stage in graph.stages if stage.tile_plan is not None
+    ]
+
+    assert tile_plans
+    assert all(not tile_plan.tileable for tile_plan in tile_plans)
+    assert not validate_memory_plan(graph).feasible
+
+
+@pytest.mark.parametrize("op_type", ["Resize"])
 def test_compile_refuses_unsafe_height_tiling_but_keeps_untiled_support(
     tmp_path, op_type
 ):
