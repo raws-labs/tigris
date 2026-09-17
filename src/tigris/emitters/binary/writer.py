@@ -1017,6 +1017,19 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
             raise ValueError(
                 f"untileable stage {stage.stage_id} must use tile axis 0"
             )
+        # Every tile extent below is a uint16 field. Say which one overflowed
+        # and on which stage: struct.pack alone reports neither, and
+        # tile_width is masked rather than checked, so it would be silent.
+        for field in (
+            "tile_height", "num_tiles", "halo",
+            "receptive_field", "original_height", "tile_width",
+        ):
+            value = int(getattr(tp, field))
+            if not 0 <= value <= 0xFFFF:
+                raise ValueError(
+                    f"stage {stage.stage_id} tile plan {field} is {value:,}, "
+                    f"outside the 0..65,535 the plan format carries"
+                )
 
         # tigris_tile_plan_t: 24 bytes
         # tileable(u8) axis(u8) tile_height(u16)

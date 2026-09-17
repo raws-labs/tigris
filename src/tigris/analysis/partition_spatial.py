@@ -103,6 +103,21 @@ _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 # stage_2d_fast_bytes check rejects, which is exactly the bug this guards.
 _CONSERVATIVE_TENSOR_ALIGN = 32
 
+# tigris_tile_plan_t carries tile_height, num_tiles and original_height in
+# uint16 fields (TILE_PLAN_STRUCT in emitters/binary/defs.py). Every solver
+# that banded a single axis stayed inside that by the nature of the shapes
+# that fit an embedded budget. The conversion and row solvers band a product
+# of axes instead, which reaches the limit at ordinary sizes: a 256x256
+# feature map through a layout conversion is 65536 rows. A solver that
+# promises a banding the plan cannot carry would abort the compile in the
+# writer with no diagnosis, so it declines the stage and says why.
+_MAX_PLAN_EXTENT = 0xFFFF
+
+
+def _plan_extents_fit(tile_height: int, num_tiles: int, original: int) -> bool:
+    """Whether a banding fits the uint16 fields of the tile plan record."""
+    return max(tile_height, num_tiles, original) <= _MAX_PLAN_EXTENT
+
 
 def classify_op(op_type: str) -> TileCategory:
     """Classify an op type into a tile category. Unknown ops are UNTILEABLE."""
@@ -602,11 +617,21 @@ def _solve_row_tile(
         else:
             high = candidate - 1
 
+    num_tiles = math.ceil(rows / band)
+    if not _plan_extents_fit(band, num_tiles, rows):
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} has {rows:,} rows, more than the "
+                f"{_MAX_PLAN_EXTENT:,} a tile plan can state"
+            ],
+        )
+
     return TilePlan(
         tileable=True,
         axis=TILE_AXIS_HEIGHT_OR_LENGTH,
         tile_height=band,
-        num_tiles=math.ceil(rows / band),
+        num_tiles=num_tiles,
         halo=0,
         receptive_field=1,
         original_height=rows,
@@ -806,11 +831,21 @@ def _solve_layout_conversion(
         else:
             high = candidate - 1
 
+    num_tiles = math.ceil(banded / band)
+    if not _plan_extents_fit(band, num_tiles, banded):
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} transposes {banded:,} rows, more "
+                f"than the {_MAX_PLAN_EXTENT:,} a tile plan can state"
+            ],
+        )
+
     return TilePlan(
         tileable=True,
         axis=TILE_AXIS_HEIGHT_OR_LENGTH,
         tile_height=band,
-        num_tiles=math.ceil(banded / band),
+        num_tiles=num_tiles,
         halo=0,
         receptive_field=1,
         original_height=banded,
