@@ -1106,6 +1106,57 @@ def _gemm_scaled_case() -> ContractCase:
     )
 
 
+def _chain_pointwise_before_spatial_case() -> ContractCase:
+    """A chain stage whose first op comes before its convolution.
+
+    exec_chain_tiled set the tile context once per stage, at the stage's
+    OUTPUT height, and corrected it only when it reached the spatial op. An op
+    ahead of the convolution therefore computed only the rows the stage
+    finally emits and left the halo rows of its own output untouched, which
+    the convolution then read as data: a silent wrong answer on interior
+    rows.
+
+    The Clip is what puts a pointwise op ahead of the convolution, and the two
+    Concats are what make the stage large enough that the partitioner cuts it
+    into two chained stages at this budget rather than one stage or four.
+    """
+    c, s = 8, 13
+    rng = np.random.default_rng(0)
+    weight = (rng.normal(size=(c, c, 3, 3)) * 0.2).astype(np.float32)
+    model = _model(
+        "chain_pointwise_before_spatial",
+        [
+            helper.make_node("Clip", ["input", "lo", "hi"], ["clipped"]),
+            helper.make_node(
+                "Conv", ["clipped", "w"], ["conv"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+            helper.make_node("Concat", ["conv", "conv"], ["wide"], axis=1),
+            helper.make_node("Concat", ["wide", "wide"], ["output"], axis=1),
+        ],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, s, s])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, 4 * c, s, s])],
+        initializers=[
+            numpy_helper.from_array(weight, "w"),
+            numpy_helper.from_array(np.array(0.0, dtype=np.float32), "lo"),
+            numpy_helper.from_array(np.array(6.0, dtype=np.float32), "hi"),
+        ],
+    )
+    data = (rng.normal(size=(1, c, s, s)) * 0.7).astype(np.float32)
+    return ContractCase(
+        "float_chain_pointwise_before_spatial",
+        model,
+        model,
+        {"input": data},
+        ("Relu6", "Conv", "Concat", "Concat"),
+        mem_budget="16K",
+        expect_tiled=True,
+        expect_chain=True,
+        expect_line_buffered=True,
+    )
+
+
 def _chained_normalization_case() -> ContractCase:
     """A chain whose second stage normalizes.
 
@@ -4486,6 +4537,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_rank4_binary_case(op_type="Sub"),
         _tiled_rank4_binary_case(op_type="Mul"),
         _chained_normalization_case(),
+        _chain_pointwise_before_spatial_case(),
         _tiled_last_axis_softmax_case(rank=3),
         _tiled_last_axis_softmax_case(rank=4),
         _layer_norm_case(),
