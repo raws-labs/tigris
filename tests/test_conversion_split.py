@@ -1,5 +1,7 @@
 """A stage that cannot tile because it fuses a layout conversion is re-cut."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
@@ -7,9 +9,11 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import (
+    _transpose_band_extents,
     conversion_cut_points,
     partition_spatial,
 )
+from tigris.graph.ir import Layout
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.loaders import load_model
 
@@ -214,3 +218,24 @@ def test_a_transpose_the_model_asks_for_is_banded_too(tmp_path):
         assert stage.tile_plan is not None and stage.tile_plan.tileable
         assert stage.tile_plan.original_height == tokens
         assert stage.tile_plan.num_tiles > 1
+
+
+def test_band_extents_come_from_the_permutation_not_the_layout():
+    """The executor's transpose_extents reads the stored permutation alone.
+
+    Splitting the tensor by its layout instead agrees only when the
+    permutation happens to run the way that layout implies. Where it runs the
+    other way the two disagree, and the plan then states a band geometry the
+    runtime does not perform.
+    """
+    # A LINEAR tensor serializes in the model's own order, so stored is the
+    # shape as written. Both permutations below are ones the runtime bands.
+    linear = SimpleNamespace(shape=[1, 8, 6, 6], layout=Layout.LINEAR)
+
+    # The spatial pair is the row axis: 8 * 6 rows of 6.
+    assert _transpose_band_extents(linear, (0, 3, 1, 2)) == (1, 48, 6)
+    # The other way round: 8 rows of 6 * 6. This is also what the layout
+    # alone would have said, which is why the disagreement stayed hidden.
+    assert _transpose_band_extents(linear, (0, 2, 3, 1)) == (1, 8, 36)
+    # A permutation the runtime does not band gets no extents at all.
+    assert _transpose_band_extents(linear, (0, 1, 2, 3)) is None
