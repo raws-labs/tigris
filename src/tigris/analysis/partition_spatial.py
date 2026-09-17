@@ -490,6 +490,132 @@ def _conversion_extents(info) -> tuple[int, int, int] | None:
     return batch, rows, cols
 
 
+# Operators that keep a rank-2 matrix's rows independent: a matrix product
+# against a constant reads one row to write one row, and the pointwise
+# operators beside it preserve rows outright. Mirrors is_row_tiling_op in the
+# loader and the executor.
+_ROW_TILING_OPS = frozenset({
+    "Gemm",
+    "Relu",
+    "Relu6",
+    "Sigmoid",
+    "Tanh",
+    "Erf",
+    "Softmax",
+    "LayerNormalization",
+    "Reshape",
+    "Flatten",
+})
+
+
+def _row_view(info) -> tuple[int, int] | None:
+    """The (rows, columns) a tensor presents to a row band, or None.
+
+    A rank-2 matrix is one directly. A rank-3 tensor with a unit leading axis
+    in the model's own order is the same bytes as that matrix, which is what
+    lets the Reshape pair around a lowered matrix product join the band: it
+    moves no data, so the band means the same on both sides of it.
+    """
+    shape = [int(dim) for dim in info.shape]
+    if len(shape) == 2:
+        return shape[0], shape[1]
+    if len(shape) == 3 and shape[0] == 1 and info.layout is Layout.LINEAR:
+        return shape[1], shape[2]
+    return None
+
+
+def _stage_is_row_tiled(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """A rank-2 matrix pipeline whose rows can be taken a band at a time.
+
+    Rank 2 has no batch or spatial axis, so the stripe contract never reaches
+    it, yet a projection's rows are independent. Every tensor the stage touches
+    has to agree on the row count, which is what makes a band mean the same
+    thing on each of them.
+    """
+    if not stage_ops:
+        return False
+
+    rows: int | None = None
+    names = [*stage.input_tensors, *stage.output_tensors]
+    for op in stage_ops:
+        names.extend(op.outputs)
+    for name in names:
+        info = ag.tensors.get(name)
+        view = _row_view(info) if info is not None else None
+        if view is None:
+            return False
+        if rows is None:
+            rows = view[0]
+        if view[0] != rows:
+            return False
+    if rows is None or rows <= 1:
+        return False
+
+    return all(
+        op.op_type in _ROW_TILING_OPS
+        and len(op.inputs) >= 1
+        and len(op.outputs) == 1
+        for op in stage_ops
+    )
+
+
+def _solve_row_tile(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Size the band of rows a matrix pipeline takes at a time.
+
+    Mirrors the runtime: the stage inputs and every op output are resident
+    together, each its own aligned allocation, and a row costs the same on
+    every tensor whatever the band.
+    """
+    rows = _row_view(ag.tensors[stage.input_tensors[0]])[0]
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+
+    resident: list[int] = []
+    for name in stage.input_tensors:
+        info = ag.tensors[name]
+        resident.append(_row_view(info)[1] * info.elem_size)
+    for op in stage_ops:
+        info = ag.tensors[op.outputs[0]]
+        resident.append(_row_view(info)[1] * info.elem_size)
+
+    def working_set(band: int) -> int:
+        return sum(_align_up(row * band, align) for row in resident)
+
+    if working_set(1) > budget:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum row band still exceeds "
+                f"budget ({budget:,} bytes)"
+            ],
+        )
+
+    low, high, band = 1, rows, 1
+    while low <= high:
+        candidate = low + (high - low) // 2
+        if working_set(candidate) <= budget:
+            band = candidate
+            low = candidate + 1
+        else:
+            high = candidate - 1
+
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+        tile_height=band,
+        num_tiles=math.ceil(rows / band),
+        halo=0,
+        receptive_field=1,
+        original_height=rows,
+        tiled_peak_bytes=working_set(band),
+        overhead_bytes=0,
+        warnings=[],
+    )
+
+
 def _stage_is_global_reduction(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -945,6 +1071,12 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         # through to the existing byte-identical path below.
         if _stage_is_convtranspose_2d(stage_ops):
             stage.tile_plan = _solve_convtranspose_2d(ag, stage, stage_ops, budget)
+            continue
+
+        # Rank 2 has no axis the stripe contract names, but a matrix
+        # pipeline's rows are independent, so it bands along them.
+        if _stage_is_row_tiled(ag, stage, stage_ops):
+            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget)
             continue
 
         # A global reduction has no output axis to tile, so the runtime walks

@@ -1374,6 +1374,52 @@ def _tiled_erf_case() -> ContractCase:
     )
 
 
+def _tiled_matrix_rows_case() -> ContractCase:
+    """A projection pipeline the solver has to band along its rows.
+
+    A matrix product against a constant reads one row to write one row, so a
+    band of rows computes exactly the rows it holds. Rank 2 has no axis the
+    height contract names, which is why this needs its own path: the
+    projections of a transformer lower to exactly this shape.
+    """
+    rows, width, hidden = 256, 32, 64
+    initializers = [
+        numpy_helper.from_array(
+            (np.arange(width * hidden, dtype=np.float32).reshape(width, hidden)
+             / (width * hidden) - 0.5), "w1"),
+        numpy_helper.from_array(
+            (np.arange(hidden * width, dtype=np.float32).reshape(hidden, width)
+             / (hidden * width) - 0.5), "w2"),
+    ]
+    nodes = [
+        helper.make_node("MatMul", ["input", "w1"], ["hidden"]),
+        helper.make_node("Relu", ["hidden"], ["act"]),
+        helper.make_node("MatMul", ["act", "w2"], ["output"]),
+    ]
+    model = _model(
+        "tiled_matrix_rows",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, rows, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, rows, width])],
+        initializers,
+    )
+    data = np.linspace(
+        -1.0, 1.0, rows * width, dtype=np.float32
+    ).reshape(1, rows, width)
+    return ContractCase(
+        "float_tiled_matrix_rows",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Reshape", "Gemm", "Reshape", "Relu",
+         "Reshape", "Gemm", "Reshape", "Transpose"),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -4376,6 +4422,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _qdq_layer_norm_case(),
         _tiled_layer_norm_case(),
         _tiled_erf_case(),
+        _tiled_matrix_rows_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
