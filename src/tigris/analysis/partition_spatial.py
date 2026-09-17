@@ -19,6 +19,8 @@ from tigris.graph.ir import (
     OpNode,
     Stage,
     TilePlan,
+    serialized_shape,
+    serialized_transpose_perm,
 )
 
 
@@ -449,24 +451,6 @@ def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
     return True
 
 
-def _serialized_shape(info) -> tuple[int, ...]:
-    """The extents in the order the runtime stores them.
-
-    The IR keeps ONNX NCHW/NCL. A SPATIAL tensor serializes with its channel
-    axis last; a LINEAR one is already in storage order. Tile geometry for a
-    conversion stage has to be read in that storage order, because the
-    conversion is a permutation of exactly those axes.
-    """
-    shape = tuple(int(dim) for dim in info.shape)
-    if info.layout is Layout.LINEAR:
-        return shape
-    if len(shape) == 4:
-        return (shape[0], shape[2], shape[3], shape[1])
-    if len(shape) == 3:
-        return (shape[0], shape[2], shape[1])
-    return shape
-
-
 def _conversion_extents(info) -> tuple[int, int, int] | None:
     """The batch and the two extents a conversion of this tensor transposes.
 
@@ -475,7 +459,7 @@ def _conversion_extents(info) -> tuple[int, int, int] | None:
     one it is a plain matrix transpose. In storage order a SPATIAL tensor has
     its channels last, a LINEAR one has them at position 1.
     """
-    stored = _serialized_shape(info)
+    stored = serialized_shape(info.shape, info.layout)
     if len(stored) not in (3, 4):
         return None
     batch = stored[0]
@@ -718,15 +702,31 @@ def _solve_global_reduction(
         warnings=[],
     )
 
-def _stage_is_layout_conversion(
+# Permutations of stored axes that move the channel axis past the spatial ones
+# while leaving those in their relative order. That is what makes the operator
+# a plain matrix transpose once the axes that travel together are read as one,
+# whether it arose from a layout conversion or from the model itself. Mirrors
+# transpose_extents in the executor.
+_TRANSPOSE_BAND_PERMS = frozenset({
+    (0, 2, 1),           # rank 3, the two axes swap outright
+    (0, 3, 1, 2),        # rank 4 going to the model's own order
+    (0, 2, 3, 1),        # rank 4 coming back
+})
+
+
+def _stage_is_tiled_transpose(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
-    """A stage that is one conversion between the two storage orders.
+    """A stage that is one transpose the runtime can band.
 
-    Transpose stays UNTILEABLE in _OP_CATEGORY because it swaps the two axes
-    the stripe contract propagates. The runtime instead walks the conversion's
-    output rows, gathering the input columns each band transposes, which only
-    works when the conversion is the whole stage.
+    Transpose stays UNTILEABLE in _OP_CATEGORY because it moves the axis the
+    stripe contract propagates. The runtime instead walks the longer of the
+    two extents it transposes, which only works when the transpose is the
+    whole stage.
+
+    What decides this is the permutation of stored axes, not why it is there.
+    A layout conversion and an attention block's key transpose emit the same
+    permutation, and the runtime cannot tell them apart, so neither does this.
     """
     if len(stage_ops) != 1 or stage_ops[0].op_type != "Transpose":
         return False
@@ -740,20 +740,22 @@ def _stage_is_layout_conversion(
     result = ag.tensors.get(op.outputs[0])
     if source is None or result is None:
         return False
-    if source.layout is result.layout:
-        return False
     if len(source.shape) != len(result.shape):
         return False
 
-    perm = op.attrs.get("perm")
-    if perm is None or list(perm) != list(range(len(source.shape))):
+    raw_perm = op.attrs.get("perm")
+    if raw_perm is None or len(raw_perm) != len(source.shape):
+        return False
+    stored_perm = serialized_transpose_perm(
+        raw_perm, source.layout, result.layout)
+    if stored_perm not in _TRANSPOSE_BAND_PERMS:
         return False
 
     from_side = _conversion_extents(source)
     to_side = _conversion_extents(result)
     if from_side is None or to_side is None:
         return False
-    # The conversion transposes the pair, so the other side reads reversed.
+    # The transpose swaps the pair, so the other side reads reversed.
     return (
         from_side[0] == to_side[0]
         and from_side[1] == to_side[2]
@@ -772,7 +774,7 @@ def _solve_layout_conversion(
     """
     source = ag.tensors[stage_ops[0].inputs[0]]
     extents = _conversion_extents(source)
-    if extents is None:  # guarded by _stage_is_layout_conversion; defensive
+    if extents is None:  # guarded by _stage_is_tiled_transpose; defensive
         return TilePlan(
             tileable=False,
             warnings=[
@@ -1089,7 +1091,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         # A conversion permutes the two axes the stripe contract propagates,
         # so it reaches its own execution path the same way.
-        if _stage_is_layout_conversion(ag, stage, stage_ops):
+        if _stage_is_tiled_transpose(ag, stage, stage_ops):
             stage.tile_plan = _solve_layout_conversion(
                 ag, stage, stage_ops, budget)
             continue

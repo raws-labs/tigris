@@ -189,3 +189,28 @@ def test_a_matrix_pipeline_bands_along_its_rows(tmp_path):
     assert reshapes
     assert all(st.tile_plan is None or st.tile_plan.tileable
                for st in reshapes)
+
+
+def test_a_transpose_the_model_asks_for_is_banded_too(tmp_path):
+    """What decides the band is the permutation, not why the transpose exists."""
+    tokens, width = 256, 16
+    weight = numpy_helper.from_array(
+        np.zeros((width, width), dtype=np.float32), "wk")
+    nodes = [
+        helper.make_node("MatMul", ["x", "wk"], ["keys"]),
+        helper.make_node("Transpose", ["keys"], ["y"], perm=[0, 2, 1]),
+    ]
+    ag = _planned(
+        tmp_path, nodes, ([1, tokens, width], [1, width, tokens]), 8_000,
+        name="attn", initializers=(weight,),
+    )
+
+    transposes = [
+        st for st in ag.stages
+        if _stage_op_types(ag)[st.stage_id] == ["Transpose"]
+    ]
+    assert transposes
+    for stage in transposes:
+        assert stage.tile_plan is not None and stage.tile_plan.tileable
+        assert stage.tile_plan.original_height == tokens
+        assert stage.tile_plan.num_tiles > 1

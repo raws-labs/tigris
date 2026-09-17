@@ -5,8 +5,8 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.emitters.binary.writer import _serialized_axis_map, emit_binary_bytes
-from tigris.graph.ir import Layout, TensorInfo
+from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.graph.ir import Layout, TensorInfo, serialized_axis_map
 from tigris.cli import _run_pipeline
 
 
@@ -31,12 +31,12 @@ def test_tensors_are_spatial_by_default():
 
 def test_serialized_axis_map_follows_the_layout():
     # Spatial tensors are held channels-last; linear ones are already in order.
-    assert _serialized_axis_map(4, Layout.SPATIAL) == [0, 3, 1, 2]
-    assert _serialized_axis_map(3, Layout.SPATIAL) == [0, 2, 1]
-    assert _serialized_axis_map(4, Layout.LINEAR) == [0, 1, 2, 3]
-    assert _serialized_axis_map(3, Layout.LINEAR) == [0, 1, 2]
+    assert serialized_axis_map(4, Layout.SPATIAL) == [0, 3, 1, 2]
+    assert serialized_axis_map(3, Layout.SPATIAL) == [0, 2, 1]
+    assert serialized_axis_map(4, Layout.LINEAR) == [0, 1, 2, 3]
+    assert serialized_axis_map(3, Layout.LINEAR) == [0, 1, 2]
     # Rank 2 and below cannot disagree.
-    assert _serialized_axis_map(2, Layout.SPATIAL) == [0, 1]
+    assert serialized_axis_map(2, Layout.SPATIAL) == [0, 1]
 
 
 def test_spatial_activation_is_stored_channels_last(tmp_path):

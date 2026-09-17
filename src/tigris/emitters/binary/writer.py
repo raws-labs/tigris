@@ -12,7 +12,12 @@ from tigris import (
     TILE_AXIS_HW,
     TILE_AXIS_NONE,
 )
-from tigris.graph.ir import AnalyzedGraph, Layout, OpNode
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    Layout,
+    OpNode,
+    serialized_transpose_perm,
+)
 
 from .defs import (
     ACT_NONE,
@@ -721,19 +726,6 @@ def _declared_interface_dtype(ag: AnalyzedGraph, name: str) -> int | None:
     return None
 
 
-def _serialized_axis_map(
-    rank: int, layout: Layout = Layout.SPATIAL
-) -> list[int]:
-    """Map an ONNX axis to its serialized tensor axis."""
-    if layout is Layout.LINEAR:
-        return list(range(rank))
-    if rank == 4:
-        return [0, 3, 1, 2]  # NCHW -> NHWC
-    if rank == 3:
-        return [0, 2, 1]     # NCL -> NLC
-    return list(range(rank))
-
-
 def _build_op_attributes(
     ag: AnalyzedGraph, tensor_idx: dict[str, int]
 ) -> bytes:
@@ -759,17 +751,11 @@ def _build_op_attributes(
             raise ValueError(f"Transpose '{op.name}' must use runtime tensors")
         input_info = ag.tensors[input_name]
         output_info = ag.tensors[output_name]
-        rank = len(input_info.shape)
-        raw_perm = [int(axis) for axis in op.attrs["perm"]]
-        input_axes = _serialized_axis_map(rank, input_info.layout)
-        output_axes = _serialized_axis_map(rank, output_info.layout)
-        output_raw_by_serialized = [0] * rank
-        for raw_axis, serialized_axis in enumerate(output_axes):
-            output_raw_by_serialized[serialized_axis] = raw_axis
-        serialized_perm = bytes(
-            input_axes[raw_perm[output_raw_by_serialized[serialized_axis]]]
-            for serialized_axis in range(rank)
-        )
+        serialized_perm = bytes(serialized_transpose_perm(
+            [int(axis) for axis in op.attrs["perm"]],
+            input_info.layout,
+            output_info.layout,
+        ))
         records.append((op_index, OP_ATTR_TRANSPOSE_PERM, serialized_perm))
 
     if not records:
