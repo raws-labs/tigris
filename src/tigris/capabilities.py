@@ -56,6 +56,8 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Resize",
     "Softmax",
     "Transpose",
+    "LayerNormalization",
+    "Erf",
 })
 
 _S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS

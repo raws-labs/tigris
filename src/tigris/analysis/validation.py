@@ -246,9 +246,9 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if len(op.outputs) != 1:
                 reasons.append("MaxPool indices output is not implemented")
 
-        if op.op_type == "Softmax":
+        if op.op_type in ("Softmax", "LayerNormalization"):
             input_tensor = (
-                ag.tensors.get(op.inputs[0]) if len(op.inputs) == 1 else None
+                ag.tensors.get(op.inputs[0]) if op.inputs else None
             )
             if input_tensor is None or not input_tensor.shape:
                 reasons.append("runtime requires one concrete, non-scalar input")
@@ -266,10 +266,28 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     runtime_final_axis = rank - 1
                 if normalized_axis != runtime_final_axis:
                     reasons.append(
-                        "Softmax axis must map to the runtime's final dimension "
-                        f"(axis {runtime_final_axis} for rank {rank} in "
-                        f"{input_tensor.layout.value} layout)"
+                        f"{op.op_type} axis must map to the runtime's final "
+                        f"dimension (axis {runtime_final_axis} for rank {rank} "
+                        f"in {input_tensor.layout.value} layout)"
                     )
+
+        if op.op_type == "LayerNormalization":
+            # Scale is a weight and bias an optional one; both are indexed by
+            # position along the normalized axis, so neither may be an
+            # activation the plan would have to route.
+            if not 2 <= len(op.inputs) <= 3:
+                reasons.append(
+                    "runtime requires a scale and an optional bias, both "
+                    "constant"
+                )
+            elif any(name not in ag.weight_data for name in op.inputs[1:]):
+                reasons.append("scale and bias must be constants")
+            if len(op.outputs) != 1:
+                reasons.append(
+                    "the mean and inverse-deviation outputs are not implemented"
+                )
+            if int(op.attrs.get("stash_type", 1)) != 1:
+                reasons.append("stash_type other than float32 is not encoded")
 
         if op.op_type == "Gemm":
             if int(op.attrs.get("transA", 0)) != 0:

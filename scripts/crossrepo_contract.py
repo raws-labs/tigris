@@ -82,12 +82,14 @@ def _model(
     inputs: list[onnx.ValueInfoProto],
     outputs: list[onnx.ValueInfoProto],
     initializers: list[onnx.TensorProto] = [],
+    opset: int = 13,
 ) -> onnx.ModelProto:
+    """Build a checked model. `opset` rises only for an operator that needs it."""
     model = helper.make_model(
         helper.make_graph(nodes, name, inputs, outputs, initializers),
-        opset_imports=[helper.make_opsetid("", 13)],
+        opset_imports=[helper.make_opsetid("", opset)],
     )
-    model.ir_version = 8
+    model.ir_version = 8 if opset < 17 else 9
     onnx.checker.check_model(model)
     return model
 
@@ -1162,6 +1164,152 @@ def _tiled_last_axis_softmax_case(*, rank: int) -> ContractCase:
         ("Transpose", "Softmax", "Transpose"),
         mem_budget="8K",
         expect_tiled=True,
+    )
+
+
+def _layer_norm_case() -> ContractCase:
+    """LayerNormalization over the model's own last axis.
+
+    The kernel normalizes along the final stored dimension, so the graph
+    compiles to a conversion, the normalization, and a conversion back, the
+    same shape a last-axis Softmax takes.
+    """
+    shape = [1, 12, 16]
+    initializers = [
+        numpy_helper.from_array(
+            np.linspace(0.75, 1.25, shape[-1], dtype=np.float32), "gamma"),
+        numpy_helper.from_array(
+            np.linspace(-0.2, 0.2, shape[-1], dtype=np.float32), "beta"),
+    ]
+    model = _model(
+        "layer_norm",
+        [helper.make_node(
+            "LayerNormalization", ["input", "gamma", "beta"], ["output"],
+            axis=-1, epsilon=1e-5)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        initializers,
+        opset=17,
+    )
+    # Each row spans its own range about zero. A row whose spread is small
+    # against its mean makes the centering cancel and the division by a small
+    # deviation amplify what is left, which measures float32 summation order
+    # against ONNX Runtime rather than the kernel.
+    row = np.linspace(-3.0, 3.0, shape[-1], dtype=np.float32)
+    gains = (1.0 + 0.1 * np.arange(shape[1], dtype=np.float32))[:, None]
+    data = (row[None, None, :] * gains[None, :, :]).astype(np.float32)
+    return ContractCase(
+        "float_layer_norm",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "LayerNormalization", "Transpose"),
+    )
+
+
+def _erf_case() -> ContractCase:
+    """Erf, the exact form GELU is written in."""
+    shape = [1, 3, 8]
+    model = _model(
+        "erf",
+        [helper.make_node("Erf", ["input"], ["output"])],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    data = np.linspace(
+        -3.0, 3.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase("float_erf", model, model, {"input": data}, ("Erf",))
+
+
+def _qdq_erf_case() -> ContractCase:
+    """The int8 sibling of _erf_case, through a lookup table."""
+    shape = [1, 3, 8]
+    initializers = [
+        numpy_helper.from_array(np.array(0.03, dtype=np.float32), "in_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "in_zero_point"),
+        numpy_helper.from_array(np.array(0.01, dtype=np.float32), "out_scale"),
+        numpy_helper.from_array(np.array(-5, dtype=np.int8), "out_zero_point"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["input", "in_scale", "in_zero_point"], ["iq"]),
+        helper.make_node(
+            "DequantizeLinear", ["iq", "in_scale", "in_zero_point"], ["idq"]),
+        helper.make_node("Erf", ["idq"], ["raw"]),
+        helper.make_node(
+            "QuantizeLinear", ["raw", "out_scale", "out_zero_point"], ["oq"]),
+        helper.make_node(
+            "DequantizeLinear",
+            ["oq", "out_scale", "out_zero_point"], ["output"]),
+    ]
+    compile_model = _model(
+        "qdq_erf",
+        nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    data = np.linspace(
+        -2.0, 2.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "int8_erf", compile_model, reference_model, {"input": data}, ("Erf",))
+
+
+def _qdq_layer_norm_case() -> ContractCase:
+    """The int8 sibling of _layer_norm_case.
+
+    A normalization divides by a per-row standard deviation that no fixed
+    multiplier stands in for, so the kernel takes its statistics in float from
+    the dequantized row and requantizes only the result.
+    """
+    shape = [1, 12, 16]
+    initializers = [
+        numpy_helper.from_array(np.array(0.05, dtype=np.float32), "in_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "in_zero_point"),
+        numpy_helper.from_array(np.array(0.03, dtype=np.float32), "out_scale"),
+        numpy_helper.from_array(np.array(2, dtype=np.int8), "out_zero_point"),
+        numpy_helper.from_array(
+            np.linspace(0.75, 1.25, shape[-1], dtype=np.float32), "gamma"),
+        numpy_helper.from_array(
+            np.linspace(-0.2, 0.2, shape[-1], dtype=np.float32), "beta"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["input", "in_scale", "in_zero_point"], ["iq"]),
+        helper.make_node(
+            "DequantizeLinear", ["iq", "in_scale", "in_zero_point"], ["idq"]),
+        helper.make_node(
+            "LayerNormalization", ["idq", "gamma", "beta"], ["raw"],
+            axis=-1, epsilon=1e-5),
+        helper.make_node(
+            "QuantizeLinear", ["raw", "out_scale", "out_zero_point"], ["oq"]),
+        helper.make_node(
+            "DequantizeLinear",
+            ["oq", "out_scale", "out_zero_point"], ["output"]),
+    ]
+    compile_model = _model(
+        "qdq_layer_norm",
+        nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        initializers,
+        opset=17,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    row = np.linspace(-3.0, 3.0, shape[-1], dtype=np.float32)
+    gains = (1.0 + 0.1 * np.arange(shape[1], dtype=np.float32))[:, None]
+    data = (row[None, None, :] * gains[None, :, :]).astype(np.float32)
+    return ContractCase(
+        "int8_layer_norm",
+        compile_model,
+        reference_model,
+        {"input": data},
+        ("Transpose", "LayerNormalization", "Transpose"),
     )
 
 
@@ -4161,6 +4309,10 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_softmax_rank4_case(),
         _tiled_last_axis_softmax_case(rank=3),
         _tiled_last_axis_softmax_case(rank=4),
+        _layer_norm_case(),
+        _erf_case(),
+        _qdq_erf_case(),
+        _qdq_layer_norm_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
