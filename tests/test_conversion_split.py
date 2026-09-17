@@ -149,3 +149,43 @@ def test_a_rank4_conversion_tiles_on_the_collapsed_matrix(tmp_path):
     # 16 x 16 spatial against 6 channels: the spatial pair is the long axis.
     assert ag.stages[0].tile_plan.original_height == 256
     assert ag.stages[2].tile_plan.original_height == 256
+
+
+def test_a_matrix_pipeline_bands_along_its_rows(tmp_path):
+    """Rank 2 has no axis the stripe contract names, but rows are independent."""
+    rows, width, hidden = 256, 32, 64
+    inits = [
+        numpy_helper.from_array(
+            np.zeros((width, hidden), dtype=np.float32), "w1"),
+        numpy_helper.from_array(
+            np.zeros((hidden, width), dtype=np.float32), "w2"),
+    ]
+    nodes = [
+        helper.make_node("MatMul", ["x", "w1"], ["h"]),
+        helper.make_node("Relu", ["h"], ["a"]),
+        helper.make_node("MatMul", ["a", "w2"], ["y"]),
+    ]
+    ag = _planned(
+        tmp_path, nodes, ([1, rows, width], [1, rows, width]), 8_000,
+        name="rows", initializers=inits,
+    )
+
+    banded = [
+        st for st in ag.stages
+        if st.tile_plan is not None and st.tile_plan.tileable
+        and st.tile_plan.original_height == rows
+    ]
+    assert banded, _stage_op_types(ag)
+    for stage in banded:
+        assert stage.tile_plan.num_tiles > 1
+        assert stage.tile_plan.halo == 0
+
+    # The Reshape pair around a lowered product joins the band: it drops a unit
+    # leading axis without moving a byte.
+    reshapes = [
+        st for st in ag.stages
+        if _stage_op_types(ag)[st.stage_id] == ["Reshape"]
+    ]
+    assert reshapes
+    assert all(st.tile_plan is None or st.tile_plan.tileable
+               for st in reshapes)
