@@ -1106,6 +1106,40 @@ def _gemm_scaled_case() -> ContractCase:
     )
 
 
+def _chained_normalization_case() -> ContractCase:
+    """A chain whose second stage normalizes.
+
+    The chain operator list in the loader is a fifth copy of the height-stripe
+    set and had drifted by four operators. A chain is a run of stripe-tileable
+    stages, so anything the stripe contract admits has to survive being
+    chained. The budget is what makes the compiler cut and chain: the same
+    graph at a roomy budget is one stage and exercises none of this.
+    """
+    shape = [1, 4, 26, 26]
+    model = _model(
+        "chained_normalization",
+        [
+            helper.make_node("Add", ["input", "input"], ["sum"]),
+            helper.make_node("Softmax", ["sum"], ["output"], axis=1),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    data = np.linspace(
+        -2.0, 2.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_chained_normalization",
+        model,
+        model,
+        {"input": data},
+        ("Add", "Softmax"),
+        mem_budget="16K",
+        expect_tiled=True,
+        expect_chain=True,
+    )
+
+
 def _tiled_rank4_binary_case(*, op_type: str) -> ContractCase:
     """A rank-4 binary pointwise stage the solver has to tile.
 
@@ -4451,6 +4485,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_rank4_binary_case(op_type="Add"),
         _tiled_rank4_binary_case(op_type="Sub"),
         _tiled_rank4_binary_case(op_type="Mul"),
+        _chained_normalization_case(),
         _tiled_last_axis_softmax_case(rank=3),
         _tiled_last_axis_softmax_case(rank=4),
         _layer_norm_case(),
