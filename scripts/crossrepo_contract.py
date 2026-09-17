@@ -1104,6 +1104,33 @@ def _gemm_scaled_case() -> ContractCase:
     )
 
 
+def _tiled_softmax_rank4_case() -> ContractCase:
+    """Softmax on a rank-4 stage the solver has to tile.
+
+    The rank-3 twin above covers the NLC contract. This covers the NHWC one,
+    which the compiler, the loader and the executor each state separately.
+    """
+    shape = [1, 4, 32, 32]
+    model = _model(
+        "tiled_softmax_rank4",
+        [helper.make_node("Softmax", ["input"], ["output"], axis=1)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    data = np.linspace(
+        -3.0, 3.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_tiled_softmax_rank4",
+        model,
+        model,
+        {"input": data},
+        ("Softmax",),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -4002,6 +4029,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _clip_as_relu_case(),
         _negate_case(),
         _gemm_scaled_case(),
+        _tiled_softmax_rank4_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
