@@ -1131,18 +1131,22 @@ def _tiled_softmax_rank4_case() -> ContractCase:
     )
 
 
-
-def _tiled_last_axis_softmax_case() -> ContractCase:
+def _tiled_last_axis_softmax_case(*, rank: int) -> ContractCase:
     """Softmax over the last axis on a stage the solver has to tile.
 
     Normalization runs along the model's own final axis, which is not the axis
     the runtime stores last, so the graph compiles to a conversion, the
     Softmax, and a conversion back. At this budget all three have to tile, and
     the two conversions tile along opposite transfers.
+
+    The rank-4 shape is the one an attention block produces: the conversion
+    there moves the channel axis past two spatial axes rather than one, which
+    collapses to the same transpose only because those two keep their order.
     """
-    shape = [1, 512, 6]
+    shape = [1, 512, 6] if rank == 3 else [1, 6, 16, 16]
+    name = f"tiled_last_axis_softmax_rank{rank}"
     model = _model(
-        "tiled_last_axis_softmax",
+        name,
         [helper.make_node("Softmax", ["input"], ["output"], axis=-1)],
         [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
         [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
@@ -1151,7 +1155,7 @@ def _tiled_last_axis_softmax_case() -> ContractCase:
         -3.0, 3.0, int(np.prod(shape)), dtype=np.float32
     ).reshape(shape)
     return ContractCase(
-        "float_tiled_last_axis_softmax",
+        f"float_{name}",
         model,
         model,
         {"input": data},
@@ -4060,7 +4064,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _negate_case(),
         _gemm_scaled_case(),
         _tiled_softmax_rank4_case(),
-        _tiled_last_axis_softmax_case(),
+        _tiled_last_axis_softmax_case(rank=3),
+        _tiled_last_axis_softmax_case(rank=4),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

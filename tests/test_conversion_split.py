@@ -110,3 +110,26 @@ def test_a_conversion_whose_narrow_slice_does_not_fit_stays_untileable(tmp_path)
     ]
     assert conversions
     assert all(not st.tile_plan.tileable for st in conversions)
+
+
+_RANK4_SHAPE = [1, 6, 16, 16]
+_RANK4_NODES = [
+    helper.make_node("Softmax", ["x"], ["y"], axis=-1, name="sm4")
+]
+
+
+def test_a_rank4_conversion_tiles_on_the_collapsed_matrix(tmp_path):
+    """The two spatial axes keep their order, so H*W reads as one extent."""
+    ag = _planned(
+        tmp_path, _RANK4_NODES, (_RANK4_SHAPE, _RANK4_SHAPE), 8_000,
+        name="rank4",
+    )
+
+    assert _stage_op_types(ag) == [["Transpose"], ["Softmax"], ["Transpose"]]
+    for stage in ag.stages:
+        assert stage.tile_plan is not None and stage.tile_plan.tileable
+        assert stage.tile_plan.num_tiles > 1
+
+    # 16 x 16 spatial against 6 channels: the spatial pair is the long axis.
+    assert ag.stages[0].tile_plan.original_height == 256
+    assert ag.stages[2].tile_plan.original_height == 256

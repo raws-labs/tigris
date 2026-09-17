@@ -459,6 +459,29 @@ def _serialized_shape(info) -> tuple[int, ...]:
     return shape
 
 
+def _conversion_extents(info) -> tuple[int, int, int] | None:
+    """The batch and the two extents a conversion of this tensor transposes.
+
+    A conversion moves the channel axis past the spatial ones and leaves those
+    in their relative order, so once the axes that travel together are read as
+    one it is a plain matrix transpose. In storage order a SPATIAL tensor has
+    its channels last, a LINEAR one has them at position 1.
+    """
+    stored = _serialized_shape(info)
+    if len(stored) not in (3, 4):
+        return None
+    batch = stored[0]
+    if info.layout is Layout.SPATIAL:
+        rows = math.prod(stored[1:-1])
+        cols = stored[-1]
+    else:
+        rows = stored[1]
+        cols = math.prod(stored[2:])
+    if batch <= 0 or rows <= 0 or cols <= 0:
+        return None
+    return batch, rows, cols
+
+
 def _stage_is_layout_conversion(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -483,21 +506,22 @@ def _stage_is_layout_conversion(
         return False
     if source.layout is result.layout:
         return False
-    if len(source.shape) != 3 or len(result.shape) != 3:
+    if len(source.shape) != len(result.shape):
         return False
 
     perm = op.attrs.get("perm")
     if perm is None or list(perm) != list(range(len(source.shape))):
         return False
 
-    stored_in = _serialized_shape(source)
-    stored_out = _serialized_shape(result)
+    from_side = _conversion_extents(source)
+    to_side = _conversion_extents(result)
+    if from_side is None or to_side is None:
+        return False
+    # The conversion transposes the pair, so the other side reads reversed.
     return (
-        stored_in[0] == stored_out[0]
-        and stored_in[1] == stored_out[2]
-        and stored_in[2] == stored_out[1]
-        and stored_in[1] > 0
-        and stored_in[2] > 0
+        from_side[0] == to_side[0]
+        and from_side[1] == to_side[2]
+        and from_side[2] == to_side[1]
     )
 
 
@@ -511,7 +535,15 @@ def _solve_layout_conversion(
     allocations, so each is aligned on its own.
     """
     source = ag.tensors[stage_ops[0].inputs[0]]
-    batch, rows, cols = _serialized_shape(source)
+    extents = _conversion_extents(source)
+    if extents is None:  # guarded by _stage_is_layout_conversion; defensive
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine conversion extents"
+            ],
+        )
+    batch, rows, cols = extents
     banded = max(rows, cols)
     other = min(rows, cols)
 
