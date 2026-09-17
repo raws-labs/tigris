@@ -1,7 +1,8 @@
 """A stage that cannot tile because it fuses a layout conversion is re-cut."""
 
+import numpy as np
 import onnx
-from onnx import TensorProto, helper
+from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
@@ -13,12 +14,13 @@ from tigris.analysis.partition_temporal import partition_temporal
 from tigris.loaders import load_model
 
 
-def _planned(tmp_path, nodes, shapes, budget, name="split"):
+def _planned(tmp_path, nodes, shapes, budget, name="split", initializers=()):
     graph = helper.make_graph(
         nodes,
         name,
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, shapes[0])],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, shapes[1])],
+        initializer=list(initializers),
     )
     model = helper.make_model(
         graph, opset_imports=[helper.make_opsetid("", 13)]
@@ -67,17 +69,31 @@ def test_a_conversion_that_fits_is_left_fused(tmp_path):
 
 
 def test_an_untileable_stage_without_a_conversion_is_left_alone(tmp_path):
-    """The fallback only answers the disagreement a conversion creates."""
-    shape = [1, 8, 64, 64]
+    """The fallback only answers the disagreement a conversion creates.
+
+    Resize changes the height a stripe would carry and has no tiled execution
+    path at all, which makes it the untileable operator that is neither a
+    reduction nor a conversion.
+    """
+    scales = numpy_helper.from_array(
+        np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), "scales"
+    )
     nodes = [
         helper.make_node("Relu", ["x"], ["h"], name="relu1"),
-        helper.make_node("GlobalAveragePool", ["h"], ["y"], name="gap1"),
+        helper.make_node(
+            "Resize", ["h", "", "scales"], ["y"], name="resize1",
+            mode="nearest", coordinate_transformation_mode="asymmetric",
+            nearest_mode="floor",
+        ),
     ]
-    ag = _planned(tmp_path, nodes, (shape, [1, 8, 1, 1]), 32_000)
+    ag = _planned(
+        tmp_path, nodes, ([1, 8, 32, 32], [1, 8, 64, 64]), 32_000,
+        initializers=(scales,),
+    )
 
-    gap = next(st for st in ag.stages if "GlobalAveragePool" in
-               [ag.ops[i].op_type for i in st.op_indices])
-    assert not gap.tile_plan.tileable
+    resize = next(st for st in ag.stages if "Resize" in
+                  [ag.ops[i].op_type for i in st.op_indices])
+    assert not resize.tile_plan.tileable
     assert conversion_cut_points(ag) == frozenset()
 
 
