@@ -1341,6 +1341,75 @@ def _erf_case() -> ContractCase:
     return ContractCase("float_erf", model, model, {"input": data}, ("Erf",))
 
 
+def _qdq_rescale_passthrough_case(*, op_type: str) -> ContractCase:
+    """A value-preserving int8 operator whose output rescales.
+
+    Relu, Relu6, Reshape and nearest Resize all carry a value through
+    unchanged, and all four used to write the input's encoding straight out.
+    One case each, with an output scale and zero point deliberately unlike the
+    input's, which is what a quantizer that assigns per-tensor scales
+    independently produces.
+    """
+    c, s = 4, 8
+    in_scale, out_scale = 0.05, 0.08
+    initializers = [
+        numpy_helper.from_array(np.array(in_scale, dtype=np.float32), "in_s"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "in_z"),
+        numpy_helper.from_array(np.array(out_scale, dtype=np.float32), "out_s"),
+        numpy_helper.from_array(np.array(-3, dtype=np.int8), "out_z"),
+    ]
+    out_shape = [1, c, s, s]
+    if op_type == "Relu":
+        body = [helper.make_node("Relu", ["idq"], ["raw"])]
+    elif op_type == "Relu6":
+        initializers += [
+            numpy_helper.from_array(np.array(0.0, dtype=np.float32), "lo"),
+            numpy_helper.from_array(np.array(6.0, dtype=np.float32), "hi"),
+        ]
+        body = [helper.make_node("Clip", ["idq", "lo", "hi"], ["raw"])]
+    elif op_type == "Reshape":
+        initializers.append(numpy_helper.from_array(
+            np.array([1, c, s * s], dtype=np.int64), "newshape"))
+        body = [helper.make_node("Reshape", ["idq", "newshape"], ["raw"])]
+        out_shape = [1, c, s * s]
+    else:
+        initializers.append(numpy_helper.from_array(
+            np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), "scales"))
+        body = [helper.make_node(
+            "Resize", ["idq", "", "scales"], ["raw"], mode="nearest",
+            coordinate_transformation_mode="asymmetric", nearest_mode="floor")]
+        out_shape = [1, c, 2 * s, 2 * s]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "in_s", "in_z"], ["iq"]),
+        helper.make_node("DequantizeLinear", ["iq", "in_s", "in_z"], ["idq"]),
+    ] + body + [
+        helper.make_node("QuantizeLinear", ["raw", "out_s", "out_z"], ["oq"]),
+        helper.make_node(
+            "DequantizeLinear", ["oq", "out_s", "out_z"], ["output"]),
+    ]
+    compile_model = _model(
+        f"qdq_rescale_{op_type.lower()}",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, s, s])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, out_shape)],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    rng = np.random.default_rng(5)
+    data = (rng.integers(-100, 100, size=(1, c, s, s)).astype(np.float32)
+            * in_scale)
+    return ContractCase(
+        f"int8_rescale_{op_type.lower()}",
+        compile_model,
+        reference_model,
+        {"input": data},
+        (op_type,),
+    )
+
+
 def _qdq_max_pool_rescale_case() -> ContractCase:
     """An int8 MaxPool whose output declares a different quantization.
 
@@ -4588,6 +4657,10 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _chained_normalization_case(),
         _chain_pointwise_before_spatial_case(),
         _qdq_max_pool_rescale_case(),
+        _qdq_rescale_passthrough_case(op_type="Relu"),
+        _qdq_rescale_passthrough_case(op_type="Relu6"),
+        _qdq_rescale_passthrough_case(op_type="Reshape"),
+        _qdq_rescale_passthrough_case(op_type="Resize"),
         _tiled_last_axis_softmax_case(rank=3),
         _tiled_last_axis_softmax_case(rank=4),
         _layer_norm_case(),
