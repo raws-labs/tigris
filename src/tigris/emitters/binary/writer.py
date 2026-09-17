@@ -27,6 +27,7 @@ from .defs import (
     MAGIC,
     NO_QUANT_PARAM,
     NO_WEIGHT,
+    OP_ATTR_EPSILON,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ACTIVATION_STRUCT,
     OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
@@ -744,6 +745,13 @@ def _build_op_attributes(
     """
     records: list[tuple[int, int, bytes]] = []
     for op_index, op in enumerate(ag.ops):
+        if op.op_type == "LayerNormalization":
+            records.append((
+                op_index,
+                OP_ATTR_EPSILON,
+                struct.pack("<f", float(op.attrs.get("epsilon", 1e-5))),
+            ))
+            continue
         if op.op_type != "Transpose":
             continue
         input_name, output_name = op.inputs[0], op.outputs[0]

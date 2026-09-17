@@ -444,9 +444,29 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "opcode": 33,
+      "operator": "LayerNormalization",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 34,
+      "operator": "Erf",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
-  "schema_version": 7,
+  "schema_version": 8,
   "scope": "post-normalization operator dispatch; model-specific shape, attribute, quantization, memory, and tiling validation still applies",
   "source": "tigris.capabilities"
 }

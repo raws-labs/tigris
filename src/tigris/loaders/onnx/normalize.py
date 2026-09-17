@@ -137,7 +137,7 @@ _LINEAR_LAYOUT_OPS = frozenset({
 })
 
 
-def _softmax_required_layout(
+def _trailing_axis_required_layout(
     ag: AnalyzedGraph, op: OpNode
 ) -> Layout | None:
     """The layout that puts Softmax's axis where the kernel reduces.
@@ -148,7 +148,7 @@ def _softmax_required_layout(
     axis last. A Softmax over either one is expressible, and the layout is what
     says which. Anything else has no layout that helps and stays unsupported.
     """
-    if len(op.inputs) != 1:
+    if not op.inputs:
         return None
     info = ag.tensors.get(op.inputs[0])
     if info is None or not info.shape:
@@ -171,8 +171,10 @@ def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
         return Layout.SPATIAL
     if op.op_type in _LINEAR_LAYOUT_OPS:
         return Layout.LINEAR
-    if op.op_type == "Softmax":
-        return _softmax_required_layout(ag, op)
+    if op.op_type in ("Softmax", "LayerNormalization"):
+        # Both reduce along one axis and the kernel takes the final stored
+        # one, so the layout is what says which ONNX axis that is.
+        return _trailing_axis_required_layout(ag, op)
     return None
 
 

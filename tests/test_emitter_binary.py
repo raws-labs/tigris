@@ -17,6 +17,7 @@ from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary.defs import (
     HEADER_SIZE,
     MAGIC,
+    OP_ATTR_EPSILON,
     OP_TYPE_MAP,
     TENSOR_FLAG_LINEAR,
     TENSOR_FLAG_MODEL_INPUT,
@@ -438,6 +439,13 @@ def test_immutable_supported_schema_fixtures():
             0,
             2,
         ),
+        (
+            8,
+            "schema-v8-layer-norm.tgrs",
+            "cb675bf404c94af8f80e854a5d52175efd3e61ce313989b26f68c18dc5152365",
+            0,
+            3,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -463,6 +471,15 @@ def test_immutable_supported_schema_fixtures():
             assert linear
             boundary = TENSOR_FLAG_MODEL_INPUT | TENSOR_FLAG_MODEL_OUTPUT
             assert not any(t["flags"] & boundary for t in linear)
+        if version == 8:
+            # Schema 8 opens the attribute section to kinds beyond the
+            # Transpose permutation. This fixture carries a normalization
+            # whose variance floor is one of them.
+            epsilons = [
+                a for a in plan["op_attributes"] if a["type"] == OP_ATTR_EPSILON
+            ]
+            assert len(epsilons) == 1
+            assert struct.unpack("<f", epsilons[0]["data"])[0] > 0.0
         if version == 6:
             # A quantized boundary states the float interface the model
             # declares, which is what schema 6 added.
