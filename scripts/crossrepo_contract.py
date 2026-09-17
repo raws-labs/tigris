@@ -519,19 +519,21 @@ def _tcn_16k_case() -> ContractCase:
     )
 
 
-def _reduce_mean_case() -> ContractCase:
-    """ReduceMean over spatial axes must execute as GlobalAveragePool."""
+def _reduce_case(*, maximum: bool) -> ContractCase:
+    """A spatial ReduceMean or ReduceMax must execute as its global pool."""
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 3, 2, 3]
     )
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 3, 1, 1]
     )
+    operator = "ReduceMax" if maximum else "ReduceMean"
+    pool = "GlobalMaxPool" if maximum else "GlobalAveragePool"
     model = _model(
-        "reduce_mean_to_gap",
+        f"{operator.lower()}_to_pool",
         [
             helper.make_node(
-                "ReduceMean",
+                operator,
                 ["input"],
                 ["output"],
                 axes=[2, 3],
@@ -542,7 +544,7 @@ def _reduce_mean_case() -> ContractCase:
         [model_output],
     )
     return ContractCase(
-        "float_reduce_mean_to_gap",
+        f"float_{operator.lower()}_to_pool",
         model,
         model,
         {
@@ -550,7 +552,7 @@ def _reduce_mean_case() -> ContractCase:
                 18, dtype=np.float32
             ).reshape(1, 3, 2, 3)
         },
-        ("GlobalAveragePool",),
+        (pool,),
     )
 
 
@@ -828,6 +830,218 @@ def _tiled_softmax_case() -> ContractCase:
         ("Softmax",),
         mem_budget="8K",
         expect_tiled=True,
+    )
+
+
+def _subtract_case() -> ContractCase:
+    """Sub of two activations, the form whose operand order is unambiguous."""
+    shape = [1, 3, 4]
+    model = _model(
+        "subtract",
+        [helper.make_node("Sub", ["left", "right"], ["output"])],
+        [
+            helper.make_tensor_value_info("left", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("right", TensorProto.FLOAT, shape),
+        ],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    count = int(np.prod(shape))
+    return ContractCase(
+        "float_subtract",
+        model,
+        model,
+        {
+            "left": np.linspace(-2.0, 2.0, count, dtype=np.float32).reshape(shape),
+            "right": np.linspace(1.0, -1.0, count, dtype=np.float32).reshape(shape),
+        },
+        ("Sub",),
+    )
+
+
+def _qdq_subtract_case() -> ContractCase:
+    """A QDQ Sub of two quantized activations.
+
+    Both operands arrive from DequantizeLinear, so the difference is taken in
+    the integer domain and requantized the way TFLite does it. The reference
+    evaluates the same graph, so a sign or scale error in the shared Add/Sub
+    path shows up here rather than in the float case.
+    """
+    shape = [1, 1, 4, 4]
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, shape)
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, shape)
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "io_scale"),
+        numpy_helper.from_array(np.array([0], dtype=np.int8), "io_zero_point"),
+        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "out_scale"),
+        numpy_helper.from_array(np.array([-8], dtype=np.int8), "out_zero_point"),
+        numpy_helper.from_array(np.array([[[[0.5]]]], dtype=np.float32), "weight"),
+        numpy_helper.from_array(
+            np.array([0.25], dtype=np.float32), "weight_scale"),
+        numpy_helper.from_array(
+            np.array([0], dtype=np.int8), "weight_zero_point"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear", ["input", "io_scale", "io_zero_point"], ["input_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["input_q", "io_scale", "io_zero_point"],
+            ["input_dq"]),
+        helper.make_node(
+            "QuantizeLinear", ["weight", "weight_scale", "weight_zero_point"],
+            ["weight_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["weight_q", "weight_scale", "weight_zero_point"],
+            ["weight_dq"]),
+        helper.make_node("Conv", ["input_dq", "weight_dq"], ["branch"]),
+        helper.make_node(
+            "QuantizeLinear", ["branch", "io_scale", "io_zero_point"],
+            ["branch_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["branch_q", "io_scale", "io_zero_point"],
+            ["branch_dq"]),
+        helper.make_node("Sub", ["input_dq", "branch_dq"], ["difference"]),
+        helper.make_node(
+            "QuantizeLinear", ["difference", "out_scale", "out_zero_point"],
+            ["output_q"]),
+        helper.make_node(
+            "DequantizeLinear", ["output_q", "out_scale", "out_zero_point"],
+            ["output"]),
+    ]
+    compile_model = _model(
+        "qdq_subtract", nodes, [model_input], [model_output], initializers)
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    input_data = np.linspace(
+        -2.0, 1.75, 16, dtype=np.float32).reshape(shape)
+    return ContractCase(
+        "int8_subtract",
+        compile_model,
+        reference_model,
+        {"input": input_data},
+        ("Conv", "Sub"),
+    )
+
+
+def _global_max_pool_case() -> ContractCase:
+    """GlobalMaxPool, the counterpart of GlobalAveragePool."""
+    model = _model(
+        "global_max_pool",
+        [helper.make_node("GlobalMaxPool", ["input"], ["output"])],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, 3, 2, 4])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, 3, 1, 1])],
+    )
+    data = np.linspace(-1.5, 1.5, 24, dtype=np.float32).reshape(1, 3, 2, 4)
+    return ContractCase(
+        "float_global_max_pool",
+        model,
+        model,
+        {"input": data},
+        ("GlobalMaxPool",),
+    )
+
+
+def _sub_constant_case() -> ContractCase:
+    """Sub against a constant, which compiles as an added negation.
+
+    ONNX Runtime evaluates the subtraction as written, so a sign error in the
+    rewrite shows up here.
+    """
+    shape = [1, 4]
+    constant = numpy_helper.from_array(
+        np.array([[0.5, -1.0, 2.0, 0.25]], dtype=np.float32), "constant")
+    model = _model(
+        "sub_constant",
+        [
+            helper.make_node("Relu", ["input"], ["gated"]),
+            helper.make_node("Sub", ["gated", "constant"], ["output"]),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        [constant],
+    )
+    return ContractCase(
+        "float_sub_constant",
+        model,
+        model,
+        {"input": np.array([[0.25, -1.0, 5.0, -4.0]], dtype=np.float32)},
+        ("Relu", "Add"),
+    )
+
+
+def _clip_as_relu_case() -> ContractCase:
+    """Clip with a zero floor and no ceiling, which an exporter writes for Relu."""
+    shape = [1, 6]
+    lower = numpy_helper.from_array(np.float32(0.0), "lower")
+    model = _model(
+        "clip_as_relu",
+        [helper.make_node("Clip", ["input", "lower"], ["output"])],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        [lower],
+    )
+    return ContractCase(
+        "float_clip_as_relu",
+        model,
+        model,
+        {"input": np.array([[-3.0, -0.5, 0.0, 0.5, 2.0, 9.0]],
+                           dtype=np.float32)},
+        ("Relu",),
+    )
+
+
+def _negate_case() -> ContractCase:
+    """Neg has no opcode; it compiles as a multiplication by minus one."""
+    shape = [1, 5]
+    model = _model(
+        "negate",
+        [
+            helper.make_node("Relu", ["input"], ["gated"]),
+            helper.make_node("Neg", ["gated"], ["output"]),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    return ContractCase(
+        "float_negate",
+        model,
+        model,
+        {"input": np.array([[-2.0, -0.5, 0.0, 1.5, 3.0]], dtype=np.float32)},
+        ("Relu", "Mul"),
+    )
+
+
+def _gemm_scaled_case() -> ContractCase:
+    """A Gemm carrying alpha and beta, folded into the constants they scale.
+
+    The plan has no field for either and the kernel computes Y = X * W^T + B,
+    so before the fold this compiled and returned a silently wrong answer.
+    ONNX Runtime applies both, which is what makes this case decisive.
+    """
+    weight = numpy_helper.from_array(
+        np.linspace(-0.5, 0.5, 12, dtype=np.float32).reshape(4, 3), "weight")
+    bias = numpy_helper.from_array(
+        np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32), "bias")
+    model = _model(
+        "gemm_scaled",
+        [
+            helper.make_node(
+                "Gemm", ["input", "weight", "bias"], ["output"],
+                alpha=2.0, beta=3.0, transB=1),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])],
+        [weight, bias],
+    )
+    return ContractCase(
+        "float_gemm_scaled",
+        model,
+        model,
+        {"input": np.array([[1.0, -2.0, 0.5]], dtype=np.float32)},
+        ("Gemm",),
     )
 
 
@@ -3707,7 +3921,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _rank3_pointwise_case(),
         _many_stage_case(),
         _tcn_16k_case(),
-        _reduce_mean_case(),
+        _reduce_case(maximum=False),
+        _reduce_case(maximum=True),
         _inference_identity_case(),
         _channel_bias_add_case(producer_has_bias=False),
         _channel_bias_add_case(producer_has_bias=True),
@@ -3720,6 +3935,13 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _softmax_axis_case(rank=4, last_axis=True),
         _softmax_axis_case(rank=4, last_axis=False),
         _tiled_softmax_case(),
+        _subtract_case(),
+        _qdq_subtract_case(),
+        _global_max_pool_case(),
+        _sub_constant_case(),
+        _clip_as_relu_case(),
+        _negate_case(),
+        _gemm_scaled_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),

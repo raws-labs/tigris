@@ -35,6 +35,7 @@ Passes applied in sequence (matches ``normalize()`` call order):
     Runs last so all relabeling and rewiring is already done.
 """
 
+import math
 import numpy as np
 
 from tigris.graph.ir import (
@@ -51,8 +52,11 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _drop_inference_identities(ag)
     ag = _fold_constant_ops(ag)
     ag = _fold_qdq(ag)
+    ag = _fold_gemm_scalars(ag)
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
+    ag = _neg_to_scalar_mul(ag)
+    ag = _fold_sub_constant_to_add(ag)
     ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
@@ -956,6 +960,43 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
 _BIAS_PRODUCERS = frozenset({"Conv", "DepthwiseConv", "Conv1D", "Gemm"})
 
 
+
+def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Fold Gemm's alpha and beta into the constants they scale.
+
+    The plan has no field for either, and the fully-connected kernel computes
+    Y = X * W^T + B, so a Gemm carrying them used to compile and return a
+    silently wrong answer. Scaling a constant weight by alpha and a constant
+    bias by beta is exact and leaves nothing for the plan to express. transA
+    transposes an activation, which no constant can absorb; validation refuses
+    it.
+    """
+    for op in ag.ops:
+        if op.op_type != "Gemm" or len(op.inputs) < 2:
+            continue
+
+        alpha = float(op.attrs.get("alpha", 1.0))
+        if alpha != 1.0:
+            weight = ag.weight_data.get(op.inputs[1])
+            if weight is not None and weight.dtype == np.float32:
+                ag.weight_data[op.inputs[1]] = np.ascontiguousarray(
+                    weight * np.float32(alpha))
+                op.attrs["alpha"] = 1.0
+
+        beta = float(op.attrs.get("beta", 1.0))
+        if beta != 1.0:
+            if len(op.inputs) < 3:
+                # beta scales C; with no C there is no term for it to scale.
+                op.attrs["beta"] = 1.0
+            else:
+                bias = ag.weight_data.get(op.inputs[2])
+                if bias is not None and bias.dtype == np.float32:
+                    ag.weight_data[op.inputs[2]] = np.ascontiguousarray(
+                        bias * np.float32(beta))
+                    op.attrs["beta"] = 1.0
+    return ag
+
+
 def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Put a constant-weight matrix product in the layout the kernels read.
 
@@ -1013,6 +1054,57 @@ def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
                 )
         op.op_type = "Gemm"
         op.attrs["transB"] = 1
+    return ag
+
+
+
+
+def _neg_to_scalar_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite Neg as a multiplication by minus one.
+
+    Neg has no opcode, so a graph holding one is rejected outright, yet it is
+    exactly the scalar-constant Mul the kernels already carry. The scalar is a
+    float, so this applies before quantization folding, where a quantized graph
+    still states its operands in float.
+    """
+    for index, op in enumerate(ag.ops):
+        if op.op_type != "Neg" or len(op.inputs) != 1:
+            continue
+        info = ag.tensors.get(op.inputs[0])
+        if info is None or info.dtype != 1:
+            continue
+
+        scalar = f"{op.outputs[0]}_minus_one_{index}"
+        ag.weight_data[scalar] = np.array([-1.0], dtype=np.float32)
+        ag.tensors[scalar] = TensorInfo(
+            name=scalar, shape=(1,), dtype=1, is_constant=True)
+        op.op_type = "Mul"
+        op.inputs = [op.inputs[0], scalar]
+        op.attrs = {}
+    return ag
+
+
+def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite a constant subtrahend as an added negation.
+
+    Sub does not commute and the plan records only that an operand is constant,
+    not which side it was on, so the runtime takes two tensor operands. A
+    constant on the right has an exact commutative equivalent, x + (-c), which
+    the Add path already carries, including folding it into a producer's bias.
+    A constant on the left has no such equivalent and is left for validation to
+    reject.
+    """
+    for op in ag.ops:
+        if op.op_type != "Sub" or len(op.inputs) != 2:
+            continue
+        subtrahend = op.inputs[1]
+        if subtrahend not in ag.weight_data or op.inputs[0] in ag.weight_data:
+            continue
+        constant = ag.weight_data[subtrahend]
+        if constant.dtype != np.float32:
+            continue
+        ag.weight_data[subtrahend] = np.ascontiguousarray(-constant)
+        op.op_type = "Add"
     return ag
 
 
@@ -1338,7 +1430,13 @@ def _relabel_conv1d(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Replace Clip(min=0, max=6) with Relu6."""
+    """Replace a Clip that states an activation the runtime already has.
+
+    Clip(0, 6) is Relu6. Clip(0, unbounded) is Relu, which exporters emit in
+    place of a Relu often enough to be worth recognizing: an absent upper bound,
+    an infinite one, or one at the float maximum all mean the same thing.
+    Anything else keeps its bounds and has no kernel to run on.
+    """
     for op in ag.ops:
         if op.op_type != "Clip":
             continue
@@ -1362,18 +1460,30 @@ def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
             if arr.size == 1:
                 max_val = float(arr.flat[0])
 
-        if min_val is not None and max_val is not None:
-            if abs(min_val) < 1e-6 and abs(max_val - 6.0) < 1e-6:
-                op.op_type = "Relu6"
-                # Keep only the data input, drop min/max constant inputs
-                op.inputs = [op.inputs[0]]
-                op.attrs = {}
+        if min_val is None or abs(min_val) >= 1e-6:
+            continue
+
+        unbounded_above = (
+            max_val is None
+            or math.isinf(max_val)
+            or max_val >= np.finfo(np.float32).max
+        )
+        if max_val is not None and abs(max_val - 6.0) < 1e-6:
+            op.op_type = "Relu6"
+        elif unbounded_above:
+            op.op_type = "Relu"
+        else:
+            continue
+
+        # Keep only the data input, drop min/max constant inputs
+        op.inputs = [op.inputs[0]]
+        op.attrs = {}
 
     return ag
 
 
 def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Replace ReduceMean(axes=[2,3]) with GlobalAveragePool.
+    """Replace a spatial ReduceMean or ReduceMax with its global pool.
 
     Newer ONNX exporters (PyTorch >= 2.x) emit ReduceMean over spatial
     dimensions instead of GlobalAveragePool.  They are semantically
@@ -1383,8 +1493,10 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
     Handles both attribute-based axes (opset < 18) and input-based axes
     (opset >= 18).
     """
+    reductions = {"ReduceMean": "GlobalAveragePool", "ReduceMax": "GlobalMaxPool"}
+
     for op in ag.ops:
-        if op.op_type != "ReduceMean":
+        if op.op_type not in reductions:
             continue
 
         # Try axes from attribute first (opset < 18)
@@ -1406,7 +1518,7 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
         if axes_norm not in ({2, 3}, {1, 2}):
             continue
 
-        op.op_type = "GlobalAveragePool"
+        op.op_type = reductions[op.op_type]
         op.attrs = {}
 
         # Remove axes input and clean up axes tensor

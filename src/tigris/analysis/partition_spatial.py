@@ -47,6 +47,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     "Sigmoid": TileCategory.POINTWISE,
     "Tanh": TileCategory.POINTWISE,
     "Add": TileCategory.POINTWISE,
+    "Sub": TileCategory.POINTWISE,
     "Mul": TileCategory.POINTWISE,
     "Concat": TileCategory.POINTWISE,
     # Softmax normalizes along the final stored dimension, which is the channel
@@ -67,7 +68,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 # the wrong region or size from its second operand. Safe only in stages with
 # no spatial op. Shared between the rank-3 and rank-4 eligibility checks
 # below since the hazard is the same in both.
-_BINARY_OPS = frozenset({"Add", "Mul"})
+_BINARY_OPS = frozenset({"Add", "Sub", "Mul"})
 
 # Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
 # NHWC stages.  Unary pointwise operators preserve the current length and may
