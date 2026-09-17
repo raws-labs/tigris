@@ -1106,6 +1106,40 @@ def _gemm_scaled_case() -> ContractCase:
     )
 
 
+def _tiled_rank4_binary_case(*, op_type: str) -> ContractCase:
+    """A rank-4 binary pointwise stage the solver has to tile.
+
+    The height-stripe contract is stated in four places: the compiler's op
+    category table, the loader's rank-4 operator list, the executor's
+    is_height_tiling_op, and the accelerator routing policy. Sub was in three
+    of them, so a model with one compiled and then failed to load. One case
+    per binary operator keeps each of the four honest.
+    """
+    shape = [1, 4, 32, 32]
+    model = _model(
+        f"tiled_rank4_{op_type.lower()}",
+        [helper.make_node(op_type, ["left", "right"], ["output"])],
+        [
+            helper.make_tensor_value_info("left", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("right", TensorProto.FLOAT, shape),
+        ],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    count = int(np.prod(shape))
+    return ContractCase(
+        f"float_tiled_rank4_{op_type.lower()}",
+        model,
+        model,
+        {
+            "left": np.linspace(-1.0, 1.0, count, dtype=np.float32).reshape(shape),
+            "right": np.linspace(0.5, -0.5, count, dtype=np.float32).reshape(shape),
+        },
+        (op_type,),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _tiled_softmax_rank4_case() -> ContractCase:
     """Softmax on a rank-4 stage the solver has to tile.
 
@@ -4414,6 +4448,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _negate_case(),
         _gemm_scaled_case(),
         _tiled_softmax_rank4_case(),
+        _tiled_rank4_binary_case(op_type="Add"),
+        _tiled_rank4_binary_case(op_type="Sub"),
+        _tiled_rank4_binary_case(op_type="Mul"),
         _tiled_last_axis_softmax_case(rank=3),
         _tiled_last_axis_softmax_case(rank=4),
         _layer_norm_case(),
