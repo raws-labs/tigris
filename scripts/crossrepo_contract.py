@@ -1420,6 +1420,101 @@ def _tiled_pool_case() -> ContractCase:
     )
 
 
+def _tiled_global_reduction_case() -> ContractCase:
+    """A GlobalAveragePool too large for the budget, so it reduces in bands."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 8, 64, 64]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 8, 1, 1]
+    )
+    model = _model(
+        "tiled_global_reduction",
+        [
+            helper.make_node(
+                "GlobalAveragePool", ["input"], ["output"], name="gap"
+            )
+        ],
+        [model_input],
+        [model_output],
+    )
+    # 4096 samples per channel, kept inside [-1, 1] so the running sum stays
+    # small: a mean over values of magnitude 30 accumulates past 1e5, where
+    # float32 summation order alone moves the result by more than the 1e-5
+    # bound and the case would measure numpy against ONNX Runtime rather than
+    # tiled against untiled.
+    values = np.arange(1 * 8 * 64 * 64, dtype=np.float32).reshape(1, 8, 64, 64)
+    return ContractCase(
+        "float_tiled_global_reduction",
+        model,
+        model,
+        {"input": (values % 17.0) * 0.125 - 1.0},
+        ("GlobalAveragePool",),
+        mem_budget="16K",
+        expect_tiled=True,
+    )
+
+
+def _qdq_tiled_global_reduction_case() -> ContractCase:
+    """The int8 sibling: the banded sum must requantize exactly once."""
+    model_input = helper.make_tensor_value_info(
+        "input", TensorProto.FLOAT, [1, 8, 64, 64]
+    )
+    model_output = helper.make_tensor_value_info(
+        "output", TensorProto.FLOAT, [1, 8, 1, 1]
+    )
+    initializers = [
+        numpy_helper.from_array(np.array(0.25, dtype=np.float32), "input_scale"),
+        numpy_helper.from_array(np.array(-3, dtype=np.int8), "input_zero_point"),
+        numpy_helper.from_array(np.array(0.125, dtype=np.float32), "output_scale"),
+        numpy_helper.from_array(np.array(7, dtype=np.int8), "output_zero_point"),
+    ]
+    nodes = [
+        helper.make_node(
+            "QuantizeLinear",
+            ["input", "input_scale", "input_zero_point"],
+            ["input_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["input_q", "input_scale", "input_zero_point"],
+            ["input_dq"],
+        ),
+        helper.make_node(
+            "GlobalAveragePool", ["input_dq"], ["raw"], name="gap"
+        ),
+        helper.make_node(
+            "QuantizeLinear",
+            ["raw", "output_scale", "output_zero_point"],
+            ["output_q"],
+        ),
+        helper.make_node(
+            "DequantizeLinear",
+            ["output_q", "output_scale", "output_zero_point"],
+            ["output"],
+        ),
+    ]
+    compile_model = _model(
+        "qdq_tiled_global_reduction",
+        nodes,
+        [model_input],
+        [model_output],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    values = np.arange(1 * 8 * 64 * 64, dtype=np.float32).reshape(1, 8, 64, 64)
+    return ContractCase(
+        "int8_tiled_global_reduction",
+        compile_model,
+        reference_model,
+        {"input": (values % 61) * 0.25 - 7.5},
+        ("GlobalAveragePool",),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _tiled_pool_chain_case() -> ContractCase:
     """AveragePool -> MaxPool must stream with both spatial ranges composed."""
     model_input = helper.make_tensor_value_info(
@@ -4070,6 +4165,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _resize_concat_case(),
         _tiled_pool_case(),
         _tiled_pool_chain_case(),
+        _tiled_global_reduction_case(),
+        _qdq_tiled_global_reduction_case(),
         _tiled_chain_case(compression="lz4"),
         _tiled_chain_case(xip=True),
         _qdq_case("Conv"),

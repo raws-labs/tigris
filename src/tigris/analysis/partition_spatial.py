@@ -482,6 +482,108 @@ def _conversion_extents(info) -> tuple[int, int, int] | None:
     return batch, rows, cols
 
 
+def _stage_is_global_reduction(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """A stage that reduces a whole rank-4 plane and nothing else.
+
+    GlobalAveragePool stays UNTILEABLE in _OP_CATEGORY because it collapses
+    the height the stripe contract propagates. The runtime instead walks such
+    a stage along its input, a band of rows at a time, carrying one partial
+    per channel between bands. That only works when the reduction is the
+    whole stage: with another op present there would be a height to carry.
+    Mirrors stage_is_input_driven_reduction in the executor.
+    """
+    if len(stage_ops) != 1 or stage_ops[0].op_type != "GlobalAveragePool":
+        return False
+    op = stage_ops[0]
+    if len(op.inputs) != 1 or len(op.outputs) != 1:
+        return False
+    if stage.input_tensors != op.inputs or stage.output_tensors != op.outputs:
+        return False
+
+    source = ag.tensors.get(op.inputs[0])
+    result = ag.tensors.get(op.outputs[0])
+    if source is None or result is None:
+        return False
+    if len(source.shape) != 4 or len(result.shape) != 4:
+        return False
+    # NCHW: the reduction collapses H and W, keeping N and C.
+    return (
+        int(source.shape[2]) > 1
+        and int(source.shape[3]) > 0
+        and int(result.shape[0]) == int(source.shape[0])
+        and int(result.shape[1]) == int(source.shape[1])
+        and int(result.shape[2]) == 1
+        and int(result.shape[3]) == 1
+    )
+
+
+def _solve_global_reduction(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Size the band of input rows a global reduction reads at a time.
+
+    Mirrors the runtime's arena accounting: one accumulator of four bytes per
+    (batch, channel) held for the whole stage, plus one band of input rows and
+    the collapsed output, all resident together.
+    """
+    op = stage_ops[0]
+    source = ag.tensors[op.inputs[0]]
+    result = ag.tensors[op.outputs[0]]
+
+    batch = int(source.shape[0])
+    channels = int(source.shape[1])
+    full_h = int(source.shape[2])
+    full_w = int(source.shape[3])
+
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+    # The accumulator is int32 for the int8 kernels and float for the float32
+    # ones, four bytes either way.
+    acc_bytes = _align_up(batch * channels * 4, align)
+    out_bytes = _align_up(
+        batch * channels * result.elem_size, align
+    )
+    row_elems = batch * full_w * channels
+
+    def working_set(rows: int) -> int:
+        return (
+            acc_bytes
+            + _align_up(rows * row_elems * source.elem_size, align)
+            + out_bytes
+        )
+
+    if working_set(1) > budget:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum reduction band still "
+                f"exceeds budget ({budget:,} bytes)"
+            ],
+        )
+
+    low, high, rows = 1, full_h, 1
+    while low <= high:
+        candidate = low + (high - low) // 2
+        if working_set(candidate) <= budget:
+            rows = candidate
+            low = candidate + 1
+        else:
+            high = candidate - 1
+
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+        tile_height=rows,
+        num_tiles=math.ceil(full_h / rows),
+        halo=0,
+        receptive_field=1,
+        original_height=full_h,
+        tiled_peak_bytes=working_set(rows),
+        overhead_bytes=0,
+        warnings=[],
+    )
+
 def _stage_is_layout_conversion(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -837,9 +939,16 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             stage.tile_plan = _solve_convtranspose_2d(ag, stage, stage_ops, budget)
             continue
 
+        # A global reduction has no output axis to tile, so the runtime walks
+        # its input instead. Like ConvTranspose it stays UNTILEABLE in
+        # _OP_CATEGORY and reaches its execution path only through this branch.
+        if _stage_is_global_reduction(ag, stage, stage_ops):
+            stage.tile_plan = _solve_global_reduction(
+                ag, stage, stage_ops, budget)
+            continue
+
         # A conversion permutes the two axes the stripe contract propagates,
-        # so like ConvTranspose it stays UNTILEABLE in _OP_CATEGORY and reaches
-        # its execution path only through this branch.
+        # so it reaches its own execution path the same way.
         if _stage_is_layout_conversion(ag, stage, stage_ops):
             stage.tile_plan = _solve_layout_conversion(
                 ag, stage, stage_ops, budget)
