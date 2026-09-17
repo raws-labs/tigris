@@ -1341,6 +1341,55 @@ def _erf_case() -> ContractCase:
     return ContractCase("float_erf", model, model, {"input": data}, ("Erf",))
 
 
+def _qdq_max_pool_rescale_case() -> ContractCase:
+    """An int8 MaxPool whose output declares a different quantization.
+
+    A maximum preserves the value, not its encoding. Both max kernels wrote the
+    input's encoding straight out, so a model whose quantizer assigned the pool
+    a different output scale came back wrong by tens of steps with no error.
+    kern_avg_pool_s8 has always defined this case; this is its MaxPool twin.
+    """
+    c, s = 4, 9
+    in_scale, out_scale = 0.05, 0.08
+    initializers = [
+        numpy_helper.from_array(np.array(in_scale, dtype=np.float32), "in_s"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "in_z"),
+        numpy_helper.from_array(np.array(out_scale, dtype=np.float32), "out_s"),
+        numpy_helper.from_array(np.array(-3, dtype=np.int8), "out_z"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "in_s", "in_z"], ["iq"]),
+        helper.make_node("DequantizeLinear", ["iq", "in_s", "in_z"], ["idq"]),
+        helper.make_node(
+            "MaxPool", ["idq"], ["raw"], kernel_shape=[3, 3], strides=[1, 1],
+            pads=[1, 1, 1, 1]),
+        helper.make_node("QuantizeLinear", ["raw", "out_s", "out_z"], ["oq"]),
+        helper.make_node(
+            "DequantizeLinear", ["oq", "out_s", "out_z"], ["output"]),
+    ]
+    compile_model = _model(
+        "qdq_max_pool_rescale",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, s, s])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, c, s, s])],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    rng = np.random.default_rng(5)
+    data = (rng.integers(-100, 100, size=(1, c, s, s)).astype(np.float32)
+            * in_scale)
+    return ContractCase(
+        "int8_max_pool_rescale",
+        compile_model,
+        reference_model,
+        {"input": data},
+        ("MaxPool",),
+    )
+
+
 def _qdq_erf_case() -> ContractCase:
     """The int8 sibling of _erf_case, through a lookup table."""
     shape = [1, 3, 8]
@@ -4538,6 +4587,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_rank4_binary_case(op_type="Mul"),
         _chained_normalization_case(),
         _chain_pointwise_before_spatial_case(),
+        _qdq_max_pool_rescale_case(),
         _tiled_last_axis_softmax_case(rank=3),
         _tiled_last_axis_softmax_case(rank=4),
         _layer_norm_case(),
