@@ -1073,8 +1073,12 @@ def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
     weights) are not included - they keep their raw tensor scale.
     """
     effective: dict[str, np.ndarray] = {}
-    weight_ops = {"Conv", "ConvTranspose", "ConvInteger", "DepthwiseConv",
-                  "MatMul", "Gemm", "QLinearConv", "QLinearMatMul"}
+    # Every operator whose kernel requantizes an int32 accumulator belongs
+    # here. Conv1D is a distinct op type from Conv after the normalizer
+    # relabels it, and its kernel requantizes the same way.
+    weight_ops = {"Conv", "Conv1D", "ConvTranspose", "ConvInteger",
+                  "DepthwiseConv", "MatMul", "Gemm", "QLinearConv",
+                  "QLinearMatMul"}
 
     for op in ag.ops:
         if op.op_type not in weight_ops:
