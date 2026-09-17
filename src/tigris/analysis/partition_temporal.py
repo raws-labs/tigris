@@ -11,16 +11,25 @@ def _aligned_size(size_bytes: int, alignment: int) -> int:
     return (size_bytes + alignment - 1) & ~(alignment - 1)
 
 
-def partition_temporal(ag: AnalyzedGraph, budget: int) -> AnalyzedGraph:
+def partition_temporal(
+    ag: AnalyzedGraph,
+    budget: int,
+    forced_cuts: frozenset[int] | None = None,
+) -> AnalyzedGraph:
     """Partition the execution graph into sequential stages.
 
     Greedy forward walk: accumulate ops into the current stage. When adding
     the next op would push the stage's peak live memory above *budget*,
     cut before it and start a new stage.
 
+    *forced_cuts* names op indices that must begin a stage whatever the
+    memory model says. Spatial partitioning supplies them for a stage it
+    could not tile, where a different set of stage boundaries can be.
+
     Stage inputs = tensors produced outside the stage but consumed inside.
     Stage outputs = tensors produced inside the stage but consumed later (or model outputs).
     """
+    cuts = forced_cuts or frozenset()
     ag.budget = replace(ag.budget, fast=budget)
     num_ops = len(ag.ops)
     if num_ops == 0:
@@ -46,6 +55,10 @@ def partition_temporal(ag: AnalyzedGraph, budget: int) -> AnalyzedGraph:
         running_peak = 0
 
         for candidate_end in range(current_start, num_ops):
+            if candidate_end > current_start and candidate_end in cuts:
+                # A caller-required boundary: stop before it.
+                break
+
             running_peak = max(running_peak, step_bytes[candidate_end])
 
             if running_peak <= budget:
