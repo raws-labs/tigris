@@ -59,6 +59,12 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     # neighbours. Shape-preserving and halo-free, which is what POINTWISE means
     # here, even though the operator itself is a reduction.
     "Softmax": TileCategory.POINTWISE,
+    # Erf is elementwise. LayerNormalization reduces along the final stored
+    # dimension, which both tile axes are ahead of, so a tile holds whole
+    # normalization rows and needs nothing from its neighbours: the same
+    # argument that admits Softmax.
+    "Erf": TileCategory.POINTWISE,
+    "LayerNormalization": TileCategory.POINTWISE,
 }
 
 
@@ -83,6 +89,8 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Sigmoid",
     "Tanh",
     "Softmax",
+    "Erf",
+    "LayerNormalization",
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 

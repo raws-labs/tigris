@@ -1313,6 +1313,67 @@ def _qdq_layer_norm_case() -> ContractCase:
     )
 
 
+def _tiled_layer_norm_case() -> ContractCase:
+    """LayerNormalization on a stage the solver has to tile.
+
+    A tile cuts an axis ahead of the one the kernel normalizes, so each tile
+    holds whole normalization rows. If the kernel took its statistics over the
+    wrong span the values would not match ONNX Runtime.
+    """
+    shape = [1, 256, 16]
+    initializers = [
+        numpy_helper.from_array(
+            np.linspace(0.75, 1.25, shape[-1], dtype=np.float32), "gamma"),
+        numpy_helper.from_array(
+            np.linspace(-0.2, 0.2, shape[-1], dtype=np.float32), "beta"),
+    ]
+    model = _model(
+        "tiled_layer_norm",
+        [helper.make_node(
+            "LayerNormalization", ["input", "gamma", "beta"], ["output"],
+            axis=-1, epsilon=1e-5)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        initializers,
+        opset=17,
+    )
+    row = np.linspace(-3.0, 3.0, shape[-1], dtype=np.float32)
+    gains = (1.0 + 0.01 * np.arange(shape[1], dtype=np.float32))[:, None]
+    data = (row[None, None, :] * gains[None, :, :]).astype(np.float32)
+    return ContractCase(
+        "float_tiled_layer_norm",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "LayerNormalization", "Transpose"),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
+def _tiled_erf_case() -> ContractCase:
+    """Erf on a stage the solver has to tile."""
+    shape = [1, 8, 512]
+    model = _model(
+        "tiled_erf",
+        [helper.make_node("Erf", ["input"], ["output"])],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    data = np.linspace(
+        -3.0, 3.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_tiled_erf",
+        model,
+        model,
+        {"input": data},
+        ("Erf",),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -4313,6 +4374,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _erf_case(),
         _qdq_erf_case(),
         _qdq_layer_norm_case(),
+        _tiled_layer_norm_case(),
+        _tiled_erf_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
