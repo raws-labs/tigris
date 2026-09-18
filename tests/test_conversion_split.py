@@ -119,6 +119,12 @@ def test_an_isolated_conversion_tiles_along_its_longer_axis(tmp_path):
     assert ag.stages[0].tile_plan.original_height == 4096
     assert ag.stages[2].tile_plan.original_height == 4096
 
+    # The plan also says which of the two swapped axes that was. The runtime
+    # used to derive it, and agrees with the solver only by coincidence when
+    # the two axes are equal.
+    assert ag.stages[0].tile_plan.band_on_columns is True
+    assert ag.stages[2].tile_plan.band_on_columns is False
+
 
 def test_a_conversion_whose_narrow_slice_does_not_fit_stays_untileable(tmp_path):
     """The smallest band is one column of the short axis on each side."""

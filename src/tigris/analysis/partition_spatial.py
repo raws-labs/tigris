@@ -935,8 +935,9 @@ def _solve_layout_conversion(
             ],
         )
     batch, rows, cols = extents
-    banded = max(rows, cols)
-    other = min(rows, cols)
+    band_on_columns = cols >= rows
+    banded = cols if band_on_columns else rows
+    other = rows if band_on_columns else cols
 
     align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
@@ -981,6 +982,7 @@ def _solve_layout_conversion(
         original_height=banded,
         tiled_peak_bytes=working_set(band),
         overhead_bytes=0,
+        band_on_columns=band_on_columns,
         warnings=[],
     )
 

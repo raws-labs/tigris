@@ -47,6 +47,7 @@ from .defs import (
     TENSOR_SIZE,
     TENSOR_STRUCT,
     TILE_PLAN_SIZE,
+    TILE_FLAG_BAND_ON_COLUMNS,
     TILE_PLAN_STRUCT,
     WEIGHT_BLOCK_SIZE,
     WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
@@ -252,7 +253,7 @@ def read_binary_plan(data: bytes) -> dict:
             tileable, axis, tile_height,
             n_tiles, halo,
             rf, orig_h,
-            tiled_peak, overhead, reserved,
+            tiled_peak, overhead, tile_width, tile_flags,
         ) = TILE_PLAN_STRUCT.unpack_from(data, pos)
         decoded_axis = (
             axis
@@ -264,15 +265,17 @@ def read_binary_plan(data: bytes) -> dict:
             "tileable": bool(tileable),
             "axis": decoded_axis,
             "tile_height": tile_height,
-            # Packed into the low 16 bits of the trailing reserved u32; only
-            # meaningful for the HW axis, where the writer populates it.
-            "tile_width": reserved & 0xFFFF if decoded_axis == TILE_AXIS_HW else 0,
+            # Only meaningful for the HW axis, where the writer populates it.
+            "tile_width": tile_width if decoded_axis == TILE_AXIS_HW else 0,
             "num_tiles": n_tiles,
             "halo": halo,
             "receptive_field": rf,
             "original_height": orig_h,
             "tiled_peak_bytes": tiled_peak,
             "overhead_bytes": overhead,
+            # Schema 9 and later; an older plan leaves the field zero, which
+            # reads as the longer axis the two sides used to each derive.
+            "band_on_columns": bool(tile_flags & TILE_FLAG_BAND_ON_COLUMNS),
         })
 
     # Parse weights

@@ -70,6 +70,7 @@ from .defs import (
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
     TENSOR_STRUCT,
+    TILE_FLAG_BAND_ON_COLUMNS,
     TILE_PLAN_STRUCT,
     WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
     WEIGHT_BLOCK_STRUCT,
@@ -1092,6 +1093,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
             tp.tiled_peak_bytes,
             tp.overhead_bytes,
             tp.tile_width & 0xFFFF,
+            TILE_FLAG_BAND_ON_COLUMNS if tp.band_on_columns else 0,
         ))
 
     return bytes(buf), stage_to_tile
