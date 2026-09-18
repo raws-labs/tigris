@@ -1106,6 +1106,125 @@ def _gemm_scaled_case() -> ContractCase:
     )
 
 
+def _chain_pointwise_before_spatial_case() -> ContractCase:
+    """A chain stage whose first op comes before its convolution.
+
+    exec_chain_tiled set the tile context once per stage, at the stage's
+    OUTPUT height, and corrected it only when it reached the spatial op. An op
+    ahead of the convolution therefore computed only the rows the stage
+    finally emits and left the halo rows of its own output untouched, which
+    the convolution then read as data: a silent wrong answer on interior
+    rows.
+
+    The Clip is what puts a pointwise op ahead of the convolution, and the two
+    Concats are what make the stage large enough that the partitioner cuts it
+    into two chained stages at this budget rather than one stage or four.
+    """
+    c, s = 8, 13
+    rng = np.random.default_rng(0)
+    weight = (rng.normal(size=(c, c, 3, 3)) * 0.2).astype(np.float32)
+    model = _model(
+        "chain_pointwise_before_spatial",
+        [
+            helper.make_node("Clip", ["input", "lo", "hi"], ["clipped"]),
+            helper.make_node(
+                "Conv", ["clipped", "w"], ["conv"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+            helper.make_node("Concat", ["conv", "conv"], ["wide"], axis=1),
+            helper.make_node("Concat", ["wide", "wide"], ["output"], axis=1),
+        ],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, s, s])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, 4 * c, s, s])],
+        initializers=[
+            numpy_helper.from_array(weight, "w"),
+            numpy_helper.from_array(np.array(0.0, dtype=np.float32), "lo"),
+            numpy_helper.from_array(np.array(6.0, dtype=np.float32), "hi"),
+        ],
+    )
+    data = (rng.normal(size=(1, c, s, s)) * 0.7).astype(np.float32)
+    return ContractCase(
+        "float_chain_pointwise_before_spatial",
+        model,
+        model,
+        {"input": data},
+        ("Relu6", "Conv", "Concat", "Concat"),
+        mem_budget="16K",
+        expect_tiled=True,
+        expect_chain=True,
+        expect_line_buffered=True,
+    )
+
+
+def _chained_normalization_case() -> ContractCase:
+    """A chain whose second stage normalizes.
+
+    The chain operator list in the loader is a fifth copy of the height-stripe
+    set and had drifted by four operators. A chain is a run of stripe-tileable
+    stages, so anything the stripe contract admits has to survive being
+    chained. The budget is what makes the compiler cut and chain: the same
+    graph at a roomy budget is one stage and exercises none of this.
+    """
+    shape = [1, 4, 26, 26]
+    model = _model(
+        "chained_normalization",
+        [
+            helper.make_node("Add", ["input", "input"], ["sum"]),
+            helper.make_node("Softmax", ["sum"], ["output"], axis=1),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    data = np.linspace(
+        -2.0, 2.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_chained_normalization",
+        model,
+        model,
+        {"input": data},
+        ("Add", "Softmax"),
+        mem_budget="16K",
+        expect_tiled=True,
+        expect_chain=True,
+    )
+
+
+def _tiled_rank4_binary_case(*, op_type: str) -> ContractCase:
+    """A rank-4 binary pointwise stage the solver has to tile.
+
+    The height-stripe contract is stated in four places: the compiler's op
+    category table, the loader's rank-4 operator list, the executor's
+    is_height_tiling_op, and the accelerator routing policy. Sub was in three
+    of them, so a model with one compiled and then failed to load. One case
+    per binary operator keeps each of the four honest.
+    """
+    shape = [1, 4, 32, 32]
+    model = _model(
+        f"tiled_rank4_{op_type.lower()}",
+        [helper.make_node(op_type, ["left", "right"], ["output"])],
+        [
+            helper.make_tensor_value_info("left", TensorProto.FLOAT, shape),
+            helper.make_tensor_value_info("right", TensorProto.FLOAT, shape),
+        ],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    count = int(np.prod(shape))
+    return ContractCase(
+        f"float_tiled_rank4_{op_type.lower()}",
+        model,
+        model,
+        {
+            "left": np.linspace(-1.0, 1.0, count, dtype=np.float32).reshape(shape),
+            "right": np.linspace(0.5, -0.5, count, dtype=np.float32).reshape(shape),
+        },
+        (op_type,),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _tiled_softmax_rank4_case() -> ContractCase:
     """Softmax on a rank-4 stage the solver has to tile.
 
@@ -1220,6 +1339,124 @@ def _erf_case() -> ContractCase:
         -3.0, 3.0, int(np.prod(shape)), dtype=np.float32
     ).reshape(shape)
     return ContractCase("float_erf", model, model, {"input": data}, ("Erf",))
+
+
+def _qdq_rescale_passthrough_case(*, op_type: str) -> ContractCase:
+    """A value-preserving int8 operator whose output rescales.
+
+    Relu, Relu6, Reshape and nearest Resize all carry a value through
+    unchanged, and all four used to write the input's encoding straight out.
+    One case each, with an output scale and zero point deliberately unlike the
+    input's, which is what a quantizer that assigns per-tensor scales
+    independently produces.
+    """
+    c, s = 4, 8
+    in_scale, out_scale = 0.05, 0.08
+    initializers = [
+        numpy_helper.from_array(np.array(in_scale, dtype=np.float32), "in_s"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "in_z"),
+        numpy_helper.from_array(np.array(out_scale, dtype=np.float32), "out_s"),
+        numpy_helper.from_array(np.array(-3, dtype=np.int8), "out_z"),
+    ]
+    out_shape = [1, c, s, s]
+    if op_type == "Relu":
+        body = [helper.make_node("Relu", ["idq"], ["raw"])]
+    elif op_type == "Relu6":
+        initializers += [
+            numpy_helper.from_array(np.array(0.0, dtype=np.float32), "lo"),
+            numpy_helper.from_array(np.array(6.0, dtype=np.float32), "hi"),
+        ]
+        body = [helper.make_node("Clip", ["idq", "lo", "hi"], ["raw"])]
+    elif op_type == "Reshape":
+        initializers.append(numpy_helper.from_array(
+            np.array([1, c, s * s], dtype=np.int64), "newshape"))
+        body = [helper.make_node("Reshape", ["idq", "newshape"], ["raw"])]
+        out_shape = [1, c, s * s]
+    else:
+        initializers.append(numpy_helper.from_array(
+            np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), "scales"))
+        body = [helper.make_node(
+            "Resize", ["idq", "", "scales"], ["raw"], mode="nearest",
+            coordinate_transformation_mode="asymmetric", nearest_mode="floor")]
+        out_shape = [1, c, 2 * s, 2 * s]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "in_s", "in_z"], ["iq"]),
+        helper.make_node("DequantizeLinear", ["iq", "in_s", "in_z"], ["idq"]),
+    ] + body + [
+        helper.make_node("QuantizeLinear", ["raw", "out_s", "out_z"], ["oq"]),
+        helper.make_node(
+            "DequantizeLinear", ["oq", "out_s", "out_z"], ["output"]),
+    ]
+    compile_model = _model(
+        f"qdq_rescale_{op_type.lower()}",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, s, s])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, out_shape)],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    rng = np.random.default_rng(5)
+    data = (rng.integers(-100, 100, size=(1, c, s, s)).astype(np.float32)
+            * in_scale)
+    return ContractCase(
+        f"int8_rescale_{op_type.lower()}",
+        compile_model,
+        reference_model,
+        {"input": data},
+        (op_type,),
+    )
+
+
+def _qdq_max_pool_rescale_case() -> ContractCase:
+    """An int8 MaxPool whose output declares a different quantization.
+
+    A maximum preserves the value, not its encoding. Both max kernels wrote the
+    input's encoding straight out, so a model whose quantizer assigned the pool
+    a different output scale came back wrong by tens of steps with no error.
+    kern_avg_pool_s8 has always defined this case; this is its MaxPool twin.
+    """
+    c, s = 4, 9
+    in_scale, out_scale = 0.05, 0.08
+    initializers = [
+        numpy_helper.from_array(np.array(in_scale, dtype=np.float32), "in_s"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "in_z"),
+        numpy_helper.from_array(np.array(out_scale, dtype=np.float32), "out_s"),
+        numpy_helper.from_array(np.array(-3, dtype=np.int8), "out_z"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "in_s", "in_z"], ["iq"]),
+        helper.make_node("DequantizeLinear", ["iq", "in_s", "in_z"], ["idq"]),
+        helper.make_node(
+            "MaxPool", ["idq"], ["raw"], kernel_shape=[3, 3], strides=[1, 1],
+            pads=[1, 1, 1, 1]),
+        helper.make_node("QuantizeLinear", ["raw", "out_s", "out_z"], ["oq"]),
+        helper.make_node(
+            "DequantizeLinear", ["oq", "out_s", "out_z"], ["output"]),
+    ]
+    compile_model = _model(
+        "qdq_max_pool_rescale",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, s, s])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, c, s, s])],
+        initializers,
+    )
+    reference_model = copy.deepcopy(compile_model)
+    onnx.checker.check_model(reference_model)
+    rng = np.random.default_rng(5)
+    data = (rng.integers(-100, 100, size=(1, c, s, s)).astype(np.float32)
+            * in_scale)
+    return ContractCase(
+        "int8_max_pool_rescale",
+        compile_model,
+        reference_model,
+        {"input": data},
+        ("MaxPool",),
+    )
 
 
 def _qdq_erf_case() -> ContractCase:
@@ -4453,6 +4690,16 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _negate_case(),
         _gemm_scaled_case(),
         _tiled_softmax_rank4_case(),
+        _tiled_rank4_binary_case(op_type="Add"),
+        _tiled_rank4_binary_case(op_type="Sub"),
+        _tiled_rank4_binary_case(op_type="Mul"),
+        _chained_normalization_case(),
+        _chain_pointwise_before_spatial_case(),
+        _qdq_max_pool_rescale_case(),
+        _qdq_rescale_passthrough_case(op_type="Relu"),
+        _qdq_rescale_passthrough_case(op_type="Relu6"),
+        _qdq_rescale_passthrough_case(op_type="Reshape"),
+        _qdq_rescale_passthrough_case(op_type="Resize"),
         _tiled_last_axis_softmax_case(rank=3),
         _tiled_last_axis_softmax_case(rank=4),
         _layer_norm_case(),
