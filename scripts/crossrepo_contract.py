@@ -1420,6 +1420,45 @@ def _tiled_matrix_rows_case() -> ContractCase:
     )
 
 
+def _tiled_attention_transpose_case() -> ContractCase:
+    """A transpose the model itself asks for, on a stage that has to tile.
+
+    An attention block transposes its keys between two operands that are both
+    already in the model's own order, so no layout conversion is involved.
+    The permutation of stored axes is the same one a conversion emits, which
+    is what lets the same band serve it.
+    """
+    tokens, width = 256, 16
+    weight = numpy_helper.from_array(
+        (np.arange(width * width, dtype=np.float32).reshape(width, width)
+         / (width * width) - 0.5), "wk")
+    nodes = [
+        helper.make_node("MatMul", ["input", "wk"], ["keys"]),
+        helper.make_node("Transpose", ["keys"], ["output"], perm=[0, 2, 1]),
+    ]
+    model = _model(
+        "tiled_attention_transpose",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, tokens, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, width, tokens])],
+        [weight],
+    )
+    data = np.linspace(
+        -1.0, 1.0, tokens * width, dtype=np.float32
+    ).reshape(1, tokens, width)
+    return ContractCase(
+        "float_tiled_attention_transpose",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Reshape", "Gemm", "Reshape", "Transpose"),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
     model_input = helper.make_tensor_value_info(
@@ -4423,6 +4462,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_layer_norm_case(),
         _tiled_erf_case(),
         _tiled_matrix_rows_case(),
+        _tiled_attention_transpose_case(),
         _normalized_classifier_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
