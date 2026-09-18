@@ -239,3 +239,51 @@ def test_band_extents_come_from_the_permutation_not_the_layout():
     assert _transpose_band_extents(linear, (0, 2, 3, 1)) == (1, 8, 36)
     # A permutation the runtime does not band gets no extents at all.
     assert _transpose_band_extents(linear, (0, 1, 2, 3)) is None
+
+def test_a_row_pipeline_too_tall_for_the_plan_format_declines(tmp_path):
+    """The band has to be stateable in the plan, not just computable.
+
+    tile_height, num_tiles and original_height are uint16 fields. A solver
+    that bands a single spatial axis never reaches that on a shape which fits
+    an embedded budget; one that bands a matrix's rows does.
+    """
+    rows, width, hidden = 70_000, 8, 8
+    inits = [
+        numpy_helper.from_array(
+            np.zeros((width, hidden), dtype=np.float32), "w1"),
+    ]
+    nodes = [helper.make_node("MatMul", ["x", "w1"], ["y"])]
+    ag = _planned(
+        tmp_path, nodes, ([1, rows, width], [1, rows, hidden]), 8_000,
+        name="tallrows", initializers=inits,
+    )
+
+    banded = [
+        st for st in ag.stages
+        if st.tile_plan is not None and st.tile_plan.tileable
+        and st.tile_plan.original_height > 0xFFFF
+    ]
+    assert not banded
+    declined = [
+        st for st in ag.stages
+        if st.tile_plan is not None and not st.tile_plan.tileable
+        and any("a tile plan can state" in w for w in st.tile_plan.warnings)
+    ]
+    assert declined, [st.tile_plan for st in ag.stages]
+
+
+def test_a_conversion_too_wide_for_the_plan_format_declines(tmp_path):
+    """A 256x256 plane collapses to 65,536 rows, one past the field."""
+    shape = [1, 4, 256, 256]
+    nodes = [helper.make_node("Softmax", ["x"], ["y"], axis=-1, name="smbig")]
+    ag = _planned(tmp_path, nodes, (shape, shape), 32_000, name="bigconv")
+
+    conversions = [
+        st for st in ag.stages
+        if _stage_op_types(ag)[st.stage_id] == ["Transpose"]
+    ]
+    assert conversions
+    for stage in conversions:
+        assert not stage.tile_plan.tileable
+        assert any("a tile plan can state" in w
+                   for w in stage.tile_plan.warnings)
