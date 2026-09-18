@@ -16,6 +16,7 @@ from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
     OpNode,
+    serialized_axis_map,
     serialized_transpose_perm,
 )
 
@@ -32,6 +33,7 @@ from .defs import (
     MAGIC,
     NO_QUANT_PARAM,
     NO_WEIGHT,
+    OP_ATTR_AXES,
     OP_ATTR_EPSILON,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ACTIVATION_STRUCT,
@@ -743,6 +745,17 @@ def _build_op_attributes(
                 OP_ATTR_EPSILON,
                 struct.pack("<f", float(op.attrs.get("epsilon", 1e-5))),
             ))
+            continue
+        if op.op_type == "ReduceMean":
+            axes = op.attrs.get("axes")
+            if not axes:
+                raise ValueError(f"ReduceMean '{op.name}' must state its axes")
+            info = ag.tensors[op.inputs[0]]
+            axis_map = serialized_axis_map(len(info.shape), info.layout)
+            serialized = sorted(
+                axis_map[int(axis) % len(info.shape)] for axis in axes
+            )
+            records.append((op_index, OP_ATTR_AXES, bytes(serialized)))
             continue
         if op.op_type != "Transpose":
             continue

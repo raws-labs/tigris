@@ -1557,11 +1557,20 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
         if axes is None:
             continue
 
-        # Normalize negative axes for 4D tensors (ndim=4)
-        axes_norm = set(int(a) % 4 for a in axes)
+        source = ag.tensors.get(op.inputs[0])
+        rank = len(source.shape) if source is not None else 0
+        if rank == 0:
+            continue
+        axes_norm = set(int(a) % rank for a in axes)
 
-        # Accept axes {2,3} (NCHW spatial) or {1,2} (NHWC spatial)
-        if axes_norm not in ({2, 3}, {1, 2}):
+        # An operator that keeps its own type still has to carry its axes in
+        # one place, because the emitter reads them from the attribute and an
+        # opset-18 model states them as an input.
+        op.attrs["axes"] = sorted(axes_norm)
+
+        # Only a rank-4 mean over both spatial axes is the global pool. The
+        # axes read the same in either order the graph may state them.
+        if rank != 4 or axes_norm not in ({2, 3}, {1, 2}):
             continue
 
         op.op_type = reductions[op.op_type]

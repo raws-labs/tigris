@@ -271,6 +271,76 @@ def _reshape_alias_case(*, spatial: bool) -> ContractCase:
     )
 
 
+def _reduce_mean_case(*, quantized: bool, keepdims: bool) -> ContractCase:
+    """A mean over the token axis, which is what a pooled sequence head is.
+
+    The encoder leaves one vector per token and the head wants one vector for
+    the sequence, so the mean collapses the rows of a rank-3 tensor. Both the
+    kept and the dropped row axis are here because the two write the same
+    bytes and only the declared rank differs, which is exactly the kind of
+    difference the loader has to police rather than guess at.
+    """
+    tokens, width = 12, 8
+    in_shape = [1, tokens, width]
+    out_shape = [1, 1, width] if keepdims else [1, width]
+    kd = 1 if keepdims else 0
+    name = f"reduce_mean_{'keepdims' if keepdims else 'flat'}"
+    if quantized:
+        in_scale, out_scale = 0.05, 0.03
+        initializers = [
+            numpy_helper.from_array(
+                np.array(in_scale, dtype=np.float32), "in_s"),
+            numpy_helper.from_array(np.array(2, dtype=np.int8), "in_z"),
+            numpy_helper.from_array(
+                np.array(out_scale, dtype=np.float32), "out_s"),
+            numpy_helper.from_array(np.array(-5, dtype=np.int8), "out_z"),
+        ]
+        nodes = [
+            helper.make_node(
+                "QuantizeLinear", ["input", "in_s", "in_z"], ["iq"]),
+            helper.make_node(
+                "DequantizeLinear", ["iq", "in_s", "in_z"], ["idq"]),
+            helper.make_node(
+                "ReduceMean", ["idq"], ["raw"], axes=[1], keepdims=kd),
+            helper.make_node(
+                "QuantizeLinear", ["raw", "out_s", "out_z"], ["oq"]),
+            helper.make_node(
+                "DequantizeLinear", ["oq", "out_s", "out_z"], ["output"]),
+        ]
+        rng = np.random.default_rng(11)
+        data = (rng.integers(-100, 100, size=in_shape).astype(np.float32)
+                * in_scale)
+        label = f"int8_{name}"
+    else:
+        initializers = []
+        nodes = [
+            helper.make_node(
+                "ReduceMean", ["input"], ["output"], axes=[1], keepdims=kd),
+        ]
+        data = np.linspace(
+            -1.5, 1.5, int(np.prod(in_shape)), dtype=np.float32
+        ).reshape(in_shape)
+        label = f"float_{name}"
+    model = _model(
+        label,
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, in_shape)],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, out_shape)],
+        initializers,
+    )
+    reference_model = copy.deepcopy(model)
+    onnx.checker.check_model(reference_model)
+    return ContractCase(
+        label,
+        model,
+        reference_model,
+        {"input": data},
+        ("ReduceMean",),
+    )
+
+
 def _head_permutation_case() -> ContractCase:
     """The permutation that moves an attention block into its head layout.
 
@@ -4841,6 +4911,10 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _head_permutation_case(),
         _reshape_alias_case(spatial=False),
         _reshape_alias_case(spatial=True),
+        _reduce_mean_case(quantized=False, keepdims=True),
+        _reduce_mean_case(quantized=False, keepdims=False),
+        _reduce_mean_case(quantized=True, keepdims=True),
+        _reduce_mean_case(quantized=True, keepdims=False),
         _output_transpose_case(),
         _dilated_conv_case(),
         _depthwise_conv_case(),

@@ -58,6 +58,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Transpose",
     "LayerNormalization",
     "Erf",
+    "ReduceMean",
 })
 
 _S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS
@@ -116,6 +117,10 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "shape-preserving unary pointwise operators",
     ),
     "GlobalAveragePool": ("untiled execution",),
+    "ReduceMean": (
+        "rank-3 mean over serialized axis 1; untiled execution. A rank-4 mean "
+        "over both spatial axes is rewritten to GlobalAveragePool instead",
+    ),
     "Resize": (
         "rank-4 nearest-neighbor integer H/W upscaling; untiled execution",
     ),
