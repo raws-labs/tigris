@@ -45,6 +45,8 @@ OP_ATTR_ALPHA = 3            # float32, a leaky activation's negative slope
 OP_ATTR_CLIP_BOUNDS = 4      # float32[2], a clip's lower then upper bound
 OP_ATTR_PADS = 5             # int32[2 * rank], leading then trailing per axis
 OP_ATTR_AXES = 6             # uint8[n], the axes a reduction collapses
+OP_ATTR_BINARY_REQUANT = 7   # int32[6], three Q0.31 (multiplier, shift) pairs:
+                             # the first operand's, the second's, the result's
 
 OP_ATTR_KINDS = (
     OP_ATTR_TRANSPOSE_PERM,
@@ -53,6 +55,7 @@ OP_ATTR_KINDS = (
     OP_ATTR_CLIP_BOUNDS,
     OP_ATTR_PADS,
     OP_ATTR_AXES,
+    OP_ATTR_BINARY_REQUANT,
 )
 
 # Compression types

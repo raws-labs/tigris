@@ -24,6 +24,7 @@ from tigris.emitters.binary.defs import (
     HEADER_SIZE,
     MAGIC,
     OP_ATTR_AXES,
+    OP_ATTR_BINARY_REQUANT,
     OP_ATTR_EPSILON,
     OP_TYPE_MAP,
     TENSOR_FLAG_LINEAR,
@@ -466,6 +467,13 @@ def test_immutable_supported_schema_fixtures():
             0,
             3,
         ),
+        (
+            9,
+            "schema-v9-binary-requant.tgrs",
+            "856d250b3a6bffbdc99a752813d652d720965abf0ee4aba33e9276847baa22c0",
+            3,
+            1,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -477,6 +485,12 @@ def test_immutable_supported_schema_fixtures():
         assert plan["version"] == version
         assert len(plan["quant_params"]) == quant_params
         assert len(plan["op_attributes"]) == op_attributes
+        if version == 9:
+            # The quantized sum states the three pairs that scale its two
+            # operands and its result, which is what schema 9 added.
+            attribute = plan["op_attributes"][0]
+            assert attribute["type"] == OP_ATTR_BINARY_REQUANT
+            assert len(attribute["data"]) == 24
         if version == 5:
             assert plan["tile_plans"][0]["axis"] == 1
             assert plan["tile_plans"][0]["num_tiles"] > 1
