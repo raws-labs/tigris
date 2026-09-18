@@ -178,6 +178,46 @@ def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     return None
 
 
+def _operand_layouts(ag: AnalyzedGraph, op: OpNode) -> list[Layout]:
+    """The layouts of the operands whose layout can differ from each other.
+
+    Constants carry no layout of their own and rank 2 and below cannot
+    disagree, so neither constrains anything.
+    """
+    layouts = []
+    for name in op.inputs:
+        if not name:
+            continue
+        info = ag.tensors.get(name)
+        if info is None or info.is_constant or len(info.shape) < 3:
+            continue
+        layouts.append(info.layout)
+    return layouts
+
+
+def _agreed_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
+    """The layout an operator's operands have to share, when they must.
+
+    An operator that works in either layout still needs its operands to agree
+    with each other: an elementwise Add reads both at the same offset, so two
+    operands stored in different axis orders add unrelated elements. The
+    shapes only reveal it when they differ, which is why a square block came
+    back wrong rather than refused.
+
+    Where they already agree there is nothing to do. Where they do not, the
+    majority wins and a tie goes to the model's own order, because a
+    disagreement arises only when a matrix product or a trailing-axis
+    normalization produced one of the operands, and those are exactly the
+    operators that will read the result.
+    """
+    layouts = _operand_layouts(ag, op)
+    if len(set(layouts)) < 2:
+        return None
+    spatial = layouts.count(Layout.SPATIAL)
+    linear = layouts.count(Layout.LINEAR)
+    return Layout.SPATIAL if spatial > linear else Layout.LINEAR
+
+
 def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Give every tensor a layout and convert where producer and consumer differ.
 
@@ -197,7 +237,11 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     for op in ag.ops:
         required = _required_layout(ag, op)
-        if required is not None:
+        # An operator with no requirement of its own still needs its operands
+        # to agree with each other. _agreed_layout is None when they already
+        # do, which is every operator with one activation operand.
+        enforced = required if required is not None else _agreed_layout(ag, op)
+        if enforced is not None:
             for position, name in enumerate(op.inputs):
                 if not name:
                     continue
@@ -205,20 +249,20 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
                 if info is None or info.is_constant:
                     continue
                 # Rank 2 and below cannot disagree, so never pay for a copy.
-                if len(info.shape) < 3 or info.layout is required:
+                if len(info.shape) < 3 or info.layout is enforced:
                     continue
 
-                key = (name, required)
+                key = (name, enforced)
                 target = converted.get(key)
                 if target is None:
                     counter += 1
-                    target = f"{name}_to_{required.value}_{counter}"
+                    target = f"{name}_to_{enforced.value}_{counter}"
                     ag.tensors[target] = TensorInfo(
                         name=target,
                         shape=info.shape,
                         dtype=info.dtype,
                         quant=info.quant,
-                        layout=required,
+                        layout=enforced,
                     )
                     rewritten.append(OpNode(
                         name=f"layout_{counter}",
@@ -230,7 +274,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
                     converted[key] = target
                 op.inputs[position] = target
 
-        produced = required
+        produced = enforced
         if produced is None:
             produced = Layout.SPATIAL
             for name in op.inputs:

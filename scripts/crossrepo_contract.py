@@ -202,6 +202,44 @@ def _residual_case() -> ContractCase:
     )
 
 
+def _layout_mixing_residual_case(*, square: bool) -> ContractCase:
+    """A residual connection around a matrix product.
+
+    The matrix product needs the model's own axis order and the skip arrives
+    in storage order, so the Add's two operands disagree about layout and the
+    normalizer has to unify them. Two shapes, because the failure wore two
+    faces: an oblong block was refused at load on the Add shape check, and a
+    square one passed that check and added transposed data. The square case is
+    the one that matters, and it is the ordinary shape for a small transformer
+    whose sequence length equals its width.
+    """
+    tokens, width = (8, 8) if square else (8, 4)
+    rng = np.random.default_rng(0)
+    weight = (rng.normal(size=(width, width)) * 0.3).astype(np.float32)
+    model = _model(
+        f"layout_mixing_residual_{'square' if square else 'oblong'}",
+        [
+            helper.make_node("MatMul", ["input", "w"], ["projected"]),
+            helper.make_node("Add", ["input", "projected"], ["output"]),
+        ],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, tokens, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, tokens, width])],
+        [numpy_helper.from_array(weight, "w")],
+    )
+    data = np.linspace(
+        -1.5, 1.5, tokens * width, dtype=np.float32
+    ).reshape(1, tokens, width)
+    return ContractCase(
+        f"float_residual_over_matmul_{'square' if square else 'oblong'}",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Reshape", "Gemm", "Reshape", "Add", "Transpose"),
+    )
+
+
 def _output_transpose_case() -> ContractCase:
     """A public Transpose must retain its ONNX shape and element ordering."""
     model_input = helper.make_tensor_value_info(
@@ -4422,6 +4460,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _constant_add_case(),
         _add_relu_fusion_case(),
         _residual_case(),
+        _layout_mixing_residual_case(square=True),
+        _layout_mixing_residual_case(square=False),
         _output_transpose_case(),
         _dilated_conv_case(),
         _depthwise_conv_case(),
