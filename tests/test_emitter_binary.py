@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tigris import SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
+from tigris import (
+    SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
+    TILE_AXIS_HEIGHT_OR_LENGTH,
+)
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import partition_spatial
@@ -24,8 +28,21 @@ from tigris.emitters.binary.defs import (
     TENSOR_FLAG_MODEL_OUTPUT,
 )
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.emitters.binary.writer import _build_quant_params, emit_binary, emit_binary_bytes
-from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, QuantParam, Stage, TensorInfo
+from tigris.emitters.binary.writer import (
+    _build_quant_params,
+    _build_tile_plans,
+    emit_binary,
+    emit_binary_bytes,
+)
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    MemoryBudget,
+    OpNode,
+    QuantParam,
+    Stage,
+    TensorInfo,
+    TilePlan,
+)
 from tigris.loaders import load_model
 
 
@@ -530,3 +547,30 @@ def test_truncated():
         assert False, "Should have raised ValueError"
     except ValueError as e:
         assert "too small" in str(e)
+
+
+def test_a_tile_extent_that_does_not_fit_names_the_field_and_the_stage():
+    """struct.pack alone would abort the compile with no diagnosis.
+
+    Every solver that bands a single axis stays inside a uint16 by the nature
+    of shapes that fit an embedded budget. The ones that band a product of
+    axes do not, so the writer says which field overflowed on which stage
+    rather than letting struct raise. tile_width is masked on the way out,
+    so without this it would truncate silently instead.
+    """
+    ag = SimpleNamespace(stages=[
+        SimpleNamespace(
+            stage_id=3,
+            tile_plan=TilePlan(
+                tileable=True,
+                axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+                tile_height=8192,
+                num_tiles=8,
+                original_height=65_536,
+                tiled_peak_bytes=262_144,
+            ),
+        ),
+    ])
+
+    with pytest.raises(ValueError, match=r"stage 3 tile plan original_height"):
+        _build_tile_plans(ag)
