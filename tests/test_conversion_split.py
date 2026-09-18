@@ -11,6 +11,7 @@ from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import (
     _row_view,
     _transpose_band_extents,
+    _transpose_band_groups,
     conversion_cut_points,
     partition_spatial,
 )
@@ -335,3 +336,34 @@ def test_the_row_view_reads_the_trailing_pair_as_the_matrix():
     # matrix and it presents no row view at all.
     spatial = SimpleNamespace(shape=[1, 4, 64, 16], layout=Layout.SPATIAL)
     assert _row_view(spatial) is None
+
+
+def test_a_banded_transpose_is_an_adjacent_group_swap():
+    """The rule the three named permutations were instances of.
+
+    A transpose is a plain matrix transpose when it swaps two adjacent groups
+    of axes and leaves everything else in relative order. The prefix is a
+    batch it repeats over and the suffix is a block that travels with the
+    element; the three permutations this used to name were the cases with
+    neither.
+    """
+    # (prefix, |A|, middle) for each of the three it named before.
+    assert _transpose_band_groups((0, 2, 1)) == (1, 1, 2)
+    assert _transpose_band_groups((0, 3, 1, 2)) == (1, 2, 3)
+    assert _transpose_band_groups((0, 2, 3, 1)) == (1, 1, 3)
+
+    # An attention block's head permutation: the first with a suffix.
+    assert _transpose_band_groups((0, 2, 1, 3)) == (1, 1, 2)
+    # And one with a longer prefix.
+    assert _transpose_band_groups((0, 1, 3, 2)) == (2, 1, 2)
+
+    # The identity moves nothing, and a permutation that is not an adjacent
+    # swap is not a matrix transpose however the axes are grouped.
+    assert _transpose_band_groups((0, 1, 2, 3)) is None
+    assert _transpose_band_groups((0, 3, 2, 1)) is None
+
+
+def test_the_head_permutation_bands_over_the_token_axis():
+    """[1, T, H, HD] -> [1, H, T, HD] is T by H carrying HD at each position."""
+    info = SimpleNamespace(shape=[1, 64, 4, 16], layout=Layout.LINEAR)
+    assert _transpose_band_extents(info, (0, 2, 1, 3)) == (1, 64, 4)

@@ -466,6 +466,53 @@ def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
     return True
 
 
+def _transpose_band_groups(
+    stored_perm: tuple[int, ...]
+) -> tuple[int, int, int] | None:
+    """Split a stored permutation into (prefix, first group, middle) sizes.
+
+    A transpose is a plain matrix transpose when it swaps two adjacent groups
+    of axes and leaves everything else in its relative order:
+
+        [prefix][A][B][suffix] -> [prefix][B][A][suffix]
+
+    It then transposes prod(A) by prod(B), repeated over prod(prefix), and
+    carries prod(suffix) elements at each position. A layout conversion, an
+    attention block's key transpose and its head permutation are all instances
+    of this; the prefix and the suffix are what tell them apart, and the three
+    permutations this used to name were the cases with neither.
+
+    Returns the prefix length, the length of A, and the length of the middle,
+    or None when the permutation is not of that shape.
+    """
+    rank = len(stored_perm)
+    if rank < 2:
+        return None
+    prefix = 0
+    while prefix < rank and stored_perm[prefix] == prefix:
+        prefix += 1
+    if prefix >= rank:
+        return None  # the identity moves nothing
+    suffix = 0
+    while (suffix < rank - prefix
+           and stored_perm[rank - 1 - suffix] == rank - 1 - suffix):
+        suffix += 1
+    middle = rank - prefix - suffix
+    if middle < 2:
+        return None
+    # Inside the middle the permutation reads [B][A], so where A begins is
+    # where the first index lands.
+    split = stored_perm[prefix] - prefix
+    if split <= 0 or split >= middle:
+        return None
+    for i in range(middle):
+        want = (prefix + split + i if i < middle - split
+                else prefix + i - (middle - split))
+        if stored_perm[prefix + i] != want:
+            return None
+    return prefix, split, middle
+
+
 def _transpose_band_extents(
     info, stored_perm: tuple[int, ...]
 ) -> tuple[int, int, int] | None:
@@ -475,22 +522,18 @@ def _transpose_band_extents(
     permutation and nothing else. The tensor's layout does not decide the
     split: the same stored shape is banded differently depending on which way
     the permutation runs, and a transpose that is not a layout conversion has
-    no layout difference to read in the first place. Rank 3 swaps the pair
-    outright; rank 4 keeps the two axes that travel together adjacent and in
-    order, so they collapse into one extent.
+    no layout difference to read in the first place.
     """
     stored = serialized_shape(info.shape, info.layout)
     if len(stored) != len(stored_perm):
         return None
-    batch = stored[0]
-    if stored_perm == (0, 2, 1):
-        rows, cols = stored[1], stored[2]
-    elif stored_perm == (0, 3, 1, 2):
-        rows, cols = stored[1] * stored[2], stored[3]
-    elif stored_perm == (0, 2, 3, 1):
-        rows, cols = stored[1], stored[2] * stored[3]
-    else:
+    groups = _transpose_band_groups(stored_perm)
+    if groups is None:
         return None
+    prefix, split, middle = groups
+    batch = math.prod(stored[:prefix]) if prefix else 1
+    rows = math.prod(stored[prefix:prefix + split])
+    cols = math.prod(stored[prefix + split:prefix + middle])
     if batch <= 0 or rows <= 0 or cols <= 0:
         return None
     return batch, rows, cols
@@ -794,18 +837,6 @@ def _solve_global_reduction(
         warnings=[],
     )
 
-# Permutations of stored axes that move the channel axis past the spatial ones
-# while leaving those in their relative order. That is what makes the operator
-# a plain matrix transpose once the axes that travel together are read as one,
-# whether it arose from a layout conversion or from the model itself. Mirrors
-# transpose_extents in the executor.
-_TRANSPOSE_BAND_PERMS = frozenset({
-    (0, 2, 1),           # rank 3, the two axes swap outright
-    (0, 3, 1, 2),        # rank 4 going to the model's own order
-    (0, 2, 3, 1),        # rank 4 coming back
-})
-
-
 def _stage_is_tiled_transpose(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -840,9 +871,6 @@ def _stage_is_tiled_transpose(
         return False
     stored_perm = serialized_transpose_perm(
         raw_perm, source.layout, result.layout)
-    if stored_perm not in _TRANSPOSE_BAND_PERMS:
-        return False
-
     extents = _transpose_band_extents(source, stored_perm)
     if extents is None:
         return False

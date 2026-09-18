@@ -202,6 +202,37 @@ def _residual_case() -> ContractCase:
     )
 
 
+def _head_permutation_case() -> ContractCase:
+    """The permutation that moves an attention block into its head layout.
+
+    Stored (0, 2, 1, 3): a token by head transpose carrying the head width at
+    each position. It is the first permutation the band path accepts with a
+    suffix, and the three it named before were the cases with none.
+    """
+    tokens, heads, width = 64, 4, 16
+    model = _model(
+        "head_permutation",
+        [helper.make_node(
+            "Transpose", ["input"], ["output"], perm=[0, 2, 1, 3])],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, tokens, heads, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, heads, tokens, width])],
+    )
+    data = np.linspace(
+        -1.0, 1.0, tokens * heads * width, dtype=np.float32
+    ).reshape(1, tokens, heads, width)
+    return ContractCase(
+        "float_head_permutation",
+        model,
+        model,
+        {"input": data},
+        ("Transpose",),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
 def _banded_attention_case() -> ContractCase:
     """An attention region banded over its query axis.
 
@@ -4738,6 +4769,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _layout_mixing_residual_case(square=True),
         _layout_mixing_residual_case(square=False),
         _banded_attention_case(),
+        _head_permutation_case(),
         _output_transpose_case(),
         _dilated_conv_case(),
         _depthwise_conv_case(),
