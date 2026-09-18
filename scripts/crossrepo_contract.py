@@ -202,6 +202,75 @@ def _residual_case() -> ContractCase:
     )
 
 
+def _reshape_alias_case(*, spatial: bool) -> ContractCase:
+    """A reshape that moves no byte, so the two tensors share a buffer.
+
+    The linear case regroups a matrix's shape; the spatial one regroups a
+    feature map's spatial axes into patches, which is what a vision
+    transformer's unfold is. Both leave the stored bytes untouched, so the
+    executor gives the output the input's buffer and the compiler counts one
+    allocation. A wrong answer here means the two do not agree on when that is
+    safe.
+    """
+    if spatial:
+        channels, side = 8, 4
+        nodes = [
+            helper.make_node(
+                "Conv", ["input", "w"], ["features"], kernel_shape=[1, 1]),
+            helper.make_node("Reshape", ["features", "shape"], ["patches"]),
+            helper.make_node("Relu", ["patches"], ["output"]),
+        ]
+        initializers = [
+            numpy_helper.from_array(
+                (np.random.default_rng(0).normal(
+                    size=(channels, channels, 1, 1)) * 0.3
+                 ).astype(np.float32), "w"),
+            numpy_helper.from_array(
+                np.array([1, channels, side * side, 1], np.int64), "shape"),
+        ]
+        in_shape = [1, channels, side, side]
+        out_shape = [1, channels, side * side, 1]
+    else:
+        tokens, width = 8, 8
+        nodes = [
+            helper.make_node("MatMul", ["input", "w"], ["projected"]),
+            helper.make_node("Reshape", ["projected", "shape"], ["heads"]),
+            helper.make_node("Erf", ["heads"], ["output"]),
+        ]
+        initializers = [
+            numpy_helper.from_array(
+                (np.random.default_rng(0).normal(size=(width, width)) * 0.3
+                 ).astype(np.float32), "w"),
+            numpy_helper.from_array(
+                np.array([1, tokens, 2, width // 2], np.int64), "shape"),
+        ]
+        in_shape = [1, tokens, width]
+        out_shape = [1, tokens, 2, width // 2]
+    kind = "spatial" if spatial else "linear"
+    model = _model(
+        f"reshape_alias_{kind}",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, in_shape)],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, out_shape)],
+        initializers,
+    )
+    data = np.linspace(
+        -1.5, 1.5, int(np.prod(in_shape)), dtype=np.float32
+    ).reshape(in_shape)
+    ops = (("Conv", "Reshape", "Relu") if spatial
+           else ("Transpose", "Reshape", "Gemm", "Reshape", "Reshape", "Erf",
+                 "Transpose"))
+    return ContractCase(
+        f"float_reshape_alias_{kind}",
+        model,
+        model,
+        {"input": data},
+        ops,
+    )
+
+
 def _head_permutation_case() -> ContractCase:
     """The permutation that moves an attention block into its head layout.
 
@@ -4770,6 +4839,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _layout_mixing_residual_case(square=False),
         _banded_attention_case(),
         _head_permutation_case(),
+        _reshape_alias_case(spatial=False),
+        _reshape_alias_case(spatial=True),
         _output_transpose_case(),
         _dilated_conv_case(),
         _depthwise_conv_case(),
