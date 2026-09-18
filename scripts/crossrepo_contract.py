@@ -202,6 +202,44 @@ def _residual_case() -> ContractCase:
     )
 
 
+def _banded_attention_case() -> ContractCase:
+    """An attention region banded over its query axis.
+
+    The band cuts the second to last axis of a rank-4 tensor, so the head axis
+    is batch that the band spans rather than cuts, and the matrix product's
+    second operand is read whole the way a weight is. Sized so the budget
+    forces the band: the same graph at a roomy budget runs whole and exercises
+    none of it.
+    """
+    heads, tokens, width = 4, 64, 16
+    shape = [1, heads, tokens, width]
+    model = _model(
+        "banded_attention",
+        [
+            helper.make_node(
+                "Transpose", ["input"], ["keys"], perm=[0, 1, 3, 2]),
+            helper.make_node("MatMul", ["input", "keys"], ["scores"]),
+            helper.make_node("Softmax", ["scores"], ["output"], axis=-1),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, heads, tokens, tokens])],
+    )
+    data = np.linspace(
+        -1.0, 1.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_banded_attention",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Transpose", "Transpose", "MatMul", "Softmax",
+         "Transpose"),
+        mem_budget="64K",
+        expect_tiled=True,
+    )
+
+
 def _layout_mixing_residual_case(*, square: bool) -> ContractCase:
     """A residual connection around a matrix product.
 
@@ -4699,6 +4737,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _residual_case(),
         _layout_mixing_residual_case(square=True),
         _layout_mixing_residual_case(square=False),
+        _banded_attention_case(),
         _output_transpose_case(),
         _dilated_conv_case(),
         _depthwise_conv_case(),

@@ -9,6 +9,7 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import (
+    _row_view,
     _transpose_band_extents,
     conversion_cut_points,
     partition_spatial,
@@ -287,3 +288,50 @@ def test_a_conversion_too_wide_for_the_plan_format_declines(tmp_path):
         assert not stage.tile_plan.tileable
         assert any("a tile plan can state" in w
                    for w in stage.tile_plan.warnings)
+
+
+def test_a_batched_matrix_region_bands_over_its_rows(tmp_path):
+    """The attention shape: the head axis is batch the band spans, not cuts.
+
+    The last two axes are the matrix and everything before them is batch,
+    which is what a matrix product already means by its shape. A band of query
+    rows therefore means the same thing on a rank-2 projection and on a rank-4
+    attention tensor, and the second operand of the product is read whole the
+    way a weight is.
+    """
+    heads, tokens, width = 4, 64, 16
+    nodes = [
+        helper.make_node("Transpose", ["x"], ["kt"], perm=[0, 1, 3, 2]),
+        helper.make_node("MatMul", ["x", "kt"], ["s"]),
+        helper.make_node("Softmax", ["s"], ["y"], axis=-1),
+    ]
+    ag = _planned(
+        tmp_path, nodes,
+        ([1, heads, tokens, width], [1, heads, tokens, tokens]),
+        65_536, name="attnband")
+
+    banded = [
+        st for st in ag.stages
+        if st.tile_plan is not None and st.tile_plan.tileable
+        and st.tile_plan.original_height == tokens
+        and st.tile_plan.num_tiles > 1
+    ]
+    assert banded, _stage_op_types(ag)
+    for stage in banded:
+        assert stage.tile_plan.halo == 0
+
+
+def test_the_row_view_reads_the_trailing_pair_as_the_matrix():
+    linear4 = SimpleNamespace(shape=[1, 4, 64, 16], layout=Layout.LINEAR)
+    assert _row_view(linear4) == (4, 64, 16)
+
+    linear3 = SimpleNamespace(shape=[2, 64, 16], layout=Layout.LINEAR)
+    assert _row_view(linear3) == (2, 64, 16)
+
+    rank2 = SimpleNamespace(shape=[64, 16], layout=Layout.LINEAR)
+    assert _row_view(rank2) == (1, 64, 16)
+
+    # A spatial tensor holds its channels last, so its trailing pair is not a
+    # matrix and it presents no row view at all.
+    spatial = SimpleNamespace(shape=[1, 4, 64, 16], layout=Layout.SPATIAL)
+    assert _row_view(spatial) is None

@@ -502,6 +502,7 @@ def _transpose_band_extents(
 # loader and the executor.
 _ROW_TILING_OPS = frozenset({
     "Gemm",
+    "MatMul",
     "Relu",
     "Relu6",
     "Sigmoid",
@@ -511,23 +512,44 @@ _ROW_TILING_OPS = frozenset({
     "LayerNormalization",
     "Reshape",
     "Flatten",
+    "Add",
+    "Sub",
+    "Mul",
 })
 
+# The operators that may read an operand the band does not cut. A matrix
+# product reads every row of its second operand to produce one row of its
+# output, so that operand is resident whole exactly as a weight is. Nothing
+# else here has an operand it would make sense to leave whole: an elementwise
+# pair whose rows do not match is not an elementwise pair.
+_ROW_TILING_WHOLE_OPERAND_OPS = frozenset({"Gemm", "MatMul"})
 
-def _row_view(info) -> tuple[int, int] | None:
-    """The (rows, columns) a tensor presents to a row band, or None.
 
-    A rank-2 matrix is one directly. A rank-3 tensor with a unit leading axis
-    in the model's own order is the same bytes as that matrix, which is what
-    lets the Reshape pair around a lowered matrix product join the band: it
-    moves no data, so the band means the same on both sides of it.
+def _row_view(info) -> tuple[int, int, int] | None:
+    """The (batch, rows, columns) a tensor presents to a row band, or None.
+
+    The last two axes are the matrix and everything before them is batch,
+    which is what a matrix product already means by its shape. A rank-2 tensor
+    is one matrix; a rank-3 tensor is a batch of them; a rank-4 one is a batch
+    of batches, which is what an attention block's head axis is. Reading them
+    the same way is what lets a band of query rows mean the same thing on
+    every tensor in the region, and what lets the Reshape pair around a
+    lowered matrix product join the band, since it moves no data.
+
+    Anything above rank 2 has to be in the model's own axis order: a spatial
+    tensor holds its channels last, so its final two axes are not a matrix.
     """
     shape = [int(dim) for dim in info.shape]
     if len(shape) == 2:
-        return shape[0], shape[1]
-    if len(shape) == 3 and shape[0] == 1 and info.layout is Layout.LINEAR:
-        return shape[1], shape[2]
-    return None
+        return 1, shape[0], shape[1]
+    if len(shape) < 2 or info.layout is not Layout.LINEAR:
+        return None
+    batch = 1
+    for dim in shape[:-2]:
+        batch *= dim
+    if batch <= 0:
+        return None
+    return batch, shape[-2], shape[-1]
 
 
 def _stage_is_row_tiled(
@@ -543,28 +565,53 @@ def _stage_is_row_tiled(
     if not stage_ops:
         return False
 
-    rows: int | None = None
-    names = [*stage.input_tensors, *stage.output_tensors]
-    for op in stage_ops:
-        names.extend(op.outputs)
-    for name in names:
+    # Every tensor the band cuts has to agree on the batch and the row count,
+    # which is what makes a band mean the same thing on each of them. The
+    # outputs settle it: an output is always banded.
+    banded: tuple[int, int] | None = None
+    produced = [name for op in stage_ops for name in op.outputs]
+    for name in [*stage.output_tensors, *produced]:
         info = ag.tensors.get(name)
         view = _row_view(info) if info is not None else None
         if view is None:
             return False
-        if rows is None:
-            rows = view[0]
-        if view[0] != rows:
+        if banded is None:
+            banded = (view[0], view[1])
+        if (view[0], view[1]) != banded:
             return False
-    if rows is None or rows <= 1:
+    if banded is None or banded[1] <= 1:
         return False
 
-    return all(
-        op.op_type in _ROW_TILING_OPS
-        and len(op.inputs) >= 1
-        and len(op.outputs) == 1
-        for op in stage_ops
-    )
+    for op in stage_ops:
+        if (op.op_type not in _ROW_TILING_OPS
+                or len(op.inputs) < 1 or len(op.outputs) != 1):
+            return False
+        for position, name in enumerate(op.inputs):
+            if not name:
+                continue
+            info = ag.tensors.get(name)
+            if info is None or info.is_constant:
+                continue
+            view = _row_view(info)
+            if view is not None and (view[0], view[1]) == banded:
+                continue
+            # An operand the band does not cut is read whole, which only a
+            # matrix product's second operand is entitled to be.
+            if (position == 0
+                    or op.op_type not in _ROW_TILING_WHOLE_OPERAND_OPS):
+                return False
+
+    # A stage input the band does not cut is the whole operand of some matrix
+    # product inside the stage, which the loop above has already allowed.
+    for name in stage.input_tensors:
+        info = ag.tensors.get(name)
+        if info is None:
+            return False
+        view = _row_view(info)
+        if view is None:
+            return False
+
+    return True
 
 
 def _solve_row_tile(
@@ -576,19 +623,32 @@ def _solve_row_tile(
     together, each its own aligned allocation, and a row costs the same on
     every tensor whatever the band.
     """
-    rows = _row_view(ag.tensors[stage.input_tensors[0]])[0]
+    first_output = stage_ops[0].outputs[0]
+    batch, rows, _ = _row_view(ag.tensors[first_output])
     align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
-    resident: list[int] = []
-    for name in stage.input_tensors:
-        info = ag.tensors[name]
-        resident.append(_row_view(info)[1] * info.elem_size)
+    # A tensor the band cuts costs its row size for every row in the band, on
+    # every batch. One it does not cut is resident whole for the whole stage,
+    # which is what a matrix product's second operand is.
+    per_row: list[int] = []
+    whole: int = 0
+    seen: set[str] = set()
+    names = [*stage.input_tensors]
     for op in stage_ops:
-        info = ag.tensors[op.outputs[0]]
-        resident.append(_row_view(info)[1] * info.elem_size)
+        names.extend(op.outputs)
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        info = ag.tensors[name]
+        view = _row_view(info)
+        if view is not None and (view[0], view[1]) == (batch, rows):
+            per_row.append(batch * view[2] * info.elem_size)
+        else:
+            whole += _align_up(info.size_bytes, align)
 
     def working_set(band: int) -> int:
-        return sum(_align_up(row * band, align) for row in resident)
+        return whole + sum(_align_up(row * band, align) for row in per_row)
 
     if working_set(1) > budget:
         return TilePlan(
