@@ -69,3 +69,65 @@ def test_terminal_transpose_output_is_linear_and_keeps_onnx_shape(tmp_path):
     assert ag.tensors["y"].layout is Layout.LINEAR
     stored = next(t for t in plan["tensors"] if t["name"] == "y")
     assert tuple(stored["shape"]) == (1, 5, 7, 4)   # unpermuted, as declared
+
+
+def _operand_layouts(ag, op):
+    return [
+        ag.tensors[name].layout
+        for name in op.inputs
+        if name and name in ag.tensors
+        and not ag.tensors[name].is_constant
+        and len(ag.tensors[name].shape) >= 3
+    ]
+
+
+def test_a_residual_over_a_matrix_product_unifies_its_operands(tmp_path):
+    """The skip arrives in storage order and the product's output does not.
+
+    An elementwise Add reads both operands at the same offset, so two operands
+    held in different axis orders add unrelated elements. Where the two shapes
+    differ the loader catches it; where they match, as they do whenever the
+    sequence length equals the width, nothing does and the answer is wrong.
+    """
+    tokens, width = 8, 8
+    ag, _ = _plan(
+        tmp_path, "residual_square",
+        [
+            helper.make_node("MatMul", ["x", "w"], ["p"], name="mm"),
+            helper.make_node("Add", ["x", "p"], ["y"], name="add"),
+        ],
+        [_vi("x", [1, tokens, width])], [_vi("y", [1, tokens, width])],
+        [numpy_helper.from_array(
+            np.zeros((width, width), np.float32), "w")],
+        budget="4M")
+
+    add = next(op for op in ag.ops if op.op_type == "Add")
+    layouts = _operand_layouts(ag, add)
+    assert len(layouts) == 2
+    assert len(set(layouts)) == 1, (
+        f"the Add's operands disagree about layout: {layouts}")
+
+
+def test_every_layout_agnostic_operator_has_operands_that_agree(tmp_path):
+    """The invariant, over the shapes that put a graph in both layouts."""
+    tokens, width = 8, 8
+    ag, _ = _plan(
+        tmp_path, "mixed",
+        [
+            helper.make_node("MatMul", ["x", "w"], ["p"], name="mm"),
+            helper.make_node("Add", ["x", "p"], ["s"], name="add"),
+            helper.make_node("Mul", ["s", "x"], ["m"], name="mul"),
+            helper.make_node("Softmax", ["m"], ["sm"], axis=-1, name="sm"),
+            helper.make_node("Sub", ["sm", "x"], ["y"], name="sub"),
+        ],
+        [_vi("x", [1, tokens, width])], [_vi("y", [1, tokens, width])],
+        [numpy_helper.from_array(
+            np.zeros((width, width), np.float32), "w")],
+        budget="4M")
+
+    for op in ag.ops:
+        if op.op_type not in ("Add", "Sub", "Mul", "Concat"):
+            continue
+        layouts = _operand_layouts(ag, op)
+        assert len(set(layouts)) <= 1, (
+            f"{op.name} ({op.op_type}) operands disagree: {layouts}")
