@@ -595,6 +595,24 @@ def _row_view(info) -> tuple[int, int, int] | None:
     return batch, shape[-2], shape[-1]
 
 
+def _whole_band_operands(stage_ops: list[OpNode]) -> set[str]:
+    """Tensors a row band never cuts because a matrix product reads them whole.
+
+    A matrix product reads every row of its second operand to produce one row
+    of its output. Which tensors the band cuts is a property of the role each
+    plays, not of its shape: an operand whose own row count happens to equal
+    the band's is still read whole, and cutting it computes a partial product.
+    """
+    whole: set[str] = set()
+    for op in stage_ops:
+        if op.op_type not in _ROW_TILING_WHOLE_OPERAND_OPS:
+            continue
+        for name in op.inputs[1:]:
+            if name:
+                whole.add(name)
+    return whole
+
+
 def _stage_is_row_tiled(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -625,6 +643,7 @@ def _stage_is_row_tiled(
     if banded is None or banded[1] <= 1:
         return False
 
+    whole_operands = _whole_band_operands(stage_ops)
     for op in stage_ops:
         if (op.op_type not in _ROW_TILING_OPS
                 or len(op.inputs) < 1 or len(op.outputs) != 1):
@@ -635,14 +654,17 @@ def _stage_is_row_tiled(
             info = ag.tensors.get(name)
             if info is None or info.is_constant:
                 continue
+            if name in whole_operands:
+                # The band cuts an operand or reads it whole; it cannot do
+                # both, so a tensor some product reads whole may not also be
+                # the operand the band cuts.
+                if position == 0:
+                    return False
+                continue
             view = _row_view(info)
             if view is not None and (view[0], view[1]) == banded:
                 continue
-            # An operand the band does not cut is read whole, which only a
-            # matrix product's second operand is entitled to be.
-            if (position == 0
-                    or op.op_type not in _ROW_TILING_WHOLE_OPERAND_OPS):
-                return False
+            return False
 
     # A stage input the band does not cut is the whole operand of some matrix
     # product inside the stage, which the loop above has already allowed.
@@ -650,6 +672,8 @@ def _stage_is_row_tiled(
         info = ag.tensors.get(name)
         if info is None:
             return False
+        if name in whole_operands:
+            continue
         view = _row_view(info)
         if view is None:
             return False
@@ -676,6 +700,7 @@ def _solve_row_tile(
     per_row: list[int] = []
     whole: int = 0
     seen: set[str] = set()
+    whole_operands = _whole_band_operands(stage_ops)
     names = [*stage.input_tensors]
     for op in stage_ops:
         names.extend(op.outputs)
@@ -685,7 +710,8 @@ def _solve_row_tile(
         seen.add(name)
         info = ag.tensors[name]
         view = _row_view(info)
-        if view is not None and (view[0], view[1]) == (batch, rows):
+        if (name not in whole_operands and view is not None
+                and (view[0], view[1]) == (batch, rows)):
             per_row.append(batch * view[2] * info.elem_size)
         else:
             whole += _align_up(info.size_bytes, align)
@@ -1524,19 +1550,22 @@ def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
 
     The runtime composes Conv, DepthwiseConv, MaxPool, and AveragePool geometry
     while pointwise operators preserve the current stripe height.
+
+    The stripe is a spatial height, so every stage tensor has to be one the
+    runtime stores channels-last. A rank-4 tensor that states its own axis
+    order is a batch of matrices and has no height to stripe: banding its rows
+    is a different contract, and running it through the chain executor reads
+    the head axis as an image.
     """
     for op_i in stage.op_indices:
         cat = classify_op(ag.ops[op_i].op_type)
         if cat == TileCategory.UNTILEABLE:
             return False
-    # All inputs and outputs must be 4D
-    for name in stage.input_tensors:
+    for name in (*stage.input_tensors, *stage.output_tensors):
         info = ag.tensors.get(name)
         if not info or len(info.shape) != 4:
             return False
-    for name in stage.output_tensors:
-        info = ag.tensors.get(name)
-        if not info or len(info.shape) != 4:
+        if info.layout is not Layout.SPATIAL:
             return False
     return True
 
