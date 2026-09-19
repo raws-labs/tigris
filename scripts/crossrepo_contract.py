@@ -202,6 +202,214 @@ def _residual_case() -> ContractCase:
     )
 
 
+def _reshape_alias_case(*, spatial: bool) -> ContractCase:
+    """A reshape that moves no byte, so the two tensors share a buffer.
+
+    The linear case regroups a matrix's shape; the spatial one regroups a
+    feature map's spatial axes into patches, which is what a vision
+    transformer's unfold is. Both leave the stored bytes untouched, so the
+    executor gives the output the input's buffer and the compiler counts one
+    allocation. A wrong answer here means the two do not agree on when that is
+    safe.
+    """
+    if spatial:
+        channels, side = 8, 4
+        nodes = [
+            helper.make_node(
+                "Conv", ["input", "w"], ["features"], kernel_shape=[1, 1]),
+            helper.make_node("Reshape", ["features", "shape"], ["patches"]),
+            helper.make_node("Relu", ["patches"], ["output"]),
+        ]
+        initializers = [
+            numpy_helper.from_array(
+                (np.random.default_rng(0).normal(
+                    size=(channels, channels, 1, 1)) * 0.3
+                 ).astype(np.float32), "w"),
+            numpy_helper.from_array(
+                np.array([1, channels, side * side, 1], np.int64), "shape"),
+        ]
+        in_shape = [1, channels, side, side]
+        out_shape = [1, channels, side * side, 1]
+    else:
+        tokens, width = 8, 8
+        nodes = [
+            helper.make_node("MatMul", ["input", "w"], ["projected"]),
+            helper.make_node("Reshape", ["projected", "shape"], ["heads"]),
+            helper.make_node("Erf", ["heads"], ["output"]),
+        ]
+        initializers = [
+            numpy_helper.from_array(
+                (np.random.default_rng(0).normal(size=(width, width)) * 0.3
+                 ).astype(np.float32), "w"),
+            numpy_helper.from_array(
+                np.array([1, tokens, 2, width // 2], np.int64), "shape"),
+        ]
+        in_shape = [1, tokens, width]
+        out_shape = [1, tokens, 2, width // 2]
+    kind = "spatial" if spatial else "linear"
+    model = _model(
+        f"reshape_alias_{kind}",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, in_shape)],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, out_shape)],
+        initializers,
+    )
+    data = np.linspace(
+        -1.5, 1.5, int(np.prod(in_shape)), dtype=np.float32
+    ).reshape(in_shape)
+    ops = (("Conv", "Reshape", "Relu") if spatial
+           else ("Transpose", "Reshape", "Gemm", "Reshape", "Reshape", "Erf",
+                 "Transpose"))
+    return ContractCase(
+        f"float_reshape_alias_{kind}",
+        model,
+        model,
+        {"input": data},
+        ops,
+    )
+
+
+def _reduce_mean_case(*, quantized: bool, keepdims: bool) -> ContractCase:
+    """A mean over the token axis, which is what a pooled sequence head is.
+
+    The encoder leaves one vector per token and the head wants one vector for
+    the sequence, so the mean collapses the rows of a rank-3 tensor. Both the
+    kept and the dropped row axis are here because the two write the same
+    bytes and only the declared rank differs, which is exactly the kind of
+    difference the loader has to police rather than guess at.
+    """
+    tokens, width = 12, 8
+    in_shape = [1, tokens, width]
+    out_shape = [1, 1, width] if keepdims else [1, width]
+    kd = 1 if keepdims else 0
+    name = f"reduce_mean_{'keepdims' if keepdims else 'flat'}"
+    if quantized:
+        in_scale, out_scale = 0.05, 0.03
+        initializers = [
+            numpy_helper.from_array(
+                np.array(in_scale, dtype=np.float32), "in_s"),
+            numpy_helper.from_array(np.array(2, dtype=np.int8), "in_z"),
+            numpy_helper.from_array(
+                np.array(out_scale, dtype=np.float32), "out_s"),
+            numpy_helper.from_array(np.array(-5, dtype=np.int8), "out_z"),
+        ]
+        nodes = [
+            helper.make_node(
+                "QuantizeLinear", ["input", "in_s", "in_z"], ["iq"]),
+            helper.make_node(
+                "DequantizeLinear", ["iq", "in_s", "in_z"], ["idq"]),
+            helper.make_node(
+                "ReduceMean", ["idq"], ["raw"], axes=[1], keepdims=kd),
+            helper.make_node(
+                "QuantizeLinear", ["raw", "out_s", "out_z"], ["oq"]),
+            helper.make_node(
+                "DequantizeLinear", ["oq", "out_s", "out_z"], ["output"]),
+        ]
+        rng = np.random.default_rng(11)
+        data = (rng.integers(-100, 100, size=in_shape).astype(np.float32)
+                * in_scale)
+        label = f"int8_{name}"
+    else:
+        initializers = []
+        nodes = [
+            helper.make_node(
+                "ReduceMean", ["input"], ["output"], axes=[1], keepdims=kd),
+        ]
+        data = np.linspace(
+            -1.5, 1.5, int(np.prod(in_shape)), dtype=np.float32
+        ).reshape(in_shape)
+        label = f"float_{name}"
+    model = _model(
+        label,
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, in_shape)],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, out_shape)],
+        initializers,
+    )
+    reference_model = copy.deepcopy(model)
+    onnx.checker.check_model(reference_model)
+    return ContractCase(
+        label,
+        model,
+        reference_model,
+        {"input": data},
+        ("ReduceMean",),
+    )
+
+
+def _head_permutation_case() -> ContractCase:
+    """The permutation that moves an attention block into its head layout.
+
+    Stored (0, 2, 1, 3): a token by head transpose carrying the head width at
+    each position. It is the first permutation the band path accepts with a
+    suffix, and the three it named before were the cases with none.
+    """
+    tokens, heads, width = 64, 4, 16
+    model = _model(
+        "head_permutation",
+        [helper.make_node(
+            "Transpose", ["input"], ["output"], perm=[0, 2, 1, 3])],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, tokens, heads, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, heads, tokens, width])],
+    )
+    data = np.linspace(
+        -1.0, 1.0, tokens * heads * width, dtype=np.float32
+    ).reshape(1, tokens, heads, width)
+    return ContractCase(
+        "float_head_permutation",
+        model,
+        model,
+        {"input": data},
+        ("Transpose",),
+        mem_budget="8K",
+        expect_tiled=True,
+    )
+
+
+def _banded_attention_case() -> ContractCase:
+    """An attention region banded over its query axis.
+
+    The band cuts the second to last axis of a rank-4 tensor, so the head axis
+    is batch that the band spans rather than cuts, and the matrix product's
+    second operand is read whole the way a weight is. Sized so the budget
+    forces the band: the same graph at a roomy budget runs whole and exercises
+    none of it.
+    """
+    heads, tokens, width = 4, 64, 16
+    shape = [1, heads, tokens, width]
+    model = _model(
+        "banded_attention",
+        [
+            helper.make_node(
+                "Transpose", ["input"], ["keys"], perm=[0, 1, 3, 2]),
+            helper.make_node("MatMul", ["input", "keys"], ["scores"]),
+            helper.make_node("Softmax", ["scores"], ["output"], axis=-1),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, heads, tokens, tokens])],
+    )
+    data = np.linspace(
+        -1.0, 1.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_banded_attention",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Transpose", "Transpose", "MatMul", "Softmax",
+         "Transpose"),
+        mem_budget="64K",
+        expect_tiled=True,
+    )
+
+
 def _layout_mixing_residual_case(*, square: bool) -> ContractCase:
     """A residual connection around a matrix product.
 
@@ -4699,6 +4907,14 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _residual_case(),
         _layout_mixing_residual_case(square=True),
         _layout_mixing_residual_case(square=False),
+        _banded_attention_case(),
+        _head_permutation_case(),
+        _reshape_alias_case(spatial=False),
+        _reshape_alias_case(spatial=True),
+        _reduce_mean_case(quantized=False, keepdims=True),
+        _reduce_mean_case(quantized=False, keepdims=False),
+        _reduce_mean_case(quantized=True, keepdims=True),
+        _reduce_mean_case(quantized=True, keepdims=False),
         _output_transpose_case(),
         _dilated_conv_case(),
         _depthwise_conv_case(),

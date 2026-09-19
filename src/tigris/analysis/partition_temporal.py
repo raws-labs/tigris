@@ -11,6 +11,79 @@ def _aligned_size(size_bytes: int, alignment: int) -> int:
     return (size_bytes + alignment - 1) & ~(alignment - 1)
 
 
+
+
+class _StageCost:
+    """The fast bytes a candidate stage holds, grown one op at a time.
+
+    Mirrors the executor's stage loop, which loads the stage inputs from the
+    slow pool, allocates each op output as it runs, frees a tensor after its
+    last read inside the stage, spills the stage outputs and then resets the
+    fast arena. Nothing survives that reset, so a tensor produced before the
+    stage and consumed after it costs the stage nothing: it sits in the slow
+    pool throughout. Summing the graph-wide live set instead charges the stage
+    for those bytes and cuts long before it has to.
+
+    A tensor produced inside the stage is held from its own step until its
+    last read, or until the end of the stage when something later reads it. A
+    stage input is held from the start of the stage until its last read.
+    """
+
+    def __init__(self, ag: AnalyzedGraph, start: int) -> None:
+        self._ag = ag
+        self._start = start
+        self._align = ag.tensor_alignment
+        self._bytes_at: dict[int, int] = {}
+        self._produced_open = 0
+        self._dying: dict[int, int] = {}
+        self._input_covered: dict[str, int] = {}
+        self.peak = 0
+
+    def _size(self, name: str) -> int | None:
+        lt = self._ag.lifetimes.get(name)
+        if lt is None:
+            return None
+        return _aligned_size(lt.size_bytes, self._align)
+
+    def _charge(self, step: int, size: int) -> None:
+        total = self._bytes_at.get(step, 0) + size
+        self._bytes_at[step] = total
+        if total > self.peak:
+            self.peak = total
+
+    def extend(self, step: int) -> int:
+        """Add one op and return the candidate stage's peak."""
+        op = self._ag.ops[step]
+
+        # Tensors produced earlier in the stage stop costing once nothing
+        # reads them again; the rest are held to the end of the stage.
+        self._produced_open -= self._dying.pop(step - 1, 0)
+        for name in op.outputs:
+            size = self._size(name)
+            if size is None:
+                continue
+            self._produced_open += size
+            death = self._ag.lifetimes[name].death_step
+            self._dying[death] = self._dying.get(death, 0) + size
+        self._charge(step, self._produced_open)
+
+        # A stage input is loaded at the start of the stage, so a later read
+        # widens what it has already cost, back to the first op.
+        for name in op.inputs:
+            size = self._size(name)
+            if size is None:
+                continue
+            if self._ag.lifetimes[name].birth_step >= self._start:
+                continue
+            covered = self._input_covered.get(name)
+            first = self._start if covered is None else covered + 1
+            for earlier in range(first, step + 1):
+                self._charge(earlier, size)
+            self._input_covered[name] = step
+
+        return self.peak
+
+
 def partition_temporal(
     ag: AnalyzedGraph,
     budget: int,
@@ -35,12 +108,6 @@ def partition_temporal(
     if num_ops == 0:
         return ag
 
-    # Compute live bytes once.  The old implementation rescanned every tensor
-    # at every step for every candidate stage, making an all-fit graph cubic in
-    # its op count.  A candidate's peak is simply the running maximum of this
-    # graph-wide timeline.
-    step_bytes = _live_bytes_by_step(ag)
-
     tensor_death: dict[str, int] = {}
     for lt in ag.lifetimes.values():
         tensor_death[lt.tensor_name] = lt.death_step
@@ -52,14 +119,14 @@ def partition_temporal(
         # Try extending the stage one op at a time
         best_end = current_start  # inclusive end
         best_peak = 0
-        running_peak = 0
+        cost = _StageCost(ag, current_start)
 
         for candidate_end in range(current_start, num_ops):
             if candidate_end > current_start and candidate_end in cuts:
                 # A caller-required boundary: stop before it.
                 break
 
-            running_peak = max(running_peak, step_bytes[candidate_end])
+            running_peak = cost.extend(candidate_end)
 
             if running_peak <= budget:
                 best_end = candidate_end
@@ -74,7 +141,7 @@ def partition_temporal(
         else:
             # All remaining ops fit
             best_end = num_ops - 1
-            best_peak = running_peak
+            best_peak = cost.peak
 
         stage = _build_stage(
             ag,
@@ -95,34 +162,6 @@ def partition_temporal(
 
     ag.stages = stages
     return ag
-
-
-def _live_bytes_by_step(ag: AnalyzedGraph) -> list[int]:
-    """Return aligned live activation bytes for each execution step.
-
-    Lifetimes use inclusive birth/death steps.  Clipping each lifetime to the
-    execution range and accumulating deltas preserves the memory model while
-    taking O(ops + tensors) time.
-    """
-    num_ops = len(ag.ops)
-    deltas = [0] * (num_ops + 1)
-
-    for lt in ag.lifetimes.values():
-        alive_from = max(0, lt.birth_step)
-        freed_at = min(num_ops, lt.death_step + 1)
-        if alive_from >= freed_at:
-            continue
-
-        size = _aligned_size(lt.size_bytes, ag.tensor_alignment)
-        deltas[alive_from] += size
-        deltas[freed_at] -= size
-
-    live_bytes = 0
-    result: list[int] = []
-    for step in range(num_ops):
-        live_bytes += deltas[step]
-        result.append(live_bytes)
-    return result
 
 
 def _build_stage(

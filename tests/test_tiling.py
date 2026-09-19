@@ -393,19 +393,23 @@ class TestTilingIntegration:
         model_path.write_bytes(build_tcn().SerializeToString())
 
         ag = _full_pipeline(model_path, budget=16 * 1024)
-        tiled_pointwise = {
-            ag.ops[stage.op_indices[0]].op_type: stage.tile_plan
-            for stage in ag.stages
-            if len(stage.op_indices) == 1
-            and ag.ops[stage.op_indices[0]].op_type
-            in {"Tanh", "Sigmoid", "Mul"}
-        }
+        pointwise = {"Tanh", "Sigmoid", "Mul"}
+        placed = set()
+        for stage in ag.stages:
+            held = {ag.ops[i].op_type for i in stage.op_indices} & pointwise
+            if not held:
+                continue
+            placed |= held
+            if stage.peak_bytes <= 16 * 1024:
+                continue
+            # Which ops share a stage is the partitioner's call; that an
+            # oversized one carries a tile plan is not.
+            assert stage.tile_plan is not None and stage.tile_plan.tileable, (
+                f"stage {stage.stage_id} holds {sorted(held)} over budget "
+                "without a tile plan"
+            )
+        assert placed == pointwise
 
-        assert set(tiled_pointwise) == {"Tanh", "Sigmoid", "Mul"}
-        assert all(
-            tile_plan is not None and tile_plan.tileable
-            for tile_plan in tiled_pointwise.values()
-        )
         validation = validate_memory_plan(ag)
         assert validation.feasible, [issue.describe() for issue in validation.issues]
         assert validation.scheduled_peak_bytes <= 16 * 1024

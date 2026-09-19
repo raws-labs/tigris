@@ -16,6 +16,7 @@ from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
     OpNode,
+    serialized_axis_map,
     serialized_transpose_perm,
 )
 
@@ -32,6 +33,8 @@ from .defs import (
     MAGIC,
     NO_QUANT_PARAM,
     NO_WEIGHT,
+    OP_ATTR_AXES,
+    OP_ATTR_BINARY_REQUANT,
     OP_ATTR_EPSILON,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ACTIVATION_STRUCT,
@@ -67,6 +70,7 @@ from .defs import (
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
     TENSOR_STRUCT,
+    TILE_FLAG_BAND_ON_COLUMNS,
     TILE_PLAN_STRUCT,
     WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
     WEIGHT_BLOCK_STRUCT,
@@ -726,6 +730,44 @@ def _declared_interface_dtype(ag: AnalyzedGraph, name: str) -> int | None:
     return None
 
 
+
+# The reference kernel shifts both operands left by this much before scaling
+# them onto a common scale, which is TFLite's quantized-add convention.
+_BINARY_REQUANT_LEFT_SHIFT = 20
+
+
+def _binary_requant_payload(ag: AnalyzedGraph, op: OpNode) -> bytes | None:
+    """The three Q0.31 pairs a quantized sum scales its operands and result by.
+
+    Mirrors the reference kernel's TFLite-exact arithmetic: both operands are
+    brought onto twice the larger input scale, summed, and requantized to the
+    output scale. All three are constants of the operand scales, so stating
+    them spares the kernel three frexp-and-round sequences per call and gives
+    a vendor kernel that takes them somewhere to read them from.
+    """
+    if len(op.inputs) != 2 or len(op.outputs) != 1:
+        return None
+    tensors = [ag.tensors.get(name) for name in (*op.inputs, op.outputs[0])]
+    if any(info is None or info.is_constant or info.quant is None
+           for info in tensors):
+        return None
+    scales = []
+    for info in tensors:
+        scale = np.asarray(info.quant.scale, dtype=np.float32).reshape(-1)
+        if scale.size != 1 or not (scale[0] > 0.0):
+            return None
+        scales.append(float(scale[0]))
+    left, right, result = scales
+    twice_max = 2.0 * max(left, right)
+    left_shift = 1 << _BINARY_REQUANT_LEFT_SHIFT
+    pairs = (
+        _compute_multiplier_shift(left / twice_max),
+        _compute_multiplier_shift(right / twice_max),
+        _compute_multiplier_shift(twice_max / (left_shift * result)),
+    )
+    return struct.pack("<6i", *(value for pair in pairs for value in pair))
+
+
 def _build_op_attributes(
     ag: AnalyzedGraph, tensor_idx: dict[str, int]
 ) -> bytes:
@@ -743,6 +785,22 @@ def _build_op_attributes(
                 OP_ATTR_EPSILON,
                 struct.pack("<f", float(op.attrs.get("epsilon", 1e-5))),
             ))
+            continue
+        if op.op_type in ("Add", "Sub"):
+            payload = _binary_requant_payload(ag, op)
+            if payload is not None:
+                records.append((op_index, OP_ATTR_BINARY_REQUANT, payload))
+            continue
+        if op.op_type == "ReduceMean":
+            axes = op.attrs.get("axes")
+            if not axes:
+                raise ValueError(f"ReduceMean '{op.name}' must state its axes")
+            info = ag.tensors[op.inputs[0]]
+            axis_map = serialized_axis_map(len(info.shape), info.layout)
+            serialized = sorted(
+                axis_map[int(axis) % len(info.shape)] for axis in axes
+            )
+            records.append((op_index, OP_ATTR_AXES, bytes(serialized)))
             continue
         if op.op_type != "Transpose":
             continue
@@ -1035,6 +1093,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
             tp.tiled_peak_bytes,
             tp.overhead_bytes,
             tp.tile_width & 0xFFFF,
+            TILE_FLAG_BAND_ON_COLUMNS if tp.band_on_columns else 0,
         ))
 
     return bytes(buf), stage_to_tile

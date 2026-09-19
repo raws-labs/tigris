@@ -174,6 +174,10 @@ class TilePlan:
     overhead_bytes: int = 0
     untileable_ops: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Which of the two swapped axes a layout conversion's band runs along.
+    # The runtime used to derive it from the extents, which agrees with the
+    # solver only by coincidence when the two axes are equal.
+    band_on_columns: bool = False
     # Set when a stage was eligible for 2D (HW) tiling and solve_2d_tile
     # attempted the search but even a 1x1 core tile did not fit the budget.
     # Distinguishes this case from the generic 1D minimum-tile shortfall so
