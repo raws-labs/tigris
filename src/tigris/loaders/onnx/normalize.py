@@ -57,6 +57,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_bn(ag)
     ag = _neg_to_scalar_mul(ag)
     ag = _fold_sub_constant_to_add(ag)
+    ag = _fold_div_constant_to_mul(ag)
     ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
@@ -358,7 +359,7 @@ def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
     counter = 0
 
     for op in ag.ops:
-        if (op.op_type != "MatMul" or len(op.inputs) != 2
+        if (op.op_type != "MatMul" or len(op.inputs) not in (2, 3)
                 or len(op.outputs) != 1):
             rewritten.append(op)
             continue
@@ -410,9 +411,12 @@ def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
         rewritten.append(OpNode(
             name=f"{op.name}_rows", op_type="Reshape",
             inputs=[op.inputs[0]], outputs=[flat_in]))
+        # A bias folded onto the product before lowering travels with it:
+        # the kernel reads one per output feature, which the collapse leaves
+        # in place.
         rewritten.append(OpNode(
             name=op.name, op_type="Gemm",
-            inputs=[flat_in, weight_name], outputs=[flat_out],
+            inputs=[flat_in, weight_name, *op.inputs[2:]], outputs=[flat_out],
             attrs={"transB": 1}))
         rewritten.append(OpNode(
             name=f"{op.name}_shape", op_type="Reshape",
@@ -1006,6 +1010,22 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
 _BIAS_PRODUCERS = frozenset({"Conv", "DepthwiseConv", "Conv1D", "Gemm"})
 
 
+def _takes_a_bias(ag: AnalyzedGraph, producer: OpNode) -> bool:
+    """Whether this operator has a bias operand to fold a constant Add into.
+
+    A batched matrix product over a constant weight is lowered to the same
+    fully-connected kernel as a Gemm, which reads a bias, so it can take one
+    here even though ONNX MatMul states no such operand. One over two
+    activations cannot: there is no weight for a bias to sit beside.
+    """
+    if producer.op_type in _BIAS_PRODUCERS:
+        return True
+    if producer.op_type != "MatMul" or len(producer.inputs) != 2:
+        return False
+    weight = ag.weight_data.get(producer.inputs[1])
+    return weight is not None and weight.ndim == 2
+
+
 
 def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Fold Gemm's alpha and beta into the constants they scale.
@@ -1154,6 +1174,39 @@ def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite a constant divisor as a multiplication by its reciprocal.
+
+    Div has no opcode, yet a constant divisor is exactly the Mul the kernels
+    already carry: a GELU exports as ``Erf(x / sqrt(2))`` and an attention
+    scale as a division by the head width. A divisor on the left has no such
+    equivalent, and a zero in one would turn an infinity the model states into
+    a finite number, so both are left for validation to reject.
+
+    The reciprocal is taken in double precision and stored back as float32,
+    which is the nearest representable inverse rather than the one a float32
+    division would produce. The two differ by at most a half ulp of the
+    reciprocal, well inside the tolerance the contract gate holds float to.
+    """
+    for op in ag.ops:
+        if op.op_type != "Div" or len(op.inputs) != 2:
+            continue
+        divisor = op.inputs[1]
+        if divisor not in ag.weight_data or op.inputs[0] in ag.weight_data:
+            continue
+        constant = ag.weight_data[divisor]
+        if constant.dtype != np.float32 or constant.size == 0:
+            continue
+        if not np.all(np.isfinite(constant)) or np.any(constant == 0.0):
+            continue
+        reciprocal = (1.0 / constant.astype(np.float64)).astype(np.float32)
+        if not np.all(np.isfinite(reciprocal)):
+            continue
+        ag.weight_data[divisor] = np.ascontiguousarray(reciprocal)
+        op.op_type = "Mul"
+    return ag
+
+
 def _fold_constant_add_into_bias(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Turn a constant Add after a quantized producer into that producer's bias.
 
@@ -1251,10 +1304,12 @@ def _fold_constant_add_into_bias(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _channel_broadcast_size(
-    constant_shape: tuple[int, ...], reference_shape: tuple[int, ...]
+def _axis_broadcast_size(
+    constant_shape: tuple[int, ...],
+    reference_shape: tuple[int, ...],
+    axis: int,
 ) -> int | None:
-    """Channel count when a constant broadcasts only along the channel axis.
+    """Extent when a constant broadcasts only along *axis* of the reference.
 
     ONNX right-aligns operands, so ``(C,)``, ``(C, 1, 1)`` and ``(1, C, 1, 1)``
     all address the channel axis of an NCHW activation while ``(1, 1, 1, W)``
@@ -1263,21 +1318,46 @@ def _channel_broadcast_size(
     """
     if len(reference_shape) < 2 or len(constant_shape) > len(reference_shape):
         return None
-    channels = reference_shape[1]
-    if channels <= 0:
+    extent_on_axis = reference_shape[axis]
+    if extent_on_axis <= 0:
         return None
     offset = len(reference_shape) - len(constant_shape)
-    for axis, extent in enumerate(constant_shape):
-        aligned = axis + offset
-        if aligned == 1:
-            if extent != channels:
+    for position, extent in enumerate(constant_shape):
+        aligned = position + offset
+        if aligned == axis:
+            if extent != extent_on_axis:
                 return None
         elif extent != 1:
             return None
-    # A constant shorter than the reference must still reach the channel axis.
-    if offset > 1:
+    # A constant shorter than the reference must still reach the axis.
+    if offset > axis:
         return None
-    return channels
+    return extent_on_axis
+
+
+def _channel_broadcast_size(
+    constant_shape: tuple[int, ...], reference_shape: tuple[int, ...]
+) -> int | None:
+    """The channel count a constant addresses on an NCHW or NCL activation."""
+    return _axis_broadcast_size(constant_shape, reference_shape, 1)
+
+
+def _bias_broadcast_size(
+    producer_type: str,
+    constant_shape: tuple[int, ...],
+    reference_shape: tuple[int, ...],
+) -> int | None:
+    """The bias length a constant states for *producer_type*'s output.
+
+    Which axis a bias addresses is a property of the operator that produced
+    the tensor, not of the tensor's rank. A convolution biases its output
+    channel, which the model states second. A matrix product biases its output
+    feature, which is the last axis on both sides and is what the
+    fully-connected kernel indexes its bias by.
+    """
+    matrix = producer_type in ("Gemm", "MatMul")
+    axis = len(reference_shape) - 1 if matrix else 1
+    return _axis_broadcast_size(constant_shape, reference_shape, axis)
 
 
 def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -1317,7 +1397,7 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
         if producer_idx is None or producer_idx in removed:
             continue
         producer = ag.ops[producer_idx]
-        if producer.op_type not in _BIAS_PRODUCERS:
+        if not _takes_a_bias(ag, producer):
             continue
         if len(producer.inputs) not in (2, 3):
             continue
@@ -1332,8 +1412,8 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
         constant = ag.weight_data[const_name]
         if constant.dtype != np.float32:
             continue
-        channels = _channel_broadcast_size(
-            tuple(constant.shape), tuple(product_info.shape)
+        channels = _bias_broadcast_size(
+            producer.op_type, tuple(constant.shape), tuple(product_info.shape)
         )
         if channels is None or constant.size != channels:
             continue

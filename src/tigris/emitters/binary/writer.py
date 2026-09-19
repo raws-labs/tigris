@@ -339,6 +339,11 @@ def _build_fc_layout_permutations(
         vector_info = ag.tensors.get(data_input)
         if spatial_info is None or vector_info is None:
             continue
+        # A tensor that states its own axis order is stored the way the model
+        # states it, so flattening it needs no permutation. Only one the
+        # runtime holds channels-last does.
+        if spatial_info.layout is not Layout.SPATIAL:
+            continue
         shape = spatial_info.shape
         if len(shape) not in (3, 4):
             continue
