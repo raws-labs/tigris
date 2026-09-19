@@ -406,6 +406,50 @@ def _constant_divisor_case() -> ContractCase:
     )
 
 
+def _traced_shape_scale_case() -> ContractCase:
+    """A scale the exporter traced out of the tensor's own shape.
+
+    An exporter that traces a model rather than folding it writes a scale
+    stated in code as ``1 / sqrt(x.shape[-1])`` as a Shape of the tensor, a
+    Slice of that shape, a Cast, a Sqrt and a division, then multiplies by the
+    result. Every value in the chain is settled by extents the plan already
+    states, so none of it survives into the plan, and the multiplication that
+    reads it is a scale rather than a broadcast against a rank-1 operand.
+    """
+    tokens, width = 6, 8
+    shape = [1, tokens, width]
+    nodes = [
+        helper.make_node("Shape", ["input"], ["dims"]),
+        helper.make_node("Slice", ["dims", "last", "stop", "axis"], ["width"]),
+        helper.make_node("Cast", ["width"], ["as_float"], to=TensorProto.FLOAT),
+        helper.make_node("Sqrt", ["as_float"], ["root"]),
+        helper.make_node("Div", ["one", "root"], ["scale"]),
+        helper.make_node("Mul", ["input", "scale"], ["scaled"]),
+        helper.make_node("Erf", ["scaled"], ["output"]),
+    ]
+    model = _model(
+        "traced_shape_scale",
+        nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        [numpy_helper.from_array(np.array([-1], np.int64), "last"),
+         numpy_helper.from_array(
+             np.array([np.iinfo(np.int64).max], np.int64), "stop"),
+         numpy_helper.from_array(np.array([0], np.int64), "axis"),
+         numpy_helper.from_array(np.array(1.0, np.float32), "one")],
+    )
+    data = np.linspace(
+        -2.0, 2.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_traced_shape_scale",
+        model,
+        model,
+        {"input": data},
+        ("Mul", "Erf"),
+    )
+
+
 def _reduce_mean_case(*, quantized: bool, keepdims: bool) -> ContractCase:
     """A mean over the token axis, which is what a pooled sequence head is.
 
@@ -5049,6 +5093,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _token_bias_case(),
         _flattened_token_head_case(),
         _constant_divisor_case(),
+        _traced_shape_scale_case(),
         _reduce_mean_case(quantized=False, keepdims=True),
         _reduce_mean_case(quantized=False, keepdims=False),
         _reduce_mean_case(quantized=True, keepdims=True),
