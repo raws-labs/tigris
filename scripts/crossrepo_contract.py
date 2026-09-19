@@ -271,6 +271,269 @@ def _reshape_alias_case(*, spatial: bool) -> ContractCase:
     )
 
 
+def _token_bias_case() -> ContractCase:
+    """A bias added onto a batched matrix product over a token sequence.
+
+    An exporter that does not fuse the bias writes it as a rank-1 constant Add
+    on the product, in either operand order. The Add kernel takes two operands
+    of one shape, so the graph is refused for a broadcast it cannot do, while
+    the product it follows is lowered to the fully-connected kernel, which
+    reads a bias per output feature. Which axis that bias addresses is a
+    property of the producer: a convolution biases the channel the model
+    states second, a matrix product the last one.
+    """
+    tokens, width, hidden = 12, 16, 24
+    rng = np.random.default_rng(7)
+    first = (rng.normal(size=(width, hidden)) * 0.3).astype(np.float32)
+    first_bias = (rng.normal(size=(hidden,)) * 0.5).astype(np.float32)
+    second = (rng.normal(size=(hidden, width)) * 0.3).astype(np.float32)
+    second_bias = (rng.normal(size=(width,)) * 0.5).astype(np.float32)
+    nodes = [
+        helper.make_node("MatMul", ["input", "w1"], ["p1"]),
+        helper.make_node("Add", ["b1", "p1"], ["h"]),
+        helper.make_node("Erf", ["h"], ["he"]),
+        helper.make_node("MatMul", ["he", "w2"], ["p2"]),
+        helper.make_node("Add", ["p2", "b2"], ["output"]),
+    ]
+    model = _model(
+        "token_bias",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, tokens, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, tokens, width])],
+        [numpy_helper.from_array(first, "w1"),
+         numpy_helper.from_array(first_bias, "b1"),
+         numpy_helper.from_array(second, "w2"),
+         numpy_helper.from_array(second_bias, "b2")],
+    )
+    data = np.linspace(
+        -1.5, 1.5, tokens * width, dtype=np.float32
+    ).reshape(1, tokens, width)
+    return ContractCase(
+        "float_token_bias",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Reshape", "Gemm", "Reshape", "Erf", "Reshape", "Gemm",
+         "Reshape", "Transpose"),
+    )
+
+
+def _flattened_token_head_case() -> ContractCase:
+    """A sequence flattened whole and fed to a matrix product.
+
+    A classifier or forecast head flattens every token into one vector. When
+    the tensor is one the runtime stores channels-last, the flat order differs
+    from the model's and the weight's columns are permuted to compensate. A
+    tensor that states its own axis order is already stored the way the model
+    states it, so permuting it there is a silent wrong answer: the rank is the
+    same, only the layout differs.
+    """
+    tokens, width, outputs = 9, 16, 5
+    rng = np.random.default_rng(13)
+    project = (rng.normal(size=(width, width)) * 0.3).astype(np.float32)
+    head = (rng.normal(size=(outputs, tokens * width)) * 0.05).astype(np.float32)
+    bias = (rng.normal(size=(outputs,)) * 0.1).astype(np.float32)
+    nodes = [
+        # The product is what makes the sequence state its own axis order.
+        helper.make_node("MatMul", ["input", "w"], ["tokens"]),
+        helper.make_node("Reshape", ["tokens", "flat"], ["vector"]),
+        helper.make_node(
+            "Gemm", ["vector", "head", "bias"], ["output"],
+            alpha=1.0, beta=1.0, transB=1),
+    ]
+    model = _model(
+        "flattened_token_head",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, tokens, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, outputs])],
+        [numpy_helper.from_array(project, "w"),
+         numpy_helper.from_array(
+             np.array([1, tokens * width], np.int64), "flat"),
+         numpy_helper.from_array(head, "head"),
+         numpy_helper.from_array(bias, "bias")],
+    )
+    data = np.linspace(
+        -1.0, 1.0, tokens * width, dtype=np.float32
+    ).reshape(1, tokens, width)
+    return ContractCase(
+        "float_flattened_token_head",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Reshape", "Gemm", "Reshape", "Reshape", "Gemm"),
+    )
+
+
+def _constant_divisor_case() -> ContractCase:
+    """A division by a constant, which is how an exporter writes a GELU.
+
+    ``gelu`` leaves ``Erf(x / sqrt(2))`` behind and an attention scale leaves a
+    division by the head width. Div has no opcode, but a constant divisor is
+    the Mul the kernels already carry, so the graph is rewritten rather than
+    refused. Both shapes a Mul takes are here: a scalar and a whole tensor.
+    """
+    channels, side = 4, 8
+    shape = [1, channels, side, side]
+    nodes = [
+        helper.make_node("Div", ["input", "root_two"], ["scaled"]),
+        helper.make_node("Erf", ["scaled"], ["shaped"]),
+        helper.make_node("Div", ["shaped", "whole"], ["output"]),
+    ]
+    model = _model(
+        "constant_divisor",
+        nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        [numpy_helper.from_array(
+            np.array(np.sqrt(2.0), dtype=np.float32), "root_two"),
+         numpy_helper.from_array(
+             np.linspace(0.5, 2.0, int(np.prod(shape)), dtype=np.float32
+                         ).reshape(shape), "whole")],
+    )
+    data = np.linspace(
+        -3.0, 3.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_constant_divisor",
+        model,
+        model,
+        {"input": data},
+        ("Mul", "Erf", "Mul"),
+    )
+
+
+def _traced_shape_scale_case() -> ContractCase:
+    """A scale the exporter traced out of the tensor's own shape.
+
+    An exporter that traces a model rather than folding it writes a scale
+    stated in code as ``1 / sqrt(x.shape[-1])`` as a Shape of the tensor, a
+    Slice of that shape, a Cast, a Sqrt and a division, then multiplies by the
+    result. Every value in the chain is settled by extents the plan already
+    states, so none of it survives into the plan, and the multiplication that
+    reads it is a scale rather than a broadcast against a rank-1 operand.
+    """
+    tokens, width = 6, 8
+    shape = [1, tokens, width]
+    nodes = [
+        helper.make_node("Shape", ["input"], ["dims"]),
+        helper.make_node("Slice", ["dims", "last", "stop", "axis"], ["width"]),
+        helper.make_node("Cast", ["width"], ["as_float"], to=TensorProto.FLOAT),
+        helper.make_node("Sqrt", ["as_float"], ["root"]),
+        helper.make_node("Div", ["one", "root"], ["scale"]),
+        helper.make_node("Mul", ["input", "scale"], ["scaled"]),
+        helper.make_node("Erf", ["scaled"], ["output"]),
+    ]
+    model = _model(
+        "traced_shape_scale",
+        nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        [numpy_helper.from_array(np.array([-1], np.int64), "last"),
+         numpy_helper.from_array(
+             np.array([np.iinfo(np.int64).max], np.int64), "stop"),
+         numpy_helper.from_array(np.array([0], np.int64), "axis"),
+         numpy_helper.from_array(np.array(1.0, np.float32), "one")],
+    )
+    data = np.linspace(
+        -2.0, 2.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_traced_shape_scale",
+        model,
+        model,
+        {"input": data},
+        ("Mul", "Erf"),
+    )
+
+
+def _unfolded_feature_map_case() -> ContractCase:
+    """A feature map regrouped into patches, which is an unfold.
+
+    A reshape renames axes over one sequence and the kernel copies straight
+    through, which states the model's regrouping only when the runtime holds
+    the elements in that order. This one folds the channel axis into the
+    leading one, which a tensor held channels-last does not, so the plan used
+    to compile and come back wrong. Holding the operand in the model's own
+    order first is what makes it expressible.
+    """
+    channels, side, patch = 6, 8, 2
+    cells = side // patch
+    nodes = [
+        helper.make_node(
+            "Conv", ["input", "w"], ["features"], kernel_shape=[1, 1]),
+        # [1, C, 8, 8] -> [C * cells, patch, cells, patch]: the channel axis
+        # joins the leading one, which the stored order does not hold next to
+        # it.
+        helper.make_node("Reshape", ["features", "patches"], ["grouped"]),
+        helper.make_node("Erf", ["grouped"], ["output"]),
+    ]
+    model = _model(
+        "unfolded_feature_map",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT,
+            [channels * cells, patch, cells, patch])],
+        [numpy_helper.from_array(
+            (np.random.default_rng(3).normal(size=(channels, channels, 1, 1))
+             * 0.4).astype(np.float32), "w"),
+         numpy_helper.from_array(
+             np.array([channels * cells, patch, cells, patch], np.int64),
+             "patches")],
+    )
+    data = np.linspace(
+        -1.0, 1.0, channels * side * side, dtype=np.float32
+    ).reshape(1, channels, side, side)
+    return ContractCase(
+        "float_unfolded_feature_map",
+        model,
+        model,
+        {"input": data},
+        ("Conv", "Transpose", "Reshape", "Erf", "Transpose"),
+    )
+
+
+def _split_case() -> ContractCase:
+    """A tensor cut into contiguous parts, which is how a fused qkv unbinds.
+
+    One projection produces query, key and value together and the model cuts
+    them apart along the axis they were stacked on. The parts are runs of the
+    input, so each is that many bytes taken in order; a cut anywhere else
+    interleaves and is refused rather than copied wrongly.
+    """
+    parts, tokens, width = 3, 5, 8
+    nodes = [
+        helper.make_node(
+            "Split", ["input", "parts"], ["first", "second", "third"], axis=0),
+        helper.make_node("Add", ["first", "second"], ["pair"]),
+        helper.make_node("Mul", ["pair", "third"], ["output"]),
+    ]
+    model = _model(
+        "split_parts",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [parts, tokens, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, tokens, width])],
+        [numpy_helper.from_array(np.array([1, 1, 1], np.int64), "parts")],
+    )
+    data = np.linspace(
+        -2.0, 2.0, parts * tokens * width, dtype=np.float32
+    ).reshape(parts, tokens, width)
+    return ContractCase(
+        "float_split_parts",
+        model,
+        model,
+        {"input": data},
+        ("Split", "Add", "Mul"),
+    )
+
+
 def _reduce_mean_case(*, quantized: bool, keepdims: bool) -> ContractCase:
     """A mean over the token axis, which is what a pooled sequence head is.
 
@@ -4911,6 +5174,12 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _head_permutation_case(),
         _reshape_alias_case(spatial=False),
         _reshape_alias_case(spatial=True),
+        _token_bias_case(),
+        _flattened_token_head_case(),
+        _constant_divisor_case(),
+        _traced_shape_scale_case(),
+        _unfolded_feature_map_case(),
+        _split_case(),
         _reduce_mean_case(quantized=False, keepdims=True),
         _reduce_mean_case(quantized=False, keepdims=False),
         _reduce_mean_case(quantized=True, keepdims=True),

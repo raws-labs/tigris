@@ -76,7 +76,10 @@ def test_reshape_target_shape_is_not_a_weight(tmp_path):
     ag = load_model(path)
 
     reshape = next(op for op in ag.ops if op.op_type == "Reshape")
-    assert reshape.inputs == ["act"]
+    # The operand is gone, whichever tensor the layout pass leaves feeding it:
+    # regrouping a feature map needs it held in the model's own order first.
+    assert reshape.inputs == [reshape.inputs[0]]
+    assert "target_shape" not in reshape.inputs
     assert "target_shape" not in ag.weight_data
 
 
@@ -121,7 +124,10 @@ def test_runtime_computed_metadata_operand_is_kept(tmp_path):
     ag = load_model(path)
 
     reshape = next(op for op in ag.ops if op.op_type == "Reshape")
-    assert reshape.inputs == ["act", "target_shape"]
+    # A shape the graph computes at runtime stays an operand, whichever
+    # tensor the layout pass leaves as the data one.
+    assert len(reshape.inputs) == 2
+    assert reshape.inputs[1] == "target_shape"
 
 
 def test_orphan_value_info_is_not_a_tensor(tmp_path):
