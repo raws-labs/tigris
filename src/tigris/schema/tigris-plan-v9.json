@@ -48,6 +48,7 @@
     "Resize": 30,
     "Sigmoid": 12,
     "Softmax": 10,
+    "Split": 35,
     "Squeeze": 27,
     "Sub": 18,
     "Tanh": 20,

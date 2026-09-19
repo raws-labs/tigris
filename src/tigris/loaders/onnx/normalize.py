@@ -44,6 +44,7 @@ from tigris.graph.ir import (
     OpNode,
     QuantParam,
     TensorInfo,
+    serialized_shape,
 )
 
 
@@ -67,13 +68,13 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _clip_to_relu6(ag)
     ag = _reduce_mean_to_gap(ag)
     ag = _fold_shape_ops(ag)
-    ag = _relabel_shape_ops_to_reshape(ag)
     ag = _extract_resize_scales(ag)
     ag = _strip_metadata_inputs(ag)
     ag = _normalize_concat_axis(ag)
     ag = _validate_transposes(ag)
     ag = _absorb_activations(ag)
     ag = _assign_tensor_layouts(ag)
+    ag = _relabel_shape_ops_to_reshape(ag)
     ag = _lower_linear_matmul(ag)
     ag = _drop_unreferenced_weights(ag)
     return ag
@@ -167,11 +168,87 @@ def _trailing_axis_required_layout(
     return None
 
 
+def _flattened_into_a_product(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """Whether a matrix product downstream absorbs the difference in order.
+
+    A flatten whose one reader is a product over a constant weight needs no
+    conversion: the emitter permutes the weight's columns instead, which
+    costs nothing at inference. Mirrors _fc_inputs_flattening_spatial in the
+    binary writer, which performs that permutation; a flatten this does not
+    describe has to be converted rather than left to a compensation nobody
+    applies.
+    """
+    if not op.outputs:
+        return False
+    vector = ag.tensors.get(op.outputs[0])
+    if vector is None or len(vector.shape) != 2:
+        return False
+    readers = [
+        other for other in ag.ops
+        if op.outputs[0] in other.inputs and other is not op
+    ]
+    if len(readers) != 1:
+        return False
+    reader = readers[0]
+    if reader.op_type != "Gemm" or len(reader.inputs) < 2:
+        return False
+    if reader.inputs[0] != op.outputs[0]:
+        return False
+    weight = ag.weight_data.get(reader.inputs[1])
+    return weight is not None and weight.ndim == 2
+
+
+def _states_its_own_order(info) -> bool:
+    """Whether this tensor lists its axes in the order the runtime stores."""
+    return info.layout is Layout.LINEAR or len(info.shape) <= 2
+
+
+def _reshape_keeps_its_order(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """Whether a regrouping is the same bytes in the order the runtime holds.
+
+    A reshape moves no element: it renames axes over one sequence, and the
+    kernel copies straight through. That states the model's regrouping when
+    both sides list their axes in storage order, and when two feature maps
+    regroup only the axes between the first and the last, since the runtime
+    holds those contiguously. A regrouping that reaches across the channel
+    axis of a tensor held channels-last does not, and copying it through
+    would read the elements in another order. That is what a vision
+    transformer's unfold does, and holding the operand in the model's own
+    order first is what makes it expressible.
+
+    Same question, same answer as pure_reinterpretations in the lifetime
+    analysis, which decides when such a reshape can share its input's buffer.
+    """
+    if not op.inputs or not op.outputs:
+        return True
+    src = ag.tensors.get(op.inputs[0])
+    dst = ag.tensors.get(op.outputs[0])
+    if src is None or dst is None:
+        return True
+    src_own = _states_its_own_order(src)
+    dst_own = _states_its_own_order(dst)
+    if src_own and dst_own:
+        return True
+    if src_own or dst_own:
+        return False
+    first = serialized_shape(tuple(src.shape), src.layout)
+    second = serialized_shape(tuple(dst.shape), dst.layout)
+    return (bool(first) and bool(second)
+            and first[0] == second[0] and first[-1] == second[-1])
+
+
 def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     """The layout an operator needs, or None when it works in either."""
     if op.op_type in _SPATIAL_LAYOUT_OPS:
         return Layout.SPATIAL
     if op.op_type in _LINEAR_LAYOUT_OPS:
+        return Layout.LINEAR
+    if op.op_type in ("Reshape", "Flatten"):
+        # A regrouping the runtime's own order does not state is expressible
+        # once the operand is held the way the model states it, unless a
+        # matrix product downstream already compensates for the difference.
+        if _reshape_keeps_its_order(ag, op) or _flattened_into_a_product(ag, op):
+            return None
         return Layout.LINEAR
     if op.op_type in ("Softmax", "LayerNormalization"):
         # Both reduce along one axis and the kernel takes the final stored
@@ -500,23 +577,21 @@ def _drop_inference_identities(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _stored_extent(shape: tuple[int, ...]) -> tuple[int, ...]:
+def _stored_extent(
+    shape: tuple[int, ...], layout: Layout = Layout.SPATIAL
+) -> tuple[int, ...]:
     """Non-unit axis sizes in the order the runtime serializes them.
 
-    The IR keeps ONNX NCHW/NCL while the runtime stores NHWC/NLC, so the same
-    element sequence is described by different axis orders at different ranks.
-    Axes of size 1 contribute no stride, so dropping them leaves exactly the
-    sequence the runtime walks. Two shapes with equal results hold their
-    elements in the same order.
+    A tensor the runtime stores channels-last is described by a different axis
+    order than the one the model states, and which order that is depends on
+    the tensor's layout, not on its rank: a rank-4 matrix operand lists its
+    axes in storage order already. Axes of size 1 contribute no stride, so
+    dropping them leaves exactly the sequence the runtime walks. Two shapes
+    with equal results hold their elements in the same order.
     """
-    rank = len(shape)
-    if rank == 4:
-        order = (0, 2, 3, 1)   # N, H, W, C
-    elif rank == 3:
-        order = (0, 2, 1)      # N, L, C
-    else:
-        order = tuple(range(rank))
-    return tuple(shape[axis] for axis in order if shape[axis] != 1)
+    return tuple(
+        extent for extent in serialized_shape(shape, layout) if extent != 1
+    )
 
 
 def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -528,6 +603,11 @@ def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
     to rank-3 squeeze that removes the channel axis turns NHWC (h, w) order into
     NLC (w, h) order, which would transpose the data silently. Anything that
     fails the check keeps its original op type and is reported as unsupported.
+
+    Runs after layouts are assigned, because which order the runtime walks is
+    a property of the tensor rather than of its rank. Judging it by rank
+    refuses every squeeze on a matrix tensor, which is what a batch of
+    attention heads is.
     """
     for op in ag.ops:
         if op.op_type not in ("Squeeze", "Unsqueeze"):
@@ -536,7 +616,8 @@ def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
         dst = ag.tensors.get(op.outputs[0])
         if src is None or dst is None:
             continue
-        if _stored_extent(tuple(src.shape)) != _stored_extent(tuple(dst.shape)):
+        if (_stored_extent(tuple(src.shape), src.layout)
+                != _stored_extent(tuple(dst.shape), dst.layout)):
             continue
         op.op_type = "Reshape"
         # Squeeze and Unsqueeze carry their axes as a second input or an

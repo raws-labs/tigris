@@ -467,6 +467,19 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "constraints": [
+        "contiguous parts along the outermost stored axis; untiled execution"
+      ],
+      "opcode": 35,
+      "operator": "Split",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
   "schema_version": 9,

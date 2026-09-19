@@ -10,7 +10,12 @@ from tigris.analysis.partition_spatial import (
 )
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
-from tigris.graph.ir import AnalyzedGraph, Layout, Stage
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    Layout,
+    Stage,
+    serialized_axis_map,
+)
 
 
 _FLOAT32 = 1
@@ -321,6 +326,30 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 or normalized_axis != [3]
             ):
                 reasons.append("runtime supports rank-4 channel-axis Concat only")
+
+        if op.op_type == "Split":
+            source = ag.tensors.get(op.inputs[0])
+            parts = [ag.tensors.get(name) for name in op.outputs]
+            axis = int(op.attrs.get("axis", 0))
+            if source is None or any(part is None for part in parts):
+                reasons.append("Split operands are not runtime tensors")
+            else:
+                rank = len(source.shape)
+                stored = serialized_axis_map(rank, source.layout)
+                # Only the outermost stored axis leaves every part a
+                # contiguous run of the input; anything else interleaves.
+                if rank == 0 or stored[axis % rank] != 0:
+                    reasons.append(
+                        "runtime splits only along the outermost stored axis"
+                    )
+                elif any(
+                    len(part.shape) != rank
+                    or tuple(part.shape[1:]) != tuple(source.shape[1:])
+                    for part in parts
+                ):
+                    reasons.append(
+                        "every Split part keeps the shape it was cut from"
+                    )
 
         if op.op_type == "Resize":
             if op.attrs.get("mode", "nearest") != "nearest":

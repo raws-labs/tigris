@@ -105,6 +105,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "Conv1D": 32,
     "LayerNormalization": 33,
     "Erf": 34,
+    "Split": 35,
 }
 OP_TYPE_UNKNOWN = 255
 

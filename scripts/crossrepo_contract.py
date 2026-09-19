@@ -450,6 +450,90 @@ def _traced_shape_scale_case() -> ContractCase:
     )
 
 
+def _unfolded_feature_map_case() -> ContractCase:
+    """A feature map regrouped into patches, which is an unfold.
+
+    A reshape renames axes over one sequence and the kernel copies straight
+    through, which states the model's regrouping only when the runtime holds
+    the elements in that order. This one folds the channel axis into the
+    leading one, which a tensor held channels-last does not, so the plan used
+    to compile and come back wrong. Holding the operand in the model's own
+    order first is what makes it expressible.
+    """
+    channels, side, patch = 6, 8, 2
+    cells = side // patch
+    nodes = [
+        helper.make_node(
+            "Conv", ["input", "w"], ["features"], kernel_shape=[1, 1]),
+        # [1, C, 8, 8] -> [C * cells, patch, cells, patch]: the channel axis
+        # joins the leading one, which the stored order does not hold next to
+        # it.
+        helper.make_node("Reshape", ["features", "patches"], ["grouped"]),
+        helper.make_node("Erf", ["grouped"], ["output"]),
+    ]
+    model = _model(
+        "unfolded_feature_map",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT,
+            [channels * cells, patch, cells, patch])],
+        [numpy_helper.from_array(
+            (np.random.default_rng(3).normal(size=(channels, channels, 1, 1))
+             * 0.4).astype(np.float32), "w"),
+         numpy_helper.from_array(
+             np.array([channels * cells, patch, cells, patch], np.int64),
+             "patches")],
+    )
+    data = np.linspace(
+        -1.0, 1.0, channels * side * side, dtype=np.float32
+    ).reshape(1, channels, side, side)
+    return ContractCase(
+        "float_unfolded_feature_map",
+        model,
+        model,
+        {"input": data},
+        ("Conv", "Transpose", "Reshape", "Erf", "Transpose"),
+    )
+
+
+def _split_case() -> ContractCase:
+    """A tensor cut into contiguous parts, which is how a fused qkv unbinds.
+
+    One projection produces query, key and value together and the model cuts
+    them apart along the axis they were stacked on. The parts are runs of the
+    input, so each is that many bytes taken in order; a cut anywhere else
+    interleaves and is refused rather than copied wrongly.
+    """
+    parts, tokens, width = 3, 5, 8
+    nodes = [
+        helper.make_node(
+            "Split", ["input", "parts"], ["first", "second", "third"], axis=0),
+        helper.make_node("Add", ["first", "second"], ["pair"]),
+        helper.make_node("Mul", ["pair", "third"], ["output"]),
+    ]
+    model = _model(
+        "split_parts",
+        nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [parts, tokens, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, tokens, width])],
+        [numpy_helper.from_array(np.array([1, 1, 1], np.int64), "parts")],
+    )
+    data = np.linspace(
+        -2.0, 2.0, parts * tokens * width, dtype=np.float32
+    ).reshape(parts, tokens, width)
+    return ContractCase(
+        "float_split_parts",
+        model,
+        model,
+        {"input": data},
+        ("Split", "Add", "Mul"),
+    )
+
+
 def _reduce_mean_case(*, quantized: bool, keepdims: bool) -> ContractCase:
     """A mean over the token axis, which is what a pooled sequence head is.
 
@@ -5094,6 +5178,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _flattened_token_head_case(),
         _constant_divisor_case(),
         _traced_shape_scale_case(),
+        _unfolded_feature_map_case(),
+        _split_case(),
         _reduce_mean_case(quantized=False, keepdims=True),
         _reduce_mean_case(quantized=False, keepdims=False),
         _reduce_mean_case(quantized=True, keepdims=True),
