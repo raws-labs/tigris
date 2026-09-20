@@ -1666,6 +1666,64 @@ def _chain_pointwise_before_spatial_case() -> ContractCase:
     )
 
 
+def _chain_skip_out_of_a_stage_case() -> ContractCase:
+    """A chained stage that emits a tensor produced before its last convolution.
+
+    A stage may hand more than one tensor to later stages, and one of them can
+    be written by an op that runs before the stage's last spatial op. That
+    tensor spans the spatial op's INPUT rows: more rows than the stage finally
+    emits, starting on a different row. Both tiled executors spilled every
+    stage output at the stage's output range, so the tensor landed shifted in
+    slow memory from the second tile onward, and the later Concat read it.
+
+    The SiLU ahead of the two convolutions is what overflows the budget and
+    makes the partitioner chain, and the Concat is what keeps the 1x1
+    convolution's output alive past the stage that wrote it.
+    """
+    c, s = 4, 16
+    rng = np.random.default_rng(0)
+    first = (rng.normal(size=(c, c, 3, 3)) * 0.2).astype(np.float32)
+    point = (rng.normal(size=(c, c, 1, 1)) * 0.3).astype(np.float32)
+    deep = (rng.normal(size=(c, c, 3, 3)) * 0.2).astype(np.float32)
+    model = _model(
+        "chain_skip_out_of_a_stage",
+        [
+            helper.make_node(
+                "Conv", ["input", "first"], ["a"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+            helper.make_node("Sigmoid", ["a"], ["gate"]),
+            helper.make_node("Mul", ["a", "gate"], ["silu"]),
+            helper.make_node(
+                "Conv", ["silu", "point"], ["skip"], kernel_shape=[1, 1]),
+            helper.make_node(
+                "Conv", ["skip", "deep"], ["wide"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+            helper.make_node("Concat", ["skip", "wide"], ["output"], axis=1),
+        ],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, s, s])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, 2 * c, s, s])],
+        initializers=[
+            numpy_helper.from_array(first, "first"),
+            numpy_helper.from_array(point, "point"),
+            numpy_helper.from_array(deep, "deep"),
+        ],
+    )
+    data = (rng.normal(size=(1, c, s, s)) * 0.7).astype(np.float32)
+    return ContractCase(
+        "float_chain_skip_out_of_a_stage",
+        model,
+        model,
+        {"input": data},
+        ("Conv", "Sigmoid", "Mul", "Conv", "Conv", "Concat"),
+        mem_budget="8K",
+        expect_tiled=True,
+        expect_chain=True,
+        expect_line_buffered=True,
+    )
+
+
 def _chained_normalization_case() -> ContractCase:
     """A chain whose second stage normalizes.
 
@@ -5220,6 +5278,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_rank4_binary_case(op_type="Mul"),
         _chained_normalization_case(),
         _chain_pointwise_before_spatial_case(),
+        _chain_skip_out_of_a_stage_case(),
         _qdq_max_pool_rescale_case(),
         _qdq_rescale_passthrough_case(op_type="Relu"),
         _qdq_rescale_passthrough_case(op_type="Relu6"),

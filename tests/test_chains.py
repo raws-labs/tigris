@@ -10,6 +10,7 @@ from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import (
     _back_propagate_tile_heights,
     _chain_fast_bytes,
+    _external_outputs_keep_their_rows,
     _get_stage_spatial_params,
     detect_and_solve_chains,
     detect_chains,
@@ -19,6 +20,7 @@ from tigris.analysis.partition_spatial import (
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.graph.ir import OpNode, Stage
 from tigris.loaders import load_model
 
 
@@ -232,6 +234,42 @@ def test_chain_does_not_span_model_output(chain_with_model_output_mid_path):
     boundaries = _chain_boundary_tensors(ag, chains)
     assert not (boundaries & set(ag.model_outputs)), (
         f"model output streamed as chain intermediate: {boundaries & set(ag.model_outputs)}")
+
+
+class TestExternalOutputRows:
+    """A stage output written before a spatial op keeps that op's input rows."""
+
+    @staticmethod
+    def _stage(stride):
+        ops = [
+            OpNode("point", "Conv", ["x"], ["skip"],
+                   {"kernel_shape": [1, 1], "strides": [1, 1]}),
+            OpNode("deep", "Conv", ["skip"], ["wide"],
+                   {"kernel_shape": [3, 3], "strides": [stride, stride],
+                    "pads": [1, 1, 1, 1]}),
+        ]
+        stage = Stage(0, [0, 1], ["x"], ["skip", "wide"])
+        return stage, ops
+
+    def test_unit_stride_after_an_escaping_output_is_admitted(self):
+        stage, ops = self._stage(1)
+        assert _external_outputs_keep_their_rows(stage, ops)
+
+    def test_a_stride_after_an_escaping_output_is_refused(self):
+        """At stride 2 the tiles never read the rows the strided op drops, so
+        nothing would ever write them into the escaping tensor."""
+        stage, ops = self._stage(2)
+        assert not _external_outputs_keep_their_rows(stage, ops)
+
+    def test_a_stride_before_the_only_escaping_output_is_admitted(self):
+        ops = [
+            OpNode("deep", "Conv", ["x"], ["wide"],
+                   {"kernel_shape": [3, 3], "strides": [2, 2],
+                    "pads": [1, 1, 1, 1]}),
+            OpNode("act", "Relu", ["wide"], ["out"], {}),
+        ]
+        stage = Stage(0, [0, 1], ["x"], ["out"])
+        assert _external_outputs_keep_their_rows(stage, ops)
 
 
 # Chain detection tests
