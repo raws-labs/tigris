@@ -73,6 +73,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _normalize_concat_axis(ag)
     ag = _validate_transposes(ag)
     ag = _absorb_activations(ag)
+    ag = _fold_split_into_its_weight(ag)
     ag = _assign_tensor_layouts(ag)
     ag = _relabel_shape_ops_to_reshape(ag)
     ag = _lower_linear_matmul(ag)
@@ -412,6 +413,235 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
         op.step = step
     return ag
 
+
+
+# Shape-only operators a split can be pushed back through.
+_SPLIT_TRANSPARENT = frozenset({"Reshape", "Transpose"})
+
+
+def _split_axis_before_reshape(
+    source: tuple[int, ...], result: tuple[int, ...], axis: int
+) -> tuple[int, int] | None:
+    """Where *axis* of a reshape's result sits in its source, and its stride.
+
+    A split is a cut into contiguous blocks, so pushing one back through a
+    reshape is only sound when the axis being cut is the outermost factor of a
+    single source axis: everything before it has to line up, and everything
+    after it has to come from that same axis. Then cutting the result at that
+    axis is cutting the source axis into blocks of the trailing product.
+    """
+    prefix = 1
+    for extent in result[:axis]:
+        prefix *= int(extent)
+    trailing = 1
+    for extent in result[axis + 1:]:
+        trailing *= int(extent)
+    running = 1
+    for position, extent in enumerate(source):
+        if running == prefix:
+            if int(extent) != int(result[axis]) * trailing:
+                return None
+            return position, trailing
+        running *= int(extent)
+    return None
+
+
+def _fold_split_into_its_weight(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Cut the weight rather than the product it produced.
+
+    A fused projection computes query, key and value in one matrix product and
+    the model cuts them apart afterwards, through whatever reshapes and
+    transposes put the stacked axis where the cut wants it. Cutting a product
+    along its output-feature axis is the same as three products against three
+    blocks of the weight, so the cut can be done once at compile time. The
+    stacked tensor then never exists: neither the product that holds all three
+    parts, nor the copy that separates them.
+
+    The split is pushed back through shape-only operators one at a time and
+    folded only if it reaches a product's feature axis. Anything else keeps
+    its split, which the runtime executes.
+    """
+    while True:
+        if not _fold_one_split(ag):
+            return ag
+
+
+def _fold_one_split(ag: AnalyzedGraph) -> bool:
+    producer_of: dict[str, int] = {}
+    for index, op in enumerate(ag.ops):
+        for name in op.outputs:
+            producer_of[name] = index
+    readers: dict[str, int] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            if name:
+                readers[name] = readers.get(name, 0) + 1
+
+    for split_index, split in enumerate(ag.ops):
+        if split.op_type != "Split" or len(split.inputs) < 1:
+            continue
+        parts = [ag.tensors.get(name) for name in split.outputs]
+        if len(parts) < 2 or any(part is None for part in parts):
+            continue
+
+        axis = int(split.attrs.get("axis", 0))
+        name = split.inputs[0]
+        chain: list[int] = []
+        while True:
+            index = producer_of.get(name)
+            if index is None or readers.get(name, 0) != 1:
+                break
+            op = ag.ops[index]
+            current = ag.tensors.get(name)
+            source = ag.tensors.get(op.inputs[0]) if op.inputs else None
+            if current is None or source is None:
+                break
+            if op.op_type == "Transpose":
+                perm = [int(a) for a in op.attrs.get("perm", [])]
+                if len(perm) != len(current.shape):
+                    break
+                axis = perm[axis]
+            elif op.op_type == "Reshape":
+                mapped = _split_axis_before_reshape(
+                    tuple(source.shape), tuple(current.shape), axis)
+                if mapped is None:
+                    break
+                axis, _ = mapped
+            elif op.op_type in ("MatMul", "Gemm"):
+                if axis != len(current.shape) - 1:
+                    break
+                if _fold_split_onto(ag, split_index, chain, index, parts):
+                    return True
+                break
+            else:
+                break
+            if op.op_type not in _SPLIT_TRANSPARENT:
+                break
+            chain.append(index)
+            name = op.inputs[0]
+    return False
+
+
+def _fold_split_onto(
+    ag: AnalyzedGraph,
+    split_index: int,
+    chain: list[int],
+    product_index: int,
+    parts: list,
+) -> bool:
+    """Rebuild the chain once per part, over a block of the weight."""
+    product = ag.ops[product_index]
+    if len(product.inputs) not in (2, 3):
+        return False
+    weight = ag.weight_data.get(product.inputs[1])
+    if weight is None or weight.ndim != 2:
+        return False
+    if int(product.attrs.get("transB", 0)):
+        return False
+    features = int(weight.shape[1])
+    result = ag.tensors.get(product.outputs[0])
+    if result is None or int(result.shape[-1]) != features:
+        return False
+
+    split = ag.ops[split_index]
+    axis = int(split.attrs.get("axis", 0))
+    widths = [int(part.shape[axis]) for part in parts]
+    stride, remainder = divmod(features, sum(widths))
+    if remainder or stride <= 0:
+        return False
+
+    bias = None
+    if len(product.inputs) == 3:
+        bias = ag.weight_data.get(product.inputs[2])
+        if bias is None or bias.reshape(-1).size != features:
+            return False
+        bias = bias.reshape(-1)
+
+    rebuilt: list[OpNode] = []
+    offset = 0
+    for position, part in enumerate(parts):
+        block = widths[position] * stride
+        tag = f"{product.name}_part{position}"
+        weight_name = f"{product.inputs[1]}_part{position}"
+        ag.weight_data[weight_name] = np.ascontiguousarray(
+            weight[:, offset:offset + block])
+        ag.tensors[weight_name] = TensorInfo(
+            name=weight_name, shape=(int(weight.shape[0]), block),
+            dtype=ag.tensors[product.inputs[1]].dtype, is_constant=True)
+        inputs = [product.inputs[0], weight_name]
+        if bias is not None:
+            bias_name = f"{product.inputs[2]}_part{position}"
+            ag.weight_data[bias_name] = np.ascontiguousarray(
+                bias[offset:offset + block])
+            ag.tensors[bias_name] = TensorInfo(
+                name=bias_name, shape=(block,),
+                dtype=ag.tensors[product.inputs[2]].dtype, is_constant=True)
+            inputs.append(bias_name)
+
+        carried = f"{tag}_product"
+        ag.tensors[carried] = TensorInfo(
+            name=carried,
+            shape=(*tuple(result.shape[:-1]), block),
+            dtype=result.dtype, quant=result.quant, layout=result.layout)
+        rebuilt.append(OpNode(
+            name=tag, op_type=product.op_type, inputs=inputs,
+            outputs=[carried], attrs=dict(product.attrs)))
+
+        # The chain is walked from the split back to the product, so replaying
+        # it forwards means reversing it. Every shape it states loses the
+        # stacked axis, which this part no longer spans.
+        for depth, index in enumerate(reversed(chain)):
+            step = ag.ops[index]
+            last = depth == len(chain) - 1
+            output = split.outputs[position] if last else (
+                f"{tag}_step{depth}")
+            if not last:
+                shape = _part_shape(ag, step.outputs[0], widths[position],
+                                    len(parts))
+                if shape is None:
+                    return False
+                reference = ag.tensors[step.outputs[0]]
+                ag.tensors[output] = TensorInfo(
+                    name=output, shape=shape, dtype=reference.dtype,
+                    quant=reference.quant, layout=reference.layout)
+            rebuilt.append(OpNode(
+                name=f"{tag}_{step.name.split('/')[-1]}",
+                op_type=step.op_type,
+                inputs=[carried],
+                outputs=[output],
+                attrs=dict(step.attrs)))
+            carried = output
+        offset += block
+
+    replaced = {split_index, product_index, *chain}
+    ops: list[OpNode] = []
+    for index, op in enumerate(ag.ops):
+        if index == product_index:
+            ops.extend(rebuilt)
+        elif index in replaced:
+            continue
+        else:
+            ops.append(op)
+    ag.ops = ops
+    for step, op in enumerate(ag.ops):
+        op.step = step
+    return True
+
+
+def _part_shape(
+    ag: AnalyzedGraph, name: str, width: int, parts: int
+) -> tuple[int, ...] | None:
+    """A chain tensor's shape once it carries one part instead of all of them."""
+    info = ag.tensors.get(name)
+    if info is None:
+        return None
+    shape = [int(extent) for extent in info.shape]
+    total = width * parts
+    for position, extent in enumerate(shape):
+        if extent == total:
+            shape[position] = width
+            return tuple(shape)
+    return None
 
 
 def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:

@@ -118,6 +118,36 @@ static uint8_t executor_workspace[TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES];
 """
 
 
+def _build_limit_assertions(plan: dict) -> str:
+    """Require the build to allow what this plan needs.
+
+    The workspace above is sized from the plan, but the loader refuses a plan
+    that asks more than the build it runs in was compiled to carry, and those
+    limits size fixed storage inside the runtime rather than in this file.
+    Defining them here would change only this translation unit and leave the
+    loader refusing at run time, so this says what the build must set and
+    fails while there is still a compiler to say it to.
+    """
+    tensors, inputs, outputs, chain_stages, spatial_ops = (
+        _executor_workspace_limits(plan)
+    )
+    needed = (
+        ("TIGRIS_MAX_TENSORS", tensors),
+        ("TIGRIS_MAX_STAGE_INPUTS", inputs),
+        ("TIGRIS_MAX_STAGE_OUTPUTS", outputs),
+        ("TIGRIS_MAX_CHAIN_STAGES", chain_stages),
+        ("TIGRIS_MAX_SPATIAL_OPS_PER_STAGE", spatial_ops),
+    )
+    lines = [
+        f'_Static_assert({name} >= {value}u,\n'
+        f'    "this plan needs {name} >= {value}; rebuild the runtime with '
+        f'-D{name}={value}");'
+        for name, value in needed
+        if value > 0
+    ]
+    return "\n".join(lines) + "\n" if lines else ""
+
+
 def _plan_dtype(plan: dict) -> DTypeMode:
     """Resolve the graph-wide runtime dtype from serialized tensors."""
     tensor_dtypes = {tensor["dtype"] for tensor in plan.get("tensors", [])}
@@ -438,7 +468,9 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
     dispatch = "tigris_dispatch_kernel_s8" if is_quantized else "tigris_dispatch_kernel"
     kernel_include = '#include "tigris_kernels_s8.h"' if is_quantized else '#include "tigris_kernels.h"'
     budget = plan["budget"] or 65536
-    workspace_declaration = _executor_workspace_declaration(plan)
+    workspace_declaration = (
+        _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
+    )
 
     return f"""\
 #define _POSIX_C_SOURCE 200112L
@@ -618,7 +650,9 @@ int main(int argc, char **argv)
 
 def _generate_esp(plan: dict, is_quantized: bool) -> str:
     budget = plan["budget"] or 65536
-    workspace_declaration = _executor_workspace_declaration(plan)
+    workspace_declaration = (
+        _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
+    )
 
     if is_quantized:
         dispatch = "tigris_dispatch_kernel_esp_nn"
@@ -818,7 +852,9 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
             "CMSIS-NN static fast arena exceeds the uint32 runtime size limit"
         )
     slow_arena_size = max(budget * 4, 256 * 1024)
-    workspace_declaration = _executor_workspace_declaration(plan)
+    workspace_declaration = (
+        _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
+    )
     if slow_arena_size > 0xFFFFFFFF:
         raise ValueError(
             "CMSIS-NN static slow arena exceeds the uint32 runtime size limit"

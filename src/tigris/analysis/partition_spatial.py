@@ -1272,6 +1272,18 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             ):
                 untileable.append(f"{op.name} ({op.op_type})")
 
+        if tile_axis != TILE_AXIS_NONE and not _external_outputs_keep_their_rows(
+            stage, stage_ops
+        ):
+            stage.tile_plan = TilePlan(
+                tileable=False,
+                warnings=[
+                    f"Stage {stage.stage_id} emits a tensor whose rows a tile "
+                    f"would leave unwritten"
+                ],
+            )
+            continue
+
         if tile_axis == TILE_AXIS_NONE or untileable:
             stage.tile_plan = TilePlan(
                 tileable=False,
@@ -1545,6 +1557,31 @@ def _estimate_halo_bytes(ag: AnalyzedGraph, stage, halo: int, input_h: int) -> i
 # Chain detection and solving
 
 
+def _external_outputs_keep_their_rows(
+    stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """Whether every tensor leaving the stage has all of its rows written.
+
+    A tiled stage writes each of its outputs at the row range of the op that
+    produced it. For an output produced ahead of a spatial op that range is the
+    spatial op's INPUT range, and the tiles cover the whole tensor only while
+    the ops after it map rows one to one. A stride above one drops the trailing
+    rows no output row reads, which would leave them unwritten in slow memory.
+    """
+    external = set(stage.output_tensors)
+    seen_external = False
+    for op in stage_ops:
+        if seen_external:
+            cat = classify_op(op.op_type)
+            if cat in (TileCategory.CONV, TileCategory.POOL) and (
+                _get_stride_h(op) != 1
+            ):
+                return False
+        if any(name in external for name in op.outputs):
+            seen_external = True
+    return True
+
+
 def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
     """Check if a stage may be part of a streamable CHAIN (used only by
     detect_chains): all ops implement the schema-v4 height-stripe contract and
@@ -1569,7 +1606,9 @@ def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
             return False
         if info.layout is not Layout.SPATIAL:
             return False
-    return True
+    return _external_outputs_keep_their_rows(
+        stage, [ag.ops[i] for i in stage.op_indices]
+    )
 
 
 def _tensor_consumer_count(ag: AnalyzedGraph) -> dict[str, int]:

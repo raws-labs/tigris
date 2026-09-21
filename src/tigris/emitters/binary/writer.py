@@ -87,6 +87,9 @@ WEIGHT_ALIGN = PLAN_SECTION_ALIGNMENT
 # These are execution limits of the current runtime, rather than wire-format
 # limits. Keep them explicit here so the compiler fails before producing a plan
 # the loader will inevitably reject.
+# What the runtime carries by default. It states these at compile time because
+# they size fixed storage, so a plan that needs more is not wrong, it needs a
+# target built for it. Nothing here refuses such a plan: the target does.
 RUNTIME_MAX_TENSORS = 512
 RUNTIME_MAX_STAGE_INPUTS = 16
 RUNTIME_MAX_STAGE_OUTPUTS = 16
@@ -1332,14 +1335,19 @@ def _patch_stage_tile_indices(stage_data: bytearray, ag: AnalyzedGraph, stage_to
 # Plan assembly
 
 
-def emit_binary(ag: AnalyzedGraph, path: Path, compress: str | None = None, xip: bool = False) -> None:
+def emit_binary(
+    ag: AnalyzedGraph, path: Path, compress: str | None = None,
+    xip: bool = False,
+) -> None:
     """Write an execution plan as a binary file to *path*."""
     data = emit_binary_bytes(ag, compress=compress, xip=xip)
     with open(path, "wb") as f:
         f.write(data)
 
 
-def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool = False) -> bytes:
+def emit_binary_bytes(
+    ag: AnalyzedGraph, compress: str | None = None, xip: bool = False,
+) -> bytes:
     """Build the complete binary plan and return as bytes.
 
     Args:
@@ -1414,12 +1422,13 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     # Reject counts before any fixed-width table field is packed. The runtime
     # has a deliberately bounded tensor working set; the other limits are
     # direct consequences of the current wire layout.
-    runtime_tensor_count = sum(1 for info in ag.tensors.values() if not info.is_constant)
-    if runtime_tensor_count > RUNTIME_MAX_TENSORS:
-        raise ValueError(
-            f"plan has {runtime_tensor_count} tensors; current runtime loader limit is "
-            f"{RUNTIME_MAX_TENSORS}"
-        )
+    # How many tensors a plan holds is derived from the model, not chosen, so
+    # it is emitted whatever it comes to. A target built to carry fewer
+    # refuses the plan and says which build would run it, which is where that
+    # judgement belongs; the CLI says so at compile time as a courtesy.
+    _require_uint(
+        sum(1 for info in ag.tensors.values() if not info.is_constant),
+        16, "runtime tensor count")
     _require_uint(len(ag.weight_data), 16, "weight count")
     _require_uint(len(ag.stages), 16, "stage count")
 
