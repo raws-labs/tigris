@@ -230,6 +230,10 @@ class AnalyzedGraph:
 
     # Populated by loader
     model_name: str = ""
+    # The ai.onnx opset the model declares. Several operators changed their
+    # default behaviour across versions, so a pass that reads an attribute's
+    # default has to know which version's default applies.
+    opset: int = 0
     ops: list[OpNode] = field(default_factory=list)
     tensors: dict[str, TensorInfo] = field(default_factory=dict)
     model_inputs: list[str] = field(default_factory=list)

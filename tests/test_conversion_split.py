@@ -99,7 +99,9 @@ def test_an_untileable_stage_without_a_conversion_is_left_alone(tmp_path):
 
     resize = next(st for st in ag.stages if "Resize" in
                   [ag.ops[i].op_type for i in st.op_indices])
-    assert not resize.tile_plan.tileable
+    # The resample tiles on its own now; what this case is about is that a
+    # stage carrying no layout conversion is not cut looking for one.
+    assert resize.tile_plan.tileable
     assert conversion_cut_points(ag) == frozenset()
 
 

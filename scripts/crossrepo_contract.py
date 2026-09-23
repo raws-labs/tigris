@@ -66,6 +66,7 @@ class ContractCase:
     inputs: dict[str, Array]
     expected_operators: tuple[str, ...]
     mem_budget: str = "4K"
+    slow_budget: str | None = None
     compression: str | None = None
     xip: bool = False
     expect_tiled: bool = False
@@ -375,13 +376,20 @@ def _constant_divisor_case() -> ContractCase:
     division by the head width. Div has no opcode, but a constant divisor is
     the Mul the kernels already carry, so the graph is rewritten rather than
     refused. Both shapes a Mul takes are here: a scalar and a whole tensor.
+
+    The scalar is read by two divisions, which is what an exporter leaves
+    behind once a deduplicating pass gives every GELU in a stack of blocks the
+    same initializer. Inverting that constant in place inverts it once per
+    reader, so the second division multiplied by sqrt(2) instead of dividing
+    by it and the model came out wrong by a factor of two.
     """
     channels, side = 4, 8
     shape = [1, channels, side, side]
     nodes = [
         helper.make_node("Div", ["input", "root_two"], ["scaled"]),
         helper.make_node("Erf", ["scaled"], ["shaped"]),
-        helper.make_node("Div", ["shaped", "whole"], ["output"]),
+        helper.make_node("Div", ["shaped", "whole"], ["widened"]),
+        helper.make_node("Div", ["widened", "root_two"], ["output"]),
     ]
     model = _model(
         "constant_divisor",
@@ -402,7 +410,88 @@ def _constant_divisor_case() -> ContractCase:
         model,
         model,
         {"input": data},
-        ("Mul", "Erf", "Mul"),
+        ("Mul", "Erf", "Mul", "Mul"),
+    )
+
+
+def _per_channel_constant_case() -> ContractCase:
+    """An input normalization, which is one constant value per channel.
+
+    An exporter writes the mean and the standard deviation into the graph as
+    (1, C, 1, 1) constants. The wire format gives a constant operand a byte
+    size and nothing else, so the runtime reads that length as one value per
+    channel and repeats it: channels are stored innermost, which is what makes
+    the pattern hold wherever a tile starts.
+    """
+    channels, side = 3, 12
+    rng = np.random.default_rng(0)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+    deviation = np.array(
+        [0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+    weight = (rng.normal(size=(4, channels, 3, 3)) * 0.2).astype(np.float32)
+    model = _model(
+        "per_channel_constant",
+        [
+            helper.make_node("Sub", ["input", "mean"], ["centered"]),
+            helper.make_node("Div", ["centered", "deviation"], ["scaled"]),
+            helper.make_node(
+                "Conv", ["scaled", "weight"], ["output"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        ],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, 4, side, side])],
+        initializers=[
+            numpy_helper.from_array(mean, "mean"),
+            numpy_helper.from_array(deviation, "deviation"),
+            numpy_helper.from_array(weight, "weight"),
+        ],
+    )
+    data = rng.random((1, channels, side, side)).astype(np.float32)
+    return ContractCase(
+        "float_per_channel_constant",
+        model,
+        model,
+        {"input": data},
+        ("Add", "Mul", "Conv"),
+    )
+
+
+def _bilinear_upsample_case() -> ContractCase:
+    """Bilinear upsampling, which is how a dense prediction returns to size.
+
+    It is its own operator rather than a mode on the nearest one, so a runtime
+    that does not carry it refuses the plan instead of quietly resampling a
+    different way. The coordinates are half-pixel: an output sample sits at
+    (o + 0.5) / scale - 0.5 and the border clamps.
+    """
+    channels, side = 3, 6
+    rng = np.random.default_rng(1)
+    model = _model(
+        "bilinear_upsample",
+        [
+            helper.make_node(
+                "Resize", ["input", "roi", "scales"], ["output"],
+                mode="linear"),
+        ],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, channels, 2 * side, 2 * side])],
+        initializers=[
+            numpy_helper.from_array(np.array([], dtype=np.float32), "roi"),
+            numpy_helper.from_array(
+                np.array([1, 1, 2, 2], dtype=np.float32), "scales"),
+        ],
+    )
+    data = (rng.normal(size=(1, channels, side, side))).astype(np.float32)
+    return ContractCase(
+        "float_bilinear_upsample",
+        model,
+        model,
+        {"input": data},
+        ("ResizeLinear",),
     )
 
 
@@ -495,6 +584,50 @@ def _unfolded_feature_map_case() -> ContractCase:
         model,
         {"input": data},
         ("Conv", "Transpose", "Reshape", "Erf", "Transpose"),
+    )
+
+
+def _prepended_token_case() -> ContractCase:
+    """A learned token concatenated onto a sequence, then read back out.
+
+    This is how a vision transformer carries a class token: one constant row
+    is prepended to the patch sequence, travels through the blocks, and the
+    head reads index 0 back out. The plan names the constant as the
+    operator's weight, since only activations get tensor-table entries, and
+    the index read is a cut of the stored bytes rather than an operator of
+    its own.
+    """
+    tokens, width = 4, 8
+    rng = np.random.default_rng(0)
+    cls = (rng.normal(size=(1, 1, width)) * 0.3).astype(np.float32)
+    proj = (rng.normal(size=(width, width)) * 0.3).astype(np.float32)
+    head = (rng.normal(size=(width, 3)) * 0.3).astype(np.float32)
+    model = _model(
+        "prepended_token",
+        [
+            helper.make_node("Concat", ["cls", "input"], ["sequence"], axis=1),
+            helper.make_node("MatMul", ["sequence", "proj"], ["mixed"]),
+            helper.make_node("Gather", ["mixed", "first"], ["token"], axis=1),
+            helper.make_node("MatMul", ["token", "head"], ["output"]),
+        ],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, tokens, width])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3])],
+        initializers=[
+            numpy_helper.from_array(cls, "cls"),
+            numpy_helper.from_array(proj, "proj"),
+            numpy_helper.from_array(head, "head"),
+            numpy_helper.from_array(np.array(0, dtype=np.int64), "first"),
+        ],
+    )
+    data = (rng.normal(size=(1, tokens, width)) * 0.7).astype(np.float32)
+    return ContractCase(
+        "float_prepended_token",
+        model,
+        model,
+        {"input": data},
+        ("Concat", "Transpose", "Reshape", "Gemm", "Reshape", "Reshape",
+         "Split", "Reshape", "Gemm"),
     )
 
 
@@ -669,6 +802,47 @@ def _banded_attention_case() -> ContractCase:
         ("Transpose", "Transpose", "Transpose", "MatMul", "Softmax",
          "Transpose"),
         mem_budget="64K",
+        expect_tiled=True,
+    )
+
+
+def _row_band_alias_case() -> ContractCase:
+    """A banded stage that writes its output over its own input.
+
+    The scores a Softmax normalizes are dead the moment it has read them, and
+    a row band is gathered out of the input before any op runs and scattered
+    back to the same rows, so one slow buffer can carry both tensors. The
+    compiler sizes the slow pool on that rule and the runtime fills the pool
+    on its own copy of it, so the slow budget here is the tight one: 96 KiB is
+    what the pair costs shared, and 144 KiB is what it costs apart. A runtime
+    that stops aliasing overruns the budget the compiler accepted.
+    """
+    heads, tokens, width = 4, 64, 16
+    shape = [1, heads, tokens, width]
+    model = _model(
+        "row_band_alias",
+        [
+            helper.make_node(
+                "Transpose", ["input"], ["keys"], perm=[0, 1, 3, 2]),
+            helper.make_node("MatMul", ["input", "keys"], ["scores"]),
+            helper.make_node("Softmax", ["scores"], ["probs"], axis=-1),
+            helper.make_node("MatMul", ["probs", "input"], ["output"]),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    data = np.linspace(
+        -1.0, 1.0, int(np.prod(shape)), dtype=np.float32
+    ).reshape(shape)
+    return ContractCase(
+        "float_row_band_alias",
+        model,
+        model,
+        {"input": data},
+        ("Transpose", "Transpose", "Transpose", "MatMul", "Softmax", "MatMul",
+         "Transpose"),
+        mem_budget="32K",
+        slow_budget="96K",
         expect_tiled=True,
     )
 
@@ -1721,6 +1895,103 @@ def _chain_skip_out_of_a_stage_case() -> ContractCase:
         expect_tiled=True,
         expect_chain=True,
         expect_line_buffered=True,
+    )
+
+
+def _cotiled_gate_chain_case() -> ContractCase:
+    """A chain that carries one operator's output past the next operator.
+
+    A gate reads the tensor it gates, so the Mul takes both the convolution's
+    output and the Sigmoid of it. The chain rule used to stop at an operator
+    with a second operand, which left both of those tensors in slow memory.
+    Carried instead, they are streamed a tile at a time and never reach it:
+    the slow budget here is what the pair costs when the chain carries them,
+    and a compiler that stops chaining at the Mul needs half again as much.
+    """
+    c, s = 8, 24
+    rng = np.random.default_rng(0)
+    first = (rng.normal(size=(c, c, 3, 3)) * 0.2).astype(np.float32)
+    second = (rng.normal(size=(c, c, 3, 3)) * 0.2).astype(np.float32)
+    model = _model(
+        "cotiled_gate_chain",
+        [
+            helper.make_node(
+                "Conv", ["input", "first"], ["gated"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+            helper.make_node("Sigmoid", ["gated"], ["gate"]),
+            helper.make_node("Mul", ["gated", "gate"], ["silu"]),
+            helper.make_node(
+                "Conv", ["silu", "second"], ["output"],
+                kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        ],
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, s, s])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, c, s, s])],
+        initializers=[
+            numpy_helper.from_array(first, "first"),
+            numpy_helper.from_array(second, "second"),
+        ],
+    )
+    data = (rng.normal(size=(1, c, s, s)) * 0.7).astype(np.float32)
+    return ContractCase(
+        "float_cotiled_gate_chain",
+        model,
+        model,
+        {"input": data},
+        ("Conv", "Sigmoid", "Mul", "Conv"),
+        mem_budget="16K",
+        slow_budget="36K",
+        expect_tiled=True,
+        expect_chain=True,
+        expect_line_buffered=True,
+    )
+
+
+def _reshape_alias_release_case() -> ContractCase:
+    """A stage whose reshapes hand their buffers on and then let go.
+
+    Lowering a matrix product leaves a reshape on either side of it, and each
+    one shares its input's buffer rather than copying. The executor used to
+    pin that buffer for the rest of the stage, so a stack of products filled
+    the fast pool with buffers nothing would read again and pushed every later
+    output into slow memory. The slow budget here is what the stage costs when
+    a shared buffer is released at the last read of either tensor holding it,
+    and it is a sixth of what the pinned version took.
+    """
+    tokens, width, depth = 64, 64, 6
+    rng = np.random.default_rng(0)
+    nodes = []
+    weights = []
+    current = "input"
+    for index in range(depth):
+        weight = (rng.normal(size=(width, width)) * 0.2).astype(np.float32)
+        weights.append(numpy_helper.from_array(weight, f"w{index}"))
+        nodes.append(helper.make_node("MatMul", [current, f"w{index}"],
+                                      [f"product{index}"]))
+        nodes.append(helper.make_node("Sigmoid", [f"product{index}"],
+                                      [f"gated{index}"]))
+        current = f"gated{index}"
+    nodes.append(helper.make_node("Add", [current, "input"], ["output"]))
+    model = _model(
+        "reshape_alias_release", nodes,
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, tokens, width])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, tokens, width])],
+        initializers=weights,
+    )
+    data = (rng.normal(size=(1, tokens, width)) * 0.5).astype(np.float32)
+    return ContractCase(
+        "float_reshape_alias_release",
+        model,
+        model,
+        {"input": data},
+        ("Transpose",)
+        + ("Reshape", "Gemm", "Reshape", "Sigmoid") * depth
+        + ("Add", "Transpose"),
+        mem_budget="64K",
+        slow_budget="32K",
     )
 
 
@@ -4575,11 +4846,13 @@ def _compile_plan(
     plan_path: Path,
     *,
     mem_budget: str,
+    slow_budget: str | None,
     compression: str | None,
     xip: bool,
     force_one_op_stages: bool = False,
 ) -> dict:
-    graph, _ = _run_pipeline(str(model_path), (mem_budget,))
+    budgets = (mem_budget,) if slow_budget is None else (mem_budget, slow_budget)
+    graph, _ = _run_pipeline(str(model_path), budgets)
     if force_one_op_stages:
         stages: list[Stage] = []
         for index, op in enumerate(graph.ops):
@@ -4616,6 +4889,7 @@ def _compile_plan(
     plan_bytes = plan_path.read_bytes()
     plan = read_binary_plan(plan_bytes)
     plan["_compiler_scheduled_peak"] = validation.scheduled_peak_bytes
+    plan["_compiler_slow_budget"] = graph.budget.slow
     plan["_plan_bytes"] = plan_bytes
     return plan
 
@@ -4722,7 +4996,8 @@ def _run(command: list[str], description: str) -> subprocess.CompletedProcess[st
 
 _MEMORY_REPORT = re.compile(
     r"^TIGRIS_CONTRACT_MEMORY budget=(\d+) activation_limit=(\d+) "
-    r"reserve=(\d+) required=(\d+) allocated=(\d+) peak=(\d+)$",
+    r"reserve=(\d+) required=(\d+) allocated=(\d+) peak=(\d+) "
+    r"slow_peak=(\d+)$",
     re.MULTILINE,
 )
 
@@ -4734,9 +5009,15 @@ def _assert_memory_contract(
     if match is None:
         raise AssertionError(f"{case.name}: runtime emitted no memory report")
 
-    budget, activation_limit, reserve, required, allocated, measured_peak = map(
-        int, match.groups()
-    )
+    (
+        budget,
+        activation_limit,
+        reserve,
+        required,
+        allocated,
+        measured_peak,
+        slow_peak,
+    ) = map(int, match.groups())
     scheduled_peak = int(plan["_compiler_scheduled_peak"])
     if budget != plan["budget"]:
         raise AssertionError(
@@ -4767,6 +5048,15 @@ def _assert_memory_contract(
             f"{case.name}: runtime peak {measured_peak} exceeds compiler "
             f"core estimate {allocated} "
             f"({scheduled_peak} activations + {reserve} reserve)"
+        )
+    # The slow pool is sized by the compiler and filled by the runtime, and
+    # each derives what shares a buffer from the plan on its own. A case that
+    # names a slow budget is the check that those two rules still agree.
+    slow_budget = int(plan["_compiler_slow_budget"])
+    if slow_budget > 0 and slow_peak > slow_budget:
+        raise AssertionError(
+            f"{case.name}: runtime slow peak {slow_peak} exceeds the slow "
+            f"budget {slow_budget} the compiler accepted"
         )
 
 
@@ -4845,6 +5135,7 @@ def _run_metric_case(
         compile_path,
         plan_path,
         mem_budget=case.mem_budget,
+        slow_budget=case.slow_budget,
         compression=case.compression,
         xip=case.xip,
     )
@@ -4932,6 +5223,7 @@ def _run_case(
         compile_path,
         plan_path,
         mem_budget=case.mem_budget,
+        slow_budget=case.slow_budget,
         compression=case.compression,
         xip=case.xip,
         force_one_op_stages=case.force_one_op_stages,
@@ -5135,6 +5427,9 @@ def _assert_compile_rejected(work_dir: Path) -> None:
             ],
         ),
         _model(
+            # Nearest and bilinear both execute. Cubic resampling reads a
+            # four-by-four neighbourhood and has no kernel, so it is the mode
+            # that still has to be refused.
             "unsupported_resize_mode",
             [
                 helper.make_node(
@@ -5142,7 +5437,7 @@ def _assert_compile_rejected(work_dir: Path) -> None:
                     ["input", "", "scales"],
                     ["output"],
                     coordinate_transformation_mode="asymmetric",
-                    mode="linear",
+                    mode="cubic",
                 )
             ],
             [
@@ -5189,6 +5484,7 @@ def _assert_compile_rejected(work_dir: Path) -> None:
                 path,
                 work_dir / f"rejected-{index}.tgrs",
                 mem_budget="4K",
+                slow_budget=None,
                 compression=None,
                 xip=False,
             )
@@ -5235,9 +5531,12 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _token_bias_case(),
         _flattened_token_head_case(),
         _constant_divisor_case(),
+        _per_channel_constant_case(),
+        _bilinear_upsample_case(),
         _traced_shape_scale_case(),
         _unfolded_feature_map_case(),
         _split_case(),
+        _prepended_token_case(),
         _reduce_mean_case(quantized=False, keepdims=True),
         _reduce_mean_case(quantized=False, keepdims=False),
         _reduce_mean_case(quantized=True, keepdims=True),
@@ -5279,6 +5578,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _chained_normalization_case(),
         _chain_pointwise_before_spatial_case(),
         _chain_skip_out_of_a_stage_case(),
+        _row_band_alias_case(),
+        _cotiled_gate_chain_case(),
+        _reshape_alias_release_case(),
         _qdq_max_pool_rescale_case(),
         _qdq_rescale_passthrough_case(op_type="Relu"),
         _qdq_rescale_passthrough_case(op_type="Relu6"),

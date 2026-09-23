@@ -31,6 +31,10 @@ class TileCategory(Enum):
     CONV = "conv"
     POOL = "pool"
     POINTWISE = "pointwise"
+    # An operator whose output has more rows than its input. The tile loop
+    # divides to find the source band instead of multiplying, so it is its
+    # own category rather than a convolution with a fractional stride.
+    UPSAMPLE = "upsample"
     UNTILEABLE = "untileable"
 
 
@@ -67,6 +71,12 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     # argument that admits Softmax.
     "Erf": TileCategory.POINTWISE,
     "LayerNormalization": TileCategory.POINTWISE,
+    # Resampling along the height: the runtime cuts the output into bands and
+    # reads the source band each one needs. Only the height axis, and only on
+    # its own stage, because the chain executor does not compose a fractional
+    # stride through the rest of a run.
+    "Resize": TileCategory.UPSAMPLE,
+    "ResizeLinear": TileCategory.UPSAMPLE,
 }
 
 
@@ -153,6 +163,13 @@ def compute_receptive_field(
 
     for op in reversed(ops):
         cat = classify_op(op.op_type)
+        if cat is TileCategory.UPSAMPLE:
+            # Measured in input rows, a nearest resample reads one row per
+            # output row and a bilinear one reads the pair around it.
+            if op.op_type == "ResizeLinear":
+                rf_h += jump_h
+                rf_w += jump_w
+            continue
         if cat in (TileCategory.CONV, TileCategory.POOL):
             kernel_h = _get_kernel_h(op, weight_shapes)
             stride_h = _get_stride_h(op)
@@ -1463,6 +1480,10 @@ def _op_supports_axis(op: OpNode, axis: int) -> bool:
         # explicitly rather than relying on the membership check alone.
         if op.op_type == "Conv1D":
             return False
+        # A resample is cut along its height only; the 2D tiler does not
+        # invert its rectangle.
+        if classify_op(op.op_type) is TileCategory.UPSAMPLE:
+            return False
         return op.op_type in _OP_CATEGORY
     return False
 
@@ -1598,7 +1619,9 @@ def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
     """
     for op_i in stage.op_indices:
         cat = classify_op(ag.ops[op_i].op_type)
-        if cat == TileCategory.UNTILEABLE:
+        # A resample stays out of a chain: the chain executor composes one
+        # receptive field across its members and has no fractional stride.
+        if cat in (TileCategory.UNTILEABLE, TileCategory.UPSAMPLE):
             return False
     for name in (*stage.input_tensors, *stage.output_tensors):
         info = ag.tensors.get(name)
@@ -1620,62 +1643,154 @@ def _tensor_consumer_count(ag: AnalyzedGraph) -> dict[str, int]:
     return counts
 
 
+def _stage_consumers(ag: AnalyzedGraph) -> dict[str, list[int]]:
+    """Which stages read each tensor."""
+    readers: dict[str, list[int]] = {}
+    for index, stage in enumerate(ag.stages):
+        for name in stage.input_tensors:
+            readers.setdefault(name, []).append(index)
+    return readers
+
+
+def _stage_producer(ag: AnalyzedGraph) -> dict[str, int]:
+    """Which stage writes each tensor."""
+    return {
+        name: index
+        for index, stage in enumerate(ag.stages)
+        for name in stage.output_tensors
+    }
+
+
+def _has_height_spatial_op(ag: AnalyzedGraph, stage: Stage) -> bool:
+    return any(
+        classify_op(ag.ops[i].op_type) in (TileCategory.CONV, TileCategory.POOL)
+        for i in stage.op_indices
+    )
+
+
+def _skip_rows_still_line_up(
+    ag: AnalyzedGraph, run: list[int], source: int, target: int, name: str
+) -> bool:
+    """Whether a tensor carried past the next stage still has the right rows.
+
+    A chain streams one tile at a time, and a tensor produced two or more
+    stages back is still in fast memory when a later stage reads it. Its tile
+    holds the rows the producing stage wrote, so the stages in between have to
+    leave the row count alone, and the reading stage has to reach it before
+    any operator of its own changes rows. A convolution or a pool in that
+    span would leave the two operands describing different rows.
+    """
+    for index in run[run.index(source) + 1:]:
+        if index == target:
+            break
+        if _has_height_spatial_op(ag, ag.stages[index]):
+            return False
+    for op_index in ag.stages[target].op_indices:
+        op = ag.ops[op_index]
+        if name in op.inputs:
+            return True
+        if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL):
+            return False
+    return True
+
+
+def _may_extend_chain(
+    ag: AnalyzedGraph,
+    run: list[int],
+    index: int,
+    producer: dict[str, int],
+) -> bool:
+    """Whether the stage at `index` streams from the run it would join."""
+    stage = ag.stages[index]
+    if not _is_stage_tileable(ag, stage):
+        return False
+    previous = ag.stages[run[-1]]
+    if len(previous.output_tensors) != 1:
+        return False
+    streamed = previous.output_tensors[0]
+    if streamed in ag.model_outputs or streamed not in stage.input_tensors:
+        return False
+    inside = set(run)
+    for name in stage.input_tensors:
+        source = producer.get(name)
+        # Only the first stage of a chain loads from slow memory. Every other
+        # operand has to be one the chain itself is already carrying.
+        if source is None or source not in inside:
+            return False
+        if source != run[-1] and not _skip_rows_still_line_up(
+            ag, run, source, index, name
+        ):
+            return False
+    return True
+
+
+def _run_is_self_contained(
+    ag: AnalyzedGraph, run: list[int], readers: dict[str, list[int]]
+) -> bool:
+    """Whether everything the run produces before its last stage stays inside.
+
+    A chain writes only its last stage's outputs to slow memory. Anything an
+    earlier stage produces is streamed and gone, so a reader outside the run,
+    or a model output, would be left with nothing.
+    """
+    inside = set(run)
+    for index in run[:-1]:
+        stage = ag.stages[index]
+        if len(stage.output_tensors) != 1:
+            return False
+        produced = stage.output_tensors[0]
+        if produced in ag.model_outputs:
+            return False
+        if any(r not in inside for r in readers.get(produced, ())):
+            return False
+    return True
+
+
 def detect_chains(ag: AnalyzedGraph) -> list[list[int]]:
     """Detect streamable chains: maximal runs of consecutive tiled stages.
 
-    A chain [s_i, s_{i+1}, ...] requires for each adjacent pair (s_k, s_{k+1}):
-      1. Both stages are spatially tileable (all ops tileable, 4D I/O)
-      2. s_k has exactly one output tensor
-      3. s_{k+1} has exactly one input tensor
-      4. s_k's output IS s_{k+1}'s input (same tensor)
-      5. No other stage consumes that intermediate tensor (no fan-out)
+    A run [s_i .. s_j] is a chain when every stage is spatially tileable, each
+    stage takes the single output of the one before it, and everything the run
+    produces short of its last stage is read only inside the run and is not a
+    model output. Those intermediates are streamed a tile at a time and never
+    reach slow memory.
 
-    Returns a list of chain groups, each a sorted list of stage indices (length >= 2).
+    A stage may also read a tensor an earlier stage of the same run produced,
+    which is what a gate or a residual around one operator looks like: the
+    tile is still in fast memory when the later stage wants it, as long as
+    nothing in between changed the rows it describes.
+
+    Returns a list of chain groups, each a sorted list of stage indices
+    (length >= 2).
     """
     if not ag.stages or len(ag.stages) < 2:
         return []
 
-    consumer_counts = _tensor_consumer_count(ag)
+    readers = _stage_consumers(ag)
+    producer = _stage_producer(ag)
     chains: list[list[int]] = []
-    current_chain: list[int] = []
 
-    for i, stage in enumerate(ag.stages):
-        if not current_chain:
-            # Try to start a chain at this stage
-            if _is_stage_tileable(ag, stage):
-                current_chain = [i]
+    index = 0
+    while index < len(ag.stages):
+        if not _is_stage_tileable(ag, ag.stages[index]):
+            index += 1
             continue
-
-        prev_stage = ag.stages[current_chain[-1]]
-
-        # Check chaining conditions between prev and current
-        can_chain = (
-            _is_stage_tileable(ag, stage)
-            and len(prev_stage.output_tensors) == 1
-            and len(stage.input_tensors) == 1
-            and prev_stage.output_tensors[0] == stage.input_tensors[0]
-            and consumer_counts.get(prev_stage.output_tensors[0], 0) == 1
-            # The chain intermediate is streamed tile-by-tile and never
-            # materialized to slow memory; if it is also a model output, chaining
-            # would leave that output unwritten. Keep it out of the chain.
-            and prev_stage.output_tensors[0] not in ag.model_outputs
-        )
-
-        if can_chain:
-            current_chain.append(i)
+        run = [index]
+        follower = index + 1
+        while follower < len(ag.stages) and _may_extend_chain(
+            ag, run, follower, producer
+        ):
+            run.append(follower)
+            follower += 1
+        # Dropping the last stage can orphan a tensor an earlier stage carries
+        # for it, so re-check after every trim rather than once.
+        while len(run) >= 2 and not _run_is_self_contained(ag, run, readers):
+            run.pop()
+        if len(run) >= 2:
+            chains.append(run)
+            index = run[-1] + 1
         else:
-            # Flush current chain if length >= 2
-            if len(current_chain) >= 2:
-                chains.append(current_chain)
-            # Try starting a new chain from this stage
-            if _is_stage_tileable(ag, stage):
-                current_chain = [i]
-            else:
-                current_chain = []
-
-    # Flush last chain
-    if len(current_chain) >= 2:
-        chains.append(current_chain)
+            index += 1
 
     return chains
 

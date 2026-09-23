@@ -272,6 +272,103 @@ class TestExternalOutputRows:
         assert _external_outputs_keep_their_rows(stage, ops)
 
 
+def _gate_model(path, *, between_changes_rows: bool, gate_escapes: bool = False):
+    """Conv -> Sigmoid -> Mul(conv, sigmoid) -> Conv, the shape of a SiLU.
+
+    The Mul reads the tensor the Sigmoid read, so the chain has to carry it
+    past the Sigmoid. `between_changes_rows` puts a strided convolution in
+    that span instead, which leaves the two operands describing different
+    rows. `gate_escapes` gives the Sigmoid's output a second reader after the
+    chain, which nothing streams to.
+    """
+    c, side = 8, 24
+    rng = np.random.default_rng(0)
+    first = rng.normal(size=(c, c, 3, 3)).astype(np.float32) * 0.2
+    second = rng.normal(size=(c, c, 3, 3)).astype(np.float32) * 0.2
+    inits = [
+        helper.make_tensor("first", TensorProto.FLOAT, [c, c, 3, 3],
+                           first.flatten().tolist()),
+        helper.make_tensor("second", TensorProto.FLOAT, [c, c, 3, 3],
+                           second.flatten().tolist()),
+    ]
+    nodes = [
+        helper.make_node("Conv", ["input", "first"], ["gated"],
+                         kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+    ]
+    if between_changes_rows:
+        nodes.append(helper.make_node("MaxPool", ["gated"], ["pooled"],
+                                      kernel_shape=[2, 2], strides=[2, 2]))
+        nodes.append(helper.make_node("Sigmoid", ["pooled"], ["gate"]))
+        nodes.append(helper.make_node("Mul", ["gated", "gate"], ["silu"]))
+    else:
+        nodes.append(helper.make_node("Sigmoid", ["gated"], ["gate"]))
+        nodes.append(helper.make_node("Mul", ["gated", "gate"], ["silu"]))
+    nodes.append(helper.make_node("Conv", ["silu", "second"], ["convolved"],
+                                 kernel_shape=[3, 3], pads=[1, 1, 1, 1]))
+    if gate_escapes:
+        nodes.append(helper.make_node("Add", ["convolved", "gate"], ["output"]))
+    else:
+        nodes.append(helper.make_node("Relu", ["convolved"], ["output"]))
+
+    graph = helper.make_graph(
+        nodes, "gate",
+        [helper.make_tensor_value_info(
+            "input", TensorProto.FLOAT, [1, c, side, side])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, c, side, side])],
+        initializer=inits)
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    onnx.save(model, str(path))
+    return path
+
+
+class TestCarriedOperand:
+    """A chain may carry one stage's output past the next stage."""
+
+    def test_a_gate_is_carried_through_the_chain(self, tmp_path):
+        path = _gate_model(tmp_path / "gate.onnx", between_changes_rows=False)
+        ag, chains = _stages_then_chains(path, budget=16 * 1024)
+        carried = [
+            group for group in chains
+            if any(len(ag.stages[i].input_tensors) > 1 for i in group[1:])
+        ]
+        assert carried, "expected the Mul to join the chain it gates"
+        group = carried[0]
+        types = [
+            [ag.ops[o].op_type for o in ag.stages[i].op_indices]
+            for i in group
+        ]
+        assert ["Sigmoid"] in types and ["Mul"] in types
+
+    def test_a_row_change_in_between_refuses_the_carry(self, tmp_path):
+        """The carried tile holds the producer's rows, so anything that
+        changes rows in between leaves the two operands disagreeing."""
+        path = _gate_model(tmp_path / "pooled.onnx", between_changes_rows=True)
+        ag, chains = _stages_then_chains(path, budget=16 * 1024)
+        for group in chains:
+            for index in group[1:]:
+                assert len(ag.stages[index].input_tensors) <= 1
+
+    def test_a_reader_after_the_chain_refuses_the_carry(self, tmp_path):
+        """Nothing writes a streamed tensor to slow memory, so a reader past
+        the chain would find nothing there."""
+        path = _gate_model(
+            tmp_path / "escapes.onnx", between_changes_rows=False,
+            gate_escapes=True)
+        ag, chains = _stages_then_chains(path, budget=16 * 1024)
+        readers: dict[str, set[int]] = {}
+        for index, stage in enumerate(ag.stages):
+            for name in stage.input_tensors:
+                readers.setdefault(name, set()).add(index)
+        for group in chains:
+            inside = set(group)
+            for index in group[:-1]:
+                for name in ag.stages[index].output_tensors:
+                    assert readers.get(name, set()) <= inside
+
+
 # Chain detection tests
 
 
@@ -292,21 +389,28 @@ class TestDetectChains:
         assert len(chain_ids) == 1
 
     def test_fanout_breaks_chain(self, chain_with_fanout_path):
-        """Fan-out on intermediate tensor should prevent chaining."""
+        """A reader outside the chain keeps the chain from reaching it.
+
+        The Add takes the Relu's output as well as the convolution's, and a
+        chain only streams what it also consumes. Here the convolution between
+        the two changes the rows, so the Add cannot join and read the carried
+        tensor; the chain has to stop before the Relu's output leaves it.
+        """
         ag = _full_pipeline(chain_with_fanout_path, budget=32000)
 
-        # If there are chains, they should not span across the fan-out point
-        # The Add stage consumes t1 (produced by Relu stage) AND t2 (produced by Conv1 stage)
-        # So the Add stage has 2 inputs -> can't be part of a chain
+        readers: dict[str, set[int]] = {}
+        for index, stage in enumerate(ag.stages):
+            for name in stage.input_tensors:
+                readers.setdefault(name, set()).add(index)
+
         for s in ag.stages:
-            if s.chain_len >= 2:
-                # Verify the chain doesn't include stages with multi-input
-                chain_stages = [
-                    ag.stages[i]
-                    for i in range(s.chain_id, s.chain_id + s.chain_len)
-                ]
-                for cs in chain_stages[1:]:  # skip first (can have any input)
-                    assert len(cs.input_tensors) <= 1
+            if s.chain_len < 2:
+                continue
+            inside = set(range(s.chain_id, s.chain_id + s.chain_len))
+            for index in sorted(inside)[:-1]:
+                for name in ag.stages[index].output_tensors:
+                    assert readers.get(name, set()) <= inside, (
+                        f"{name} is streamed but read outside the chain")
 
     def test_no_chains_when_all_fits(self, three_conv_chain_path):
         """With a huge budget, everything fits in one stage - no chains."""

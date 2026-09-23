@@ -46,6 +46,7 @@
     "Relu6": 4,
     "Reshape": 17,
     "Resize": 30,
+    "ResizeLinear": 36,
     "Sigmoid": 12,
     "Softmax": 10,
     "Split": 35,
