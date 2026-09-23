@@ -51,6 +51,7 @@ from test_2d_tiling_plan import decode_first_tile_plan  # noqa: E402
 Array = NDArray[np.generic]
 _DTYPE_BY_ONNX_CODE = {
     TensorProto.FLOAT: np.dtype("<f4"),
+    TensorProto.UINT8: np.dtype("u1"),
     TensorProto.INT8: np.dtype("i1"),
 }
 _INT8_LSB_TOLERANCE = 1
@@ -458,7 +459,7 @@ def _per_channel_constant_case() -> ContractCase:
     )
 
 
-def _bilinear_upsample_case() -> ContractCase:
+def _bilinear_upsample_case(*, tiled: bool = False) -> ContractCase:
     """Bilinear upsampling, which is how a dense prediction returns to size.
 
     It is its own operator rather than a mode on the nearest one, so a runtime
@@ -486,6 +487,13 @@ def _bilinear_upsample_case() -> ContractCase:
         ],
     )
     data = (rng.normal(size=(1, channels, side, side))).astype(np.float32)
+    if tiled:
+        # In bands, every band after the first starts a source row ahead of
+        # out / scale, which the band has to reach.
+        return ContractCase(
+            "float_bilinear_upsample_tiled", model, model, {"input": data},
+            ("ResizeLinear",), mem_budget="2K", expect_tiled=True,
+        )
     return ContractCase(
         "float_bilinear_upsample",
         model,
@@ -493,6 +501,254 @@ def _bilinear_upsample_case() -> ContractCase:
         {"input": data},
         ("ResizeLinear",),
     )
+
+
+def _qdq(tensor: str, scale: str, zero: str, out: str) -> list[onnx.NodeProto]:
+    """A QuantizeLinear/DequantizeLinear pair, the way a QDQ export marks a tensor int8."""
+    return [
+        helper.make_node("QuantizeLinear", [tensor, scale, zero], [f"{out}_q"]),
+        helper.make_node("DequantizeLinear", [f"{out}_q", scale, zero], [out]),
+    ]
+
+
+def _scalars(**values: tuple[float, int]) -> list[onnx.TensorProto]:
+    """Scale and int8 zero-point initializers, named <key>_s and <key>_z."""
+    tensors = []
+    for key, (scale, zero) in values.items():
+        tensors.append(numpy_helper.from_array(
+            np.array(scale, dtype=np.float32), f"{key}_s"))
+        tensors.append(numpy_helper.from_array(
+            np.array(zero, dtype=np.int8), f"{key}_z"))
+    return tensors
+
+
+def _hardswish_case(*, quantized: bool) -> ContractCase:
+    """HardSwish, MobileNetV3's activation, banded behind a convolution.
+
+    The convolution's outputs span roughly [-4, 4], so the sample covers the
+    zero region below -3, the curved middle and the identity above 3.
+    """
+    channels, side = 8, 16
+    rng = np.random.default_rng(21)
+    weight = (rng.normal(size=(channels, channels, 3, 3)) * 0.25).astype(np.float32)
+    data = rng.uniform(-1.0, 1.0, size=(1, channels, side, side)).astype(np.float32)
+    initializers = [numpy_helper.from_array(weight, "weight")]
+    if quantized:
+        initializers += _scalars(inp=(0.008, 0), w=(0.01, 0), conv=(0.035, 0), hs=(0.03, -40))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            *_qdq("weight", "w_s", "w_z", "wdq"),
+            helper.make_node("Conv", ["x", "wdq"], ["raw"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+            *_qdq("raw", "conv_s", "conv_z", "act_in"),
+            helper.make_node("HardSwish", ["act_in"], ["act"]),
+            *_qdq("act", "hs_s", "hs_z", "output"),
+        ]
+    else:
+        nodes = [
+            helper.make_node("Conv", ["input", "weight"], ["raw"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+            helper.make_node("HardSwish", ["raw"], ["output"]),
+        ]
+    label = f"{'int8' if quantized else 'float'}_hardswish"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, side, side])],
+        initializers, opset=14,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data},
+                        ("Conv", "HardSwish"), mem_budget="2K", expect_tiled=True,
+                        # int8 rows are small enough that the solver streams the
+                        # pair as a line-buffered chain, which bands HardSwish
+                        # the other way.
+                        expect_chain=quantized, expect_line_buffered=quantized)
+
+
+def _split_chain_case(*, quantized: bool) -> ContractCase:
+    """A strided stem feeding wide layers, too big to stream as one chain.
+
+    Three stride-2 convolutions shrink the map to 8x8 and three wide layers
+    follow. At the budget the whole run has no tile height that fits, so it
+    streams as consecutive chains, each writing only its last output.
+    """
+    rng = np.random.default_rng(29)
+    layers = [(3, 8, 3, 2), (8, 16, 3, 2), (16, 16, 3, 2), (16, 64, 1, 1), (64, 64, 3, 1), (64, 8, 1, 1)]
+    data = rng.uniform(0.0, 1.0, size=(1, 3, 64, 64)).astype(np.float32)
+    initializers, nodes = [], []
+    previous = "input"
+    if quantized:
+        initializers += _scalars(inp=(1 / 255, -128))
+        nodes += _qdq("input", "inp_s", "inp_z", "x")
+        previous = "x"
+    for index, (cin, cout, kernel, stride) in enumerate(layers):
+        weight = (rng.normal(size=(cout, cin, kernel, kernel)) / np.sqrt(cin * kernel * kernel)).astype(np.float32)
+        initializers.append(numpy_helper.from_array(weight, f"w{index}"))
+        weight_name = f"w{index}"
+        if quantized:
+            initializers += _scalars(**{f"w{index}q": (float(np.abs(weight).max()) / 127, 0),
+                                        f"a{index}": (0.02, -128)})
+            nodes += _qdq(f"w{index}", f"w{index}q_s", f"w{index}q_z", f"w{index}dq")
+            weight_name = f"w{index}dq"
+        last = index == len(layers) - 1
+        nodes += [
+            helper.make_node("Conv", [previous, weight_name], [f"c{index}"], kernel_shape=[kernel, kernel],
+                             strides=[stride, stride], pads=[kernel // 2] * 4),
+            helper.make_node("Relu", [f"c{index}"], [f"r{index}"]),
+        ]
+        previous = f"r{index}"
+        if quantized:
+            out = "output" if last else f"q{index}"
+            nodes += _qdq(previous, f"a{index}_s", f"a{index}_z", out)
+            previous = out
+    nodes[-1].output[0] = "output"
+    label = f"{'int8' if quantized else 'float'}_split_chain"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 64, 64])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 8, 8])],
+        initializers,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data},
+                        ("Conv",) * len(layers), mem_budget="3K" if quantized else "12K",
+                        expect_tiled=True, expect_chain=True, expect_line_buffered=True)
+
+
+def _squeeze_excitation_case(*, quantized: bool) -> ContractCase:
+    """A squeeze-and-excitation gate: one value per channel scales the map.
+
+    The gate is the Mul's first operand, as exporters write it, so the case
+    also covers putting the full-shape operand first. The map is larger than
+    the budget, so the Mul runs in bands with the gate loaded whole each time.
+    """
+    channels, side = 16, 12
+    rng = np.random.default_rng(22)
+    weight = (rng.normal(size=(channels, channels, 1, 1)) * 0.5).astype(np.float32)
+    bias = (rng.normal(size=(channels,)) * 0.2).astype(np.float32)
+    data = rng.uniform(-1.0, 1.0, size=(1, channels, side, side)).astype(np.float32)
+    initializers = [numpy_helper.from_array(weight, "weight")]
+    if not quantized:
+        initializers.append(numpy_helper.from_array(bias, "bias"))
+    if quantized:
+        initializers += _scalars(inp=(0.008, 3), pool=(0.004, 0), w=(0.008, 0),
+                                 fc=(0.02, 0), gate=(1.0 / 256.0, -128), out=(0.007, 1))
+        # An int32 bias at the accumulator scale, dequantized only, which is
+        # how a QDQ export states it.
+        bias_scale = np.float32(0.004 * 0.008)
+        initializers.append(numpy_helper.from_array(
+            np.round(bias / bias_scale).astype(np.int32), "bias_q"))
+        initializers.append(numpy_helper.from_array(np.array(bias_scale, dtype=np.float32), "b_s"))
+        initializers.append(numpy_helper.from_array(np.array(0, dtype=np.int32), "b_z"))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            helper.make_node("GlobalAveragePool", ["x"], ["pooled_raw"]),
+            *_qdq("pooled_raw", "pool_s", "pool_z", "pooled"),
+            *_qdq("weight", "w_s", "w_z", "wdq"),
+            helper.make_node("DequantizeLinear", ["bias_q", "b_s", "b_z"], ["bdq"]),
+            helper.make_node("Conv", ["pooled", "wdq", "bdq"], ["fc_raw"], kernel_shape=[1, 1]),
+            *_qdq("fc_raw", "fc_s", "fc_z", "fc"),
+            helper.make_node("Sigmoid", ["fc"], ["gate_raw"]),
+            *_qdq("gate_raw", "gate_s", "gate_z", "gate"),
+            helper.make_node("Mul", ["gate", "x"], ["scaled"]),
+            *_qdq("scaled", "out_s", "out_z", "output"),
+        ]
+    else:
+        nodes = [
+            helper.make_node("GlobalAveragePool", ["input"], ["pooled"]),
+            helper.make_node("Conv", ["pooled", "weight", "bias"], ["fc"], kernel_shape=[1, 1]),
+            helper.make_node("Sigmoid", ["fc"], ["gate"]),
+            helper.make_node("Mul", ["gate", "input"], ["output"]),
+        ]
+    label = f"{'int8' if quantized else 'float'}_squeeze_excitation"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, side, side])],
+        initializers,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data},
+                        ("GlobalAveragePool", "Conv", "Sigmoid", "Mul"),
+                        mem_budget="2K", expect_tiled=True)
+
+
+def _qdq_bilinear_upsample_case() -> ContractCase:
+    """Int8 bilinear upsampling in bands, with different input and output scales.
+
+    The four samples are mixed in the real domain and requantized, so an
+    output scale that differed from the input's and went unapplied would be
+    off by far more than rounding.
+    """
+    channels, side = 4, 8
+    rng = np.random.default_rng(23)
+    data = rng.uniform(-2.0, 2.0, size=(1, channels, side, side)).astype(np.float32)
+    initializers = _scalars(inp=(0.02, 3), out=(0.013, -5)) + [
+        numpy_helper.from_array(np.array([], dtype=np.float32), "roi"),
+        numpy_helper.from_array(np.array([1, 1, 2, 2], dtype=np.float32), "scales"),
+    ]
+    nodes = [
+        *_qdq("input", "inp_s", "inp_z", "x"),
+        helper.make_node("Resize", ["x", "roi", "scales"], ["raw"], mode="linear"),
+        *_qdq("raw", "out_s", "out_z", "output"),
+    ]
+    model = _model(
+        "int8_bilinear_upsample", nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 2 * side, 2 * side])],
+        initializers,
+    )
+    return ContractCase("int8_bilinear_upsample", model, copy.deepcopy(model), {"input": data},
+                        ("ResizeLinear",), mem_budget="512", expect_tiled=True)
+
+
+def _quantized_boundary_case() -> ContractCase:
+    """A model that takes and returns uint8, the way a camera pipeline does.
+
+    The input is dequantized straight off the graph input and the output is
+    the QuantizeLinear itself, with no float anywhere at the boundary. Both
+    fold onto int8 tensors whose declared interface stays uint8.
+    """
+    rng = np.random.default_rng(24)
+    weight = (rng.normal(size=(4, 3, 3, 3)) * 0.3).astype(np.float32)
+    initializers = [
+        numpy_helper.from_array(weight, "weight"),
+        numpy_helper.from_array(np.array(1.0 / 255.0, dtype=np.float32), "img_s"),
+        numpy_helper.from_array(np.array(0, dtype=np.uint8), "img_z"),
+        numpy_helper.from_array(np.array(0.02, dtype=np.float32), "out_s"),
+        numpy_helper.from_array(np.array(100, dtype=np.uint8), "out_z"),
+    ] + _scalars(w=(0.01, 0))
+    nodes = [
+        helper.make_node("DequantizeLinear", ["image", "img_s", "img_z"], ["x"]),
+        *_qdq("weight", "w_s", "w_z", "wdq"),
+        helper.make_node("Conv", ["x", "wdq"], ["raw"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        helper.make_node("QuantizeLinear", ["raw", "out_s", "out_z"], ["mask"]),
+    ]
+    model = _model(
+        "uint8_boundary", nodes,
+        [helper.make_tensor_value_info("image", TensorProto.UINT8, [1, 3, 8, 8])],
+        [helper.make_tensor_value_info("mask", TensorProto.UINT8, [1, 4, 8, 8])],
+        initializers,
+    )
+    data = rng.integers(0, 256, size=(1, 3, 8, 8)).astype(np.uint8)
+    return ContractCase("uint8_boundary", model, copy.deepcopy(model), {"image": data}, ("Conv",))
+
+
+def _whole_map_average_pool_case() -> ContractCase:
+    """An AveragePool whose window is the whole map, as F.avg_pool2d writes it.
+
+    count_include_pad=1 is PyTorch's default and changes nothing without
+    padding. The op becomes the global pool, which streams in bands instead of
+    needing the whole input at once.
+    """
+    channels, side = 8, 12
+    rng = np.random.default_rng(25)
+    data = rng.normal(size=(1, channels, side, side)).astype(np.float32)
+    model = _model(
+        "whole_map_average_pool",
+        [helper.make_node("AveragePool", ["input"], ["output"], kernel_shape=[side, side],
+                          strides=[side, side], count_include_pad=1)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 1, 1])],
+    )
+    return ContractCase("float_whole_map_average_pool", model, copy.deepcopy(model), {"input": data},
+                        ("GlobalAveragePool",), mem_budget="2K", expect_tiled=True)
 
 
 def _traced_shape_scale_case() -> ContractCase:
@@ -4923,6 +5179,10 @@ def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
             encoded = source.astype(np.float32, copy=False)
         elif declared == TensorProto.INT8:
             encoded = _quantize_input(source, plan, tensor)
+        elif declared == TensorProto.UINT8:
+            # A camera hands over bytes; the runtime moves them onto the int8
+            # tensor itself, so the harness passes them through untouched.
+            encoded = source.astype(np.uint8, copy=False)
         else:
             raise AssertionError(
                 f"unsupported contract input dtype {declared}"
@@ -5297,8 +5557,10 @@ def _assert_output_parity(
         elif np.issubdtype(expected.dtype, np.floating):
             np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
         else:
+            # Widen first: unsigned bytes would wrap in the subtraction.
             np.testing.assert_allclose(
-                actual, expected, rtol=0, atol=_INT8_LSB_TOLERANCE
+                actual.astype(np.int64), expected.astype(np.int64),
+                rtol=0, atol=_INT8_LSB_TOLERANCE,
             )
 
 
@@ -5533,6 +5795,16 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _constant_divisor_case(),
         _per_channel_constant_case(),
         _bilinear_upsample_case(),
+        _bilinear_upsample_case(tiled=True),
+        _split_chain_case(quantized=False),
+        _split_chain_case(quantized=True),
+        _hardswish_case(quantized=False),
+        _hardswish_case(quantized=True),
+        _squeeze_excitation_case(quantized=False),
+        _squeeze_excitation_case(quantized=True),
+        _qdq_bilinear_upsample_case(),
+        _quantized_boundary_case(),
+        _whole_map_average_pool_case(),
         _traced_shape_scale_case(),
         _unfolded_feature_map_case(),
         _split_case(),

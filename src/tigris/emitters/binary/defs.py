@@ -107,6 +107,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "Erf": 34,
     "Split": 35,
     "ResizeLinear": 36,
+    "HardSwish": 37,
 }
 OP_TYPE_UNKNOWN = 255
 

@@ -91,7 +91,8 @@ def test_public_qualifications_reference_real_native_routes():
     assert "length tiling" in OPERATOR_CONSTRAINTS["Tanh"][0]
     assert "length tiling" in OPERATOR_CONSTRAINTS["Add"][1]
     assert "untiled execution" in OPERATOR_CONSTRAINTS["GlobalAveragePool"][0]
-    assert "untiled execution" in OPERATOR_CONSTRAINTS["Resize"][0]
+    assert "height tiling" in OPERATOR_CONSTRAINTS["Resize"][0]
+    assert "never in a chain" in OPERATOR_CONSTRAINTS["ResizeLinear"][0]
 
 
 def test_codegen_route_descriptions_do_not_imply_float_acceleration():

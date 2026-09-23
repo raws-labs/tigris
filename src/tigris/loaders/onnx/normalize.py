@@ -71,11 +71,13 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _relabel_conv1d(ag)
     ag = _clip_to_relu6(ag)
     ag = _reduce_mean_to_gap(ag)
+    ag = _whole_map_average_pool_to_gap(ag)
     ag = _fold_shape_ops(ag)
     ag = _resolve_resize_conventions(ag)
     ag = _extract_resize_scales(ag)
     ag = _strip_metadata_inputs(ag)
     ag = _validate_transposes(ag)
+    ag = _order_broadcast_operands(ag)
     ag = _absorb_activations(ag)
     ag = _fold_split_into_its_weight(ag)
     ag = _assign_tensor_layouts(ag)
@@ -1280,7 +1282,34 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 removed.add(i)
                 removed.add(ql_idx)
 
-        if is_weight_dql:
+        # Case 3: a quantized model input -> DequantizeLinear. The input keeps
+        # its place and becomes the int8 tensor the kernels read; the dtype
+        # the model declares stays recorded, so the plan converts at the
+        # boundary instead of carrying a float copy of the input.
+        is_boundary_dql = False
+        if (
+            not is_weight_dql
+            and dql_input in ag.model_inputs
+            and dql_input not in output_to_op
+            and dql_input in ag.tensors
+            and ag.tensors[dql_input].dtype in (2, 3)  # uint8, int8
+            and all(
+                ag.ops[cons_idx].op_type == "DequantizeLinear"
+                for cons_idx, _ in input_to_consumers.get(dql_input, [])
+            )
+        ):
+            qp, _ = _get_quant_param(op)
+            if qp is not None:
+                is_boundary_dql = True
+                ag.tensors[dql_input].quant = qp
+                ag.tensors[dql_input].dtype = 3  # INT8
+                for cons_idx, pos in input_to_consumers.get(dql_output, []):
+                    ag.ops[cons_idx].inputs[pos] = dql_input
+                if dql_output in ag.tensors and dql_output != dql_input:
+                    del ag.tensors[dql_output]
+                removed.add(i)
+
+        if is_weight_dql or is_boundary_dql:
             for inp_name in op.inputs[1:]:
                 if inp_name:
                     deferred_cleanup.add(inp_name)
@@ -1341,6 +1370,14 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 if inp_name:
                     deferred_cleanup.add(inp_name)
 
+        # A graph output taken straight off the QuantizeLinear moves onto the
+        # tensor it quantizes, which now carries the parameters. The declared
+        # dtype stays recorded by position, so the boundary still converts.
+        if ql_output in ag.model_outputs:
+            ag.model_outputs = [
+                ql_input if n == ql_output else n for n in ag.model_outputs
+            ]
+
         # Remove QL intermediate tensor
         if ql_output in ag.tensors and ql_output != ql_input:
             del ag.tensors[ql_output]
@@ -1369,6 +1406,28 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 # Batch normalization
+
+
+def _order_broadcast_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Put the full-shape operand first in an Add or Mul that broadcasts.
+
+    A squeeze-and-excitation block multiplies a feature map by one value per
+    channel, and exporters write either operand first. The kernels take the
+    first operand's shape as the result's and repeat the second, so the
+    commutative ops are reordered here rather than taught both orders.
+    """
+    for op in ag.ops:
+        if op.op_type not in ("Add", "Mul") or len(op.inputs) != 2:
+            continue
+        if len(op.outputs) != 1 or op.outputs[0] not in ag.tensors:
+            continue
+        first, second = (ag.tensors.get(name) for name in op.inputs)
+        if first is None or second is None:
+            continue
+        result = tuple(ag.tensors[op.outputs[0]].shape)
+        if tuple(first.shape) != result and tuple(second.shape) == result:
+            op.inputs = [op.inputs[1], op.inputs[0]]
+    return ag
 
 
 def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -2356,6 +2415,37 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
             if axes_name in ag.tensors:
                 del ag.tensors[axes_name]
 
+    return ag
+
+
+def _whole_map_average_pool_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Replace an AveragePool whose one window is the whole map with its global pool.
+
+    ``F.avg_pool2d(x, x.shape[2:])`` exports as AveragePool with the kernel set
+    to the input's height and width. With no padding it averages the same
+    samples by the same count as GlobalAveragePool, which the compiler streams
+    through fast memory a band at a time; as a pooling window it spans the
+    whole height, so no band could be smaller than the input.
+    """
+    for op in ag.ops:
+        if op.op_type != "AveragePool" or len(op.inputs) != 1:
+            continue
+        source = ag.tensors.get(op.inputs[0])
+        result = ag.tensors.get(op.outputs[0]) if op.outputs else None
+        if source is None or result is None:
+            continue
+        if len(source.shape) != 4 or len(result.shape) != 4:
+            continue
+        kernel = [int(k) for k in op.attrs.get("kernel_shape", [])]
+        pads = [int(p) for p in op.attrs.get("pads", [0, 0, 0, 0])]
+        if kernel != [int(source.shape[2]), int(source.shape[3])]:
+            continue
+        if any(pads) or int(op.attrs.get("ceil_mode", 0)) != 0:
+            continue
+        if tuple(result.shape[2:]) != (1, 1):
+            continue
+        op.op_type = "GlobalAveragePool"
+        op.attrs = {}
     return ag
 
 

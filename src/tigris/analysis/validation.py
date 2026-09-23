@@ -243,10 +243,14 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if any(value != 1 for value in dilations):
                 reasons.append("pooling dilation is not implemented")
 
-        if op.op_type == "AveragePool" and int(
-            op.attrs.get("count_include_pad", 0)
-        ) != 0:
-            reasons.append("count_include_pad=1 is not encoded")
+        # Without padding every window lies inside the input, so counting the
+        # padded positions changes nothing: PyTorch states the flag by default.
+        if (
+            op.op_type == "AveragePool"
+            and int(op.attrs.get("count_include_pad", 0)) != 0
+            and any(int(pad) != 0 for pad in op.attrs.get("pads", []))
+        ):
+            reasons.append("count_include_pad=1 with padding is not encoded")
 
         if op.op_type == "MaxPool":
             if int(op.attrs.get("storage_order", 0)) != 0:
@@ -399,10 +403,6 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         "bilinear Resize coordinate_transformation_mode must "
                         "be 'half_pixel' or 'asymmetric'"
                     )
-                if ag.is_quantized:
-                    reasons.append(
-                        "bilinear Resize mixes samples and has no int8 kernel"
-                    )
             else:
                 if op.attrs.get("mode", "nearest") != "nearest":
                     reasons.append("Resize mode must be 'nearest'")
@@ -469,11 +469,46 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 reference_shape = dynamic_inputs[0].shape
                 if output.shape != reference_shape:
                     reasons.append("output shape must match the first operand exactly")
-                if any(
-                    tensor.shape != reference_shape
+                per_channel = [
+                    tensor
                     for tensor in dynamic_inputs[1:]
+                    if tensor.shape != reference_shape
+                ]
+                # The runtime takes a per-channel operand at the full
+                # operand's rank; a constant may be written shorter, a
+                # dynamic tensor may not.
+                if any(
+                    len(tensor.shape) != len(reference_shape)
+                    or not _is_per_channel_constant(
+                        tuple(tensor.shape), dynamic_inputs[0])
+                    for tensor in per_channel
                 ):
-                    reasons.append("dynamic operand broadcasting is not implemented")
+                    reasons.append(
+                        "a dynamic second operand must have the first "
+                        "operand's shape or one value per channel"
+                    )
+                elif per_channel:
+                    stage = next(
+                        (candidate for candidate in ag.stages
+                         if candidate.stage_id == op.stage),
+                        None,
+                    )
+                    # One row high, a per-channel operand is loaded whole
+                    # for every band of a rank-4 height stripe. No other tile
+                    # executor has that rule.
+                    tiled = stage is not None and stage.tile_plan is not None \
+                        and stage.tile_plan.tileable
+                    if stage is not None and (
+                        stage.chain_id != 0xFFFF
+                        or (tiled and (
+                            stage.tile_plan.tile_width != 0
+                            or stage.tile_plan.axis != TILE_AXIS_HEIGHT_OR_LENGTH
+                            or len(dynamic_inputs[0].shape) != 4))
+                    ):
+                        reasons.append(
+                            "a per-channel operand is banded only by a "
+                            "rank-4 height stripe"
+                        )
 
                 if constant_names:
                     if ag.is_quantized:

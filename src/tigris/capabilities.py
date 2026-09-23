@@ -59,14 +59,15 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Transpose",
     "LayerNormalization",
     "Erf",
+    "HardSwish",
     "ReduceMean",
     "Split",
 })
 
-# Bilinear upsampling mixes neighbouring samples, and a constant operand in
-# the plan carries no scale or zero point, so the int8 dispatcher has no
-# requantizing kernel for it. Every other reference operator is in both sets.
-_S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS - frozenset({"ResizeLinear"})
+# Every reference operator has an int8 kernel. What an int8 plan cannot state
+# is a constant operand's scale and zero point, which validation refuses per
+# operator.
+_S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS
 
 
 # Native accelerated adapters sometimes route a supported variant through the
@@ -103,15 +104,15 @@ CONDITIONAL_FALLBACKS: dict[str, dict[str, str]] = {
 # mistaken for support for every ONNX attribute combination.
 OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "Add": (
-        "dynamic operands must have identical shapes; a float constant operand is one value, one per channel, or one per element",
+        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a float constant operand is one value, one per channel, or one per element",
         "standalone rank-3 pointwise length tiling on serialized axis 1",
     ),
     "Mul": (
-        "dynamic operands must have identical shapes; a float constant operand is one value, one per channel, or one per element",
+        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a float constant operand is one value, one per channel, or one per element",
         "standalone rank-3 pointwise length tiling on serialized axis 1",
     ),
     "AveragePool": (
-        "explicit padding, floor output sizing, unit dilation, and count_include_pad=0",
+        "explicit padding, floor output sizing, unit dilation, and count_include_pad=0 wherever padding is non-zero",
     ),
     "MaxPool": (
         "explicit padding, floor output sizing, unit dilation, and no indices output",
@@ -133,17 +134,20 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "over both spatial axes is rewritten to GlobalAveragePool instead",
     ),
     "Resize": (
-        "rank-4 nearest-neighbor integer H/W upscaling; untiled execution",
+        "rank-4 nearest-neighbor integer H/W upscaling; height tiling as the "
+        "stage's single spatial op, never in a chain",
     ),
     "ResizeLinear": (
-        "rank-4 bilinear integer H/W upscaling with half-pixel coordinates; "
-        "float only; untiled execution",
+        "rank-4 bilinear integer H/W upscaling with half-pixel or asymmetric "
+        "coordinates; height tiling as the stage's single spatial op, never "
+        "in a chain",
     ),
     "Softmax": ("final axis only; untiled execution",),
     "Relu": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Relu6": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Sigmoid": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Tanh": ("rank-3 pointwise length tiling on serialized axis 1",),
+    "HardSwish": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Transpose": ("a concrete, valid permutation is stored in schema 4+ plans",),
 }
 

@@ -177,3 +177,84 @@ def test_a_gather_on_an_axis_something_precedes_is_left_alone(tmp_path):
               numpy_helper.from_array(np.array(0, dtype=np.int64), "first")],
     )
     assert "Gather" in [op.op_type for op in ag.ops]
+
+
+def _boundary_model(tmp_path):
+    """uint8 image -> DequantizeLinear -> Conv -> (QuantizeLinear to uint8)."""
+    weight = np.full((2, 3, 1, 1), 0.5, dtype=np.float32)
+    inits = [
+        numpy_helper.from_array(weight, "w"),
+        numpy_helper.from_array(np.array(1.0 / 255.0, dtype=np.float32), "img_s"),
+        numpy_helper.from_array(np.array(0, dtype=np.uint8), "img_z"),
+        numpy_helper.from_array(np.array(0.01, dtype=np.float32), "w_s"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "w_z"),
+        numpy_helper.from_array(np.array(0.02, dtype=np.float32), "out_s"),
+        numpy_helper.from_array(np.array(100, dtype=np.uint8), "out_z"),
+    ]
+    nodes = [
+        helper.make_node("DequantizeLinear", ["image", "img_s", "img_z"], ["x"]),
+        helper.make_node("QuantizeLinear", ["w", "w_s", "w_z"], ["wq"]),
+        helper.make_node("DequantizeLinear", ["wq", "w_s", "w_z"], ["wdq"]),
+        helper.make_node("Conv", ["x", "wdq"], ["raw"], kernel_shape=[1, 1]),
+        helper.make_node("QuantizeLinear", ["raw", "out_s", "out_z"], ["mask"]),
+    ]
+    model = helper.make_model(
+        helper.make_graph(
+            nodes, "boundary",
+            [helper.make_tensor_value_info("image", TensorProto.UINT8, [1, 3, 4, 4])],
+            [helper.make_tensor_value_info("mask", TensorProto.UINT8, [1, 2, 4, 4])],
+            inits),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "boundary.onnx"
+    path.write_bytes(model.SerializeToString())
+    return path
+
+
+def test_quantized_boundaries_fold_onto_int8_tensors(tmp_path):
+    """A uint8 input and output keep their places and become int8 tensors.
+
+    The zero points move by 128 with the values, and the dtype the model
+    declares stays recorded so the plan converts at the boundary instead of
+    carrying a float copy of the image.
+    """
+    ag = normalize(load_model(str(_boundary_model(tmp_path))))
+    assert not [op for op in ag.ops if op.op_type in ("QuantizeLinear", "DequantizeLinear")]
+    image = ag.tensors[ag.model_inputs[0]]
+    mask = ag.tensors[ag.model_outputs[0]]
+    assert ag.model_inputs == ["image"]
+    assert image.dtype == 3 and int(image.quant.zero_point[0]) == -128
+    assert mask.dtype == 3 and int(mask.quant.zero_point[0]) == 100 - 128
+    assert ag.model_input_dtypes == [2] and ag.model_output_dtypes == [2]
+
+
+def test_whole_map_average_pool_becomes_the_global_pool(tmp_path):
+    """F.avg_pool2d(x, x.shape[2:]) with PyTorch's default count_include_pad."""
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("AveragePool", ["input"], ["output"], kernel_shape=[5, 7],
+                              strides=[5, 7], count_include_pad=1)],
+            "whole_map",
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 5, 7])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 1, 1])]),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "whole_map.onnx"
+    path.write_bytes(model.SerializeToString())
+    ag = normalize(load_model(str(path)))
+    assert [op.op_type for op in ag.ops] == ["GlobalAveragePool"]
+
+
+def test_partial_window_average_pool_is_left_alone(tmp_path):
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("AveragePool", ["input"], ["output"], kernel_shape=[5, 5],
+                              strides=[5, 5])],
+            "partial",
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 5, 7])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 1, 1])]),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "partial.onnx"
+    path.write_bytes(model.SerializeToString())
+    assert [op.op_type for op in normalize(load_model(str(path))).ops] == ["AveragePool"]

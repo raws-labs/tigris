@@ -70,6 +70,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     # normalization rows and needs nothing from its neighbours: the same
     # argument that admits Softmax.
     "Erf": TileCategory.POINTWISE,
+    "HardSwish": TileCategory.POINTWISE,
     "LayerNormalization": TileCategory.POINTWISE,
     # Resampling along the height: the runtime cuts the output into bands and
     # reads the source band each one needs. Only the height axis, and only on
@@ -102,6 +103,7 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Tanh",
     "Softmax",
     "Erf",
+    "HardSwish",
     "LayerNormalization",
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
@@ -129,6 +131,23 @@ _MAX_PLAN_EXTENT = 0xFFFF
 def _plan_extents_fit(tile_height: int, num_tiles: int, original: int) -> bool:
     """Whether a banding fits the uint16 fields of the tile plan record."""
     return max(tile_height, num_tiles, original) <= _MAX_PLAN_EXTENT
+
+
+def _has_unequal_binary_operands(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """A binary op whose two dynamic operands differ in shape.
+
+    The one such form the runtime executes is a per-channel second operand. It
+    is one row high, so a rank-4 height stripe loads it whole for every band;
+    the 2D, chain and row-band executors have no such rule and keep it out.
+    """
+    if op.op_type not in _BINARY_OPS or len(op.inputs) != 2:
+        return False
+    first, second = (ag.tensors.get(name) for name in op.inputs)
+    if first is None or second is None:
+        return False
+    if first.is_constant or second.is_constant:
+        return False
+    return tuple(first.shape) != tuple(second.shape)
 
 
 def classify_op(op_type: str) -> TileCategory:
@@ -165,10 +184,15 @@ def compute_receptive_field(
         cat = classify_op(op.op_type)
         if cat is TileCategory.UPSAMPLE:
             # Measured in input rows, a nearest resample reads one row per
-            # output row and a bilinear one reads the pair around it.
+            # output row and a bilinear one reads the pair around it. With
+            # half-pixel coordinates that pair can start a row ahead of
+            # out / scale, which the band has to reach as well.
             if op.op_type == "ResizeLinear":
-                rf_h += jump_h
-                rf_w += jump_w
+                lead = op.attrs.get(
+                    "coordinate_transformation_mode", "half_pixel"
+                ) == "half_pixel"
+                rf_h += jump_h * (2 if lead else 1)
+                rf_w += jump_w * (2 if lead else 1)
             continue
         if cat in (TileCategory.CONV, TileCategory.POOL):
             kernel_h = _get_kernel_h(op, weight_shapes)
@@ -444,7 +468,9 @@ def _stage_2d_eligible(
         if op.op_type in _BINARY_OPS or op.op_type == "Concat":
             if not _cotileable_skip_operands(ag, stage, op):
                 return False
-    return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
+    return all(_op_supports_axis(op, TILE_AXIS_HW)
+               and not _has_unequal_binary_operands(ag, op)
+               for op in stage_ops)
 
 
 def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
@@ -568,6 +594,7 @@ _ROW_TILING_OPS = frozenset({
     "Sigmoid",
     "Tanh",
     "Erf",
+    "HardSwish",
     "Softmax",
     "LayerNormalization",
     "Reshape",
@@ -640,7 +667,8 @@ def _stage_is_row_tiled(
     has to agree on the row count, which is what makes a band mean the same
     thing on each of them.
     """
-    if not stage_ops:
+    if not stage_ops or any(_has_unequal_binary_operands(ag, op)
+                            for op in stage_ops):
         return False
 
     # Every tensor the band cuts has to agree on the batch and the row count,
@@ -1284,9 +1312,11 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         untileable: list[str] = []
         for op in stage_ops:
             cat = classify_op(op.op_type)
-            if cat == TileCategory.UNTILEABLE or not _op_supports_axis(
-                op, tile_axis
-            ):
+            if (cat == TileCategory.UNTILEABLE
+                    or not _op_supports_axis(op, tile_axis)
+                    or (_has_unequal_binary_operands(ag, op)
+                        and not (tile_axis == TILE_AXIS_HEIGHT_OR_LENGTH
+                                 and len(ag.tensors[op.inputs[0]].shape) == 4))):
                 untileable.append(f"{op.name} ({op.op_type})")
 
         if tile_axis != TILE_AXIS_NONE and not _external_outputs_keep_their_rows(
@@ -1514,10 +1544,18 @@ def _find_source_dim_extent(
         first_op = ag.ops[stage.op_indices[0]]
         candidates = [n for n in first_op.inputs if n in ag.tensors]
 
+    # A one-row operand is broadcast over every band (a per-channel gate), so
+    # it does not say how far the band runs while another input does.
+    one_row = False
     for name in candidates:
         info = ag.tensors.get(name)
         if info and len(info.shape) in ranks:
+            if int(info.shape[dim]) == 1:
+                one_row = True
+                continue
             return int(info.shape[dim])
+    if one_row:
+        return 1
 
     return 0
 
@@ -1622,6 +1660,8 @@ def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
         # A resample stays out of a chain: the chain executor composes one
         # receptive field across its members and has no fractional stride.
         if cat in (TileCategory.UNTILEABLE, TileCategory.UPSAMPLE):
+            return False
+        if _has_unequal_binary_operands(ag, ag.ops[op_i]):
             return False
     for name in (*stage.input_tensors, *stage.output_tensors):
         info = ag.tensors.get(name)
@@ -1959,18 +1999,73 @@ def solve_chain_tile_height(
     return best
 
 
+def _carries_only_its_own_tensors(
+    ag: AnalyzedGraph, run: list[int], producer: dict[str, int]
+) -> bool:
+    """Whether every stage after the head reads only tensors the run produces."""
+    inside = set(run)
+    return all(
+        producer.get(name) in inside
+        for index in run[1:]
+        for name in ag.stages[index].input_tensors
+    )
+
+
+def _split_into_fitting_chains(
+    ag: AnalyzedGraph,
+    run: list[int],
+    readers: dict[str, list[int]],
+    producer: dict[str, int],
+) -> list[tuple[list[int], int]]:
+    """Cut a detected run into consecutive chains that fit the fast budget.
+
+    A run that does not fit as a whole still streams in pieces: each piece
+    writes only its last output to slow memory. Pieces are taken greedily,
+    longest first from the current head. Appending a stage never shrinks the
+    tile buffers of the stages before it, so once a prefix stops fitting no
+    longer prefix fits either and the scan can stop there. A prefix that
+    carries a tensor to a reader beyond its end is not a chain, but a longer
+    one may be, so the scan keeps the longest prefix that is both.
+
+    Returns (chain, tile height) pairs.
+    """
+    pieces: list[tuple[list[int], int]] = []
+    head = 0
+    while head < len(run) - 1:
+        best: tuple[list[int], int] | None = None
+        for end in range(head + 2, len(run) + 1):
+            piece = run[head:end]
+            tile_h = solve_chain_tile_height(ag, piece)
+            if tile_h <= 0:
+                break
+            if _carries_only_its_own_tensors(
+                ag, piece, producer
+            ) and _run_is_self_contained(ag, piece, readers):
+                best = (piece, tile_h)
+        if best is None:
+            head += 1
+        else:
+            pieces.append(best)
+            head += len(best[0])
+    return pieces
+
+
 def detect_and_solve_chains(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Detect chains and solve tile heights. Sets chain fields on stages.
 
     Should be called after partition_spatial() has determined individual tiling.
+    A detected run that does not fit is split into pieces that do; stages no
+    piece takes keep their standalone tiling.
     """
-    chains = detect_chains(ag)
+    readers = _stage_consumers(ag)
+    producer = _stage_producer(ag)
+    chains = [
+        piece
+        for run in detect_chains(ag)
+        for piece in _split_into_fitting_chains(ag, run, readers, producer)
+    ]
 
-    for chain in chains:
-        tile_h = solve_chain_tile_height(ag, chain)
-        if tile_h <= 0:
-            continue  # chain doesn't fit, leave stages as standalone tiled
-
+    for chain, tile_h in chains:
         head_id = chain[0]
         chain_len = len(chain)
 

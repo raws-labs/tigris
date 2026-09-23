@@ -476,3 +476,50 @@ class TestLoaderAttrs:
         assert len(relu_ops) == 0  # all Relu ops fused
         fused = [op for op in ag.ops if op.attrs.get("fused_activation") == "Relu"]
         assert len(fused) >= 1
+
+
+def _gated_map_path(tmp_path, channels=16, side=12):
+    """GlobalAveragePool -> 1x1 Conv -> Sigmoid gates the map it came from."""
+    weight = np.full((channels, channels, 1, 1), 0.1, dtype=np.float32)
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("GlobalAveragePool", ["input"], ["pooled"]),
+             helper.make_node("Conv", ["pooled", "w"], ["fc"], kernel_shape=[1, 1]),
+             helper.make_node("Sigmoid", ["fc"], ["gate"]),
+             helper.make_node("Mul", ["gate", "input"], ["output"])],
+            "gated_map",
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, side, side])],
+            [numpy_helper.from_array(weight, "w")]),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "gated_map.onnx"
+    path.write_bytes(model.SerializeToString())
+    return path
+
+
+def test_per_channel_operand_stage_is_banded_over_the_full_operand(tmp_path):
+    """The gate is one row high and listed first; the band runs over the map."""
+    from tigris.cli import _run_pipeline
+    from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
+
+    ag, _ = _run_pipeline(str(_gated_map_path(tmp_path)), ("2K",), report_bindings=False)
+    stage = next(s for s in ag.stages
+                 if any(ag.ops[i].op_type == "Mul" for i in s.op_indices))
+    plan = stage.tile_plan
+    assert plan is not None and plan.tileable
+    assert plan.axis == TILE_AXIS_HEIGHT_OR_LENGTH and plan.tile_width == 0
+    assert plan.original_height == 12 and plan.num_tiles > 1
+    assert stage.chain_id == 0xFFFF
+
+
+def test_half_pixel_bilinear_band_reaches_one_row_further():
+    """Half-pixel places output row o at (o + 0.5) / s - 0.5, a row ahead of o / s."""
+    half = OpNode(name="up", op_type="ResizeLinear", inputs=["x"], outputs=["y"],
+                  attrs={"coordinate_transformation_mode": "half_pixel"})
+    asym = OpNode(name="up", op_type="ResizeLinear", inputs=["x"], outputs=["y"],
+                  attrs={"coordinate_transformation_mode": "asymmetric"})
+    nearest = OpNode(name="up", op_type="Resize", inputs=["x"], outputs=["y"])
+    assert compute_receptive_field([half]) == (3, 3)
+    assert compute_receptive_field([asym]) == (2, 2)
+    assert compute_receptive_field([nearest]) == (1, 1)

@@ -189,7 +189,7 @@ def test_compile_preserves_existing_output_on_dtype_rejection(
 @pytest.mark.parametrize(
     ("attrs", "message"),
     [
-        ({"count_include_pad": 1}, "count_include_pad=1 is not encoded"),
+        ({"count_include_pad": 1}, "count_include_pad=1 with padding is not encoded"),
         ({"ceil_mode": 1}, "ceil_mode=1 is not encoded"),
         ({"dilations": [2, 2]}, "pooling dilation is not implemented"),
         ({"auto_pad": "SAME_UPPER"}, "requires explicit pads"),
@@ -398,7 +398,7 @@ def test_dynamic_elementwise_broadcasting_is_rejected():
     validation = validate_operator_support(graph)
 
     assert not validation.supported
-    assert "dynamic operand broadcasting is not implemented" in validation.describe()
+    assert "one value per channel" in validation.describe()
 
 
 def test_quantized_constant_elementwise_operand_is_rejected():
@@ -639,3 +639,76 @@ def test_non_qoperator_dtype_mismatch_is_still_reported():
     ag.is_quantized = False
     issues = validate_execution_dtype(ag).issues
     assert issues and "quantization metadata" in issues[0]
+
+
+def _save(tmp_path, name, nodes, inputs, outputs, initializers=(), opset=13):
+    model = helper.make_model(
+        helper.make_graph(nodes, name, inputs, outputs, list(initializers)),
+        opset_imports=[helper.make_opsetid("", opset)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"{name}.onnx"
+    path.write_bytes(model.SerializeToString())
+    return path
+
+
+def _avg_pool_path(tmp_path, pads):
+    return _save(
+        tmp_path, "avg_pool",
+        [helper.make_node("AveragePool", ["input"], ["output"],
+                          kernel_shape=[3, 3], pads=pads, count_include_pad=1)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2, 6, 6])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT,
+            [1, 2, 6, 6] if any(pads) else [1, 2, 4, 4])],
+    )
+
+
+def test_count_include_pad_without_padding_is_accepted(tmp_path):
+    """Without padding every window lies inside the input: the flag is moot."""
+    ag, _ = _run_pipeline(str(_avg_pool_path(tmp_path, [0, 0, 0, 0])), ("64K",),
+                          report_bindings=False)
+    assert emit_binary_bytes(ag)
+
+
+def test_count_include_pad_with_padding_is_refused(tmp_path):
+    ag, _ = _run_pipeline(str(_avg_pool_path(tmp_path, [1, 1, 1, 1])), ("64K",),
+                          report_bindings=False)
+    with pytest.raises(ValueError, match="count_include_pad=1 with padding"):
+        emit_binary_bytes(ag)
+
+
+def _gate_path(tmp_path, gate_shape):
+    return _save(
+        tmp_path, "gate",
+        [helper.make_node("Mul", ["gate", "input"], ["output"])],
+        [helper.make_tensor_value_info("gate", TensorProto.FLOAT, gate_shape),
+         helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 5, 5])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 5, 5])],
+    )
+
+
+def test_per_channel_dynamic_operand_is_accepted(tmp_path):
+    """A squeeze-and-excitation gate: one value per channel, written first."""
+    ag, _ = _run_pipeline(str(_gate_path(tmp_path, [1, 4, 1, 1])), ("64K",),
+                          report_bindings=False)
+    mul = next(op for op in ag.ops if op.op_type == "Mul")
+    assert mul.inputs == ["input", "gate"], "full-shape operand goes first"
+    assert emit_binary_bytes(ag)
+
+
+def test_other_dynamic_broadcast_is_refused(tmp_path):
+    """A row-wise operand repeats every row, not every channel: not executable."""
+    ag, _ = _run_pipeline(str(_gate_path(tmp_path, [1, 1, 5, 1])), ("64K",),
+                          report_bindings=False)
+    with pytest.raises(ValueError, match="one value per channel"):
+        emit_binary_bytes(ag)
+
+
+def test_hardswish_and_int8_bilinear_have_kernels():
+    from tigris.capabilities import effective_operators
+
+    for backend in ("reference", "s8_ref", "esp-nn", "cmsis-nn"):
+        assert "HardSwish" in effective_operators(backend)
+        assert "ResizeLinear" in effective_operators(backend)
