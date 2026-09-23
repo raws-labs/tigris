@@ -54,6 +54,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "MaxPool",
     "Concat",
     "Resize",
+    "ResizeLinear",
     "Softmax",
     "Transpose",
     "LayerNormalization",
@@ -62,7 +63,10 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Split",
 })
 
-_S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS
+# Bilinear upsampling mixes neighbouring samples, and a constant operand in
+# the plan carries no scale or zero point, so the int8 dispatcher has no
+# requantizing kernel for it. Every other reference operator is in both sets.
+_S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS - frozenset({"ResizeLinear"})
 
 
 # Native accelerated adapters sometimes route a supported variant through the
@@ -99,11 +103,11 @@ CONDITIONAL_FALLBACKS: dict[str, dict[str, str]] = {
 # mistaken for support for every ONNX attribute combination.
 OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "Add": (
-        "dynamic operands must have identical shapes; no general broadcasting",
+        "dynamic operands must have identical shapes; a float constant operand is one value, one per channel, or one per element",
         "standalone rank-3 pointwise length tiling on serialized axis 1",
     ),
     "Mul": (
-        "dynamic operands must have identical shapes; no general broadcasting",
+        "dynamic operands must have identical shapes; a float constant operand is one value, one per channel, or one per element",
         "standalone rank-3 pointwise length tiling on serialized axis 1",
     ),
     "AveragePool": (
@@ -112,7 +116,10 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "MaxPool": (
         "explicit padding, floor output sizing, unit dilation, and no indices output",
     ),
-    "Concat": ("rank-4 channel-axis concatenation",),
+    "Concat": (
+        "rank-3 and rank-4 concatenation on the last stored axis; a constant "
+        "part only as the leading operand of a float concatenation",
+    ),
     "Conv1D": (
         "standalone rank-3 length tiling on serialized axis 1; may compose with "
         "shape-preserving unary pointwise operators",
@@ -127,6 +134,10 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     ),
     "Resize": (
         "rank-4 nearest-neighbor integer H/W upscaling; untiled execution",
+    ),
+    "ResizeLinear": (
+        "rank-4 bilinear integer H/W upscaling with half-pixel coordinates; "
+        "float only; untiled execution",
     ),
     "Softmax": ("final axis only; untiled execution",),
     "Relu": ("rank-3 pointwise length tiling on serialized axis 1",),

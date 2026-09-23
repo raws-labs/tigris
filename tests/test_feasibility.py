@@ -56,23 +56,21 @@ def _write_oversized_height_op_model(tmp_path, op_type):
     return path
 
 
-@pytest.mark.parametrize("op_type", ["Resize"])
-def test_height_changing_stage_cannot_claim_height_tiling(tmp_path, op_type):
-    model_path = _write_oversized_height_op_model(tmp_path, op_type)
+def test_a_resample_tiles_along_its_output(tmp_path):
+    """An upsample has more output rows than input rows.
+
+    The tile loop cuts its output into bands and divides to find the source
+    band each one reads, so a stage that is nothing but a resample fits a
+    budget far below its whole output.
+    """
+    model_path = _write_oversized_height_op_model(tmp_path, "Resize")
 
     graph, _ = _run_pipeline(str(model_path), ("4K",))
-    tile_plans = [
-        stage.tile_plan for stage in graph.stages if stage.tile_plan is not None
-    ]
+    plans = [s.tile_plan for s in graph.stages if s.tile_plan is not None]
 
-    assert tile_plans
-    assert all(not tile_plan.tileable for tile_plan in tile_plans)
-    assert any(
-        op_type in untileable
-        for tile_plan in tile_plans
-        for untileable in tile_plan.untileable_ops
-    )
-    assert not validate_memory_plan(graph).feasible
+    assert plans
+    assert all(plan.tileable for plan in plans)
+    assert validate_memory_plan(graph).feasible
 
 
 def test_a_global_reduction_tiles_along_its_input(tmp_path):
@@ -107,28 +105,23 @@ def test_a_global_reduction_too_wide_for_one_row_stays_untileable(tmp_path):
     assert not validate_memory_plan(graph).feasible
 
 
-@pytest.mark.parametrize("op_type", ["Resize"])
-def test_compile_refuses_unsafe_height_tiling_but_keeps_untiled_support(
-    tmp_path, op_type
-):
-    model_path = _write_oversized_height_op_model(tmp_path, op_type)
-    rejected = tmp_path / f"{op_type}-tight.tgrs"
-    accepted = tmp_path / f"{op_type}-roomy.tgrs"
+def test_a_resample_compiles_at_a_budget_below_its_output(tmp_path):
+    """The CLI path for the same fact, at a budget a whole output cannot fit.
 
-    tight = CliRunner().invoke(
+    The model upsamples 8x8 to 16x16 over 4 channels, so its output alone is
+    4 KiB and the two tensors together are 5 KiB. Compiling it to a 4 KiB
+    arena only works if the stage is cut.
+    """
+    model_path = _write_oversized_height_op_model(tmp_path, "Resize")
+    plan = tmp_path / "resize-tight.tgrs"
+
+    result = CliRunner().invoke(
         cli,
-        ["compile", str(model_path), "-m", "4K", "-o", str(rejected)],
-    )
-    roomy = CliRunner().invoke(
-        cli,
-        ["compile", str(model_path), "-m", "256K", "-o", str(accepted)],
+        ["compile", str(model_path), "-m", "4K", "-o", str(plan)],
     )
 
-    assert tight.exit_code != 0
-    assert "Cannot compile an infeasible memory plan" in tight.output
-    assert not rejected.exists()
-    assert roomy.exit_code == 0, roomy.output
-    assert accepted.exists()
+    assert result.exit_code == 0, result.output
+    assert plan.exists()
 
 
 def test_minimum_tile_that_exceeds_budget_is_infeasible(conv_relu_chain_path):

@@ -92,6 +92,10 @@ def load_model(
     ag = AnalyzedGraph()
     ag.model_name = Path(path).stem
     ag.shape_bindings = bindings
+    ag.opset = next(
+        (entry.version for entry in model.opset_import if entry.domain in ("", "ai.onnx")),
+        0,
+    )
 
     # --- Collect initializers (constants / weights) -----------------------
     initializer_names: set[str] = set()

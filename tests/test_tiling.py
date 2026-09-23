@@ -126,13 +126,18 @@ class TestClassifyOp:
         [
             "BatchNormalization",
             "GlobalAveragePool",
-            "Resize",
         ],
     )
     def test_operators_without_schema_v4_height_contract_are_untileable(
         self, op_type
     ):
         assert classify_op(op_type) == TileCategory.UNTILEABLE
+
+    @pytest.mark.parametrize("op_type", ["Resize", "ResizeLinear"])
+    def test_resampling_is_its_own_category(self, op_type):
+        """Its output has more rows than its input, so the tile loop divides
+        to find the source band instead of multiplying."""
+        assert classify_op(op_type) == TileCategory.UPSAMPLE
 
     def test_gemm_is_untileable(self):
         assert classify_op("Gemm") == TileCategory.UNTILEABLE

@@ -262,7 +262,7 @@ def test_unrepresentable_pool_attributes_are_rejected(
                 "right": TensorInfo("right", (1, 2, 3, 4), TensorProto.FLOAT),
                 "output": TensorInfo("output", (1, 2, 6, 4), TensorProto.FLOAT),
             },
-            "rank-4 channel-axis Concat only",
+            "concatenates a rank-4 tensor on its channel axis only",
         ),
         (
             OpNode(
@@ -495,6 +495,13 @@ def test_scalar_float_constant_elementwise_operand_is_supported():
 
 
 def test_equal_numel_different_shape_constant_is_rejected():
+    """Matching element counts is not a broadcast the runtime can read.
+
+    The wire format gives a constant operand a byte size and nothing else, so
+    the runtime reads it as one value, one per channel, or one per element. A
+    (2, 2) constant against a (1, 4) operand is none of those even though the
+    counts agree.
+    """
     graph = AnalyzedGraph(
         ops=[
             OpNode(
@@ -507,15 +514,69 @@ def test_equal_numel_different_shape_constant_is_rejected():
         tensors={
             "input": TensorInfo("input", (1, 4), TensorProto.FLOAT),
             "constant": TensorInfo(
-                "constant", (4,), TensorProto.FLOAT, is_constant=True
+                "constant", (2, 2), TensorProto.FLOAT, is_constant=True
             ),
             "output": TensorInfo("output", (1, 4), TensorProto.FLOAT),
         },
-        weight_data={"constant": np.ones(4, dtype=np.float32)},
+        weight_data={"constant": np.ones((2, 2), dtype=np.float32)},
     )
 
     validation = validate_operator_support(graph)
 
+    assert not validation.supported
+    assert "requires unsupported broadcasting" in validation.describe()
+
+
+def test_a_per_channel_constant_is_accepted():
+    """One value per channel repeats on its own: channels are stored innermost.
+
+    This is the shape an exporter writes an input normalization in, and it is
+    what a (1, C, 1, 1) mean or scale looks like after right alignment.
+    """
+    graph = AnalyzedGraph(
+        ops=[
+            OpNode(
+                name="normalize",
+                op_type="Mul",
+                inputs=["input", "scale"],
+                outputs=["output"],
+            )
+        ],
+        tensors={
+            "input": TensorInfo("input", (1, 3, 8, 8), TensorProto.FLOAT),
+            "scale": TensorInfo(
+                "scale", (1, 3, 1, 1), TensorProto.FLOAT, is_constant=True
+            ),
+            "output": TensorInfo("output", (1, 3, 8, 8), TensorProto.FLOAT),
+        },
+        weight_data={"scale": np.ones((1, 3, 1, 1), dtype=np.float32)},
+    )
+
+    assert validate_operator_support(graph).supported
+
+
+def test_a_constant_on_the_wrong_axis_is_rejected():
+    """A per-row constant does not repeat every channel, so it is refused."""
+    graph = AnalyzedGraph(
+        ops=[
+            OpNode(
+                name="per_row",
+                op_type="Mul",
+                inputs=["input", "scale"],
+                outputs=["output"],
+            )
+        ],
+        tensors={
+            "input": TensorInfo("input", (1, 3, 8, 8), TensorProto.FLOAT),
+            "scale": TensorInfo(
+                "scale", (1, 1, 8, 1), TensorProto.FLOAT, is_constant=True
+            ),
+            "output": TensorInfo("output", (1, 3, 8, 8), TensorProto.FLOAT),
+        },
+        weight_data={"scale": np.ones((1, 1, 8, 1), dtype=np.float32)},
+    )
+
+    validation = validate_operator_support(graph)
     assert not validation.supported
     assert "requires unsupported broadcasting" in validation.describe()
 

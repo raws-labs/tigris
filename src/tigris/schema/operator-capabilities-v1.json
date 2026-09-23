@@ -152,7 +152,7 @@
     },
     {
       "constraints": [
-        "dynamic operands must have identical shapes; no general broadcasting",
+        "dynamic operands must have identical shapes; a float constant operand is one value, one per channel, or one per element",
         "standalone rank-3 pointwise length tiling on serialized axis 1"
       ],
       "opcode": 7,
@@ -166,7 +166,7 @@
     },
     {
       "constraints": [
-        "dynamic operands must have identical shapes; no general broadcasting",
+        "dynamic operands must have identical shapes; a float constant operand is one value, one per channel, or one per element",
         "standalone rank-3 pointwise length tiling on serialized axis 1"
       ],
       "opcode": 8,
@@ -226,7 +226,7 @@
     },
     {
       "constraints": [
-        "rank-4 channel-axis concatenation"
+        "rank-3 and rank-4 concatenation on the last stored axis; a constant part only as the leading operand of a float concatenation"
       ],
       "opcode": 13,
       "operator": "Concat",
@@ -479,6 +479,19 @@
         "esp-nn": "fallback:s8_ref",
         "reference": "native",
         "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "rank-4 bilinear integer H/W upscaling with half-pixel coordinates; float only; untiled execution"
+      ],
+      "opcode": 36,
+      "operator": "ResizeLinear",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
       }
     }
   ],

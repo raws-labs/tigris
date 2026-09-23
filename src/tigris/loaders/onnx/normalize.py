@@ -36,6 +36,8 @@ Passes applied in sequence (matches ``normalize()`` call order):
 """
 
 import math
+from dataclasses import replace
+
 import numpy as np
 
 from tigris.graph.ir import (
@@ -44,6 +46,7 @@ from tigris.graph.ir import (
     OpNode,
     QuantParam,
     TensorInfo,
+    serialized_axis_map,
     serialized_shape,
 )
 
@@ -63,18 +66,21 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
+    ag = _fold_pad_into_conv(ag)
     ag = _relabel_depthwise(ag)
     ag = _relabel_conv1d(ag)
     ag = _clip_to_relu6(ag)
     ag = _reduce_mean_to_gap(ag)
     ag = _fold_shape_ops(ag)
+    ag = _resolve_resize_conventions(ag)
     ag = _extract_resize_scales(ag)
     ag = _strip_metadata_inputs(ag)
-    ag = _normalize_concat_axis(ag)
     ag = _validate_transposes(ag)
     ag = _absorb_activations(ag)
     ag = _fold_split_into_its_weight(ag)
     ag = _assign_tensor_layouts(ag)
+    ag = _normalize_concat_axis(ag)
+    ag = _gather_one_index_to_split(ag)
     ag = _relabel_shape_ops_to_reshape(ag)
     ag = _lower_linear_matmul(ag)
     ag = _drop_unreferenced_weights(ag)
@@ -200,8 +206,22 @@ def _flattened_into_a_product(ag: AnalyzedGraph, op: OpNode) -> bool:
 
 
 def _states_its_own_order(info) -> bool:
-    """Whether this tensor lists its axes in the order the runtime stores."""
-    return info.layout is Layout.LINEAR or len(info.shape) <= 2
+    """Whether this tensor lists its axes in the order the runtime stores.
+
+    A tensor that states its own order, and one of rank 2 or less, always
+    does. So does a feature map whose storage permutation only moves axes of
+    extent one: a single-channel image is held row by row either way, and the
+    permutation that formally moves its channel axis moves nothing. Reading
+    that case as a reordering costs a copy for no reason, and refusing it
+    costs an operator the runtime could have executed.
+    """
+    if info.layout is Layout.LINEAR or len(info.shape) <= 2:
+        return True
+    rank = len(info.shape)
+    positions = serialized_axis_map(rank, info.layout)
+    in_storage_order = sorted(range(rank), key=lambda axis: positions[axis])
+    carried = [axis for axis in in_storage_order if info.shape[axis] > 1]
+    return carried == sorted(carried)
 
 
 def _reshape_keeps_its_order(ag: AnalyzedGraph, op: OpNode) -> bool:
@@ -244,10 +264,13 @@ def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
         return Layout.SPATIAL
     if op.op_type in _LINEAR_LAYOUT_OPS:
         return Layout.LINEAR
-    if op.op_type in ("Reshape", "Flatten"):
+    if op.op_type in ("Reshape", "Flatten", "Squeeze", "Unsqueeze"):
         # A regrouping the runtime's own order does not state is expressible
         # once the operand is held the way the model states it, unless a
         # matrix product downstream already compensates for the difference.
+        # Squeeze and Unsqueeze are the same question: they become a Reshape
+        # further down the pipeline, and dropping the channel axis of a
+        # feature map regroups across it exactly as a Reshape would.
         if _reshape_keeps_its_order(ag, op) or _flattened_into_a_product(ag, op):
             return None
         return Layout.LINEAR
@@ -1669,6 +1692,97 @@ def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _gather_one_index_to_split(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite a Gather of one constant index as a Split and drop the axis.
+
+    Taking a single index out of an axis nothing precedes is a contiguous run
+    of the stored bytes, which is exactly what a Split cuts. A classifier that
+    reads the leading token of a sequence is the common case, and it is the
+    only thing standing between a vision transformer and its own head.
+
+    Both sides have to state their own axis order, so the stored bytes follow
+    the shape: a tensor the runtime stores channels-last would put the wanted
+    index somewhere other than the front of a run.
+    """
+    replacements: list[tuple[int, list[OpNode]]] = []
+    for index, op in enumerate(ag.ops):
+        if op.op_type != "Gather" or len(op.inputs) != 2 or len(op.outputs) != 1:
+            continue
+        source = ag.tensors.get(op.inputs[0])
+        result = ag.tensors.get(op.outputs[0])
+        indices = ag.weight_data.get(op.inputs[1])
+        if source is None or result is None or indices is None:
+            continue
+        if indices.size != 1 or not np.issubdtype(indices.dtype, np.integer):
+            continue
+        rank = len(source.shape)
+        axis = int(op.attrs.get("axis", 0))
+        if axis < 0:
+            axis += rank
+        if rank < 2 or axis < 0 or axis >= rank:
+            continue
+        if not _states_its_own_order(source) or not _states_its_own_order(result):
+            continue
+        if any(dim != 1 for dim in source.shape[:axis]):
+            continue
+        wanted = int(indices.reshape(-1)[0])
+        if wanted < 0:
+            wanted += int(source.shape[axis])
+        if not 0 <= wanted < int(source.shape[axis]):
+            continue
+        expected = tuple(source.shape[:axis]) + tuple(source.shape[axis + 1:])
+        if tuple(result.shape) != expected:
+            continue
+
+        rest = 1
+        for dim in source.shape[axis + 1:]:
+            rest *= int(dim)
+        rows = int(source.shape[axis])
+        flat_name = _fresh_name(ag, f"{op.inputs[0]}_rows")
+        ag.tensors[flat_name] = replace(
+            ag.tensors[op.inputs[0]], name=flat_name, shape=(rows, rest),
+            layout=Layout.LINEAR)
+        rewritten = [
+            OpNode(name=f"{op.name}_rows", op_type="Reshape",
+                   inputs=[op.inputs[0]], outputs=[flat_name], attrs={}),
+        ]
+
+        cuts = [(0, wanted), (wanted, wanted + 1), (wanted + 1, rows)]
+        parts: list[str] = []
+        for start, end in cuts:
+            if end <= start:
+                parts.append("")
+                continue
+            part = _fresh_name(ag, f"{op.outputs[0]}_part{start}")
+            ag.tensors[part] = replace(
+                ag.tensors[op.outputs[0]], name=part, shape=(end - start, rest),
+                layout=Layout.LINEAR)
+            parts.append(part)
+        kept = parts[1]
+        rewritten.append(
+            OpNode(name=f"{op.name}_split", op_type="Split",
+                   inputs=[flat_name], outputs=[p for p in parts if p],
+                   attrs={"axis": 0}))
+        rewritten.append(
+            OpNode(name=op.name, op_type="Reshape",
+                   inputs=[kept], outputs=[op.outputs[0]], attrs={}))
+        replacements.append((index, rewritten))
+
+    for index, rewritten in reversed(replacements):
+        ag.ops[index:index + 1] = rewritten
+    return ag
+
+
+def _fresh_name(ag: AnalyzedGraph, base: str) -> str:
+    """A tensor name the graph does not already carry."""
+    name = base
+    suffix = 0
+    while name in ag.tensors or name in ag.weight_data:
+        suffix += 1
+        name = f"{base}_{suffix}"
+    return name
+
+
 def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Rewrite a constant divisor as a multiplication by its reciprocal.
 
@@ -1682,22 +1796,40 @@ def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
     which is the nearest representable inverse rather than the one a float32
     division would produce. The two differ by at most a half ulp of the
     reciprocal, well inside the tolerance the contract gate holds float to.
+
+    It goes into a tensor of its own rather than over the divisor. One
+    constant commonly feeds several divisions, since an exporter writes the
+    same sqrt(2) into every GELU and a deduplicating pass then hands them all
+    one initializer; inverting that in place would invert it once per reader.
+    The same constant may also be read as something other than a divisor,
+    which a rewrite in place would corrupt outright.
     """
+    reciprocals: dict[str, str] = {}
     for op in ag.ops:
         if op.op_type != "Div" or len(op.inputs) != 2:
             continue
         divisor = op.inputs[1]
         if divisor not in ag.weight_data or op.inputs[0] in ag.weight_data:
             continue
-        constant = ag.weight_data[divisor]
-        if constant.dtype != np.float32 or constant.size == 0:
-            continue
-        if not np.all(np.isfinite(constant)) or np.any(constant == 0.0):
-            continue
-        reciprocal = (1.0 / constant.astype(np.float64)).astype(np.float32)
-        if not np.all(np.isfinite(reciprocal)):
-            continue
-        ag.weight_data[divisor] = np.ascontiguousarray(reciprocal)
+        name = reciprocals.get(divisor)
+        if name is None:
+            constant = ag.weight_data[divisor]
+            if constant.dtype != np.float32 or constant.size == 0:
+                continue
+            if not np.all(np.isfinite(constant)) or np.any(constant == 0.0):
+                continue
+            reciprocal = (1.0 / constant.astype(np.float64)).astype(np.float32)
+            if not np.all(np.isfinite(reciprocal)):
+                continue
+            name = f"{divisor}_reciprocal"
+            suffix = 0
+            while name in ag.tensors or name in ag.weight_data:
+                suffix += 1
+                name = f"{divisor}_reciprocal_{suffix}"
+            ag.weight_data[name] = np.ascontiguousarray(reciprocal)
+            ag.tensors[name] = replace(ag.tensors[divisor], name=name)
+            reciprocals[divisor] = name
+        op.inputs[1] = name
         op.op_type = "Mul"
     return ag
 
@@ -2004,6 +2136,70 @@ def _decompose_silu(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _fold_pad_into_conv(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Give a convolution the zero padding a Pad ahead of it was adding.
+
+    A converter that lowers "same" padding writes it as an explicit Pad and
+    leaves the convolution unpadded, which materializes a whole padded copy of
+    the feature map for nothing. The convolution already pads with zero, and
+    in the quantized domain with the input's zero point, which is the same
+    value a constant Pad of zero writes, so the two are exchangeable.
+
+    Only the spatial axes may be padded, the fill has to be zero, and the
+    padded tensor may have no other reader: anything else and the Pad stays.
+    """
+    readers: dict[str, list[int]] = {}
+    for index, op in enumerate(ag.ops):
+        for name in op.inputs:
+            if name:
+                readers.setdefault(name, []).append(index)
+
+    folded: set[int] = set()
+    for index, op in enumerate(ag.ops):
+        if op.op_type != "Pad" or not op.outputs or len(op.inputs) < 2:
+            continue
+        if op.attrs.get("mode", "constant") != "constant":
+            continue
+        consumers = readers.get(op.outputs[0], [])
+        if len(consumers) != 1:
+            continue
+        target = ag.ops[consumers[0]]
+        if target.op_type not in ("Conv", "DepthwiseConv"):
+            continue
+        if target.inputs[0] != op.outputs[0]:
+            continue
+        amounts = ag.weight_data.get(op.inputs[1])
+        if amounts is None:
+            continue
+        fill = ag.weight_data.get(op.inputs[2]) if len(op.inputs) > 2 else None
+        if fill is not None and fill.size and float(fill.reshape(-1)[0]) != 0.0:
+            continue
+        source = ag.tensors.get(op.inputs[0])
+        if source is None or len(source.shape) != 4:
+            continue
+        values = [int(v) for v in amounts.reshape(-1)]
+        if len(values) != 8:
+            continue
+        begins, ends = values[:4], values[4:]
+        if begins[0] or begins[1] or ends[0] or ends[1]:
+            continue
+        if any(v < 0 for v in values):
+            continue
+        existing = list(target.attrs.get("pads", [0, 0, 0, 0]))
+        if len(existing) != 4:
+            continue
+        target.attrs["pads"] = [
+            existing[0] + begins[2], existing[1] + begins[3],
+            existing[2] + ends[2], existing[3] + ends[3],
+        ]
+        target.inputs[0] = op.inputs[0]
+        folded.add(index)
+
+    if folded:
+        ag.ops = [op for i, op in enumerate(ag.ops) if i not in folded]
+    return ag
+
+
 def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Relabel Conv ops with group == C_in as DepthwiseConv."""
     for op in ag.ops:
@@ -2304,6 +2500,31 @@ def _fix_reshape_shapes(ag: AnalyzedGraph) -> None:
         out_info.shape = tuple(resolved)
 
 
+def _resolve_resize_conventions(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """State what a Resize samples, rather than leaving it to a default.
+
+    Resize changed shape across opsets. Up to opset 10 it takes scales as its
+    second input and always reads the source at ``out / scale``, which later
+    versions call the asymmetric convention; there is no attribute saying so.
+    From opset 11 the attributes exist and default to half-pixel coordinates
+    and a round-half-down nearest rule. Reading the opset-11 default off an
+    opset-10 graph moves every sample by half an output pixel, so the
+    effective convention is written onto the operator here and every later
+    pass reads it rather than guessing.
+    """
+    for op in ag.ops:
+        if op.op_type != "Resize":
+            continue
+        if ag.opset and ag.opset < 11:
+            op.attrs["coordinate_transformation_mode"] = "asymmetric"
+            op.attrs.setdefault("nearest_mode", "floor")
+        else:
+            op.attrs.setdefault(
+                "coordinate_transformation_mode", "half_pixel")
+            op.attrs.setdefault("nearest_mode", "round_prefer_floor")
+    return ag
+
+
 def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Extract integer scale factors from Resize ops.
 
@@ -2356,6 +2577,17 @@ def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         op.attrs["strides"] = [scale_h, scale_w]
 
+        # Bilinear upsampling is its own operator rather than a mode on this
+        # one. A runtime that does not carry it refuses the plan outright,
+        # where a mode flag on Resize would have been read as nearest and
+        # quietly produced a different picture. Which coordinates it samples
+        # on rides in kernel_shape, the way Concat carries its axis.
+        if op.attrs.get("mode", "nearest") == "linear":
+            op.op_type = "ResizeLinear"
+            asymmetric = op.attrs.get(
+                "coordinate_transformation_mode") == "asymmetric"
+            op.attrs["kernel_shape"] = [1 if asymmetric else 0]
+
         # Strip constant inputs (roi, scales, sizes) - keep only X
         for inp_name in op.inputs[1:]:
             if inp_name and inp_name in ag.weight_data:
@@ -2368,43 +2600,28 @@ def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _normalize_concat_axis(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Translate Concat axis from NCHW to NHWC convention.
+    """Restate the Concat axis in the order the runtime stores the tensor.
 
-    ONNX Concat has an ``axis`` attribute. For 4D tensors, NCHW axis=1
-    (channel concat) maps to NHWC axis=3. The axis is stored in
-    ``kernel_shape`` for packing into spatial.kernel_h.
+    ONNX names the axis in the model's own order. The runtime reads it out of
+    ``kernel_shape`` and applies it to the stored shape, so an image tensor's
+    channel axis 1 has to come through as the last axis, and a tensor that
+    already states its own order keeps the axis it was given. The layout map
+    says which, so this runs once layouts are assigned.
     """
     for op in ag.ops:
         if op.op_type != "Concat":
             continue
-
-        axis = op.attrs.get("axis", 1)
-
-        # Normalize negative axes for 4D
+        result = ag.tensors.get(op.outputs[0]) if op.outputs else None
+        if result is None:
+            continue
+        rank = len(result.shape)
+        axis = int(op.attrs.get("axis", 1))
         if axis < 0:
-            axis = 4 + axis
-
-        # Map NCHW axis to NHWC
-        if axis == 1:
-            nhwc_axis = 3  # channel axis
-        elif axis == 0:
-            nhwc_axis = 0  # batch (rare)
-        elif axis == 2:
-            nhwc_axis = 1  # H
-        elif axis == 3:
-            nhwc_axis = 2  # W
-        else:
-            nhwc_axis = axis
-
-        # Store axis in kernel_shape so _pack_spatial_attrs writes kernel_h
-        op.attrs["kernel_shape"] = [nhwc_axis]
-        # Clear pads/strides/dilations to avoid spurious spatial packing
-        op.attrs.pop("pads", None)
-        op.attrs.pop("strides", None)
-        op.attrs.pop("dilations", None)
-
+            axis += rank
+        if not 0 <= axis < rank:
+            continue
+        op.attrs["kernel_shape"] = [serialized_axis_map(rank, result.layout)[axis]]
     return ag
-
 
 def _validate_transposes(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Validate Transpose permutations retained in the deployment plan."""
