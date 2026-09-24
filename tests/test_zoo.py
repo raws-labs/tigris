@@ -79,7 +79,7 @@ def test_unknown_upper_bound_does_not_filter_out_untested_releases(tmp_path):
     assert select(source.artifacts, runtime="0.9.0") == []
     assert select(source.artifacts, runtime="0.10.0") == source.artifacts
     assert source.artifacts[0]["tested_runtime_versions"] == ["0.9.1"]
-    result = CliRunner().invoke(cli, ["zoo", "--catalog", str(catalog), "list", "--runtime", "0.10.0"])
+    result = CliRunner().invoke(cli, ["zoo", "--catalog", str(catalog), "list", "--runtime", "0.10.0", "--verbose"])
     assert result.exit_code == 0, result.output
     assert "no known upper bound" in result.output
     assert "tested runtimes: 0.9.1" in result.output
@@ -235,6 +235,11 @@ def test_cli_filtering_and_download(tmp_path):
     catalog = snapshot(tmp_path / "source", [artifact(), artifact("example-b", withdrawn="bad output")])
     runner = CliRunner()
     prefix = ["zoo", "--catalog", str(catalog)]
+    result = runner.invoke(cli, prefix + ["list"])
+    assert result.exit_code == 0, result.output
+    assert "Model zoo" in result.output and "Classification" in result.output
+    assert "1.00 KiB" in result.output
+    assert "example-a" not in result.output and "published=" not in result.output
     result = runner.invoke(cli, prefix + ["list", "--runtime", "0.9.1", "-m", "1K+0", "--json"])
     assert result.exit_code == 0, result.output
     assert [item["id"] for item in json.loads(result.output)] == ["example-a"]

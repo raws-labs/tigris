@@ -4,8 +4,11 @@ import json
 from pathlib import Path
 
 import click
+from rich.table import Table
+from rich.text import Text
 
-from tigris.cli import _expand_mem, _parse_size, cli
+from tigris.cli import _expand_mem, _parse_size, cli, console
+from tigris.utils import fmt_bytes
 from tigris.zoo import REPOSITORY, Zoo, select, version
 
 
@@ -60,9 +63,10 @@ def zoo(ctx, **config):
 @zoo.command("list")
 @click.option("--model")
 @click.option("--json", "as_json", is_flag=True, help="Print matching catalog entries as JSON.")
+@click.option("-v", "--verbose", is_flag=True, help="Show artifact IDs, compatibility, and publication details.")
 @_filters
 @click.pass_obj
-def list_models(config, as_json, **filters):
+def list_models(config, as_json, verbose, **filters):
     """List matching artifacts, newest first; omit withdrawn builds."""
     try:
         _, matches = _matches(config, **filters)
@@ -72,9 +76,24 @@ def list_models(config, as_json, **filters):
         click.echo(json.dumps(matches, indent=2))
     elif not matches:
         click.echo("No matching artifacts.")
-    else:
+    elif verbose:
         for item in matches:
             _report(item)
+    else:
+        table = Table(title="Model zoo", border_style="dim", box=None, pad_edge=False)
+        table.add_column("Model", style="cyan")
+        table.add_column("Category")
+        table.add_column("Precision")
+        for label in ("Fast RAM", "Slow RAM", "Plan"):
+            table.add_column(label, justify="right", no_wrap=True)
+        for item in matches:
+            memory = item["memory"]
+            category = item["category"].removeprefix("time-series-").replace("-", " ").capitalize()
+            table.add_row(
+                Text(item["model"]), Text(category), Text(item["quantization"]),
+                *(fmt_bytes(memory[key]) for key in ("fast_bytes", "slow_bytes", "flash_bytes")),
+            )
+        console.print(table)
 
 
 def _report(item):
