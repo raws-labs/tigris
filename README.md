@@ -81,6 +81,36 @@ The `.tgrs` plan is target-agnostic: the same file runs on an ESP32, a Cortex-M,
 
 Link the harness against [tigris-runtime](https://github.com/raws-labs/tigris-runtime) and your kernel library, and you have a working inference binary.
 
+## Precompiled models
+
+The model zoo hosts precompiled plans with runtime requirements, input/output
+conventions, evaluation results, and per-model licenses. Public downloads need no
+account. List available builds before choosing a model:
+
+```bash
+tigris zoo list --category classification
+tigris zoo list --runtime 0.9.1 --backend reference -m 256K
+tigris zoo fetch MODEL -o downloaded-model
+tigris codegen downloaded-model/model.tgrs --format core -o model.c
+```
+
+Filters are optional. The newest published matching build wins. Runtime ranges
+include both endpoints; a null maximum means no known upper compatibility bound.
+Tested releases are reported separately. Matching a range does not claim that
+every release in it has been tested. `-m` limits the fast arena, a second
+`-m` limits the slow arena, and `-f` limits plan bytes. These are not total
+application RAM or flash limits. Unspecified resources remain unconstrained.
+The runtime is supplied separately.
+
+Use `fetch --artifact ID` to pin a build. Withdrawn builds are excluded from
+automatic selection but remain explicitly retrievable with a warning. Downloads
+verify file hashes and never replace an existing destination. `manifest.json`
+preserves the original build metadata. `download.json` records the current
+runtime constraints, tested releases, and pinned catalog revision; use it for
+dependency integration. Catalog updates do not change artifact publication dates
+or rebuild models. `tigris zoo --offline ...` uses the HF cache;
+`tigris zoo --catalog catalog.json ...` reads a local zoo snapshot.
+
 ## Further reading
 
 - [Getting started](https://tigris-ml.dev/getting-started/quickstart/): installation, first compile, deploying to ESP32
