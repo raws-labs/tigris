@@ -4380,7 +4380,7 @@ def _2d_tiled_conv_case() -> ContractCase:
     Input NCHW [1, 64, 66, 66], a 3x3 stride-1 pad-1 Conv to [1, 64, 66, 66],
     at a 24K fast budget. 64 float32 channels give the same 256 bytes per
     pixel as the int8 sibling's 256 channels, so the compiler solves the same
-    4x5 core tile. 66 is not divisible by 4 or 5, so the last row, the last
+    4x8 output tile. 66 is not divisible by 4 or 8, so the last row, the last
     column, and the bottom-right corner tile are all partial.
 
     Height-only tiling is infeasible first: partition_spatial only attempts
@@ -4403,12 +4403,48 @@ def _2d_tiled_conv_case() -> ContractCase:
     )
 
 
+def _strided_depthwise_2d_case(*, quantized: bool) -> ContractCase:
+    """A stride-2 depthwise convolution tiled along height and width.
+
+    The runtime reads the 2D tile shape as an output tile and back-computes
+    its input rectangle, (t - 1) * 2 + 3 rows and columns, so a strided tile
+    reads roughly twice the rows it writes. 34x34 in and 17x17 out leave a
+    partial last row and column of tiles.
+    """
+    channels, side = 96, 34
+    rng = np.random.default_rng(31)
+    weight = (rng.normal(size=(channels, 1, 3, 3)) * 0.3).astype(np.float32)
+    data = rng.uniform(-1.0, 1.0, size=(1, channels, side, side)).astype(np.float32)
+    initializers = [numpy_helper.from_array(weight, "weight")]
+    conv = dict(group=channels, kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1])
+    if quantized:
+        initializers += _scalars(inp=(0.008, 0), w=(0.01, 0), out=(0.02, 0))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            *_qdq("weight", "w_s", "w_z", "wdq"),
+            helper.make_node("Conv", ["x", "wdq"], ["raw"], **conv),
+            *_qdq("raw", "out_s", "out_z", "output"),
+        ]
+    else:
+        nodes = [helper.make_node("Conv", ["input", "weight"], ["output"], **conv)]
+    label = f"{'int8' if quantized else 'float'}_strided_depthwise_2d"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, side // 2, side // 2])],
+        initializers,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data},
+                        ("DepthwiseConv",), mem_budget="4K" if quantized else "16K",
+                        expect_tiled=True, expect_2d=True)
+
+
 def _qdq_2d_tiled_conv_case() -> ContractCase:
     """The int8 sibling of _2d_tiled_conv_case, built via the _qdq_case QDQ
     pattern: input NCHW [1, 256, 66, 66], a 3x3 stride-1 pad-1 Conv, 24K
     budget. 256 int8 channels give the same per-pixel byte footprint as the
-    float case's 64 float32 channels, so the compiler solves the same 4x5
-    2D core tile with the same partial last row, column, and corner.
+    float case's 64 float32 channels, so the compiler solves the same 4x8
+    2D output tile with the same partial last row, column, and corner.
     """
     h = w = 66
     c = 256
@@ -5895,6 +5931,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _qdq_conv_chain_case(),
         _2d_tiled_conv_case(),
         _qdq_2d_tiled_conv_case(),
+        _strided_depthwise_2d_case(quantized=False),
+        _strided_depthwise_2d_case(quantized=True),
         _2d_tiled_conv_sigmoid_case(),
         _cotiled_concat_2d_case(),
         _qdq_cotiled_concat_2d_case(),

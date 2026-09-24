@@ -11,7 +11,6 @@ from tigris.analysis.partition_spatial import (
     _stage_tile_axis,
     compute_receptive_field,
     partition_spatial,
-    solve_2d_tile,
 )
 from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, Stage, TensorInfo
 
@@ -51,52 +50,69 @@ def test_receptive_field_asymmetric_kernel():
 
 # 2D tile solver
 #
-# solve_2d_tile mirrors the 1D proportional model already used by
-# partition_spatial() for HEIGHT_OR_LENGTH: tiled_peak(th, tw) scales the
-# stage's activation-only peak_bytes (compute_lifetimes skips constant
-# tensors, so this never includes weights/bias) by the fraction of the
-# haloed input area the tile covers, instead of the brief's
-# "(th+hh)(tw+hw)*C_in + th*tw*C_out" formula. Resident weight/scratch bytes
-# are not modeled against the tiled budget by either the 1D or 2D solver (a
-# known pre-existing gap); the runtime backstops this by validating the
-# emitted tile shape against the real fast arena and failing closed.
+# The runtime runs a (tile_height, tile_width) grid over the stage OUTPUT and
+# checks each tile against the fast arena: one packed input tile, whose
+# rectangle it back-computes as (t - 1) * stride + eff_k, plus every op's
+# packed output tile. The compiler has to size the tile the same way.
 
 
-def test_solve_2d_tile_fits_budget():
-    # peak_bytes models a [512,512] int8 activation with C=256 baked in
-    # (512*512*256 = 67,108,864). Halo 2x2. A full 1-row tile does not fit
-    # 32K, but a small square core does.
-    peak_bytes = 512 * 512 * 256
-    shape = solve_2d_tile(
-        budget=32 * 1024,
-        peak=peak_bytes,
-        input_h=512,
-        input_w=512,
-        halo_h=2,
-        halo_w=2,
+def _strided_depthwise_stages(tmp_path, budget):
+    import numpy as np
+    import onnx
+    from onnx import helper
+
+    from tigris.analysis.lifetime import compute_lifetimes
+    from tigris.analysis.memory import compute_memory_timeline
+    from tigris.analysis.partition_temporal import partition_temporal
+    from tigris.loaders import load_model
+
+    weight = helper.make_tensor(
+        "w", TensorProto.FLOAT, [96, 1, 3, 3],
+        np.ones((96, 1, 3, 3), dtype=np.float32).ravel().tolist())
+    graph = helper.make_graph(
+        [helper.make_node("Conv", ["input", "w"], ["output"], group=96,
+                          kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1])],
+        "dw",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 96, 34, 34])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 96, 17, 17])],
+        [weight])
+    path = str(tmp_path / "dw.onnx")
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+    ag = compute_memory_timeline(compute_lifetimes(load_model(path)))
+    return partition_spatial(partition_temporal(ag, budget))
+
+
+def _runtime_2d_bytes(th, tw):
+    """stage_2d_fast_bytes for the 96-channel float stride-2 depthwise stage."""
+    def aligned(n):
+        return (n + 31) // 32 * 32
+    in_h, in_w = min((th - 1) * 2 + 3, 34), min((tw - 1) * 2 + 3, 34)
+    return aligned(in_h * in_w * 96 * 4) + aligned(th * tw * 96 * 4)
+
+
+def test_strided_2d_tile_is_an_output_tile_that_fits(tmp_path):
+    budget = 16 * 1024
+    ag = _strided_depthwise_stages(tmp_path, budget)
+    tp = ag.stages[0].tile_plan
+    assert tp.tileable and tp.axis == TILE_AXIS_HW
+    assert tp.num_tiles == math.ceil(17 / tp.tile_height) * math.ceil(17 / tp.tile_width)
+    assert _runtime_2d_bytes(tp.tile_height, tp.tile_width) <= budget
+    assert tp.tiled_peak_bytes == _runtime_2d_bytes(tp.tile_height, tp.tile_width)
+    # The tile is the largest area the budget allows.
+    assert all(
+        _runtime_2d_bytes(th, tw) > budget
+        for th in range(1, 18) for tw in range(1, 18)
+        if th * tw > tp.tile_height * tp.tile_width
     )
-    assert shape is not None
-    th, tw = shape
-    assert th >= 1 and tw >= 1
-    tiled_peak = int(peak_bytes * (th + 2) * (tw + 2) / (512 * 512))
-    assert tiled_peak <= 32 * 1024
 
 
-def test_solve_2d_tile_infeasible_returns_none():
-    # peak_bytes models a [64,64] int8 activation with C=4096 baked in.
-    # Even the 1x1 core (with 2x2 halo) overflows a 1K budget.
-    peak_bytes = 64 * 64 * 4096
-    assert (
-        solve_2d_tile(
-            budget=1024,
-            peak=peak_bytes,
-            input_h=64,
-            input_w=64,
-            halo_h=2,
-            halo_w=2,
-        )
-        is None
-    )
+def test_strided_2d_tile_infeasible_is_marked(tmp_path):
+    # A 1x1 output tile still reads a 3x3x96 float input window, 3.5K with
+    # its output; a 2K budget fits no 2D tile.
+    ag = _strided_depthwise_stages(tmp_path, 2 * 1024)
+    tp = ag.stages[0].tile_plan
+    assert tp.axis != TILE_AXIS_HW
+    assert tp.min_2d_tile_infeasible
 
 
 # Op eligibility for the HW axis. Conv1D shares the CONV category with Conv
