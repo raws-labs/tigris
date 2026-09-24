@@ -1838,11 +1838,12 @@ def _get_stage_spatial_params(ag: AnalyzedGraph, stage: Stage) -> tuple[int, int
     comp_stride = 1
     comp_eff_kh = 1
     found = False
+    weight_shapes = _ag_weight_shapes(ag)
     for op_i in stage.op_indices:
         op = ag.ops[op_i]
         cat = classify_op(op.op_type)
         if cat in (TileCategory.CONV, TileCategory.POOL):
-            kh = _get_kernel_h(op)
+            kh = _get_kernel_h(op, weight_shapes)
             sh = _get_stride_h(op)
             dh = _get_dilation_h(op)
             ekh = dh * (kh - 1) + 1
@@ -1920,6 +1921,7 @@ def _chain_fast_bytes(
                                ag.tensor_alignment)
 
     # All op output tiles - forward-compute height through spatial ops
+    weight_shapes = _ag_weight_shapes(ag)
     for s_idx, stage in enumerate(chain_stages):
         cur_h = heights[s_idx][0]  # start with stage input height
         for op_i in stage.op_indices:
@@ -1927,7 +1929,7 @@ def _chain_fast_bytes(
             cat = classify_op(op.op_type)
             # Spatial ops reduce height
             if cat in (TileCategory.CONV, TileCategory.POOL):
-                kh = _get_kernel_h(op)
+                kh = _get_kernel_h(op, weight_shapes)
                 sh = _get_stride_h(op)
                 dh = _get_dilation_h(op)
                 ekh = dh * (kh - 1) + 1

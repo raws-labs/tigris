@@ -392,6 +392,37 @@ def _strided_stem_model(path):
     return path
 
 
+def test_chain_geometry_takes_the_kernel_from_the_weight(tmp_path):
+    """A convolution without kernel_shape keeps its 5x5 window in the chain model."""
+    rng = np.random.default_rng(0)
+    w1 = helper.make_tensor("w1", TensorProto.FLOAT, [16, 8, 1, 1],
+                            rng.standard_normal((16, 8, 1, 1)).astype(np.float32).ravel().tolist())
+    w2 = helper.make_tensor("w2", TensorProto.FLOAT, [16, 1, 5, 5],
+                            rng.standard_normal((16, 1, 5, 5)).astype(np.float32).ravel().tolist())
+    graph = helper.make_graph(
+        [helper.make_node("Conv", ["input", "w1"], ["a"]),
+         helper.make_node("Conv", ["a", "w2"], ["output"], group=16,
+                          strides=[2, 2], pads=[1, 1, 2, 2])],
+        "k5",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 8, 32, 32])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 16, 16, 16])],
+        [w1, w2])
+    path = str(tmp_path / "k5.onnx")
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+    ag = load_model(path)
+    ag.stages = [Stage(stage_id=0, op_indices=[0], input_tensors=["input"], output_tensors=["a"]),
+                 Stage(stage_id=1, op_indices=[1], input_tensors=["a"], output_tensors=["output"])]
+
+    assert _get_stage_spatial_params(ag, ag.stages[1]) == (5, 2, 1)
+    heights = _back_propagate_tile_heights(
+        [_get_stage_spatial_params(ag, s) for s in ag.stages], 1)
+    assert heights == [(5, 5), (5, 1)]
+    # Five input rows of 8 channels, five rows of the 16-channel 1x1 output,
+    # one output row of the depthwise, each 32-byte aligned.
+    assert _chain_fast_bytes(ag, ag.stages, heights) == (
+        5 * 32 * 8 * 4 + 5 * 32 * 16 * 4 + 16 * 16 * 4)
+
+
 class TestSplitChains:
     """A run too big to stream whole still streams as consecutive chains."""
 
