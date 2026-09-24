@@ -319,59 +319,6 @@ def _ag_weight_shapes(ag: AnalyzedGraph) -> dict[str, tuple[int, ...]]:
 # Tile solver
 
 
-def solve_2d_tile(
-    budget: int,
-    peak: int,
-    input_h: int,
-    input_w: int,
-    halo_h: int,
-    halo_w: int,
-) -> tuple[int, int] | None:
-    """Largest square-ish (tile_h, tile_w) whose proportional working set fits budget.
-
-    Mirrors the 1D proportional model already used for HEIGHT_OR_LENGTH in
-    partition_spatial(): ``tile_h = floor(budget*input_h/peak) - halo`` and
-    ``tiled_peak = int(peak * (tile_h + halo) / input_h)``. ``peak`` is the
-    stage's activation-only peak_bytes (compute_lifetimes skips constant
-    tensors, so weights/bias are never counted there); it is scaled by the
-    fraction of the haloed input area the tile covers:
-
-        tiled_peak(th, tw) = int(peak * (th + halo_h) * (tw + halo_w)
-                                  / (input_h * input_w))
-
-    Neither this solver nor the 1D one models resident weight/scratch bytes
-    against the tiled budget; that is a known pre-existing gap, and the
-    runtime backstops it by validating the emitted tile shape against the
-    real fast arena and failing closed.
-
-    Returns None if even a 1x1 core tile does not fit.
-    """
-    if input_h <= 0 or input_w <= 0:
-        return None
-
-    def tiled_peak(th: int, tw: int) -> int:
-        return int(peak * (th + halo_h) * (tw + halo_w) / (input_h * input_w))
-
-    if tiled_peak(1, 1) > budget:
-        return None
-
-    th = tw = max(min(input_h, input_w), 1)
-
-    # Shrink the larger side first, keeping the core roughly square, until it fits.
-    while tiled_peak(th, tw) > budget:
-        if th >= tw and th > 1:
-            th -= 1
-        elif tw > 1:
-            tw -= 1
-        else:
-            th = tw = 1
-            break
-
-    th = min(th, input_h)
-    tw = min(tw, input_w)
-    return (max(th, 1), max(tw, 1))
-
-
 def _cotileable_skip_operands(
     ag: AnalyzedGraph, stage: Stage, op: OpNode
 ) -> bool:
@@ -1111,14 +1058,47 @@ def _solve_convtranspose_2d(
             ],
         )
 
+    def input_tile(th: int, tw: int) -> tuple[int, int]:
+        # A ConvTranspose input tile inverts to a smaller fixed-halo rectangle.
+        return (
+            min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h),
+            min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w),
+        )
+
+    return _solve_output_tile_2d(
+        ag, stage, stage_ops, budget, ct, in_infos, out_h, out_w, input_tile,
+        what="ConvTranspose tile",
+    )
+
+
+def _solve_output_tile_2d(
+    ag: AnalyzedGraph,
+    stage: Stage,
+    stage_ops: list[OpNode],
+    budget: int,
+    spatial: OpNode | None,
+    in_infos: list,
+    out_h: int,
+    out_w: int,
+    input_tile,
+    *,
+    what: str,
+    receptive_field: int = 1,
+) -> TilePlan:
+    """The largest 2D output tile whose runtime working set fits the budget.
+
+    The runtime executes a (tile_height, tile_width) grid over the stage
+    OUTPUT and checks each tile with stage_2d_fast_bytes (tigris_executor.c):
+    one packed input tile per stage input plus every op's packed output tile,
+    all resident at once. ``input_tile`` maps an output tile to the input
+    rectangle the spatial op reads, as the runtime computes it. Sizing the
+    tile any other way, for example by a proportional share of the stage peak
+    over the input extent, emits tiles the runtime rejects.
+    """
     align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
     def working_set(th: int, tw: int) -> int:
-        """Runtime stage_2d_fast_bytes for one (th, tw) output tile."""
-        # ConvTranspose input tile: inverts to a smaller fixed-halo rectangle,
-        # clamped to the full input, exactly as the runtime computes it.
-        in_tile_h = min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h)
-        in_tile_w = min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w)
+        in_tile_h, in_tile_w = input_tile(th, tw)
         total = 0
         for info in in_infos:
             total += _align_up(
@@ -1126,12 +1106,11 @@ def _solve_convtranspose_2d(
                 * int(info.shape[1]) * info.elem_size,
                 align,
             )
-        # Walk the op sequence tracking the running tile extent: it starts at
-        # the input tile, the single spatial op resizes it to the output tile,
-        # pointwise ops preserve it. Matches the runtime's cur_h/cur_w walk.
+        # The running tile extent starts at the input tile, the spatial op
+        # resizes it to the output tile, pointwise ops keep it.
         cur_h, cur_w = in_tile_h, in_tile_w
         for op in stage_ops:
-            is_spatial = op is ct
+            is_spatial = op is spatial
             ah = th if is_spatial else cur_h
             aw = tw if is_spatial else cur_w
             for name in op.outputs:
@@ -1146,20 +1125,18 @@ def _solve_convtranspose_2d(
                 cur_h, cur_w = th, tw
         return total
 
-    # Fail closed if even a 1x1 output tile overflows the budget.
     if working_set(1, 1) > budget:
         return TilePlan(
             tileable=False,
             warnings=[
-                f"Stage {stage.stage_id} minimum 2D ConvTranspose tile still "
-                f"exceeds budget ({budget:,} bytes)"
+                f"Stage {stage.stage_id} minimum 2D {what} still exceeds "
+                f"budget ({budget:,} bytes)"
             ],
         )
 
-    # Largest output tile whose runtime working set fits, maximizing tile area
-    # (fewest tiles). working_set is monotonic non-decreasing in both th and tw,
-    # so per th the largest feasible tw is a binary search, and once th at tw==1
-    # overflows no larger th can fit at any width.
+    # Maximize tile area (fewest tiles). working_set is monotonic
+    # non-decreasing in both th and tw, so per th the largest feasible tw is a
+    # binary search, and once th overflows at tw == 1 no larger th fits.
     best_th, best_tw, best_area = 1, 1, 1
     for th in range(1, out_h + 1):
         if working_set(th, 1) > budget:
@@ -1172,25 +1149,68 @@ def _solve_convtranspose_2d(
                 lo = mid + 1
             else:
                 hi = mid - 1
-        area = th * tw_for_th
-        if area > best_area:
-            best_area, best_th, best_tw = area, th, tw_for_th
+        if th * tw_for_th > best_area:
+            best_area, best_th, best_tw = th * tw_for_th, th, tw_for_th
 
-    th, tw = best_th, best_tw
     return TilePlan(
         tileable=True,
         axis=TILE_AXIS_HW,
-        tile_height=th,
-        tile_width=tw,
-        num_tiles=math.ceil(out_h / th) * math.ceil(out_w / tw),
-        halo=0,
-        receptive_field=1,
+        tile_height=best_th,
+        tile_width=best_tw,
+        num_tiles=math.ceil(out_h / best_th) * math.ceil(out_w / best_tw),
+        halo=receptive_field - 1,
+        receptive_field=receptive_field,
         original_height=out_h,
-        tiled_peak_bytes=working_set(th, tw),
+        tiled_peak_bytes=working_set(best_th, best_tw),
         overhead_bytes=0,
         warnings=[],
     )
 
+
+def _solve_forward_2d(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int,
+    receptive_field: int,
+) -> TilePlan:
+    """2D (HW) tile plan for a stage whose single spatial op is a Conv or Pool.
+
+    The input rectangle of an output tile is ``(t - 1) * stride + eff_k``,
+    clamped to the full input, exactly as the runtime back-computes it; a
+    stage without a spatial op reads the output rectangle itself.
+    """
+    spatial = next(
+        (op for op in stage_ops
+         if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL)),
+        None,
+    )
+    out_h = _find_output_extent(ag, stage)
+    out_w = _find_output_extent_width(ag, stage)
+    in_infos = _stage_rank4_input_infos(ag, stage)
+    if out_h <= 0 or out_w <= 0 or not in_infos:
+        return TilePlan(
+            tileable=False,
+            warnings=[f"Stage {stage.stage_id}: cannot determine 2D tile extents"],
+        )
+    full_in_h = int(in_infos[0].shape[2])
+    full_in_w = int(in_infos[0].shape[3])
+    if spatial is None:
+        def input_tile(th: int, tw: int) -> tuple[int, int]:
+            return min(th, full_in_h), min(tw, full_in_w)
+    else:
+        weight_shapes = _ag_weight_shapes(ag)
+        eff_kh = _get_dilation_h(spatial) * (_get_kernel_h(spatial, weight_shapes) - 1) + 1
+        eff_kw = _get_dilation_w(spatial) * (_get_kernel_w(spatial, weight_shapes) - 1) + 1
+        stride_h, stride_w = _get_stride_h(spatial), _get_stride_w(spatial)
+
+        def input_tile(th: int, tw: int) -> tuple[int, int]:
+            return (
+                min((th - 1) * stride_h + eff_kh, full_in_h),
+                min((tw - 1) * stride_w + eff_kw, full_in_w),
+            )
+
+    return _solve_output_tile_2d(
+        ag, stage, stage_ops, budget, spatial, in_infos, out_h, out_w,
+        input_tile, what="tile", receptive_field=receptive_field,
+    )
 
 
 def _is_layout_conversion(ag: AnalyzedGraph, op: OpNode) -> bool:
@@ -1344,7 +1364,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         # Compute receptive field
-        rf_h, rf_w = compute_receptive_field(stage_ops, _ag_weight_shapes(ag))
+        rf_h, _ = compute_receptive_field(stage_ops, _ag_weight_shapes(ag))
         halo = rf_h - 1
 
         # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.
@@ -1377,45 +1397,16 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             and tiled_peak > budget
             and _stage_2d_eligible(ag, stage, stage_ops)
         ):
-            input_w = _find_input_extent_width(ag, stage)
-            if input_w > 0:
-                halo_w = rf_w - 1
-                shape = solve_2d_tile(
-                    budget=budget,
-                    peak=peak,
-                    input_h=input_h,
-                    input_w=input_w,
-                    halo_h=halo,
-                    halo_w=halo_w,
-                )
-                if shape is not None:
-                    tile_h_2d, tile_w_2d = shape
-                    tiled_peak_2d = int(
-                        peak
-                        * (tile_h_2d + halo)
-                        * (tile_w_2d + halo_w)
-                        / (input_h * input_w)
-                    )
-                    stage.tile_plan = TilePlan(
-                        tileable=True,
-                        axis=TILE_AXIS_HW,
-                        tile_height=tile_h_2d,
-                        tile_width=tile_w_2d,
-                        num_tiles=math.ceil(input_h / tile_h_2d)
-                        * math.ceil(input_w / tile_w_2d),
-                        halo=halo,
-                        receptive_field=rf_h,
-                        original_height=input_h,
-                        tiled_peak_bytes=tiled_peak_2d,
-                        overhead_bytes=0,
-                        warnings=[],
-                    )
+            if _find_input_extent_width(ag, stage) > 0:
+                plan_2d = _solve_forward_2d(ag, stage, stage_ops, budget, rf_h)
+                if plan_2d.tileable:
+                    stage.tile_plan = plan_2d
                     continue
 
-                # solve_2d_tile was attempted and even a 1x1 core tile does
-                # not fit the budget. Mark this stage distinctly so the
-                # surfaced diagnostic names the 2D tile instead of falling
-                # back to the generic 1D minimum-tile message below.
+                # Even a 1x1 output tile does not fit the budget. Mark this
+                # stage distinctly so the surfaced diagnostic names the 2D
+                # tile instead of falling back to the generic 1D minimum-tile
+                # message below.
                 min_2d_tile_infeasible = True
 
         # Overhead: extra halo reads per tile boundary
