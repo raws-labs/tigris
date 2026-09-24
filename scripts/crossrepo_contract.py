@@ -612,6 +612,52 @@ def _split_chain_case(*, quantized: bool) -> ContractCase:
                         expect_tiled=True, expect_chain=True, expect_line_buffered=True)
 
 
+def _inferred_kernel_chain_case(*, quantized: bool) -> ContractCase:
+    """A 5x5 stride-2 depthwise that omits kernel_shape, behind a 1x1 conv.
+
+    ONNX lets a convolution take its kernel size from the weight. Read as
+    1x1, the pair looks like a chain that streams at one row per tile; with
+    the real 5x5 window one row needs five input rows, which does not fit
+    the budget, so the stages have to run tiled on their own.
+    """
+    cin, cmid, side = 24, 96, 32
+    rng = np.random.default_rng(37)
+    w1 = (rng.normal(size=(cmid, cin, 1, 1)) * 0.2).astype(np.float32)
+    w2 = (rng.normal(size=(cmid, 1, 5, 5)) * 0.2).astype(np.float32)
+    data = rng.uniform(-1.0, 1.0, size=(1, cin, side, side)).astype(np.float32)
+    initializers = [numpy_helper.from_array(w1, "w1"), numpy_helper.from_array(w2, "w2")]
+    dw = dict(group=cmid, strides=[2, 2], pads=[1, 1, 2, 2])
+    if quantized:
+        initializers += _scalars(inp=(0.008, 0), w1q=(0.01, 0), mid=(0.02, 0),
+                                 w2q=(0.01, 0), out=(0.03, 0))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            *_qdq("w1", "w1q_s", "w1q_z", "w1dq"),
+            helper.make_node("Conv", ["x", "w1dq"], ["a"]),
+            helper.make_node("Relu", ["a"], ["ar"]),
+            *_qdq("ar", "mid_s", "mid_z", "b"),
+            *_qdq("w2", "w2q_s", "w2q_z", "w2dq"),
+            helper.make_node("Conv", ["b", "w2dq"], ["c"], **dw),
+            *_qdq("c", "out_s", "out_z", "output"),
+        ]
+    else:
+        nodes = [
+            helper.make_node("Conv", ["input", "w1"], ["a"]),
+            helper.make_node("Relu", ["a"], ["b"]),
+            helper.make_node("Conv", ["b", "w2"], ["output"], **dw),
+        ]
+    label = f"{'int8' if quantized else 'float'}_inferred_kernel_chain"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, cin, side, side])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, cmid, side // 2, side // 2])],
+        initializers,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data},
+                        ("Conv", "DepthwiseConv"), mem_budget="16K" if quantized else "64K",
+                        expect_tiled=True)
+
+
 def _squeeze_excitation_case(*, quantized: bool) -> ContractCase:
     """A squeeze-and-excitation gate: one value per channel scales the map.
 
@@ -3189,7 +3235,11 @@ def _tiled_pool_chain_case() -> ContractCase:
 
 
 def _tiled_chain_case(*, compression: str | None = None, xip: bool = False) -> ContractCase:
-    """Three padded Conv stages force the streamable-chain executor."""
+    """Three padded Conv stages force the streamable-chain executor.
+
+    The convolutions take their 3x3 kernel from the weights, so the chain
+    recomputes a halo and runs line-buffered.
+    """
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 3, 64, 64]
     )
@@ -3231,6 +3281,7 @@ def _tiled_chain_case(*, compression: str | None = None, xip: bool = False) -> C
         xip=xip,
         expect_tiled=True,
         expect_chain=True,
+        expect_line_buffered=True,
     )
 
 
@@ -5834,6 +5885,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _bilinear_upsample_case(tiled=True),
         _split_chain_case(quantized=False),
         _split_chain_case(quantized=True),
+        _inferred_kernel_chain_case(quantized=False),
+        _inferred_kernel_chain_case(quantized=True),
         _hardswish_case(quantized=False),
         _hardswish_case(quantized=True),
         _squeeze_excitation_case(quantized=False),
