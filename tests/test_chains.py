@@ -369,6 +369,66 @@ class TestCarriedOperand:
                     assert readers.get(name, set()) <= inside
 
 
+def _strided_stem_model(path):
+    """Three stride-2 convolutions down to 16x16, then three wide layers."""
+    rng = np.random.default_rng(0)
+    layers = [(3, 8, 3, 2), (8, 16, 3, 2), (16, 32, 3, 2), (32, 128, 1, 1), (128, 128, 3, 1), (128, 16, 1, 1)]
+    nodes, inits, previous = [], [], "input"
+    for index, (cin, cout, kernel, stride) in enumerate(layers):
+        inits.append(helper.make_tensor(
+            f"w{index}", TensorProto.FLOAT, [cout, cin, kernel, kernel],
+            rng.standard_normal((cout, cin, kernel, kernel)).astype(np.float32).ravel().tolist()))
+        out = "output" if index == len(layers) - 1 else f"t{index}"
+        nodes.append(helper.make_node(
+            "Conv", [previous, f"w{index}"], [out], kernel_shape=[kernel, kernel],
+            strides=[stride, stride], pads=[kernel // 2] * 4))
+        previous = out
+    graph = helper.make_graph(
+        nodes, "stem",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 128, 128])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 16, 16, 16])],
+        inits)
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+    return path
+
+
+class TestSplitChains:
+    """A run too big to stream whole still streams as consecutive chains."""
+
+    budget = 48000
+
+    def _stages(self, tmp_path):
+        ag = load_model(_strided_stem_model(str(tmp_path / "stem.onnx")))
+        ag = compute_memory_timeline(compute_lifetimes(ag))
+        return partition_spatial(partition_temporal(ag, self.budget))
+
+    def test_the_whole_run_does_not_fit(self, tmp_path):
+        ag = self._stages(tmp_path)
+        runs = detect_chains(ag)
+        assert len(runs) == 1 and len(runs[0]) == len(ag.stages)
+        assert solve_chain_tile_height(ag, runs[0]) == 0
+
+    def test_the_run_streams_as_fitting_pieces(self, tmp_path):
+        ag = detect_and_solve_chains(self._stages(tmp_path))
+        heads = [s for s in ag.stages if s.chain_len >= 2 and s.chain_id == s.stage_id]
+        assert len(heads) >= 2
+        covered = []
+        for head in heads:
+            piece = list(range(head.stage_id, head.stage_id + head.chain_len))
+            assert all(ag.stages[i].chain_id == head.stage_id for i in piece)
+            assert head.chain_tile_h > 0
+            assert head.chain_tile_h == solve_chain_tile_height(ag, piece)
+            covered += piece
+        assert covered == sorted(set(covered))
+
+    def test_the_stem_intermediates_stay_in_fast_memory(self, tmp_path):
+        ag = detect_and_solve_chains(self._stages(tmp_path))
+        first = ag.stages[0]
+        assert first.chain_len >= 2
+        streamed = [ag.stages[i].output_tensors[0] for i in range(first.chain_len - 1)]
+        assert "t0" in streamed
+
+
 # Chain detection tests
 
 
