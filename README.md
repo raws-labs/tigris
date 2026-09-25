@@ -149,6 +149,12 @@ the stored axis order and declared interface dtype reported by `inspect`:
 
 ```bash
 tigris run downloaded-model/model.tgrs --input downloaded-model/example-input.bin --output prediction.bin
+```
+
+Compare `prediction.bin` with `example-output.bin` numerically; the reference
+comes from ONNX Runtime, so float results differ in the last bits.
+
+```bash
 tigris run model.tgrs --input input.npy --output prediction.npy
 tigris --version
 ```
