@@ -12,7 +12,13 @@ from tigris import (
     TILE_AXIS_HW,
     TILE_AXIS_NONE,
 )
-from tigris.graph.ir import AnalyzedGraph, Layout, OpNode
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    Layout,
+    OpNode,
+    serialized_axis_map,
+    serialized_transpose_perm,
+)
 
 from .defs import (
     ACT_NONE,
@@ -27,6 +33,9 @@ from .defs import (
     MAGIC,
     NO_QUANT_PARAM,
     NO_WEIGHT,
+    OP_ATTR_AXES,
+    OP_ATTR_BINARY_REQUANT,
+    OP_ATTR_EPSILON,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ACTIVATION_STRUCT,
     OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
@@ -61,6 +70,7 @@ from .defs import (
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
     TENSOR_STRUCT,
+    TILE_FLAG_BAND_ON_COLUMNS,
     TILE_PLAN_STRUCT,
     WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
     WEIGHT_BLOCK_STRUCT,
@@ -77,6 +87,9 @@ WEIGHT_ALIGN = PLAN_SECTION_ALIGNMENT
 # These are execution limits of the current runtime, rather than wire-format
 # limits. Keep them explicit here so the compiler fails before producing a plan
 # the loader will inevitably reject.
+# What the runtime carries by default. It states these at compile time because
+# they size fixed storage, so a plan that needs more is not wrong, it needs a
+# target built for it. Nothing here refuses such a plan: the target does.
 RUNTIME_MAX_TENSORS = 512
 RUNTIME_MAX_STAGE_INPUTS = 16
 RUNTIME_MAX_STAGE_OUTPUTS = 16
@@ -328,6 +341,11 @@ def _build_fc_layout_permutations(
         spatial_info = ag.tensors.get(spatial_input)
         vector_info = ag.tensors.get(data_input)
         if spatial_info is None or vector_info is None:
+            continue
+        # A tensor that states its own axis order is stored the way the model
+        # states it, so flattening it needs no permutation. Only one the
+        # runtime holds channels-last does.
+        if spatial_info.layout is not Layout.SPATIAL:
             continue
         shape = spatial_info.shape
         if len(shape) not in (3, 4):
@@ -720,17 +738,42 @@ def _declared_interface_dtype(ag: AnalyzedGraph, name: str) -> int | None:
     return None
 
 
-def _serialized_axis_map(
-    rank: int, layout: Layout = Layout.SPATIAL
-) -> list[int]:
-    """Map an ONNX axis to its serialized tensor axis."""
-    if layout is Layout.LINEAR:
-        return list(range(rank))
-    if rank == 4:
-        return [0, 3, 1, 2]  # NCHW -> NHWC
-    if rank == 3:
-        return [0, 2, 1]     # NCL -> NLC
-    return list(range(rank))
+
+# The reference kernel shifts both operands left by this much before scaling
+# them onto a common scale, which is TFLite's quantized-add convention.
+_BINARY_REQUANT_LEFT_SHIFT = 20
+
+
+def _binary_requant_payload(ag: AnalyzedGraph, op: OpNode) -> bytes | None:
+    """The three Q0.31 pairs a quantized sum scales its operands and result by.
+
+    Mirrors the reference kernel's TFLite-exact arithmetic: both operands are
+    brought onto twice the larger input scale, summed, and requantized to the
+    output scale. All three are constants of the operand scales, so stating
+    them spares the kernel three frexp-and-round sequences per call and gives
+    a vendor kernel that takes them somewhere to read them from.
+    """
+    if len(op.inputs) != 2 or len(op.outputs) != 1:
+        return None
+    tensors = [ag.tensors.get(name) for name in (*op.inputs, op.outputs[0])]
+    if any(info is None or info.is_constant or info.quant is None
+           for info in tensors):
+        return None
+    scales = []
+    for info in tensors:
+        scale = np.asarray(info.quant.scale, dtype=np.float32).reshape(-1)
+        if scale.size != 1 or not (scale[0] > 0.0):
+            return None
+        scales.append(float(scale[0]))
+    left, right, result = scales
+    twice_max = 2.0 * max(left, right)
+    left_shift = 1 << _BINARY_REQUANT_LEFT_SHIFT
+    pairs = (
+        _compute_multiplier_shift(left / twice_max),
+        _compute_multiplier_shift(right / twice_max),
+        _compute_multiplier_shift(twice_max / (left_shift * result)),
+    )
+    return struct.pack("<6i", *(value for pair in pairs for value in pair))
 
 
 def _build_op_attributes(
@@ -744,6 +787,29 @@ def _build_op_attributes(
     """
     records: list[tuple[int, int, bytes]] = []
     for op_index, op in enumerate(ag.ops):
+        if op.op_type == "LayerNormalization":
+            records.append((
+                op_index,
+                OP_ATTR_EPSILON,
+                struct.pack("<f", float(op.attrs.get("epsilon", 1e-5))),
+            ))
+            continue
+        if op.op_type in ("Add", "Sub"):
+            payload = _binary_requant_payload(ag, op)
+            if payload is not None:
+                records.append((op_index, OP_ATTR_BINARY_REQUANT, payload))
+            continue
+        if op.op_type == "ReduceMean":
+            axes = op.attrs.get("axes")
+            if not axes:
+                raise ValueError(f"ReduceMean '{op.name}' must state its axes")
+            info = ag.tensors[op.inputs[0]]
+            axis_map = serialized_axis_map(len(info.shape), info.layout)
+            serialized = sorted(
+                axis_map[int(axis) % len(info.shape)] for axis in axes
+            )
+            records.append((op_index, OP_ATTR_AXES, bytes(serialized)))
+            continue
         if op.op_type != "Transpose":
             continue
         input_name, output_name = op.inputs[0], op.outputs[0]
@@ -751,17 +817,11 @@ def _build_op_attributes(
             raise ValueError(f"Transpose '{op.name}' must use runtime tensors")
         input_info = ag.tensors[input_name]
         output_info = ag.tensors[output_name]
-        rank = len(input_info.shape)
-        raw_perm = [int(axis) for axis in op.attrs["perm"]]
-        input_axes = _serialized_axis_map(rank, input_info.layout)
-        output_axes = _serialized_axis_map(rank, output_info.layout)
-        output_raw_by_serialized = [0] * rank
-        for raw_axis, serialized_axis in enumerate(output_axes):
-            output_raw_by_serialized[serialized_axis] = raw_axis
-        serialized_perm = bytes(
-            input_axes[raw_perm[output_raw_by_serialized[serialized_axis]]]
-            for serialized_axis in range(rank)
-        )
+        serialized_perm = bytes(serialized_transpose_perm(
+            [int(axis) for axis in op.attrs["perm"]],
+            input_info.layout,
+            output_info.layout,
+        ))
         records.append((op_index, OP_ATTR_TRANSPOSE_PERM, serialized_perm))
 
     if not records:
@@ -1009,6 +1069,19 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
             raise ValueError(
                 f"untileable stage {stage.stage_id} must use tile axis 0"
             )
+        # Every tile extent below is a uint16 field. Say which one overflowed
+        # and on which stage: struct.pack alone reports neither, and
+        # tile_width is masked rather than checked, so it would be silent.
+        for field in (
+            "tile_height", "num_tiles", "halo",
+            "receptive_field", "original_height", "tile_width",
+        ):
+            value = int(getattr(tp, field))
+            if not 0 <= value <= 0xFFFF:
+                raise ValueError(
+                    f"stage {stage.stage_id} tile plan {field} is {value:,}, "
+                    f"outside the 0..65,535 the plan format carries"
+                )
 
         # tigris_tile_plan_t: 24 bytes
         # tileable(u8) axis(u8) tile_height(u16)
@@ -1028,6 +1101,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
             tp.tiled_peak_bytes,
             tp.overhead_bytes,
             tp.tile_width & 0xFFFF,
+            TILE_FLAG_BAND_ON_COLUMNS if tp.band_on_columns else 0,
         ))
 
     return bytes(buf), stage_to_tile
@@ -1073,8 +1147,12 @@ def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
     weights) are not included - they keep their raw tensor scale.
     """
     effective: dict[str, np.ndarray] = {}
-    weight_ops = {"Conv", "ConvTranspose", "ConvInteger", "DepthwiseConv",
-                  "MatMul", "Gemm", "QLinearConv", "QLinearMatMul"}
+    # Every operator whose kernel requantizes an int32 accumulator belongs
+    # here. Conv1D is a distinct op type from Conv after the normalizer
+    # relabels it, and its kernel requantizes the same way.
+    weight_ops = {"Conv", "Conv1D", "ConvTranspose", "ConvInteger",
+                  "DepthwiseConv", "MatMul", "Gemm", "QLinearConv",
+                  "QLinearMatMul"}
 
     for op in ag.ops:
         if op.op_type not in weight_ops:
@@ -1257,14 +1335,19 @@ def _patch_stage_tile_indices(stage_data: bytearray, ag: AnalyzedGraph, stage_to
 # Plan assembly
 
 
-def emit_binary(ag: AnalyzedGraph, path: Path, compress: str | None = None, xip: bool = False) -> None:
+def emit_binary(
+    ag: AnalyzedGraph, path: Path, compress: str | None = None,
+    xip: bool = False,
+) -> None:
     """Write an execution plan as a binary file to *path*."""
     data = emit_binary_bytes(ag, compress=compress, xip=xip)
     with open(path, "wb") as f:
         f.write(data)
 
 
-def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool = False) -> bytes:
+def emit_binary_bytes(
+    ag: AnalyzedGraph, compress: str | None = None, xip: bool = False,
+) -> bytes:
     """Build the complete binary plan and return as bytes.
 
     Args:
@@ -1339,12 +1422,13 @@ def emit_binary_bytes(ag: AnalyzedGraph, compress: str | None = None, xip: bool 
     # Reject counts before any fixed-width table field is packed. The runtime
     # has a deliberately bounded tensor working set; the other limits are
     # direct consequences of the current wire layout.
-    runtime_tensor_count = sum(1 for info in ag.tensors.values() if not info.is_constant)
-    if runtime_tensor_count > RUNTIME_MAX_TENSORS:
-        raise ValueError(
-            f"plan has {runtime_tensor_count} tensors; current runtime loader limit is "
-            f"{RUNTIME_MAX_TENSORS}"
-        )
+    # How many tensors a plan holds is derived from the model, not chosen, so
+    # it is emitted whatever it comes to. A target built to carry fewer
+    # refuses the plan and says which build would run it, which is where that
+    # judgement belongs; the CLI says so at compile time as a courtesy.
+    _require_uint(
+        sum(1 for info in ag.tensors.values() if not info.is_constant),
+        16, "runtime tensor count")
     _require_uint(len(ag.weight_data), 16, "weight count")
     _require_uint(len(ag.stages), 16, "stage count")
 

@@ -139,7 +139,7 @@
         "esp-nn": "falls back when tiled or when input/output quantization differs"
       },
       "constraints": [
-        "explicit padding, floor output sizing, unit dilation, and count_include_pad=0"
+        "explicit padding, floor output sizing, unit dilation, and count_include_pad=0 wherever padding is non-zero"
       ],
       "opcode": 6,
       "operator": "AveragePool",
@@ -152,7 +152,7 @@
     },
     {
       "constraints": [
-        "dynamic operands must have identical shapes; no general broadcasting",
+        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a float constant operand is one value, one per channel, or one per element",
         "standalone rank-3 pointwise length tiling on serialized axis 1"
       ],
       "opcode": 7,
@@ -166,7 +166,7 @@
     },
     {
       "constraints": [
-        "dynamic operands must have identical shapes; no general broadcasting",
+        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a float constant operand is one value, one per channel, or one per element",
         "standalone rank-3 pointwise length tiling on serialized axis 1"
       ],
       "opcode": 8,
@@ -226,7 +226,7 @@
     },
     {
       "constraints": [
-        "rank-4 channel-axis concatenation"
+        "rank-3 and rank-4 concatenation on the last stored axis; a constant part only as the leading operand of a float concatenation"
       ],
       "opcode": 13,
       "operator": "Concat",
@@ -287,10 +287,10 @@
       "opcode": 18,
       "operator": "Sub",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
-        "reference": "unsupported",
-        "s8_ref": "unsupported"
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
       }
     },
     {
@@ -367,13 +367,16 @@
       }
     },
     {
+      "constraints": [
+        "rank-3 mean over serialized axis 1; untiled execution. A rank-4 mean over both spatial axes is rewritten to GlobalAveragePool instead"
+      ],
       "opcode": 26,
       "operator": "ReduceMean",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
-        "reference": "unsupported",
-        "s8_ref": "unsupported"
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
       }
     },
     {
@@ -411,7 +414,7 @@
     },
     {
       "constraints": [
-        "rank-4 nearest-neighbor integer H/W upscaling; untiled execution"
+        "rank-4 nearest-neighbor integer H/W upscaling; height tiling as the stage's single spatial op, never in a chain"
       ],
       "opcode": 30,
       "operator": "Resize",
@@ -426,10 +429,10 @@
       "opcode": 31,
       "operator": "GlobalMaxPool",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
-        "reference": "unsupported",
-        "s8_ref": "unsupported"
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
       }
     },
     {
@@ -444,9 +447,68 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "opcode": 33,
+      "operator": "LayerNormalization",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 34,
+      "operator": "Erf",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "contiguous parts along the outermost stored axis; untiled execution"
+      ],
+      "opcode": 35,
+      "operator": "Split",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "rank-4 bilinear integer H/W upscaling with half-pixel or asymmetric coordinates; height tiling as the stage's single spatial op, never in a chain"
+      ],
+      "opcode": 36,
+      "operator": "ResizeLinear",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "rank-3 pointwise length tiling on serialized axis 1"
+      ],
+      "opcode": 37,
+      "operator": "HardSwish",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
-  "schema_version": 7,
+  "schema_version": 9,
   "scope": "post-normalization operator dispatch; model-specific shape, attribute, quantization, memory, and tiling validation still applies",
   "source": "tigris.capabilities"
 }

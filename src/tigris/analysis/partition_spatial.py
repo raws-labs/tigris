@@ -12,11 +12,15 @@ import math
 from enum import Enum
 
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
+from tigris.analysis.partition_temporal import partition_temporal
 from tigris.graph.ir import (
     AnalyzedGraph,
+    Layout,
     OpNode,
     Stage,
     TilePlan,
+    serialized_shape,
+    serialized_transpose_perm,
 )
 
 
@@ -27,6 +31,10 @@ class TileCategory(Enum):
     CONV = "conv"
     POOL = "pool"
     POINTWISE = "pointwise"
+    # An operator whose output has more rows than its input. The tile loop
+    # divides to find the source band instead of multiplying, so it is its
+    # own category rather than a convolution with a fractional stride.
+    UPSAMPLE = "upsample"
     UNTILEABLE = "untileable"
 
 
@@ -47,6 +55,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     "Sigmoid": TileCategory.POINTWISE,
     "Tanh": TileCategory.POINTWISE,
     "Add": TileCategory.POINTWISE,
+    "Sub": TileCategory.POINTWISE,
     "Mul": TileCategory.POINTWISE,
     "Concat": TileCategory.POINTWISE,
     # Softmax normalizes along the final stored dimension, which is the channel
@@ -56,6 +65,19 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     # neighbours. Shape-preserving and halo-free, which is what POINTWISE means
     # here, even though the operator itself is a reduction.
     "Softmax": TileCategory.POINTWISE,
+    # Erf is elementwise. LayerNormalization reduces along the final stored
+    # dimension, which both tile axes are ahead of, so a tile holds whole
+    # normalization rows and needs nothing from its neighbours: the same
+    # argument that admits Softmax.
+    "Erf": TileCategory.POINTWISE,
+    "HardSwish": TileCategory.POINTWISE,
+    "LayerNormalization": TileCategory.POINTWISE,
+    # Resampling along the height: the runtime cuts the output into bands and
+    # reads the source band each one needs. Only the height axis, and only on
+    # its own stage, because the chain executor does not compose a fractional
+    # stride through the rest of a run.
+    "Resize": TileCategory.UPSAMPLE,
+    "ResizeLinear": TileCategory.UPSAMPLE,
 }
 
 
@@ -67,7 +89,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 # the wrong region or size from its second operand. Safe only in stages with
 # no spatial op. Shared between the rank-3 and rank-4 eligibility checks
 # below since the hazard is the same in both.
-_BINARY_OPS = frozenset({"Add", "Mul"})
+_BINARY_OPS = frozenset({"Add", "Sub", "Mul"})
 
 # Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
 # NHWC stages.  Unary pointwise operators preserve the current length and may
@@ -80,6 +102,9 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Sigmoid",
     "Tanh",
     "Softmax",
+    "Erf",
+    "HardSwish",
+    "LayerNormalization",
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
@@ -91,6 +116,38 @@ _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 # alignment). Under-counting would let the solver emit a tile the runtime's
 # stage_2d_fast_bytes check rejects, which is exactly the bug this guards.
 _CONSERVATIVE_TENSOR_ALIGN = 32
+
+# tigris_tile_plan_t carries tile_height, num_tiles and original_height in
+# uint16 fields (TILE_PLAN_STRUCT in emitters/binary/defs.py). Every solver
+# that banded a single axis stayed inside that by the nature of the shapes
+# that fit an embedded budget. The conversion and row solvers band a product
+# of axes instead, which reaches the limit at ordinary sizes: a 256x256
+# feature map through a layout conversion is 65536 rows. A solver that
+# promises a banding the plan cannot carry would abort the compile in the
+# writer with no diagnosis, so it declines the stage and says why.
+_MAX_PLAN_EXTENT = 0xFFFF
+
+
+def _plan_extents_fit(tile_height: int, num_tiles: int, original: int) -> bool:
+    """Whether a banding fits the uint16 fields of the tile plan record."""
+    return max(tile_height, num_tiles, original) <= _MAX_PLAN_EXTENT
+
+
+def _has_unequal_binary_operands(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """A binary op whose two dynamic operands differ in shape.
+
+    The one such form the runtime executes is a per-channel second operand. It
+    is one row high, so a rank-4 height stripe loads it whole for every band;
+    the 2D, chain and row-band executors have no such rule and keep it out.
+    """
+    if op.op_type not in _BINARY_OPS or len(op.inputs) != 2:
+        return False
+    first, second = (ag.tensors.get(name) for name in op.inputs)
+    if first is None or second is None:
+        return False
+    if first.is_constant or second.is_constant:
+        return False
+    return tuple(first.shape) != tuple(second.shape)
 
 
 def classify_op(op_type: str) -> TileCategory:
@@ -125,6 +182,18 @@ def compute_receptive_field(
 
     for op in reversed(ops):
         cat = classify_op(op.op_type)
+        if cat is TileCategory.UPSAMPLE:
+            # Measured in input rows, a nearest resample reads one row per
+            # output row and a bilinear one reads the pair around it. With
+            # half-pixel coordinates that pair can start a row ahead of
+            # out / scale, which the band has to reach as well.
+            if op.op_type == "ResizeLinear":
+                lead = op.attrs.get(
+                    "coordinate_transformation_mode", "half_pixel"
+                ) == "half_pixel"
+                rf_h += jump_h * (2 if lead else 1)
+                rf_w += jump_w * (2 if lead else 1)
+            continue
         if cat in (TileCategory.CONV, TileCategory.POOL):
             kernel_h = _get_kernel_h(op, weight_shapes)
             stride_h = _get_stride_h(op)
@@ -250,59 +319,6 @@ def _ag_weight_shapes(ag: AnalyzedGraph) -> dict[str, tuple[int, ...]]:
 # Tile solver
 
 
-def solve_2d_tile(
-    budget: int,
-    peak: int,
-    input_h: int,
-    input_w: int,
-    halo_h: int,
-    halo_w: int,
-) -> tuple[int, int] | None:
-    """Largest square-ish (tile_h, tile_w) whose proportional working set fits budget.
-
-    Mirrors the 1D proportional model already used for HEIGHT_OR_LENGTH in
-    partition_spatial(): ``tile_h = floor(budget*input_h/peak) - halo`` and
-    ``tiled_peak = int(peak * (tile_h + halo) / input_h)``. ``peak`` is the
-    stage's activation-only peak_bytes (compute_lifetimes skips constant
-    tensors, so weights/bias are never counted there); it is scaled by the
-    fraction of the haloed input area the tile covers:
-
-        tiled_peak(th, tw) = int(peak * (th + halo_h) * (tw + halo_w)
-                                  / (input_h * input_w))
-
-    Neither this solver nor the 1D one models resident weight/scratch bytes
-    against the tiled budget; that is a known pre-existing gap, and the
-    runtime backstops it by validating the emitted tile shape against the
-    real fast arena and failing closed.
-
-    Returns None if even a 1x1 core tile does not fit.
-    """
-    if input_h <= 0 or input_w <= 0:
-        return None
-
-    def tiled_peak(th: int, tw: int) -> int:
-        return int(peak * (th + halo_h) * (tw + halo_w) / (input_h * input_w))
-
-    if tiled_peak(1, 1) > budget:
-        return None
-
-    th = tw = max(min(input_h, input_w), 1)
-
-    # Shrink the larger side first, keeping the core roughly square, until it fits.
-    while tiled_peak(th, tw) > budget:
-        if th >= tw and th > 1:
-            th -= 1
-        elif tw > 1:
-            tw -= 1
-        else:
-            th = tw = 1
-            break
-
-    th = min(th, input_h)
-    tw = min(tw, input_w)
-    return (max(th, 1), max(tw, 1))
-
-
 def _cotileable_skip_operands(
     ag: AnalyzedGraph, stage: Stage, op: OpNode
 ) -> bool:
@@ -399,7 +415,9 @@ def _stage_2d_eligible(
         if op.op_type in _BINARY_OPS or op.op_type == "Concat":
             if not _cotileable_skip_operands(ag, stage, op):
                 return False
-    return all(_op_supports_axis(op, TILE_AXIS_HW) for op in stage_ops)
+    return all(_op_supports_axis(op, TILE_AXIS_HW)
+               and not _has_unequal_binary_operands(ag, op)
+               for op in stage_ops)
 
 
 def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
@@ -436,6 +454,529 @@ def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
         if classify_op(op.op_type) != TileCategory.POINTWISE:
             return False
     return True
+
+
+def _transpose_band_groups(
+    stored_perm: tuple[int, ...]
+) -> tuple[int, int, int] | None:
+    """Split a stored permutation into (prefix, first group, middle) sizes.
+
+    A transpose is a plain matrix transpose when it swaps two adjacent groups
+    of axes and leaves everything else in its relative order:
+
+        [prefix][A][B][suffix] -> [prefix][B][A][suffix]
+
+    It then transposes prod(A) by prod(B), repeated over prod(prefix), and
+    carries prod(suffix) elements at each position. A layout conversion, an
+    attention block's key transpose and its head permutation are all instances
+    of this; the prefix and the suffix are what tell them apart, and the three
+    permutations this used to name were the cases with neither.
+
+    Returns the prefix length, the length of A, and the length of the middle,
+    or None when the permutation is not of that shape.
+    """
+    rank = len(stored_perm)
+    if rank < 2:
+        return None
+    prefix = 0
+    while prefix < rank and stored_perm[prefix] == prefix:
+        prefix += 1
+    if prefix >= rank:
+        return None  # the identity moves nothing
+    suffix = 0
+    while (suffix < rank - prefix
+           and stored_perm[rank - 1 - suffix] == rank - 1 - suffix):
+        suffix += 1
+    middle = rank - prefix - suffix
+    if middle < 2:
+        return None
+    # Inside the middle the permutation reads [B][A], so where A begins is
+    # where the first index lands.
+    split = stored_perm[prefix] - prefix
+    if split <= 0 or split >= middle:
+        return None
+    for i in range(middle):
+        want = (prefix + split + i if i < middle - split
+                else prefix + i - (middle - split))
+        if stored_perm[prefix + i] != want:
+            return None
+    return prefix, split, middle
+
+
+def _transpose_band_extents(
+    info, stored_perm: tuple[int, ...]
+) -> tuple[int, int, int] | None:
+    """The batch and the two extents a banded transpose swaps.
+
+    Mirrors transpose_extents in the executor, which reads the stored
+    permutation and nothing else. The tensor's layout does not decide the
+    split: the same stored shape is banded differently depending on which way
+    the permutation runs, and a transpose that is not a layout conversion has
+    no layout difference to read in the first place.
+    """
+    stored = serialized_shape(info.shape, info.layout)
+    if len(stored) != len(stored_perm):
+        return None
+    groups = _transpose_band_groups(stored_perm)
+    if groups is None:
+        return None
+    prefix, split, middle = groups
+    batch = math.prod(stored[:prefix]) if prefix else 1
+    rows = math.prod(stored[prefix:prefix + split])
+    cols = math.prod(stored[prefix + split:prefix + middle])
+    if batch <= 0 or rows <= 0 or cols <= 0:
+        return None
+    return batch, rows, cols
+
+
+# Operators that keep a rank-2 matrix's rows independent: a matrix product
+# against a constant reads one row to write one row, and the pointwise
+# operators beside it preserve rows outright. Mirrors is_row_tiling_op in the
+# loader and the executor.
+_ROW_TILING_OPS = frozenset({
+    "Gemm",
+    "MatMul",
+    "Relu",
+    "Relu6",
+    "Sigmoid",
+    "Tanh",
+    "Erf",
+    "HardSwish",
+    "Softmax",
+    "LayerNormalization",
+    "Reshape",
+    "Flatten",
+    "Add",
+    "Sub",
+    "Mul",
+})
+
+# The operators that may read an operand the band does not cut. A matrix
+# product reads every row of its second operand to produce one row of its
+# output, so that operand is resident whole exactly as a weight is. Nothing
+# else here has an operand it would make sense to leave whole: an elementwise
+# pair whose rows do not match is not an elementwise pair.
+_ROW_TILING_WHOLE_OPERAND_OPS = frozenset({"Gemm", "MatMul"})
+
+
+def _row_view(info) -> tuple[int, int, int] | None:
+    """The (batch, rows, columns) a tensor presents to a row band, or None.
+
+    The last two axes are the matrix and everything before them is batch,
+    which is what a matrix product already means by its shape. A rank-2 tensor
+    is one matrix; a rank-3 tensor is a batch of them; a rank-4 one is a batch
+    of batches, which is what an attention block's head axis is. Reading them
+    the same way is what lets a band of query rows mean the same thing on
+    every tensor in the region, and what lets the Reshape pair around a
+    lowered matrix product join the band, since it moves no data.
+
+    Anything above rank 2 has to be in the model's own axis order: a spatial
+    tensor holds its channels last, so its final two axes are not a matrix.
+    """
+    shape = [int(dim) for dim in info.shape]
+    if len(shape) == 2:
+        return 1, shape[0], shape[1]
+    if len(shape) < 2 or info.layout is not Layout.LINEAR:
+        return None
+    batch = 1
+    for dim in shape[:-2]:
+        batch *= dim
+    if batch <= 0:
+        return None
+    return batch, shape[-2], shape[-1]
+
+
+def _whole_band_operands(stage_ops: list[OpNode]) -> set[str]:
+    """Tensors a row band never cuts because a matrix product reads them whole.
+
+    A matrix product reads every row of its second operand to produce one row
+    of its output. Which tensors the band cuts is a property of the role each
+    plays, not of its shape: an operand whose own row count happens to equal
+    the band's is still read whole, and cutting it computes a partial product.
+    """
+    whole: set[str] = set()
+    for op in stage_ops:
+        if op.op_type not in _ROW_TILING_WHOLE_OPERAND_OPS:
+            continue
+        for name in op.inputs[1:]:
+            if name:
+                whole.add(name)
+    return whole
+
+
+def _stage_is_row_tiled(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """A rank-2 matrix pipeline whose rows can be taken a band at a time.
+
+    Rank 2 has no batch or spatial axis, so the stripe contract never reaches
+    it, yet a projection's rows are independent. Every tensor the stage touches
+    has to agree on the row count, which is what makes a band mean the same
+    thing on each of them.
+    """
+    if not stage_ops or any(_has_unequal_binary_operands(ag, op)
+                            for op in stage_ops):
+        return False
+
+    # Every tensor the band cuts has to agree on the batch and the row count,
+    # which is what makes a band mean the same thing on each of them. The
+    # outputs settle it: an output is always banded.
+    banded: tuple[int, int] | None = None
+    produced = [name for op in stage_ops for name in op.outputs]
+    for name in [*stage.output_tensors, *produced]:
+        info = ag.tensors.get(name)
+        view = _row_view(info) if info is not None else None
+        if view is None:
+            return False
+        if banded is None:
+            banded = (view[0], view[1])
+        if (view[0], view[1]) != banded:
+            return False
+    if banded is None or banded[1] <= 1:
+        return False
+
+    whole_operands = _whole_band_operands(stage_ops)
+    for op in stage_ops:
+        if (op.op_type not in _ROW_TILING_OPS
+                or len(op.inputs) < 1 or len(op.outputs) != 1):
+            return False
+        for position, name in enumerate(op.inputs):
+            if not name:
+                continue
+            info = ag.tensors.get(name)
+            if info is None or info.is_constant:
+                continue
+            if name in whole_operands:
+                # The band cuts an operand or reads it whole; it cannot do
+                # both, so a tensor some product reads whole may not also be
+                # the operand the band cuts.
+                if position == 0:
+                    return False
+                continue
+            view = _row_view(info)
+            if view is not None and (view[0], view[1]) == banded:
+                continue
+            return False
+
+    # A stage input the band does not cut is the whole operand of some matrix
+    # product inside the stage, which the loop above has already allowed.
+    for name in stage.input_tensors:
+        info = ag.tensors.get(name)
+        if info is None:
+            return False
+        if name in whole_operands:
+            continue
+        view = _row_view(info)
+        if view is None:
+            return False
+
+    return True
+
+
+def _solve_row_tile(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Size the band of rows a matrix pipeline takes at a time.
+
+    Mirrors the runtime: the stage inputs and every op output are resident
+    together, each its own aligned allocation, and a row costs the same on
+    every tensor whatever the band.
+    """
+    first_output = stage_ops[0].outputs[0]
+    batch, rows, _ = _row_view(ag.tensors[first_output])
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+
+    # A tensor the band cuts costs its row size for every row in the band, on
+    # every batch. One it does not cut is resident whole for the whole stage,
+    # which is what a matrix product's second operand is.
+    per_row: list[int] = []
+    whole: int = 0
+    seen: set[str] = set()
+    whole_operands = _whole_band_operands(stage_ops)
+    names = [*stage.input_tensors]
+    for op in stage_ops:
+        names.extend(op.outputs)
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        info = ag.tensors[name]
+        view = _row_view(info)
+        if (name not in whole_operands and view is not None
+                and (view[0], view[1]) == (batch, rows)):
+            per_row.append(batch * view[2] * info.elem_size)
+        else:
+            whole += _align_up(info.size_bytes, align)
+
+    def working_set(band: int) -> int:
+        return whole + sum(_align_up(row * band, align) for row in per_row)
+
+    if working_set(1) > budget:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum row band still exceeds "
+                f"budget ({budget:,} bytes)"
+            ],
+        )
+
+    low, high, band = 1, rows, 1
+    while low <= high:
+        candidate = low + (high - low) // 2
+        if working_set(candidate) <= budget:
+            band = candidate
+            low = candidate + 1
+        else:
+            high = candidate - 1
+
+    num_tiles = math.ceil(rows / band)
+    if not _plan_extents_fit(band, num_tiles, rows):
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} has {rows:,} rows, more than the "
+                f"{_MAX_PLAN_EXTENT:,} a tile plan can state"
+            ],
+        )
+
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+        tile_height=band,
+        num_tiles=num_tiles,
+        halo=0,
+        receptive_field=1,
+        original_height=rows,
+        tiled_peak_bytes=working_set(band),
+        overhead_bytes=0,
+        warnings=[],
+    )
+
+
+def _stage_is_global_reduction(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """A stage that reduces a whole rank-4 plane and nothing else.
+
+    GlobalAveragePool stays UNTILEABLE in _OP_CATEGORY because it collapses
+    the height the stripe contract propagates. The runtime instead walks such
+    a stage along its input, a band of rows at a time, carrying one partial
+    per channel between bands. That only works when the reduction is the
+    whole stage: with another op present there would be a height to carry.
+    Mirrors stage_is_input_driven_reduction in the executor.
+    """
+    if len(stage_ops) != 1 or stage_ops[0].op_type != "GlobalAveragePool":
+        return False
+    op = stage_ops[0]
+    if len(op.inputs) != 1 or len(op.outputs) != 1:
+        return False
+    if stage.input_tensors != op.inputs or stage.output_tensors != op.outputs:
+        return False
+
+    source = ag.tensors.get(op.inputs[0])
+    result = ag.tensors.get(op.outputs[0])
+    if source is None or result is None:
+        return False
+    if len(source.shape) != 4 or len(result.shape) != 4:
+        return False
+    # NCHW: the reduction collapses H and W, keeping N and C.
+    return (
+        int(source.shape[2]) > 1
+        and int(source.shape[3]) > 0
+        and int(result.shape[0]) == int(source.shape[0])
+        and int(result.shape[1]) == int(source.shape[1])
+        and int(result.shape[2]) == 1
+        and int(result.shape[3]) == 1
+    )
+
+
+def _solve_global_reduction(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Size the band of input rows a global reduction reads at a time.
+
+    Mirrors the runtime's arena accounting: one accumulator of four bytes per
+    (batch, channel) held for the whole stage, plus one band of input rows and
+    the collapsed output, all resident together.
+    """
+    op = stage_ops[0]
+    source = ag.tensors[op.inputs[0]]
+    result = ag.tensors[op.outputs[0]]
+
+    batch = int(source.shape[0])
+    channels = int(source.shape[1])
+    full_h = int(source.shape[2])
+    full_w = int(source.shape[3])
+
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+    # The accumulator is int32 for the int8 kernels and float for the float32
+    # ones, four bytes either way.
+    acc_bytes = _align_up(batch * channels * 4, align)
+    out_bytes = _align_up(
+        batch * channels * result.elem_size, align
+    )
+    row_elems = batch * full_w * channels
+
+    def working_set(rows: int) -> int:
+        return (
+            acc_bytes
+            + _align_up(rows * row_elems * source.elem_size, align)
+            + out_bytes
+        )
+
+    if working_set(1) > budget:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum reduction band still "
+                f"exceeds budget ({budget:,} bytes)"
+            ],
+        )
+
+    low, high, rows = 1, full_h, 1
+    while low <= high:
+        candidate = low + (high - low) // 2
+        if working_set(candidate) <= budget:
+            rows = candidate
+            low = candidate + 1
+        else:
+            high = candidate - 1
+
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+        tile_height=rows,
+        num_tiles=math.ceil(full_h / rows),
+        halo=0,
+        receptive_field=1,
+        original_height=full_h,
+        tiled_peak_bytes=working_set(rows),
+        overhead_bytes=0,
+        warnings=[],
+    )
+
+def _stage_is_tiled_transpose(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """A stage that is one transpose the runtime can band.
+
+    Transpose stays UNTILEABLE in _OP_CATEGORY because it moves the axis the
+    stripe contract propagates. The runtime instead walks the longer of the
+    two extents it transposes, which only works when the transpose is the
+    whole stage.
+
+    What decides this is the permutation of stored axes, not why it is there.
+    A layout conversion and an attention block's key transpose emit the same
+    permutation, and the runtime cannot tell them apart, so neither does this.
+    """
+    if len(stage_ops) != 1 or stage_ops[0].op_type != "Transpose":
+        return False
+    op = stage_ops[0]
+    if len(op.inputs) != 1 or len(op.outputs) != 1:
+        return False
+    if stage.input_tensors != op.inputs or stage.output_tensors != op.outputs:
+        return False
+
+    source = ag.tensors.get(op.inputs[0])
+    result = ag.tensors.get(op.outputs[0])
+    if source is None or result is None:
+        return False
+    if len(source.shape) != len(result.shape):
+        return False
+
+    raw_perm = op.attrs.get("perm")
+    if raw_perm is None or len(raw_perm) != len(source.shape):
+        return False
+    stored_perm = serialized_transpose_perm(
+        raw_perm, source.layout, result.layout)
+    extents = _transpose_band_extents(source, stored_perm)
+    if extents is None:
+        return False
+    # The far side has to be the permutation of the near one. The runtime
+    # only asks for a matching batch and byte count, because it writes the
+    # band through strides it computes from the extents rather than through
+    # the output's shape, but a stage where those disagree is a plan defect
+    # and not something to band.
+    from_stored = serialized_shape(source.shape, source.layout)
+    to_stored = serialized_shape(result.shape, result.layout)
+    if len(to_stored) != len(stored_perm):
+        return False
+    return to_stored == tuple(from_stored[axis] for axis in stored_perm)
+
+
+def _solve_layout_conversion(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+) -> TilePlan:
+    """Size the band a transpose swaps at a time.
+
+    Mirrors the runtime: the band runs along the longer of the two permuted
+    axes, and the two slices hold the same element count but are separate
+    allocations, so each is aligned on its own.
+    """
+    op = stage_ops[0]
+    source = ag.tensors[op.inputs[0]]
+    result = ag.tensors[op.outputs[0]]
+    stored_perm = serialized_transpose_perm(
+        op.attrs["perm"], source.layout, result.layout)
+    extents = _transpose_band_extents(source, stored_perm)
+    if extents is None:  # guarded by _stage_is_tiled_transpose; defensive
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id}: cannot determine conversion extents"
+            ],
+        )
+    batch, rows, cols = extents
+    band_on_columns = cols >= rows
+    banded = cols if band_on_columns else rows
+    other = rows if band_on_columns else cols
+
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+
+    def working_set(band: int) -> int:
+        return 2 * _align_up(batch * other * band * source.elem_size, align)
+
+    if working_set(1) > budget:
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} minimum conversion band still "
+                f"exceeds budget ({budget:,} bytes)"
+            ],
+        )
+
+    low, high, band = 1, banded, 1
+    while low <= high:
+        candidate = low + (high - low) // 2
+        if working_set(candidate) <= budget:
+            band = candidate
+            low = candidate + 1
+        else:
+            high = candidate - 1
+
+    num_tiles = math.ceil(banded / band)
+    if not _plan_extents_fit(band, num_tiles, banded):
+        return TilePlan(
+            tileable=False,
+            warnings=[
+                f"Stage {stage.stage_id} transposes {banded:,} rows, more "
+                f"than the {_MAX_PLAN_EXTENT:,} a tile plan can state"
+            ],
+        )
+
+    return TilePlan(
+        tileable=True,
+        axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+        tile_height=band,
+        num_tiles=num_tiles,
+        halo=0,
+        receptive_field=1,
+        original_height=banded,
+        tiled_peak_bytes=working_set(band),
+        overhead_bytes=0,
+        band_on_columns=band_on_columns,
+        warnings=[],
+    )
 
 
 def _stage_rank4_input_infos(ag: AnalyzedGraph, stage: Stage) -> list:
@@ -517,14 +1058,47 @@ def _solve_convtranspose_2d(
             ],
         )
 
+    def input_tile(th: int, tw: int) -> tuple[int, int]:
+        # A ConvTranspose input tile inverts to a smaller fixed-halo rectangle.
+        return (
+            min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h),
+            min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w),
+        )
+
+    return _solve_output_tile_2d(
+        ag, stage, stage_ops, budget, ct, in_infos, out_h, out_w, input_tile,
+        what="ConvTranspose tile",
+    )
+
+
+def _solve_output_tile_2d(
+    ag: AnalyzedGraph,
+    stage: Stage,
+    stage_ops: list[OpNode],
+    budget: int,
+    spatial: OpNode | None,
+    in_infos: list,
+    out_h: int,
+    out_w: int,
+    input_tile,
+    *,
+    what: str,
+    receptive_field: int = 1,
+) -> TilePlan:
+    """The largest 2D output tile whose runtime working set fits the budget.
+
+    The runtime executes a (tile_height, tile_width) grid over the stage
+    OUTPUT and checks each tile with stage_2d_fast_bytes (tigris_executor.c):
+    one packed input tile per stage input plus every op's packed output tile,
+    all resident at once. ``input_tile`` maps an output tile to the input
+    rectangle the spatial op reads, as the runtime computes it. Sizing the
+    tile any other way, for example by a proportional share of the stage peak
+    over the input extent, emits tiles the runtime rejects.
+    """
     align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
     def working_set(th: int, tw: int) -> int:
-        """Runtime stage_2d_fast_bytes for one (th, tw) output tile."""
-        # ConvTranspose input tile: inverts to a smaller fixed-halo rectangle,
-        # clamped to the full input, exactly as the runtime computes it.
-        in_tile_h = min((th + eff_kh + stride_h - 1) // stride_h + 2, full_in_h)
-        in_tile_w = min((tw + eff_kw + stride_w - 1) // stride_w + 2, full_in_w)
+        in_tile_h, in_tile_w = input_tile(th, tw)
         total = 0
         for info in in_infos:
             total += _align_up(
@@ -532,12 +1106,11 @@ def _solve_convtranspose_2d(
                 * int(info.shape[1]) * info.elem_size,
                 align,
             )
-        # Walk the op sequence tracking the running tile extent: it starts at
-        # the input tile, the single spatial op resizes it to the output tile,
-        # pointwise ops preserve it. Matches the runtime's cur_h/cur_w walk.
+        # The running tile extent starts at the input tile, the spatial op
+        # resizes it to the output tile, pointwise ops keep it.
         cur_h, cur_w = in_tile_h, in_tile_w
         for op in stage_ops:
-            is_spatial = op is ct
+            is_spatial = op is spatial
             ah = th if is_spatial else cur_h
             aw = tw if is_spatial else cur_w
             for name in op.outputs:
@@ -552,20 +1125,18 @@ def _solve_convtranspose_2d(
                 cur_h, cur_w = th, tw
         return total
 
-    # Fail closed if even a 1x1 output tile overflows the budget.
     if working_set(1, 1) > budget:
         return TilePlan(
             tileable=False,
             warnings=[
-                f"Stage {stage.stage_id} minimum 2D ConvTranspose tile still "
-                f"exceeds budget ({budget:,} bytes)"
+                f"Stage {stage.stage_id} minimum 2D {what} still exceeds "
+                f"budget ({budget:,} bytes)"
             ],
         )
 
-    # Largest output tile whose runtime working set fits, maximizing tile area
-    # (fewest tiles). working_set is monotonic non-decreasing in both th and tw,
-    # so per th the largest feasible tw is a binary search, and once th at tw==1
-    # overflows no larger th can fit at any width.
+    # Maximize tile area (fewest tiles). working_set is monotonic
+    # non-decreasing in both th and tw, so per th the largest feasible tw is a
+    # binary search, and once th overflows at tw == 1 no larger th fits.
     best_th, best_tw, best_area = 1, 1, 1
     for th in range(1, out_h + 1):
         if working_set(th, 1) > budget:
@@ -578,24 +1149,118 @@ def _solve_convtranspose_2d(
                 lo = mid + 1
             else:
                 hi = mid - 1
-        area = th * tw_for_th
-        if area > best_area:
-            best_area, best_th, best_tw = area, th, tw_for_th
+        if th * tw_for_th > best_area:
+            best_area, best_th, best_tw = th * tw_for_th, th, tw_for_th
 
-    th, tw = best_th, best_tw
     return TilePlan(
         tileable=True,
         axis=TILE_AXIS_HW,
-        tile_height=th,
-        tile_width=tw,
-        num_tiles=math.ceil(out_h / th) * math.ceil(out_w / tw),
-        halo=0,
-        receptive_field=1,
+        tile_height=best_th,
+        tile_width=best_tw,
+        num_tiles=math.ceil(out_h / best_th) * math.ceil(out_w / best_tw),
+        halo=receptive_field - 1,
+        receptive_field=receptive_field,
         original_height=out_h,
-        tiled_peak_bytes=working_set(th, tw),
+        tiled_peak_bytes=working_set(best_th, best_tw),
         overhead_bytes=0,
         warnings=[],
     )
+
+
+def _solve_forward_2d(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int,
+    receptive_field: int,
+) -> TilePlan:
+    """2D (HW) tile plan for a stage whose single spatial op is a Conv or Pool.
+
+    The input rectangle of an output tile is ``(t - 1) * stride + eff_k``,
+    clamped to the full input, exactly as the runtime back-computes it; a
+    stage without a spatial op reads the output rectangle itself.
+    """
+    spatial = next(
+        (op for op in stage_ops
+         if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL)),
+        None,
+    )
+    out_h = _find_output_extent(ag, stage)
+    out_w = _find_output_extent_width(ag, stage)
+    in_infos = _stage_rank4_input_infos(ag, stage)
+    if out_h <= 0 or out_w <= 0 or not in_infos:
+        return TilePlan(
+            tileable=False,
+            warnings=[f"Stage {stage.stage_id}: cannot determine 2D tile extents"],
+        )
+    full_in_h = int(in_infos[0].shape[2])
+    full_in_w = int(in_infos[0].shape[3])
+    if spatial is None:
+        def input_tile(th: int, tw: int) -> tuple[int, int]:
+            return min(th, full_in_h), min(tw, full_in_w)
+    else:
+        weight_shapes = _ag_weight_shapes(ag)
+        eff_kh = _get_dilation_h(spatial) * (_get_kernel_h(spatial, weight_shapes) - 1) + 1
+        eff_kw = _get_dilation_w(spatial) * (_get_kernel_w(spatial, weight_shapes) - 1) + 1
+        stride_h, stride_w = _get_stride_h(spatial), _get_stride_w(spatial)
+
+        def input_tile(th: int, tw: int) -> tuple[int, int]:
+            return (
+                min((th - 1) * stride_h + eff_kh, full_in_h),
+                min((tw - 1) * stride_w + eff_kw, full_in_w),
+            )
+
+    return _solve_output_tile_2d(
+        ag, stage, stage_ops, budget, spatial, in_infos, out_h, out_w,
+        input_tile, what="tile", receptive_field=receptive_field,
+    )
+
+
+def _is_layout_conversion(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """A Transpose that only restates a tensor's axis order.
+
+    The normalizer inserts one where a producer and a consumer disagree about
+    layout, with an identity permutation: the tensors differ in layout, not in
+    the order their axes are named.
+    """
+    if op.op_type != "Transpose" or len(op.inputs) != 1 or len(op.outputs) != 1:
+        return False
+    perm = op.attrs.get("perm")
+    if perm is None or list(perm) != list(range(len(perm))):
+        return False
+    source = ag.tensors.get(op.inputs[0])
+    result = ag.tensors.get(op.outputs[0])
+    return (
+        source is not None
+        and result is not None
+        and source.layout is not result.layout
+    )
+
+
+def conversion_cut_points(ag: AnalyzedGraph) -> frozenset[int]:
+    """Op indices that must start a stage for an oversized stage to tile.
+
+    A layout conversion swaps the two axes on either side of it, so a stage
+    holding one wants different tile axes for its input and its interior and
+    cannot tile on either. Isolating the conversion lets each side tile on its
+    own axis. Only stages that are both oversized and untileable are split:
+    a conversion that fits keeps its intermediates in the fast arena, which
+    splitting would force out to slow.
+    """
+    if not ag.stages or ag.mem_budget <= 0:
+        return frozenset()
+
+    cuts: set[int] = set()
+    for stage in ag.stages:
+        if stage.peak_bytes <= ag.mem_budget:
+            continue
+        if stage.tile_plan is not None and stage.tile_plan.tileable:
+            continue
+        for position, op_index in enumerate(stage.op_indices):
+            if not _is_layout_conversion(ag, ag.ops[op_index]):
+                continue
+            # Isolate it: cut before it, and after it when it is not last.
+            cuts.add(op_index)
+            if position + 1 < len(stage.op_indices):
+                cuts.add(stage.op_indices[position + 1])
+    return frozenset(cuts)
 
 
 def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -603,7 +1268,23 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     Only stages whose peak_bytes exceed mem_budget are analyzed.
     Stages that fit within budget get no tile_plan (None).
+
+    A stage that stays untileable because it fuses a layout conversion is
+    given a second chance: the graph is re-partitioned with the conversion
+    on its own stage, then re-analyzed. Stages that tiled the first time are
+    unaffected, so a graph without such a stage takes the single pass.
     """
+    _assign_tile_plans(ag)
+
+    cuts = conversion_cut_points(ag)
+    if cuts:
+        partition_temporal(ag, ag.mem_budget, forced_cuts=cuts)
+        _assign_tile_plans(ag)
+    return ag
+
+
+def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """One pass of tile analysis over the current stage list."""
     if not ag.stages or ag.mem_budget <= 0:
         return ag
 
@@ -624,16 +1305,51 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             stage.tile_plan = _solve_convtranspose_2d(ag, stage, stage_ops, budget)
             continue
 
+        # Rank 2 has no axis the stripe contract names, but a matrix
+        # pipeline's rows are independent, so it bands along them.
+        if _stage_is_row_tiled(ag, stage, stage_ops):
+            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget)
+            continue
+
+        # A global reduction has no output axis to tile, so the runtime walks
+        # its input instead. Like ConvTranspose it stays UNTILEABLE in
+        # _OP_CATEGORY and reaches its execution path only through this branch.
+        if _stage_is_global_reduction(ag, stage, stage_ops):
+            stage.tile_plan = _solve_global_reduction(
+                ag, stage, stage_ops, budget)
+            continue
+
+        # A conversion permutes the two axes the stripe contract propagates,
+        # so it reaches its own execution path the same way.
+        if _stage_is_tiled_transpose(ag, stage, stage_ops):
+            stage.tile_plan = _solve_layout_conversion(
+                ag, stage, stage_ops, budget)
+            continue
+
         tile_axis = _stage_tile_axis(ag, stage, stage_ops)
 
         # Check if all ops are tileable
         untileable: list[str] = []
         for op in stage_ops:
             cat = classify_op(op.op_type)
-            if cat == TileCategory.UNTILEABLE or not _op_supports_axis(
-                op, tile_axis
-            ):
+            if (cat == TileCategory.UNTILEABLE
+                    or not _op_supports_axis(op, tile_axis)
+                    or (_has_unequal_binary_operands(ag, op)
+                        and not (tile_axis == TILE_AXIS_HEIGHT_OR_LENGTH
+                                 and len(ag.tensors[op.inputs[0]].shape) == 4))):
                 untileable.append(f"{op.name} ({op.op_type})")
+
+        if tile_axis != TILE_AXIS_NONE and not _external_outputs_keep_their_rows(
+            stage, stage_ops
+        ):
+            stage.tile_plan = TilePlan(
+                tileable=False,
+                warnings=[
+                    f"Stage {stage.stage_id} emits a tensor whose rows a tile "
+                    f"would leave unwritten"
+                ],
+            )
+            continue
 
         if tile_axis == TILE_AXIS_NONE or untileable:
             stage.tile_plan = TilePlan(
@@ -648,7 +1364,7 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         # Compute receptive field
-        rf_h, rf_w = compute_receptive_field(stage_ops, _ag_weight_shapes(ag))
+        rf_h, _ = compute_receptive_field(stage_ops, _ag_weight_shapes(ag))
         halo = rf_h - 1
 
         # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.
@@ -681,45 +1397,16 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
             and tiled_peak > budget
             and _stage_2d_eligible(ag, stage, stage_ops)
         ):
-            input_w = _find_input_extent_width(ag, stage)
-            if input_w > 0:
-                halo_w = rf_w - 1
-                shape = solve_2d_tile(
-                    budget=budget,
-                    peak=peak,
-                    input_h=input_h,
-                    input_w=input_w,
-                    halo_h=halo,
-                    halo_w=halo_w,
-                )
-                if shape is not None:
-                    tile_h_2d, tile_w_2d = shape
-                    tiled_peak_2d = int(
-                        peak
-                        * (tile_h_2d + halo)
-                        * (tile_w_2d + halo_w)
-                        / (input_h * input_w)
-                    )
-                    stage.tile_plan = TilePlan(
-                        tileable=True,
-                        axis=TILE_AXIS_HW,
-                        tile_height=tile_h_2d,
-                        tile_width=tile_w_2d,
-                        num_tiles=math.ceil(input_h / tile_h_2d)
-                        * math.ceil(input_w / tile_w_2d),
-                        halo=halo,
-                        receptive_field=rf_h,
-                        original_height=input_h,
-                        tiled_peak_bytes=tiled_peak_2d,
-                        overhead_bytes=0,
-                        warnings=[],
-                    )
+            if _find_input_extent_width(ag, stage) > 0:
+                plan_2d = _solve_forward_2d(ag, stage, stage_ops, budget, rf_h)
+                if plan_2d.tileable:
+                    stage.tile_plan = plan_2d
                     continue
 
-                # solve_2d_tile was attempted and even a 1x1 core tile does
-                # not fit the budget. Mark this stage distinctly so the
-                # surfaced diagnostic names the 2D tile instead of falling
-                # back to the generic 1D minimum-tile message below.
+                # Even a 1x1 output tile does not fit the budget. Mark this
+                # stage distinctly so the surfaced diagnostic names the 2D
+                # tile instead of falling back to the generic 1D minimum-tile
+                # message below.
                 min_2d_tile_infeasible = True
 
         # Overhead: extra halo reads per tile boundary
@@ -814,6 +1501,10 @@ def _op_supports_axis(op: OpNode, axis: int) -> bool:
         # explicitly rather than relying on the membership check alone.
         if op.op_type == "Conv1D":
             return False
+        # A resample is cut along its height only; the 2D tiler does not
+        # invert its rectangle.
+        if classify_op(op.op_type) is TileCategory.UPSAMPLE:
+            return False
         return op.op_type in _OP_CATEGORY
     return False
 
@@ -844,10 +1535,18 @@ def _find_source_dim_extent(
         first_op = ag.ops[stage.op_indices[0]]
         candidates = [n for n in first_op.inputs if n in ag.tensors]
 
+    # A one-row operand is broadcast over every band (a per-channel gate), so
+    # it does not say how far the band runs while another input does.
+    one_row = False
     for name in candidates:
         info = ag.tensors.get(name)
         if info and len(info.shape) in ranks:
+            if int(info.shape[dim]) == 1:
+                one_row = True
+                continue
             return int(info.shape[dim])
+    if one_row:
+        return 1
 
     return 0
 
@@ -908,6 +1607,31 @@ def _estimate_halo_bytes(ag: AnalyzedGraph, stage, halo: int, input_h: int) -> i
 # Chain detection and solving
 
 
+def _external_outputs_keep_their_rows(
+    stage: Stage, stage_ops: list[OpNode]
+) -> bool:
+    """Whether every tensor leaving the stage has all of its rows written.
+
+    A tiled stage writes each of its outputs at the row range of the op that
+    produced it. For an output produced ahead of a spatial op that range is the
+    spatial op's INPUT range, and the tiles cover the whole tensor only while
+    the ops after it map rows one to one. A stride above one drops the trailing
+    rows no output row reads, which would leave them unwritten in slow memory.
+    """
+    external = set(stage.output_tensors)
+    seen_external = False
+    for op in stage_ops:
+        if seen_external:
+            cat = classify_op(op.op_type)
+            if cat in (TileCategory.CONV, TileCategory.POOL) and (
+                _get_stride_h(op) != 1
+            ):
+                return False
+        if any(name in external for name in op.outputs):
+            seen_external = True
+    return True
+
+
 def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
     """Check if a stage may be part of a streamable CHAIN (used only by
     detect_chains): all ops implement the schema-v4 height-stripe contract and
@@ -915,21 +1639,30 @@ def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
 
     The runtime composes Conv, DepthwiseConv, MaxPool, and AveragePool geometry
     while pointwise operators preserve the current stripe height.
+
+    The stripe is a spatial height, so every stage tensor has to be one the
+    runtime stores channels-last. A rank-4 tensor that states its own axis
+    order is a batch of matrices and has no height to stripe: banding its rows
+    is a different contract, and running it through the chain executor reads
+    the head axis as an image.
     """
     for op_i in stage.op_indices:
         cat = classify_op(ag.ops[op_i].op_type)
-        if cat == TileCategory.UNTILEABLE:
+        # A resample stays out of a chain: the chain executor composes one
+        # receptive field across its members and has no fractional stride.
+        if cat in (TileCategory.UNTILEABLE, TileCategory.UPSAMPLE):
             return False
-    # All inputs and outputs must be 4D
-    for name in stage.input_tensors:
+        if _has_unequal_binary_operands(ag, ag.ops[op_i]):
+            return False
+    for name in (*stage.input_tensors, *stage.output_tensors):
         info = ag.tensors.get(name)
         if not info or len(info.shape) != 4:
             return False
-    for name in stage.output_tensors:
-        info = ag.tensors.get(name)
-        if not info or len(info.shape) != 4:
+        if info.layout is not Layout.SPATIAL:
             return False
-    return True
+    return _external_outputs_keep_their_rows(
+        stage, [ag.ops[i] for i in stage.op_indices]
+    )
 
 
 def _tensor_consumer_count(ag: AnalyzedGraph) -> dict[str, int]:
@@ -941,62 +1674,154 @@ def _tensor_consumer_count(ag: AnalyzedGraph) -> dict[str, int]:
     return counts
 
 
+def _stage_consumers(ag: AnalyzedGraph) -> dict[str, list[int]]:
+    """Which stages read each tensor."""
+    readers: dict[str, list[int]] = {}
+    for index, stage in enumerate(ag.stages):
+        for name in stage.input_tensors:
+            readers.setdefault(name, []).append(index)
+    return readers
+
+
+def _stage_producer(ag: AnalyzedGraph) -> dict[str, int]:
+    """Which stage writes each tensor."""
+    return {
+        name: index
+        for index, stage in enumerate(ag.stages)
+        for name in stage.output_tensors
+    }
+
+
+def _has_height_spatial_op(ag: AnalyzedGraph, stage: Stage) -> bool:
+    return any(
+        classify_op(ag.ops[i].op_type) in (TileCategory.CONV, TileCategory.POOL)
+        for i in stage.op_indices
+    )
+
+
+def _skip_rows_still_line_up(
+    ag: AnalyzedGraph, run: list[int], source: int, target: int, name: str
+) -> bool:
+    """Whether a tensor carried past the next stage still has the right rows.
+
+    A chain streams one tile at a time, and a tensor produced two or more
+    stages back is still in fast memory when a later stage reads it. Its tile
+    holds the rows the producing stage wrote, so the stages in between have to
+    leave the row count alone, and the reading stage has to reach it before
+    any operator of its own changes rows. A convolution or a pool in that
+    span would leave the two operands describing different rows.
+    """
+    for index in run[run.index(source) + 1:]:
+        if index == target:
+            break
+        if _has_height_spatial_op(ag, ag.stages[index]):
+            return False
+    for op_index in ag.stages[target].op_indices:
+        op = ag.ops[op_index]
+        if name in op.inputs:
+            return True
+        if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL):
+            return False
+    return True
+
+
+def _may_extend_chain(
+    ag: AnalyzedGraph,
+    run: list[int],
+    index: int,
+    producer: dict[str, int],
+) -> bool:
+    """Whether the stage at `index` streams from the run it would join."""
+    stage = ag.stages[index]
+    if not _is_stage_tileable(ag, stage):
+        return False
+    previous = ag.stages[run[-1]]
+    if len(previous.output_tensors) != 1:
+        return False
+    streamed = previous.output_tensors[0]
+    if streamed in ag.model_outputs or streamed not in stage.input_tensors:
+        return False
+    inside = set(run)
+    for name in stage.input_tensors:
+        source = producer.get(name)
+        # Only the first stage of a chain loads from slow memory. Every other
+        # operand has to be one the chain itself is already carrying.
+        if source is None or source not in inside:
+            return False
+        if source != run[-1] and not _skip_rows_still_line_up(
+            ag, run, source, index, name
+        ):
+            return False
+    return True
+
+
+def _run_is_self_contained(
+    ag: AnalyzedGraph, run: list[int], readers: dict[str, list[int]]
+) -> bool:
+    """Whether everything the run produces before its last stage stays inside.
+
+    A chain writes only its last stage's outputs to slow memory. Anything an
+    earlier stage produces is streamed and gone, so a reader outside the run,
+    or a model output, would be left with nothing.
+    """
+    inside = set(run)
+    for index in run[:-1]:
+        stage = ag.stages[index]
+        if len(stage.output_tensors) != 1:
+            return False
+        produced = stage.output_tensors[0]
+        if produced in ag.model_outputs:
+            return False
+        if any(r not in inside for r in readers.get(produced, ())):
+            return False
+    return True
+
+
 def detect_chains(ag: AnalyzedGraph) -> list[list[int]]:
     """Detect streamable chains: maximal runs of consecutive tiled stages.
 
-    A chain [s_i, s_{i+1}, ...] requires for each adjacent pair (s_k, s_{k+1}):
-      1. Both stages are spatially tileable (all ops tileable, 4D I/O)
-      2. s_k has exactly one output tensor
-      3. s_{k+1} has exactly one input tensor
-      4. s_k's output IS s_{k+1}'s input (same tensor)
-      5. No other stage consumes that intermediate tensor (no fan-out)
+    A run [s_i .. s_j] is a chain when every stage is spatially tileable, each
+    stage takes the single output of the one before it, and everything the run
+    produces short of its last stage is read only inside the run and is not a
+    model output. Those intermediates are streamed a tile at a time and never
+    reach slow memory.
 
-    Returns a list of chain groups, each a sorted list of stage indices (length >= 2).
+    A stage may also read a tensor an earlier stage of the same run produced,
+    which is what a gate or a residual around one operator looks like: the
+    tile is still in fast memory when the later stage wants it, as long as
+    nothing in between changed the rows it describes.
+
+    Returns a list of chain groups, each a sorted list of stage indices
+    (length >= 2).
     """
     if not ag.stages or len(ag.stages) < 2:
         return []
 
-    consumer_counts = _tensor_consumer_count(ag)
+    readers = _stage_consumers(ag)
+    producer = _stage_producer(ag)
     chains: list[list[int]] = []
-    current_chain: list[int] = []
 
-    for i, stage in enumerate(ag.stages):
-        if not current_chain:
-            # Try to start a chain at this stage
-            if _is_stage_tileable(ag, stage):
-                current_chain = [i]
+    index = 0
+    while index < len(ag.stages):
+        if not _is_stage_tileable(ag, ag.stages[index]):
+            index += 1
             continue
-
-        prev_stage = ag.stages[current_chain[-1]]
-
-        # Check chaining conditions between prev and current
-        can_chain = (
-            _is_stage_tileable(ag, stage)
-            and len(prev_stage.output_tensors) == 1
-            and len(stage.input_tensors) == 1
-            and prev_stage.output_tensors[0] == stage.input_tensors[0]
-            and consumer_counts.get(prev_stage.output_tensors[0], 0) == 1
-            # The chain intermediate is streamed tile-by-tile and never
-            # materialized to slow memory; if it is also a model output, chaining
-            # would leave that output unwritten. Keep it out of the chain.
-            and prev_stage.output_tensors[0] not in ag.model_outputs
-        )
-
-        if can_chain:
-            current_chain.append(i)
+        run = [index]
+        follower = index + 1
+        while follower < len(ag.stages) and _may_extend_chain(
+            ag, run, follower, producer
+        ):
+            run.append(follower)
+            follower += 1
+        # Dropping the last stage can orphan a tensor an earlier stage carries
+        # for it, so re-check after every trim rather than once.
+        while len(run) >= 2 and not _run_is_self_contained(ag, run, readers):
+            run.pop()
+        if len(run) >= 2:
+            chains.append(run)
+            index = run[-1] + 1
         else:
-            # Flush current chain if length >= 2
-            if len(current_chain) >= 2:
-                chains.append(current_chain)
-            # Try starting a new chain from this stage
-            if _is_stage_tileable(ag, stage):
-                current_chain = [i]
-            else:
-                current_chain = []
-
-    # Flush last chain
-    if len(current_chain) >= 2:
-        chains.append(current_chain)
+            index += 1
 
     return chains
 
@@ -1013,11 +1838,12 @@ def _get_stage_spatial_params(ag: AnalyzedGraph, stage: Stage) -> tuple[int, int
     comp_stride = 1
     comp_eff_kh = 1
     found = False
+    weight_shapes = _ag_weight_shapes(ag)
     for op_i in stage.op_indices:
         op = ag.ops[op_i]
         cat = classify_op(op.op_type)
         if cat in (TileCategory.CONV, TileCategory.POOL):
-            kh = _get_kernel_h(op)
+            kh = _get_kernel_h(op, weight_shapes)
             sh = _get_stride_h(op)
             dh = _get_dilation_h(op)
             ekh = dh * (kh - 1) + 1
@@ -1095,6 +1921,7 @@ def _chain_fast_bytes(
                                ag.tensor_alignment)
 
     # All op output tiles - forward-compute height through spatial ops
+    weight_shapes = _ag_weight_shapes(ag)
     for s_idx, stage in enumerate(chain_stages):
         cur_h = heights[s_idx][0]  # start with stage input height
         for op_i in stage.op_indices:
@@ -1102,7 +1929,7 @@ def _chain_fast_bytes(
             cat = classify_op(op.op_type)
             # Spatial ops reduce height
             if cat in (TileCategory.CONV, TileCategory.POOL):
-                kh = _get_kernel_h(op)
+                kh = _get_kernel_h(op, weight_shapes)
                 sh = _get_stride_h(op)
                 dh = _get_dilation_h(op)
                 ekh = dh * (kh - 1) + 1
@@ -1165,18 +1992,73 @@ def solve_chain_tile_height(
     return best
 
 
+def _carries_only_its_own_tensors(
+    ag: AnalyzedGraph, run: list[int], producer: dict[str, int]
+) -> bool:
+    """Whether every stage after the head reads only tensors the run produces."""
+    inside = set(run)
+    return all(
+        producer.get(name) in inside
+        for index in run[1:]
+        for name in ag.stages[index].input_tensors
+    )
+
+
+def _split_into_fitting_chains(
+    ag: AnalyzedGraph,
+    run: list[int],
+    readers: dict[str, list[int]],
+    producer: dict[str, int],
+) -> list[tuple[list[int], int]]:
+    """Cut a detected run into consecutive chains that fit the fast budget.
+
+    A run that does not fit as a whole still streams in pieces: each piece
+    writes only its last output to slow memory. Pieces are taken greedily,
+    longest first from the current head. Appending a stage never shrinks the
+    tile buffers of the stages before it, so once a prefix stops fitting no
+    longer prefix fits either and the scan can stop there. A prefix that
+    carries a tensor to a reader beyond its end is not a chain, but a longer
+    one may be, so the scan keeps the longest prefix that is both.
+
+    Returns (chain, tile height) pairs.
+    """
+    pieces: list[tuple[list[int], int]] = []
+    head = 0
+    while head < len(run) - 1:
+        best: tuple[list[int], int] | None = None
+        for end in range(head + 2, len(run) + 1):
+            piece = run[head:end]
+            tile_h = solve_chain_tile_height(ag, piece)
+            if tile_h <= 0:
+                break
+            if _carries_only_its_own_tensors(
+                ag, piece, producer
+            ) and _run_is_self_contained(ag, piece, readers):
+                best = (piece, tile_h)
+        if best is None:
+            head += 1
+        else:
+            pieces.append(best)
+            head += len(best[0])
+    return pieces
+
+
 def detect_and_solve_chains(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Detect chains and solve tile heights. Sets chain fields on stages.
 
     Should be called after partition_spatial() has determined individual tiling.
+    A detected run that does not fit is split into pieces that do; stages no
+    piece takes keep their standalone tiling.
     """
-    chains = detect_chains(ag)
+    readers = _stage_consumers(ag)
+    producer = _stage_producer(ag)
+    chains = [
+        piece
+        for run in detect_chains(ag)
+        for piece in _split_into_fitting_chains(ag, run, readers, producer)
+    ]
 
-    for chain in chains:
-        tile_h = solve_chain_tile_height(ag, chain)
-        if tile_h <= 0:
-            continue  # chain doesn't fit, leave stages as standalone tiled
-
+    for chain, tile_h in chains:
         head_id = chain[0]
         chain_len = len(chain)
 

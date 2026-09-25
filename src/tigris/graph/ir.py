@@ -1,5 +1,6 @@
 """Core dataclasses for the tigris graph IR."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -52,6 +53,51 @@ class Layout(Enum):
 
     LINEAR = "linear"
     """Axes are already in storage order; the emitter permutes nothing."""
+
+
+def serialized_axis_map(rank: int, layout: Layout = Layout.SPATIAL) -> list[int]:
+    """Map an ONNX axis to the axis the runtime stores it at."""
+    if layout is Layout.LINEAR:
+        return list(range(rank))
+    if rank == 4:
+        return [0, 3, 1, 2]  # NCHW -> NHWC
+    if rank == 3:
+        return [0, 2, 1]     # NCL -> NLC
+    return list(range(rank))
+
+
+def serialized_shape(
+    shape: Sequence[int], layout: Layout = Layout.SPATIAL
+) -> tuple[int, ...]:
+    """The extents in the order the runtime stores them."""
+    axes = serialized_axis_map(len(shape), layout)
+    stored = [0] * len(shape)
+    for raw_axis, serialized_axis in enumerate(axes):
+        stored[serialized_axis] = int(shape[raw_axis])
+    return tuple(stored)
+
+
+def serialized_transpose_perm(
+    raw_perm: Sequence[int], input_layout: Layout, output_layout: Layout
+) -> tuple[int, ...]:
+    """The permutation a Transpose performs on stored axes.
+
+    The operator names ONNX axes on both sides while the runtime holds stored
+    ones, so the emitted permutation is the ONNX one conjugated by each side's
+    axis map. Both the emitter and the tile solver read it from here: a
+    permutation the compiler judges tileable and then emits differently is
+    exactly the kind of drift the four-place tiling contract keeps producing.
+    """
+    rank = len(raw_perm)
+    input_axes = serialized_axis_map(rank, input_layout)
+    output_axes = serialized_axis_map(rank, output_layout)
+    output_raw_by_serialized = [0] * rank
+    for raw_axis, serialized_axis in enumerate(output_axes):
+        output_raw_by_serialized[serialized_axis] = raw_axis
+    return tuple(
+        input_axes[int(raw_perm[output_raw_by_serialized[serialized_axis]])]
+        for serialized_axis in range(rank)
+    )
 
 
 @dataclass
@@ -128,6 +174,10 @@ class TilePlan:
     overhead_bytes: int = 0
     untileable_ops: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Which of the two swapped axes a layout conversion's band runs along.
+    # The runtime used to derive it from the extents, which agrees with the
+    # solver only by coincidence when the two axes are equal.
+    band_on_columns: bool = False
     # Set when a stage was eligible for 2D (HW) tiling and solve_2d_tile
     # attempted the search but even a 1x1 core tile did not fit the budget.
     # Distinguishes this case from the generic 1D minimum-tile shortfall so
@@ -180,6 +230,10 @@ class AnalyzedGraph:
 
     # Populated by loader
     model_name: str = ""
+    # The ai.onnx opset the model declares. Several operators changed their
+    # default behaviour across versions, so a pass that reads an attribute's
+    # default has to know which version's default applies.
+    opset: int = 0
     ops: list[OpNode] = field(default_factory=list)
     tensors: dict[str, TensorInfo] = field(default_factory=dict)
     model_inputs: list[str] = field(default_factory=list)

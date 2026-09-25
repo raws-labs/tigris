@@ -32,6 +32,8 @@ dependencies = [
     "click>=8.0",
     "rich>=13.0",
     "lz4>=4.0",
+    "huggingface-hub>=1.2,<2",
+    "packaging>=23.2",
 ]
 
 [project.optional-dependencies]

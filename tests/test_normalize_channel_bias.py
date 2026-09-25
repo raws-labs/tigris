@@ -5,7 +5,11 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize, _channel_broadcast_size
+from tigris.loaders.onnx.normalize import (
+    _bias_broadcast_size,
+    _channel_broadcast_size,
+    normalize,
+)
 
 
 def _normalized(tmp_path, name, nodes, inputs, outputs, init=()):
@@ -106,3 +110,26 @@ def test_channel_broadcast_size_reads_the_aligned_axis():
     assert _channel_broadcast_size((1, 1, 1, 8), ref) is None
     assert _channel_broadcast_size((8,), ref) is None
     assert _channel_broadcast_size((4, 1), ref) is None
+
+
+def test_which_axis_a_bias_addresses_follows_its_producer():
+    """A convolution biases the channel; a matrix product the last axis.
+
+    The two disagree on a token sequence, where the feature axis is last and
+    the axis the model states second is the sequence length.
+    """
+    image = (1, 8, 16, 16)
+    tokens = (4, 64, 192)
+
+    assert _bias_broadcast_size("Conv", (8, 1, 1), image) == 8
+    # Right-alignment puts a bare rank-1 constant on the width axis of an
+    # image, which is why a convolution needs the trailing ones spelled out.
+    assert _bias_broadcast_size("Conv", (8,), image) is None
+    assert _bias_broadcast_size("Conv", (192,), tokens) is None
+
+    for producer in ("Gemm", "MatMul"):
+        assert _bias_broadcast_size(producer, (192,), tokens) == 192
+        assert _bias_broadcast_size(producer, (1, 1, 192), tokens) == 192
+        # The sequence length is not a feature the product biases.
+        assert _bias_broadcast_size(producer, (64,), tokens) is None
+        assert _bias_broadcast_size(producer, (1, 64, 1), tokens) is None

@@ -5,10 +5,21 @@ step in between, and can coexist with a middle stage's own boundary
 tensors in a way no single stage's own input+output sum captures.
 """
 
-from onnx import TensorProto
+import numpy as np
+import onnx
+from onnx import TensorProto, helper
 
-from tigris.analysis.validation import slow_pool_usage
-from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, Stage, TensorInfo
+from tigris.analysis.validation import row_band_aliases, slow_pool_usage
+from tigris.cli import _run_pipeline
+from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    MemoryBudget,
+    OpNode,
+    Stage,
+    TensorInfo,
+    TilePlan,
+)
 
 
 def build_long_lived_skip_graph() -> AnalyzedGraph:
@@ -134,6 +145,12 @@ def build_multi_op_tiled_stage_graph() -> AnalyzedGraph:
         stage_id=0, op_indices=[0, 1],
         input_tensors=["in"], output_tensors=["out"],
         peak_bytes=100_000,
+        # The stage really is tiled, so the intermediate never needs a slow
+        # buffer of its own: it lives a tile at a time in the fast pool.
+        tile_plan=TilePlan(
+            tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+            tile_height=1, num_tiles=1000, original_height=1000,
+        ),
     )
     return AnalyzedGraph(
         ops=[conv, sig],
@@ -171,3 +188,53 @@ def test_slow_pool_counts_multi_op_stage_boundaries_concurrently():
     # Just above in+out fits.
     ag.budget = MemoryBudget(fast=ag.budget.fast, slow=concurrent + 1)
     assert slow_pool_usage(ag).overflow_stage_ids == ()
+
+
+def _attention_model(path):
+    """Scores, a Softmax over them, and a second product that reads the result.
+
+    The scores die the moment the Softmax has read them, and both tensors
+    present the same rows, which is what lets one buffer carry the pair.
+    """
+    heads, tokens, width = 4, 64, 16
+    shape = [1, heads, tokens, width]
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Transpose", ["input"], ["keys"], perm=[0, 1, 3, 2]),
+            helper.make_node("MatMul", ["input", "keys"], ["scores"]),
+            helper.make_node("Softmax", ["scores"], ["probs"], axis=-1),
+            helper.make_node("MatMul", ["probs", "input"], ["output"]),
+        ],
+        "attention",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    onnx.save(model, str(path))
+    return np.zeros(shape, dtype=np.float32)
+
+
+def test_a_banded_stage_shares_one_buffer_with_its_input(tmp_path):
+    path = tmp_path / "attention.onnx"
+    _attention_model(path)
+    ag, _ = _run_pipeline(str(path), ("32K", "2M"))
+
+    aliases = row_band_aliases(ag, ag.budget.fast + ag.budget.fast_reserve)
+    assert aliases == {"probs": "scores"}
+    # 64x64 float scores are 16 KiB per head over four heads: 64 KiB shared,
+    # 128 KiB apart, beside the 32 KiB the queries occupy either way.
+    assert slow_pool_usage(ag).slow_peak_bytes == 98304
+
+
+def test_a_model_input_is_never_written_over(tmp_path):
+    """The caller owns that buffer and may read it again after the run."""
+    path = tmp_path / "attention.onnx"
+    _attention_model(path)
+    ag, _ = _run_pipeline(str(path), ("32K", "2M"))
+    assert set(row_band_aliases(
+        ag, ag.budget.fast + ag.budget.fast_reserve).values()
+    ).isdisjoint(ag.model_inputs)

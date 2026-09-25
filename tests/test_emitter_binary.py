@@ -7,9 +7,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import onnx
 import pytest
+from onnx import TensorProto, helper, numpy_helper
 
-from tigris import SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
+from tigris import (
+    SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
+    TILE_AXIS_HEIGHT_OR_LENGTH,
+)
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import partition_spatial
@@ -17,14 +23,30 @@ from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary.defs import (
     HEADER_SIZE,
     MAGIC,
+    OP_ATTR_AXES,
+    OP_ATTR_BINARY_REQUANT,
+    OP_ATTR_EPSILON,
     OP_TYPE_MAP,
     TENSOR_FLAG_LINEAR,
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
 )
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.emitters.binary.writer import _build_quant_params, emit_binary, emit_binary_bytes
-from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, QuantParam, Stage, TensorInfo
+from tigris.emitters.binary.writer import (
+    _build_quant_params,
+    _build_tile_plans,
+    emit_binary,
+    emit_binary_bytes,
+)
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    MemoryBudget,
+    OpNode,
+    QuantParam,
+    Stage,
+    TensorInfo,
+    TilePlan,
+)
 from tigris.loaders import load_model
 
 
@@ -438,6 +460,20 @@ def test_immutable_supported_schema_fixtures():
             0,
             2,
         ),
+        (
+            8,
+            "schema-v8-layer-norm.tgrs",
+            "cb675bf404c94af8f80e854a5d52175efd3e61ce313989b26f68c18dc5152365",
+            0,
+            3,
+        ),
+        (
+            9,
+            "schema-v9-binary-requant.tgrs",
+            "856d250b3a6bffbdc99a752813d652d720965abf0ee4aba33e9276847baa22c0",
+            3,
+            1,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -449,6 +485,12 @@ def test_immutable_supported_schema_fixtures():
         assert plan["version"] == version
         assert len(plan["quant_params"]) == quant_params
         assert len(plan["op_attributes"]) == op_attributes
+        if version == 9:
+            # The quantized sum states the three pairs that scale its two
+            # operands and its result, which is what schema 9 added.
+            attribute = plan["op_attributes"][0]
+            assert attribute["type"] == OP_ATTR_BINARY_REQUANT
+            assert len(attribute["data"]) == 24
         if version == 5:
             assert plan["tile_plans"][0]["axis"] == 1
             assert plan["tile_plans"][0]["num_tiles"] > 1
@@ -463,6 +505,15 @@ def test_immutable_supported_schema_fixtures():
             assert linear
             boundary = TENSOR_FLAG_MODEL_INPUT | TENSOR_FLAG_MODEL_OUTPUT
             assert not any(t["flags"] & boundary for t in linear)
+        if version == 8:
+            # Schema 8 opens the attribute section to kinds beyond the
+            # Transpose permutation. This fixture carries a normalization
+            # whose variance floor is one of them.
+            epsilons = [
+                a for a in plan["op_attributes"] if a["type"] == OP_ATTR_EPSILON
+            ]
+            assert len(epsilons) == 1
+            assert struct.unpack("<f", epsilons[0]["data"])[0] > 0.0
         if version == 6:
             # A quantized boundary states the float interface the model
             # declares, which is what schema 6 added.
@@ -513,3 +564,109 @@ def test_truncated():
         assert False, "Should have raised ValueError"
     except ValueError as e:
         assert "too small" in str(e)
+
+
+def test_a_tile_extent_that_does_not_fit_names_the_field_and_the_stage():
+    """struct.pack alone would abort the compile with no diagnosis.
+
+    Every solver that bands a single axis stays inside a uint16 by the nature
+    of shapes that fit an embedded budget. The ones that band a product of
+    axes do not, so the writer says which field overflowed on which stage
+    rather than letting struct raise. tile_width is masked on the way out,
+    so without this it would truncate silently instead.
+    """
+    ag = SimpleNamespace(stages=[
+        SimpleNamespace(
+            stage_id=3,
+            tile_plan=TilePlan(
+                tileable=True,
+                axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+                tile_height=8192,
+                num_tiles=8,
+                original_height=65_536,
+                tiled_peak_bytes=262_144,
+            ),
+        ),
+    ])
+
+    with pytest.raises(ValueError, match=r"stage 3 tile plan original_height"):
+        _build_tile_plans(ag)
+
+
+def _reduce_mean_model(path, shape, axes, keepdims, projected=False):
+    """A ReduceMean over *axes*, optionally over a projected sequence.
+
+    A matrix product ahead of the mean is what makes its operand state its own
+    axis order, which is the difference between a mean over a sequence's
+    tokens and one over a feature map's channels.
+    """
+    initializers = []
+    nodes = []
+    source = "input"
+    if projected:
+        initializers.append(numpy_helper.from_array(
+            np.eye(shape[-1], dtype=np.float32), "w"))
+        nodes.append(helper.make_node("MatMul", ["input", "w"], ["tokens"]))
+        source = "tokens"
+    nodes.append(helper.make_node(
+        "ReduceMean", [source], ["output"], axes=list(axes),
+        keepdims=1 if keepdims else 0, name="pool"))
+    collapsed = {a % len(shape) for a in axes}
+    if keepdims:
+        out_shape = [
+            1 if axis in collapsed else extent
+            for axis, extent in enumerate(shape)
+        ]
+    else:
+        out_shape = [
+            extent for axis, extent in enumerate(shape)
+            if axis not in collapsed
+        ]
+    graph = helper.make_graph(
+        nodes,
+        "reduce_mean",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shape)],
+        initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path.write_bytes(model.SerializeToString())
+    return path
+
+
+def test_a_spatial_mean_over_both_image_axes_becomes_a_global_pool(tmp_path):
+    ag = _full_pipeline(_reduce_mean_model(
+        tmp_path / "gap.onnx", [1, 4, 8, 8], (2, 3), keepdims=True))
+    assert [op.op_type for op in ag.ops] == ["GlobalAveragePool"]
+
+
+def test_a_mean_over_one_axis_keeps_its_operator_and_states_the_axis(tmp_path):
+    ag = _full_pipeline(_reduce_mean_model(
+        tmp_path / "tokens.onnx", [1, 12, 8], (1,), keepdims=True,
+        projected=True))
+    assert "ReduceMean" in [op.op_type for op in ag.ops]
+    plan = read_binary_plan(emit_binary_bytes(ag))
+    axes = [a for a in plan["op_attributes"] if a["type"] == OP_ATTR_AXES]
+    assert len(axes) == 1
+    # The operand states its own axis order, so the emitted axis is the one
+    # the model named.
+    assert list(axes[0]["data"]) == [1]
+
+
+def test_a_mean_over_a_stored_axis_is_emitted_where_the_runtime_holds_it(
+    tmp_path,
+):
+    """A rank-3 feature map is stored channels-last, so its axis 1 moves.
+
+    The compiler names ONNX axes and the runtime holds serialized ones. A mean
+    over the channel axis of an NCL tensor is a mean over the last stored axis,
+    and emitting the model's own number would collapse the wrong one.
+    """
+    ag = _full_pipeline(_reduce_mean_model(
+        tmp_path / "channels.onnx", [1, 12, 8], (1,), keepdims=True))
+    plan = read_binary_plan(emit_binary_bytes(ag))
+    axes = [a for a in plan["op_attributes"] if a["type"] == OP_ATTR_AXES]
+    assert len(axes) == 1
+    assert list(axes[0]["data"]) == [2]

@@ -10,6 +10,53 @@ Git tags and the GitHub releases page.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-25
+
+### Added
+
+- Plan schema 9. Schema 8 declares every operator-attribute kind this
+  generation needs, so new operators land without further bumps; schema 9 adds
+  row bands for matrix pipelines. Plans need runtime v0.10.0 or later.
+- `tigris zoo list` and `tigris zoo fetch` for precompiled plans. Listing filters
+  by model, category, runtime release, backend and memory limits; fetching
+  verifies every file hash and records the runtime constraints in
+  `download.json`.
+- Operators: `LayerNormalization`, `Erf`, `HardSwish`, `Sub`, `MaxPool` to a
+  global maximum, `Split`, and bilinear `Resize` as `ResizeLinear` with the
+  coordinate convention taken from the graph's opset.
+- `Add` and `Mul` accept a second operand with one value per channel.
+- A graph input behind `DequantizeLinear` and an output ahead of
+  `QuantizeLinear` compile to int8 model boundaries, uint8 included.
+- More stages tile: global reductions along their input, layout conversions and
+  any transpose whose stored permutation allows it, rank-2 matrix pipelines along
+  their rows, and `Resize` as the spatial op of a height-tiled stage.
+- An `AveragePool` over the whole map becomes `GlobalAveragePool`.
+
+### Changed
+
+- A stage is costed by the bytes the executor holds for it, not by the
+  graph-wide live set, so the partitioner no longer cuts stages it does not need
+  to.
+- A detected chain too large for the fast budget is split into chains that fit
+  instead of leaving every stage standalone.
+- `codegen` emits a static assertion per runtime table limit, and `compile`
+  warns when a plan needs more than the default limits.
+
+### Fixed
+
+- `Gemm` ignored `alpha`, `beta` and `transA` and returned a wrong result.
+- An int8 `Conv1D` was requantized with the raw output scale.
+- A `Div` by a constant shared between operators inverted the constant once per
+  consumer.
+- `Squeeze` and `Unsqueeze` skipped the reshape order check, so an implied
+  layout change went unhandled.
+- A `Resize` in an opset-10 graph was read with the opset-11 half-pixel default.
+- 2D tiles are sized as output tiles by the runtime's own byte count; strided
+  stages previously got tiles the runtime refused.
+- Chain geometry takes a convolution's kernel from its weight when
+  `kernel_shape` is absent; such a chain was sized as 1x1.
+- A stage output written before a spatial op no longer enters a tile.
+
 ## [0.8.0] - 2026-09-14
 
 ### Added

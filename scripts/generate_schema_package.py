@@ -11,6 +11,7 @@ from tigris import (
     SCHEMA_VERSION,
     TILE_AXIS_HEIGHT_OR_LENGTH,
     TILE_AXIS_NONE,
+    TILE_AXIS_HW,
     TILE_AXIS_WIDTH,
 )
 from tigris.emitters.binary import defs
@@ -23,6 +24,11 @@ def schema_package() -> dict[str, object]:
         "endianness": "little",
         "magic_ascii": defs.MAGIC.decode("ascii"),
         "op_attribute_types": {
+            "alpha": defs.OP_ATTR_ALPHA,
+            "axes": defs.OP_ATTR_AXES,
+            "clip_bounds": defs.OP_ATTR_CLIP_BOUNDS,
+            "epsilon": defs.OP_ATTR_EPSILON,
+            "pads": defs.OP_ATTR_PADS,
             "transpose_perm": defs.OP_ATTR_TRANSPOSE_PERM,
         },
         "op_attribute_contract": {
@@ -52,8 +58,15 @@ def schema_package() -> dict[str, object]:
             ),
         },
         "section_alignment": defs.PLAN_SECTION_ALIGNMENT,
+        "tensor_flags": {
+            "constant": defs.TENSOR_FLAG_CONSTANT,
+            "linear": defs.TENSOR_FLAG_LINEAR,
+            "model_input": defs.TENSOR_FLAG_MODEL_INPUT,
+            "model_output": defs.TENSOR_FLAG_MODEL_OUTPUT,
+        },
         "tile_axes": {
             "height_or_length": TILE_AXIS_HEIGHT_OR_LENGTH,
+            "hw": TILE_AXIS_HW,
             "none": TILE_AXIS_NONE,
             "width_reserved": TILE_AXIS_WIDTH,
         },

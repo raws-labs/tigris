@@ -35,6 +35,9 @@ Passes applied in sequence (matches ``normalize()`` call order):
     Runs last so all relabeling and rewiring is already done.
 """
 
+import math
+from dataclasses import replace
+
 import numpy as np
 
 from tigris.graph.ir import (
@@ -43,6 +46,8 @@ from tigris.graph.ir import (
     OpNode,
     QuantParam,
     TensorInfo,
+    serialized_axis_map,
+    serialized_shape,
 )
 
 
@@ -50,24 +55,35 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
     ag = _drop_inference_identities(ag)
     ag = _fold_constant_ops(ag)
+    ag = _fold_static_subgraphs(ag)
     ag = _fold_qdq(ag)
+    ag = _fold_gemm_scalars(ag)
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
+    ag = _neg_to_scalar_mul(ag)
+    ag = _fold_sub_constant_to_add(ag)
+    ag = _fold_div_constant_to_mul(ag)
     ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
+    ag = _fold_pad_into_conv(ag)
     ag = _relabel_depthwise(ag)
     ag = _relabel_conv1d(ag)
     ag = _clip_to_relu6(ag)
     ag = _reduce_mean_to_gap(ag)
+    ag = _whole_map_average_pool_to_gap(ag)
     ag = _fold_shape_ops(ag)
-    ag = _relabel_shape_ops_to_reshape(ag)
+    ag = _resolve_resize_conventions(ag)
     ag = _extract_resize_scales(ag)
     ag = _strip_metadata_inputs(ag)
-    ag = _normalize_concat_axis(ag)
     ag = _validate_transposes(ag)
+    ag = _order_broadcast_operands(ag)
     ag = _absorb_activations(ag)
+    ag = _fold_split_into_its_weight(ag)
     ag = _assign_tensor_layouts(ag)
+    ag = _normalize_concat_axis(ag)
+    ag = _gather_one_index_to_split(ag)
+    ag = _relabel_shape_ops_to_reshape(ag)
     ag = _lower_linear_matmul(ag)
     ag = _drop_unreferenced_weights(ag)
     return ag
@@ -133,7 +149,7 @@ _LINEAR_LAYOUT_OPS = frozenset({
 })
 
 
-def _softmax_required_layout(
+def _trailing_axis_required_layout(
     ag: AnalyzedGraph, op: OpNode
 ) -> Layout | None:
     """The layout that puts Softmax's axis where the kernel reduces.
@@ -144,7 +160,7 @@ def _softmax_required_layout(
     axis last. A Softmax over either one is expressible, and the layout is what
     says which. Anything else has no layout that helps and stays unsupported.
     """
-    if len(op.inputs) != 1:
+    if not op.inputs:
         return None
     info = ag.tensors.get(op.inputs[0])
     if info is None or not info.shape:
@@ -161,15 +177,150 @@ def _softmax_required_layout(
     return None
 
 
+def _flattened_into_a_product(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """Whether a matrix product downstream absorbs the difference in order.
+
+    A flatten whose one reader is a product over a constant weight needs no
+    conversion: the emitter permutes the weight's columns instead, which
+    costs nothing at inference. Mirrors _fc_inputs_flattening_spatial in the
+    binary writer, which performs that permutation; a flatten this does not
+    describe has to be converted rather than left to a compensation nobody
+    applies.
+    """
+    if not op.outputs:
+        return False
+    vector = ag.tensors.get(op.outputs[0])
+    if vector is None or len(vector.shape) != 2:
+        return False
+    readers = [
+        other for other in ag.ops
+        if op.outputs[0] in other.inputs and other is not op
+    ]
+    if len(readers) != 1:
+        return False
+    reader = readers[0]
+    if reader.op_type != "Gemm" or len(reader.inputs) < 2:
+        return False
+    if reader.inputs[0] != op.outputs[0]:
+        return False
+    weight = ag.weight_data.get(reader.inputs[1])
+    return weight is not None and weight.ndim == 2
+
+
+def _states_its_own_order(info) -> bool:
+    """Whether this tensor lists its axes in the order the runtime stores.
+
+    A tensor that states its own order, and one of rank 2 or less, always
+    does. So does a feature map whose storage permutation only moves axes of
+    extent one: a single-channel image is held row by row either way, and the
+    permutation that formally moves its channel axis moves nothing. Reading
+    that case as a reordering costs a copy for no reason, and refusing it
+    costs an operator the runtime could have executed.
+    """
+    if info.layout is Layout.LINEAR or len(info.shape) <= 2:
+        return True
+    rank = len(info.shape)
+    positions = serialized_axis_map(rank, info.layout)
+    in_storage_order = sorted(range(rank), key=lambda axis: positions[axis])
+    carried = [axis for axis in in_storage_order if info.shape[axis] > 1]
+    return carried == sorted(carried)
+
+
+def _reshape_keeps_its_order(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """Whether a regrouping is the same bytes in the order the runtime holds.
+
+    A reshape moves no element: it renames axes over one sequence, and the
+    kernel copies straight through. That states the model's regrouping when
+    both sides list their axes in storage order, and when two feature maps
+    regroup only the axes between the first and the last, since the runtime
+    holds those contiguously. A regrouping that reaches across the channel
+    axis of a tensor held channels-last does not, and copying it through
+    would read the elements in another order. That is what a vision
+    transformer's unfold does, and holding the operand in the model's own
+    order first is what makes it expressible.
+
+    Same question, same answer as pure_reinterpretations in the lifetime
+    analysis, which decides when such a reshape can share its input's buffer.
+    """
+    if not op.inputs or not op.outputs:
+        return True
+    src = ag.tensors.get(op.inputs[0])
+    dst = ag.tensors.get(op.outputs[0])
+    if src is None or dst is None:
+        return True
+    src_own = _states_its_own_order(src)
+    dst_own = _states_its_own_order(dst)
+    if src_own and dst_own:
+        return True
+    if src_own or dst_own:
+        return False
+    first = serialized_shape(tuple(src.shape), src.layout)
+    second = serialized_shape(tuple(dst.shape), dst.layout)
+    return (bool(first) and bool(second)
+            and first[0] == second[0] and first[-1] == second[-1])
+
+
 def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     """The layout an operator needs, or None when it works in either."""
     if op.op_type in _SPATIAL_LAYOUT_OPS:
         return Layout.SPATIAL
     if op.op_type in _LINEAR_LAYOUT_OPS:
         return Layout.LINEAR
-    if op.op_type == "Softmax":
-        return _softmax_required_layout(ag, op)
+    if op.op_type in ("Reshape", "Flatten", "Squeeze", "Unsqueeze"):
+        # A regrouping the runtime's own order does not state is expressible
+        # once the operand is held the way the model states it, unless a
+        # matrix product downstream already compensates for the difference.
+        # Squeeze and Unsqueeze are the same question: they become a Reshape
+        # further down the pipeline, and dropping the channel axis of a
+        # feature map regroups across it exactly as a Reshape would.
+        if _reshape_keeps_its_order(ag, op) or _flattened_into_a_product(ag, op):
+            return None
+        return Layout.LINEAR
+    if op.op_type in ("Softmax", "LayerNormalization"):
+        # Both reduce along one axis and the kernel takes the final stored
+        # one, so the layout is what says which ONNX axis that is.
+        return _trailing_axis_required_layout(ag, op)
     return None
+
+
+def _operand_layouts(ag: AnalyzedGraph, op: OpNode) -> list[Layout]:
+    """The layouts of the operands whose layout can differ from each other.
+
+    Constants carry no layout of their own and rank 2 and below cannot
+    disagree, so neither constrains anything.
+    """
+    layouts = []
+    for name in op.inputs:
+        if not name:
+            continue
+        info = ag.tensors.get(name)
+        if info is None or info.is_constant or len(info.shape) < 3:
+            continue
+        layouts.append(info.layout)
+    return layouts
+
+
+def _agreed_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
+    """The layout an operator's operands have to share, when they must.
+
+    An operator that works in either layout still needs its operands to agree
+    with each other: an elementwise Add reads both at the same offset, so two
+    operands stored in different axis orders add unrelated elements. The
+    shapes only reveal it when they differ, which is why a square block came
+    back wrong rather than refused.
+
+    Where they already agree there is nothing to do. Where they do not, the
+    majority wins and a tie goes to the model's own order, because a
+    disagreement arises only when a matrix product or a trailing-axis
+    normalization produced one of the operands, and those are exactly the
+    operators that will read the result.
+    """
+    layouts = _operand_layouts(ag, op)
+    if len(set(layouts)) < 2:
+        return None
+    spatial = layouts.count(Layout.SPATIAL)
+    linear = layouts.count(Layout.LINEAR)
+    return Layout.SPATIAL if spatial > linear else Layout.LINEAR
 
 
 def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -191,7 +342,11 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     for op in ag.ops:
         required = _required_layout(ag, op)
-        if required is not None:
+        # An operator with no requirement of its own still needs its operands
+        # to agree with each other. _agreed_layout is None when they already
+        # do, which is every operator with one activation operand.
+        enforced = required if required is not None else _agreed_layout(ag, op)
+        if enforced is not None:
             for position, name in enumerate(op.inputs):
                 if not name:
                     continue
@@ -199,20 +354,20 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
                 if info is None or info.is_constant:
                     continue
                 # Rank 2 and below cannot disagree, so never pay for a copy.
-                if len(info.shape) < 3 or info.layout is required:
+                if len(info.shape) < 3 or info.layout is enforced:
                     continue
 
-                key = (name, required)
+                key = (name, enforced)
                 target = converted.get(key)
                 if target is None:
                     counter += 1
-                    target = f"{name}_to_{required.value}_{counter}"
+                    target = f"{name}_to_{enforced.value}_{counter}"
                     ag.tensors[target] = TensorInfo(
                         name=target,
                         shape=info.shape,
                         dtype=info.dtype,
                         quant=info.quant,
-                        layout=required,
+                        layout=enforced,
                     )
                     rewritten.append(OpNode(
                         name=f"layout_{counter}",
@@ -224,7 +379,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
                     converted[key] = target
                 op.inputs[position] = target
 
-        produced = required
+        produced = enforced
         if produced is None:
             produced = Layout.SPATIAL
             for name in op.inputs:
@@ -285,6 +440,235 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 
+# Shape-only operators a split can be pushed back through.
+_SPLIT_TRANSPARENT = frozenset({"Reshape", "Transpose"})
+
+
+def _split_axis_before_reshape(
+    source: tuple[int, ...], result: tuple[int, ...], axis: int
+) -> tuple[int, int] | None:
+    """Where *axis* of a reshape's result sits in its source, and its stride.
+
+    A split is a cut into contiguous blocks, so pushing one back through a
+    reshape is only sound when the axis being cut is the outermost factor of a
+    single source axis: everything before it has to line up, and everything
+    after it has to come from that same axis. Then cutting the result at that
+    axis is cutting the source axis into blocks of the trailing product.
+    """
+    prefix = 1
+    for extent in result[:axis]:
+        prefix *= int(extent)
+    trailing = 1
+    for extent in result[axis + 1:]:
+        trailing *= int(extent)
+    running = 1
+    for position, extent in enumerate(source):
+        if running == prefix:
+            if int(extent) != int(result[axis]) * trailing:
+                return None
+            return position, trailing
+        running *= int(extent)
+    return None
+
+
+def _fold_split_into_its_weight(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Cut the weight rather than the product it produced.
+
+    A fused projection computes query, key and value in one matrix product and
+    the model cuts them apart afterwards, through whatever reshapes and
+    transposes put the stacked axis where the cut wants it. Cutting a product
+    along its output-feature axis is the same as three products against three
+    blocks of the weight, so the cut can be done once at compile time. The
+    stacked tensor then never exists: neither the product that holds all three
+    parts, nor the copy that separates them.
+
+    The split is pushed back through shape-only operators one at a time and
+    folded only if it reaches a product's feature axis. Anything else keeps
+    its split, which the runtime executes.
+    """
+    while True:
+        if not _fold_one_split(ag):
+            return ag
+
+
+def _fold_one_split(ag: AnalyzedGraph) -> bool:
+    producer_of: dict[str, int] = {}
+    for index, op in enumerate(ag.ops):
+        for name in op.outputs:
+            producer_of[name] = index
+    readers: dict[str, int] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            if name:
+                readers[name] = readers.get(name, 0) + 1
+
+    for split_index, split in enumerate(ag.ops):
+        if split.op_type != "Split" or len(split.inputs) < 1:
+            continue
+        parts = [ag.tensors.get(name) for name in split.outputs]
+        if len(parts) < 2 or any(part is None for part in parts):
+            continue
+
+        axis = int(split.attrs.get("axis", 0))
+        name = split.inputs[0]
+        chain: list[int] = []
+        while True:
+            index = producer_of.get(name)
+            if index is None or readers.get(name, 0) != 1:
+                break
+            op = ag.ops[index]
+            current = ag.tensors.get(name)
+            source = ag.tensors.get(op.inputs[0]) if op.inputs else None
+            if current is None or source is None:
+                break
+            if op.op_type == "Transpose":
+                perm = [int(a) for a in op.attrs.get("perm", [])]
+                if len(perm) != len(current.shape):
+                    break
+                axis = perm[axis]
+            elif op.op_type == "Reshape":
+                mapped = _split_axis_before_reshape(
+                    tuple(source.shape), tuple(current.shape), axis)
+                if mapped is None:
+                    break
+                axis, _ = mapped
+            elif op.op_type in ("MatMul", "Gemm"):
+                if axis != len(current.shape) - 1:
+                    break
+                if _fold_split_onto(ag, split_index, chain, index, parts):
+                    return True
+                break
+            else:
+                break
+            if op.op_type not in _SPLIT_TRANSPARENT:
+                break
+            chain.append(index)
+            name = op.inputs[0]
+    return False
+
+
+def _fold_split_onto(
+    ag: AnalyzedGraph,
+    split_index: int,
+    chain: list[int],
+    product_index: int,
+    parts: list,
+) -> bool:
+    """Rebuild the chain once per part, over a block of the weight."""
+    product = ag.ops[product_index]
+    if len(product.inputs) not in (2, 3):
+        return False
+    weight = ag.weight_data.get(product.inputs[1])
+    if weight is None or weight.ndim != 2:
+        return False
+    if int(product.attrs.get("transB", 0)):
+        return False
+    features = int(weight.shape[1])
+    result = ag.tensors.get(product.outputs[0])
+    if result is None or int(result.shape[-1]) != features:
+        return False
+
+    split = ag.ops[split_index]
+    axis = int(split.attrs.get("axis", 0))
+    widths = [int(part.shape[axis]) for part in parts]
+    stride, remainder = divmod(features, sum(widths))
+    if remainder or stride <= 0:
+        return False
+
+    bias = None
+    if len(product.inputs) == 3:
+        bias = ag.weight_data.get(product.inputs[2])
+        if bias is None or bias.reshape(-1).size != features:
+            return False
+        bias = bias.reshape(-1)
+
+    rebuilt: list[OpNode] = []
+    offset = 0
+    for position, part in enumerate(parts):
+        block = widths[position] * stride
+        tag = f"{product.name}_part{position}"
+        weight_name = f"{product.inputs[1]}_part{position}"
+        ag.weight_data[weight_name] = np.ascontiguousarray(
+            weight[:, offset:offset + block])
+        ag.tensors[weight_name] = TensorInfo(
+            name=weight_name, shape=(int(weight.shape[0]), block),
+            dtype=ag.tensors[product.inputs[1]].dtype, is_constant=True)
+        inputs = [product.inputs[0], weight_name]
+        if bias is not None:
+            bias_name = f"{product.inputs[2]}_part{position}"
+            ag.weight_data[bias_name] = np.ascontiguousarray(
+                bias[offset:offset + block])
+            ag.tensors[bias_name] = TensorInfo(
+                name=bias_name, shape=(block,),
+                dtype=ag.tensors[product.inputs[2]].dtype, is_constant=True)
+            inputs.append(bias_name)
+
+        carried = f"{tag}_product"
+        ag.tensors[carried] = TensorInfo(
+            name=carried,
+            shape=(*tuple(result.shape[:-1]), block),
+            dtype=result.dtype, quant=result.quant, layout=result.layout)
+        rebuilt.append(OpNode(
+            name=tag, op_type=product.op_type, inputs=inputs,
+            outputs=[carried], attrs=dict(product.attrs)))
+
+        # The chain is walked from the split back to the product, so replaying
+        # it forwards means reversing it. Every shape it states loses the
+        # stacked axis, which this part no longer spans.
+        for depth, index in enumerate(reversed(chain)):
+            step = ag.ops[index]
+            last = depth == len(chain) - 1
+            output = split.outputs[position] if last else (
+                f"{tag}_step{depth}")
+            if not last:
+                shape = _part_shape(ag, step.outputs[0], widths[position],
+                                    len(parts))
+                if shape is None:
+                    return False
+                reference = ag.tensors[step.outputs[0]]
+                ag.tensors[output] = TensorInfo(
+                    name=output, shape=shape, dtype=reference.dtype,
+                    quant=reference.quant, layout=reference.layout)
+            rebuilt.append(OpNode(
+                name=f"{tag}_{step.name.split('/')[-1]}",
+                op_type=step.op_type,
+                inputs=[carried],
+                outputs=[output],
+                attrs=dict(step.attrs)))
+            carried = output
+        offset += block
+
+    replaced = {split_index, product_index, *chain}
+    ops: list[OpNode] = []
+    for index, op in enumerate(ag.ops):
+        if index == product_index:
+            ops.extend(rebuilt)
+        elif index in replaced:
+            continue
+        else:
+            ops.append(op)
+    ag.ops = ops
+    for step, op in enumerate(ag.ops):
+        op.step = step
+    return True
+
+
+def _part_shape(
+    ag: AnalyzedGraph, name: str, width: int, parts: int
+) -> tuple[int, ...] | None:
+    """A chain tensor's shape once it carries one part instead of all of them."""
+    info = ag.tensors.get(name)
+    if info is None:
+        return None
+    shape = [int(extent) for extent in info.shape]
+    total = width * parts
+    for position, extent in enumerate(shape):
+        if extent == total:
+            shape[position] = width
+            return tuple(shape)
+    return None
+
+
 def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Express a batched constant-weight matrix product with the FC kernel.
 
@@ -308,7 +692,7 @@ def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
     counter = 0
 
     for op in ag.ops:
-        if (op.op_type != "MatMul" or len(op.inputs) != 2
+        if (op.op_type != "MatMul" or len(op.inputs) not in (2, 3)
                 or len(op.outputs) != 1):
             rewritten.append(op)
             continue
@@ -360,9 +744,12 @@ def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
         rewritten.append(OpNode(
             name=f"{op.name}_rows", op_type="Reshape",
             inputs=[op.inputs[0]], outputs=[flat_in]))
+        # A bias folded onto the product before lowering travels with it:
+        # the kernel reads one per output feature, which the collapse leaves
+        # in place.
         rewritten.append(OpNode(
             name=op.name, op_type="Gemm",
-            inputs=[flat_in, weight_name], outputs=[flat_out],
+            inputs=[flat_in, weight_name, *op.inputs[2:]], outputs=[flat_out],
             attrs={"transB": 1}))
         rewritten.append(OpNode(
             name=f"{op.name}_shape", op_type="Reshape",
@@ -445,23 +832,21 @@ def _drop_inference_identities(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _stored_extent(shape: tuple[int, ...]) -> tuple[int, ...]:
+def _stored_extent(
+    shape: tuple[int, ...], layout: Layout = Layout.SPATIAL
+) -> tuple[int, ...]:
     """Non-unit axis sizes in the order the runtime serializes them.
 
-    The IR keeps ONNX NCHW/NCL while the runtime stores NHWC/NLC, so the same
-    element sequence is described by different axis orders at different ranks.
-    Axes of size 1 contribute no stride, so dropping them leaves exactly the
-    sequence the runtime walks. Two shapes with equal results hold their
-    elements in the same order.
+    A tensor the runtime stores channels-last is described by a different axis
+    order than the one the model states, and which order that is depends on
+    the tensor's layout, not on its rank: a rank-4 matrix operand lists its
+    axes in storage order already. Axes of size 1 contribute no stride, so
+    dropping them leaves exactly the sequence the runtime walks. Two shapes
+    with equal results hold their elements in the same order.
     """
-    rank = len(shape)
-    if rank == 4:
-        order = (0, 2, 3, 1)   # N, H, W, C
-    elif rank == 3:
-        order = (0, 2, 1)      # N, L, C
-    else:
-        order = tuple(range(rank))
-    return tuple(shape[axis] for axis in order if shape[axis] != 1)
+    return tuple(
+        extent for extent in serialized_shape(shape, layout) if extent != 1
+    )
 
 
 def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -473,6 +858,11 @@ def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
     to rank-3 squeeze that removes the channel axis turns NHWC (h, w) order into
     NLC (w, h) order, which would transpose the data silently. Anything that
     fails the check keeps its original op type and is reported as unsupported.
+
+    Runs after layouts are assigned, because which order the runtime walks is
+    a property of the tensor rather than of its rank. Judging it by rank
+    refuses every squeeze on a matrix tensor, which is what a batch of
+    attention heads is.
     """
     for op in ag.ops:
         if op.op_type not in ("Squeeze", "Unsqueeze"):
@@ -481,7 +871,8 @@ def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
         dst = ag.tensors.get(op.outputs[0])
         if src is None or dst is None:
             continue
-        if _stored_extent(tuple(src.shape)) != _stored_extent(tuple(dst.shape)):
+        if (_stored_extent(tuple(src.shape), src.layout)
+                != _stored_extent(tuple(dst.shape), dst.layout)):
             continue
         op.op_type = "Reshape"
         # Squeeze and Unsqueeze carry their axes as a second input or an
@@ -534,6 +925,189 @@ def _fold_constant_ops(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 # Quantization
+
+
+# A folded value stands in for an operator, so it has to stay the size of a
+# shape rather than of an activation.
+_STATIC_FOLD_LIMIT = 4096
+
+_ONNX_DTYPE_OF: dict[type, int] = {
+    np.float32: 1,
+    np.int32: 6,
+    np.int64: 7,
+    np.bool_: 9,
+    np.float64: 11,
+}
+
+# ONNX TensorProto dtypes this evaluator can materialize, and their numpy
+# equivalents. Anything else leaves its operator in the graph.
+_STATIC_DTYPES: dict[int, type] = {
+    1: np.float32,
+    6: np.int32,
+    7: np.int64,
+    9: np.bool_,
+    11: np.float64,
+}
+
+
+def _static_operand(
+    ag: AnalyzedGraph, name: str, known: dict[str, np.ndarray]
+) -> np.ndarray | None:
+    """The value of *name* when the graph settles it before it runs."""
+    if name in known:
+        return known[name]
+    return ag.weight_data.get(name)
+
+
+def _evaluate_static(
+    op: OpNode, values: list[np.ndarray]
+) -> np.ndarray | None:
+    """Compute an operator whose operands the graph already settles.
+
+    Only the shape arithmetic an exporter leaves behind is covered: enough to
+    resolve a scale stated as ``1 / sqrt(Shape(q)[-1])``, which is how an
+    attention block writes its scale when the exporter traces it instead of
+    folding it. An operator outside this set keeps its place in the graph.
+    """
+    kind = op.op_type
+    if kind == "Cast":
+        target = _STATIC_DTYPES.get(int(op.attrs.get("to", 0)))
+        return None if target is None else values[0].astype(target)
+    if kind == "Sqrt":
+        return np.sqrt(values[0])
+    if kind == "Reciprocal":
+        return np.reciprocal(values[0])
+    if kind == "Neg":
+        return -values[0]
+    if kind in ("Add", "Sub", "Mul", "Div", "Pow", "Min", "Max"):
+        left, right = values[0], values[1]
+        if kind == "Add":
+            return left + right
+        if kind == "Sub":
+            return left - right
+        if kind == "Mul":
+            return left * right
+        if kind == "Pow":
+            return np.power(left, right)
+        if kind == "Min":
+            return np.minimum(left, right)
+        if kind == "Max":
+            return np.maximum(left, right)
+        if np.any(right == 0):
+            return None
+        return left / right
+    if kind == "Concat":
+        return np.concatenate(
+            [np.atleast_1d(v) for v in values], axis=int(op.attrs.get("axis", 0))
+        )
+    if kind == "Gather":
+        return np.take(values[0], values[1], axis=int(op.attrs.get("axis", 0)))
+    if kind == "Unsqueeze":
+        axes = op.attrs.get("axes")
+        if axes is None and len(values) > 1:
+            axes = values[1]
+        return None if axes is None else np.expand_dims(
+            values[0], tuple(int(a) for a in np.atleast_1d(axes))
+        )
+    if kind == "Squeeze":
+        axes = op.attrs.get("axes")
+        if axes is None and len(values) > 1:
+            axes = values[1]
+        if axes is None:
+            return np.squeeze(values[0])
+        return np.squeeze(values[0], tuple(int(a) for a in np.atleast_1d(axes)))
+    if kind == "Reshape":
+        return values[0].reshape([int(d) for d in np.atleast_1d(values[1])])
+    if kind == "Slice":
+        data = values[0]
+        starts = [int(v) for v in np.atleast_1d(values[1])]
+        ends = [int(v) for v in np.atleast_1d(values[2])]
+        axes = ([int(v) for v in np.atleast_1d(values[3])] if len(values) > 3
+                else list(range(len(starts))))
+        steps = ([int(v) for v in np.atleast_1d(values[4])] if len(values) > 4
+                 else [1] * len(starts))
+        if len(starts) != len(ends) or len(axes) != len(starts):
+            return None
+        index: list[slice] = [slice(None)] * data.ndim
+        for axis, start, end, step in zip(axes, starts, ends, steps):
+            if step == 0 or not -data.ndim <= axis < data.ndim:
+                return None
+            index[axis] = slice(start, end, step)
+        return data[tuple(index)]
+    return None
+
+
+def _fold_static_subgraphs(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Compute the parts of the graph that do not depend on the input data.
+
+    An exporter that traces a model rather than folding it leaves the
+    arithmetic behind: an attention scale becomes a Shape of the query, a
+    Slice of that shape, a Cast, a Sqrt and a division. Every value in the
+    chain is settled by the shapes the plan already states, so it is computed
+    here and the operators disappear, which also turns the multiplication that
+    reads the result from a broadcast the runtime lacks into a scale it has.
+
+    A Shape counts as settled because the plan states every extent; a model
+    with a dimension left open is bound before normalization runs.
+    """
+    known: dict[str, np.ndarray] = {}
+    produced_outputs = set(ag.model_outputs)
+    removed: set[int] = set()
+
+    progressed = True
+    while progressed:
+        progressed = False
+        for index, op in enumerate(ag.ops):
+            if index in removed or len(op.outputs) != 1:
+                continue
+            result_name = op.outputs[0]
+            if result_name in produced_outputs or result_name in known:
+                continue
+            if op.op_type == "Shape":
+                source = ag.tensors.get(op.inputs[0])
+                if source is None or not source.shape:
+                    continue
+                if any(int(extent) <= 0 for extent in source.shape):
+                    continue
+                value = np.array(
+                    [int(extent) for extent in source.shape], dtype=np.int64)
+            else:
+                operands = [
+                    _static_operand(ag, name, known) for name in op.inputs if name
+                ]
+                if not operands or any(v is None for v in operands):
+                    continue
+                try:
+                    value = _evaluate_static(op, operands)
+                except (ValueError, IndexError, TypeError):
+                    value = None
+                if value is None:
+                    continue
+            value = np.ascontiguousarray(value)
+            if value.size > _STATIC_FOLD_LIMIT:
+                continue
+            known[result_name] = value
+            removed.add(index)
+            progressed = True
+
+    if not known:
+        return ag
+
+    for name, value in known.items():
+        ag.weight_data[name] = value
+        info = ag.tensors.get(name)
+        if info is None:
+            ag.tensors[name] = TensorInfo(
+                name=name, shape=tuple(value.shape),
+                dtype=_ONNX_DTYPE_OF.get(value.dtype.type, 1), is_constant=True)
+        else:
+            info.shape = tuple(value.shape)
+            info.is_constant = True
+
+    ag.ops = [op for index, op in enumerate(ag.ops) if index not in removed]
+    for step, op in enumerate(ag.ops):
+        op.step = step
+    return ag
 
 
 def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -708,7 +1282,34 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 removed.add(i)
                 removed.add(ql_idx)
 
-        if is_weight_dql:
+        # Case 3: a quantized model input -> DequantizeLinear. The input keeps
+        # its place and becomes the int8 tensor the kernels read; the dtype
+        # the model declares stays recorded, so the plan converts at the
+        # boundary instead of carrying a float copy of the input.
+        is_boundary_dql = False
+        if (
+            not is_weight_dql
+            and dql_input in ag.model_inputs
+            and dql_input not in output_to_op
+            and dql_input in ag.tensors
+            and ag.tensors[dql_input].dtype in (2, 3)  # uint8, int8
+            and all(
+                ag.ops[cons_idx].op_type == "DequantizeLinear"
+                for cons_idx, _ in input_to_consumers.get(dql_input, [])
+            )
+        ):
+            qp, _ = _get_quant_param(op)
+            if qp is not None:
+                is_boundary_dql = True
+                ag.tensors[dql_input].quant = qp
+                ag.tensors[dql_input].dtype = 3  # INT8
+                for cons_idx, pos in input_to_consumers.get(dql_output, []):
+                    ag.ops[cons_idx].inputs[pos] = dql_input
+                if dql_output in ag.tensors and dql_output != dql_input:
+                    del ag.tensors[dql_output]
+                removed.add(i)
+
+        if is_weight_dql or is_boundary_dql:
             for inp_name in op.inputs[1:]:
                 if inp_name:
                     deferred_cleanup.add(inp_name)
@@ -769,6 +1370,14 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 if inp_name:
                     deferred_cleanup.add(inp_name)
 
+        # A graph output taken straight off the QuantizeLinear moves onto the
+        # tensor it quantizes, which now carries the parameters. The declared
+        # dtype stays recorded by position, so the boundary still converts.
+        if ql_output in ag.model_outputs:
+            ag.model_outputs = [
+                ql_input if n == ql_output else n for n in ag.model_outputs
+            ]
+
         # Remove QL intermediate tensor
         if ql_output in ag.tensors and ql_output != ql_input:
             del ag.tensors[ql_output]
@@ -797,6 +1406,28 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 # Batch normalization
+
+
+def _order_broadcast_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Put the full-shape operand first in an Add or Mul that broadcasts.
+
+    A squeeze-and-excitation block multiplies a feature map by one value per
+    channel, and exporters write either operand first. The kernels take the
+    first operand's shape as the result's and repeat the second, so the
+    commutative ops are reordered here rather than taught both orders.
+    """
+    for op in ag.ops:
+        if op.op_type not in ("Add", "Mul") or len(op.inputs) != 2:
+            continue
+        if len(op.outputs) != 1 or op.outputs[0] not in ag.tensors:
+            continue
+        first, second = (ag.tensors.get(name) for name in op.inputs)
+        if first is None or second is None:
+            continue
+        result = tuple(ag.tensors[op.outputs[0]].shape)
+        if tuple(first.shape) != result and tuple(second.shape) == result:
+            op.inputs = [op.inputs[1], op.inputs[0]]
+    return ag
 
 
 def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -956,6 +1587,59 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
 _BIAS_PRODUCERS = frozenset({"Conv", "DepthwiseConv", "Conv1D", "Gemm"})
 
 
+def _takes_a_bias(ag: AnalyzedGraph, producer: OpNode) -> bool:
+    """Whether this operator has a bias operand to fold a constant Add into.
+
+    A batched matrix product over a constant weight is lowered to the same
+    fully-connected kernel as a Gemm, which reads a bias, so it can take one
+    here even though ONNX MatMul states no such operand. One over two
+    activations cannot: there is no weight for a bias to sit beside.
+    """
+    if producer.op_type in _BIAS_PRODUCERS:
+        return True
+    if producer.op_type != "MatMul" or len(producer.inputs) != 2:
+        return False
+    weight = ag.weight_data.get(producer.inputs[1])
+    return weight is not None and weight.ndim == 2
+
+
+
+def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Fold Gemm's alpha and beta into the constants they scale.
+
+    The plan has no field for either, and the fully-connected kernel computes
+    Y = X * W^T + B, so a Gemm carrying them used to compile and return a
+    silently wrong answer. Scaling a constant weight by alpha and a constant
+    bias by beta is exact and leaves nothing for the plan to express. transA
+    transposes an activation, which no constant can absorb; validation refuses
+    it.
+    """
+    for op in ag.ops:
+        if op.op_type != "Gemm" or len(op.inputs) < 2:
+            continue
+
+        alpha = float(op.attrs.get("alpha", 1.0))
+        if alpha != 1.0:
+            weight = ag.weight_data.get(op.inputs[1])
+            if weight is not None and weight.dtype == np.float32:
+                ag.weight_data[op.inputs[1]] = np.ascontiguousarray(
+                    weight * np.float32(alpha))
+                op.attrs["alpha"] = 1.0
+
+        beta = float(op.attrs.get("beta", 1.0))
+        if beta != 1.0:
+            if len(op.inputs) < 3:
+                # beta scales C; with no C there is no term for it to scale.
+                op.attrs["beta"] = 1.0
+            else:
+                bias = ag.weight_data.get(op.inputs[2])
+                if bias is not None and bias.dtype == np.float32:
+                    ag.weight_data[op.inputs[2]] = np.ascontiguousarray(
+                        bias * np.float32(beta))
+                    op.attrs["beta"] = 1.0
+    return ag
+
+
 def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Put a constant-weight matrix product in the layout the kernels read.
 
@@ -1013,6 +1697,199 @@ def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
                 )
         op.op_type = "Gemm"
         op.attrs["transB"] = 1
+    return ag
+
+
+
+
+def _neg_to_scalar_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite Neg as a multiplication by minus one.
+
+    Neg has no opcode, so a graph holding one is rejected outright, yet it is
+    exactly the scalar-constant Mul the kernels already carry. The scalar is a
+    float, so this applies before quantization folding, where a quantized graph
+    still states its operands in float.
+    """
+    for index, op in enumerate(ag.ops):
+        if op.op_type != "Neg" or len(op.inputs) != 1:
+            continue
+        info = ag.tensors.get(op.inputs[0])
+        if info is None or info.dtype != 1:
+            continue
+
+        scalar = f"{op.outputs[0]}_minus_one_{index}"
+        ag.weight_data[scalar] = np.array([-1.0], dtype=np.float32)
+        ag.tensors[scalar] = TensorInfo(
+            name=scalar, shape=(1,), dtype=1, is_constant=True)
+        op.op_type = "Mul"
+        op.inputs = [op.inputs[0], scalar]
+        op.attrs = {}
+    return ag
+
+
+def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite a constant subtrahend as an added negation.
+
+    Sub does not commute and the plan records only that an operand is constant,
+    not which side it was on, so the runtime takes two tensor operands. A
+    constant on the right has an exact commutative equivalent, x + (-c), which
+    the Add path already carries, including folding it into a producer's bias.
+    A constant on the left has no such equivalent and is left for validation to
+    reject.
+    """
+    for op in ag.ops:
+        if op.op_type != "Sub" or len(op.inputs) != 2:
+            continue
+        subtrahend = op.inputs[1]
+        if subtrahend not in ag.weight_data or op.inputs[0] in ag.weight_data:
+            continue
+        constant = ag.weight_data[subtrahend]
+        if constant.dtype != np.float32:
+            continue
+        ag.weight_data[subtrahend] = np.ascontiguousarray(-constant)
+        op.op_type = "Add"
+    return ag
+
+
+def _gather_one_index_to_split(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite a Gather of one constant index as a Split and drop the axis.
+
+    Taking a single index out of an axis nothing precedes is a contiguous run
+    of the stored bytes, which is exactly what a Split cuts. A classifier that
+    reads the leading token of a sequence is the common case, and it is the
+    only thing standing between a vision transformer and its own head.
+
+    Both sides have to state their own axis order, so the stored bytes follow
+    the shape: a tensor the runtime stores channels-last would put the wanted
+    index somewhere other than the front of a run.
+    """
+    replacements: list[tuple[int, list[OpNode]]] = []
+    for index, op in enumerate(ag.ops):
+        if op.op_type != "Gather" or len(op.inputs) != 2 or len(op.outputs) != 1:
+            continue
+        source = ag.tensors.get(op.inputs[0])
+        result = ag.tensors.get(op.outputs[0])
+        indices = ag.weight_data.get(op.inputs[1])
+        if source is None or result is None or indices is None:
+            continue
+        if indices.size != 1 or not np.issubdtype(indices.dtype, np.integer):
+            continue
+        rank = len(source.shape)
+        axis = int(op.attrs.get("axis", 0))
+        if axis < 0:
+            axis += rank
+        if rank < 2 or axis < 0 or axis >= rank:
+            continue
+        if not _states_its_own_order(source) or not _states_its_own_order(result):
+            continue
+        if any(dim != 1 for dim in source.shape[:axis]):
+            continue
+        wanted = int(indices.reshape(-1)[0])
+        if wanted < 0:
+            wanted += int(source.shape[axis])
+        if not 0 <= wanted < int(source.shape[axis]):
+            continue
+        expected = tuple(source.shape[:axis]) + tuple(source.shape[axis + 1:])
+        if tuple(result.shape) != expected:
+            continue
+
+        rest = 1
+        for dim in source.shape[axis + 1:]:
+            rest *= int(dim)
+        rows = int(source.shape[axis])
+        flat_name = _fresh_name(ag, f"{op.inputs[0]}_rows")
+        ag.tensors[flat_name] = replace(
+            ag.tensors[op.inputs[0]], name=flat_name, shape=(rows, rest),
+            layout=Layout.LINEAR)
+        rewritten = [
+            OpNode(name=f"{op.name}_rows", op_type="Reshape",
+                   inputs=[op.inputs[0]], outputs=[flat_name], attrs={}),
+        ]
+
+        cuts = [(0, wanted), (wanted, wanted + 1), (wanted + 1, rows)]
+        parts: list[str] = []
+        for start, end in cuts:
+            if end <= start:
+                parts.append("")
+                continue
+            part = _fresh_name(ag, f"{op.outputs[0]}_part{start}")
+            ag.tensors[part] = replace(
+                ag.tensors[op.outputs[0]], name=part, shape=(end - start, rest),
+                layout=Layout.LINEAR)
+            parts.append(part)
+        kept = parts[1]
+        rewritten.append(
+            OpNode(name=f"{op.name}_split", op_type="Split",
+                   inputs=[flat_name], outputs=[p for p in parts if p],
+                   attrs={"axis": 0}))
+        rewritten.append(
+            OpNode(name=op.name, op_type="Reshape",
+                   inputs=[kept], outputs=[op.outputs[0]], attrs={}))
+        replacements.append((index, rewritten))
+
+    for index, rewritten in reversed(replacements):
+        ag.ops[index:index + 1] = rewritten
+    return ag
+
+
+def _fresh_name(ag: AnalyzedGraph, base: str) -> str:
+    """A tensor name the graph does not already carry."""
+    name = base
+    suffix = 0
+    while name in ag.tensors or name in ag.weight_data:
+        suffix += 1
+        name = f"{base}_{suffix}"
+    return name
+
+
+def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Rewrite a constant divisor as a multiplication by its reciprocal.
+
+    Div has no opcode, yet a constant divisor is exactly the Mul the kernels
+    already carry: a GELU exports as ``Erf(x / sqrt(2))`` and an attention
+    scale as a division by the head width. A divisor on the left has no such
+    equivalent, and a zero in one would turn an infinity the model states into
+    a finite number, so both are left for validation to reject.
+
+    The reciprocal is taken in double precision and stored back as float32,
+    which is the nearest representable inverse rather than the one a float32
+    division would produce. The two differ by at most a half ulp of the
+    reciprocal, well inside the tolerance the contract gate holds float to.
+
+    It goes into a tensor of its own rather than over the divisor. One
+    constant commonly feeds several divisions, since an exporter writes the
+    same sqrt(2) into every GELU and a deduplicating pass then hands them all
+    one initializer; inverting that in place would invert it once per reader.
+    The same constant may also be read as something other than a divisor,
+    which a rewrite in place would corrupt outright.
+    """
+    reciprocals: dict[str, str] = {}
+    for op in ag.ops:
+        if op.op_type != "Div" or len(op.inputs) != 2:
+            continue
+        divisor = op.inputs[1]
+        if divisor not in ag.weight_data or op.inputs[0] in ag.weight_data:
+            continue
+        name = reciprocals.get(divisor)
+        if name is None:
+            constant = ag.weight_data[divisor]
+            if constant.dtype != np.float32 or constant.size == 0:
+                continue
+            if not np.all(np.isfinite(constant)) or np.any(constant == 0.0):
+                continue
+            reciprocal = (1.0 / constant.astype(np.float64)).astype(np.float32)
+            if not np.all(np.isfinite(reciprocal)):
+                continue
+            name = f"{divisor}_reciprocal"
+            suffix = 0
+            while name in ag.tensors or name in ag.weight_data:
+                suffix += 1
+                name = f"{divisor}_reciprocal_{suffix}"
+            ag.weight_data[name] = np.ascontiguousarray(reciprocal)
+            ag.tensors[name] = replace(ag.tensors[divisor], name=name)
+            reciprocals[divisor] = name
+        op.inputs[1] = name
+        op.op_type = "Mul"
     return ag
 
 
@@ -1113,10 +1990,12 @@ def _fold_constant_add_into_bias(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _channel_broadcast_size(
-    constant_shape: tuple[int, ...], reference_shape: tuple[int, ...]
+def _axis_broadcast_size(
+    constant_shape: tuple[int, ...],
+    reference_shape: tuple[int, ...],
+    axis: int,
 ) -> int | None:
-    """Channel count when a constant broadcasts only along the channel axis.
+    """Extent when a constant broadcasts only along *axis* of the reference.
 
     ONNX right-aligns operands, so ``(C,)``, ``(C, 1, 1)`` and ``(1, C, 1, 1)``
     all address the channel axis of an NCHW activation while ``(1, 1, 1, W)``
@@ -1125,21 +2004,46 @@ def _channel_broadcast_size(
     """
     if len(reference_shape) < 2 or len(constant_shape) > len(reference_shape):
         return None
-    channels = reference_shape[1]
-    if channels <= 0:
+    extent_on_axis = reference_shape[axis]
+    if extent_on_axis <= 0:
         return None
     offset = len(reference_shape) - len(constant_shape)
-    for axis, extent in enumerate(constant_shape):
-        aligned = axis + offset
-        if aligned == 1:
-            if extent != channels:
+    for position, extent in enumerate(constant_shape):
+        aligned = position + offset
+        if aligned == axis:
+            if extent != extent_on_axis:
                 return None
         elif extent != 1:
             return None
-    # A constant shorter than the reference must still reach the channel axis.
-    if offset > 1:
+    # A constant shorter than the reference must still reach the axis.
+    if offset > axis:
         return None
-    return channels
+    return extent_on_axis
+
+
+def _channel_broadcast_size(
+    constant_shape: tuple[int, ...], reference_shape: tuple[int, ...]
+) -> int | None:
+    """The channel count a constant addresses on an NCHW or NCL activation."""
+    return _axis_broadcast_size(constant_shape, reference_shape, 1)
+
+
+def _bias_broadcast_size(
+    producer_type: str,
+    constant_shape: tuple[int, ...],
+    reference_shape: tuple[int, ...],
+) -> int | None:
+    """The bias length a constant states for *producer_type*'s output.
+
+    Which axis a bias addresses is a property of the operator that produced
+    the tensor, not of the tensor's rank. A convolution biases its output
+    channel, which the model states second. A matrix product biases its output
+    feature, which is the last axis on both sides and is what the
+    fully-connected kernel indexes its bias by.
+    """
+    matrix = producer_type in ("Gemm", "MatMul")
+    axis = len(reference_shape) - 1 if matrix else 1
+    return _axis_broadcast_size(constant_shape, reference_shape, axis)
 
 
 def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -1179,7 +2083,7 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
         if producer_idx is None or producer_idx in removed:
             continue
         producer = ag.ops[producer_idx]
-        if producer.op_type not in _BIAS_PRODUCERS:
+        if not _takes_a_bias(ag, producer):
             continue
         if len(producer.inputs) not in (2, 3):
             continue
@@ -1194,8 +2098,8 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
         constant = ag.weight_data[const_name]
         if constant.dtype != np.float32:
             continue
-        channels = _channel_broadcast_size(
-            tuple(constant.shape), tuple(product_info.shape)
+        channels = _bias_broadcast_size(
+            producer.op_type, tuple(constant.shape), tuple(product_info.shape)
         )
         if channels is None or constant.size != channels:
             continue
@@ -1291,6 +2195,70 @@ def _decompose_silu(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _fold_pad_into_conv(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Give a convolution the zero padding a Pad ahead of it was adding.
+
+    A converter that lowers "same" padding writes it as an explicit Pad and
+    leaves the convolution unpadded, which materializes a whole padded copy of
+    the feature map for nothing. The convolution already pads with zero, and
+    in the quantized domain with the input's zero point, which is the same
+    value a constant Pad of zero writes, so the two are exchangeable.
+
+    Only the spatial axes may be padded, the fill has to be zero, and the
+    padded tensor may have no other reader: anything else and the Pad stays.
+    """
+    readers: dict[str, list[int]] = {}
+    for index, op in enumerate(ag.ops):
+        for name in op.inputs:
+            if name:
+                readers.setdefault(name, []).append(index)
+
+    folded: set[int] = set()
+    for index, op in enumerate(ag.ops):
+        if op.op_type != "Pad" or not op.outputs or len(op.inputs) < 2:
+            continue
+        if op.attrs.get("mode", "constant") != "constant":
+            continue
+        consumers = readers.get(op.outputs[0], [])
+        if len(consumers) != 1:
+            continue
+        target = ag.ops[consumers[0]]
+        if target.op_type not in ("Conv", "DepthwiseConv"):
+            continue
+        if target.inputs[0] != op.outputs[0]:
+            continue
+        amounts = ag.weight_data.get(op.inputs[1])
+        if amounts is None:
+            continue
+        fill = ag.weight_data.get(op.inputs[2]) if len(op.inputs) > 2 else None
+        if fill is not None and fill.size and float(fill.reshape(-1)[0]) != 0.0:
+            continue
+        source = ag.tensors.get(op.inputs[0])
+        if source is None or len(source.shape) != 4:
+            continue
+        values = [int(v) for v in amounts.reshape(-1)]
+        if len(values) != 8:
+            continue
+        begins, ends = values[:4], values[4:]
+        if begins[0] or begins[1] or ends[0] or ends[1]:
+            continue
+        if any(v < 0 for v in values):
+            continue
+        existing = list(target.attrs.get("pads", [0, 0, 0, 0]))
+        if len(existing) != 4:
+            continue
+        target.attrs["pads"] = [
+            existing[0] + begins[2], existing[1] + begins[3],
+            existing[2] + ends[2], existing[3] + ends[3],
+        ]
+        target.inputs[0] = op.inputs[0]
+        folded.add(index)
+
+    if folded:
+        ag.ops = [op for i, op in enumerate(ag.ops) if i not in folded]
+    return ag
+
+
 def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Relabel Conv ops with group == C_in as DepthwiseConv."""
     for op in ag.ops:
@@ -1338,7 +2306,13 @@ def _relabel_conv1d(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Replace Clip(min=0, max=6) with Relu6."""
+    """Replace a Clip that states an activation the runtime already has.
+
+    Clip(0, 6) is Relu6. Clip(0, unbounded) is Relu, which exporters emit in
+    place of a Relu often enough to be worth recognizing: an absent upper bound,
+    an infinite one, or one at the float maximum all mean the same thing.
+    Anything else keeps its bounds and has no kernel to run on.
+    """
     for op in ag.ops:
         if op.op_type != "Clip":
             continue
@@ -1362,18 +2336,30 @@ def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
             if arr.size == 1:
                 max_val = float(arr.flat[0])
 
-        if min_val is not None and max_val is not None:
-            if abs(min_val) < 1e-6 and abs(max_val - 6.0) < 1e-6:
-                op.op_type = "Relu6"
-                # Keep only the data input, drop min/max constant inputs
-                op.inputs = [op.inputs[0]]
-                op.attrs = {}
+        if min_val is None or abs(min_val) >= 1e-6:
+            continue
+
+        unbounded_above = (
+            max_val is None
+            or math.isinf(max_val)
+            or max_val >= np.finfo(np.float32).max
+        )
+        if max_val is not None and abs(max_val - 6.0) < 1e-6:
+            op.op_type = "Relu6"
+        elif unbounded_above:
+            op.op_type = "Relu"
+        else:
+            continue
+
+        # Keep only the data input, drop min/max constant inputs
+        op.inputs = [op.inputs[0]]
+        op.attrs = {}
 
     return ag
 
 
 def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Replace ReduceMean(axes=[2,3]) with GlobalAveragePool.
+    """Replace a spatial ReduceMean or ReduceMax with its global pool.
 
     Newer ONNX exporters (PyTorch >= 2.x) emit ReduceMean over spatial
     dimensions instead of GlobalAveragePool.  They are semantically
@@ -1383,8 +2369,10 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
     Handles both attribute-based axes (opset < 18) and input-based axes
     (opset >= 18).
     """
+    reductions = {"ReduceMean": "GlobalAveragePool", "ReduceMax": "GlobalMaxPool"}
+
     for op in ag.ops:
-        if op.op_type != "ReduceMean":
+        if op.op_type not in reductions:
             continue
 
         # Try axes from attribute first (opset < 18)
@@ -1399,14 +2387,23 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
         if axes is None:
             continue
 
-        # Normalize negative axes for 4D tensors (ndim=4)
-        axes_norm = set(int(a) % 4 for a in axes)
+        source = ag.tensors.get(op.inputs[0])
+        rank = len(source.shape) if source is not None else 0
+        if rank == 0:
+            continue
+        axes_norm = set(int(a) % rank for a in axes)
 
-        # Accept axes {2,3} (NCHW spatial) or {1,2} (NHWC spatial)
-        if axes_norm not in ({2, 3}, {1, 2}):
+        # An operator that keeps its own type still has to carry its axes in
+        # one place, because the emitter reads them from the attribute and an
+        # opset-18 model states them as an input.
+        op.attrs["axes"] = sorted(axes_norm)
+
+        # Only a rank-4 mean over both spatial axes is the global pool. The
+        # axes read the same in either order the graph may state them.
+        if rank != 4 or axes_norm not in ({2, 3}, {1, 2}):
             continue
 
-        op.op_type = "GlobalAveragePool"
+        op.op_type = reductions[op.op_type]
         op.attrs = {}
 
         # Remove axes input and clean up axes tensor
@@ -1418,6 +2415,37 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
             if axes_name in ag.tensors:
                 del ag.tensors[axes_name]
 
+    return ag
+
+
+def _whole_map_average_pool_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Replace an AveragePool whose one window is the whole map with its global pool.
+
+    ``F.avg_pool2d(x, x.shape[2:])`` exports as AveragePool with the kernel set
+    to the input's height and width. With no padding it averages the same
+    samples by the same count as GlobalAveragePool, which the compiler streams
+    through fast memory a band at a time; as a pooling window it spans the
+    whole height, so no band could be smaller than the input.
+    """
+    for op in ag.ops:
+        if op.op_type != "AveragePool" or len(op.inputs) != 1:
+            continue
+        source = ag.tensors.get(op.inputs[0])
+        result = ag.tensors.get(op.outputs[0]) if op.outputs else None
+        if source is None or result is None:
+            continue
+        if len(source.shape) != 4 or len(result.shape) != 4:
+            continue
+        kernel = [int(k) for k in op.attrs.get("kernel_shape", [])]
+        pads = [int(p) for p in op.attrs.get("pads", [0, 0, 0, 0])]
+        if kernel != [int(source.shape[2]), int(source.shape[3])]:
+            continue
+        if any(pads) or int(op.attrs.get("ceil_mode", 0)) != 0:
+            continue
+        if tuple(result.shape[2:]) != (1, 1):
+            continue
+        op.op_type = "GlobalAveragePool"
+        op.attrs = {}
     return ag
 
 
@@ -1562,6 +2590,31 @@ def _fix_reshape_shapes(ag: AnalyzedGraph) -> None:
         out_info.shape = tuple(resolved)
 
 
+def _resolve_resize_conventions(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """State what a Resize samples, rather than leaving it to a default.
+
+    Resize changed shape across opsets. Up to opset 10 it takes scales as its
+    second input and always reads the source at ``out / scale``, which later
+    versions call the asymmetric convention; there is no attribute saying so.
+    From opset 11 the attributes exist and default to half-pixel coordinates
+    and a round-half-down nearest rule. Reading the opset-11 default off an
+    opset-10 graph moves every sample by half an output pixel, so the
+    effective convention is written onto the operator here and every later
+    pass reads it rather than guessing.
+    """
+    for op in ag.ops:
+        if op.op_type != "Resize":
+            continue
+        if ag.opset and ag.opset < 11:
+            op.attrs["coordinate_transformation_mode"] = "asymmetric"
+            op.attrs.setdefault("nearest_mode", "floor")
+        else:
+            op.attrs.setdefault(
+                "coordinate_transformation_mode", "half_pixel")
+            op.attrs.setdefault("nearest_mode", "round_prefer_floor")
+    return ag
+
+
 def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Extract integer scale factors from Resize ops.
 
@@ -1614,6 +2667,17 @@ def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         op.attrs["strides"] = [scale_h, scale_w]
 
+        # Bilinear upsampling is its own operator rather than a mode on this
+        # one. A runtime that does not carry it refuses the plan outright,
+        # where a mode flag on Resize would have been read as nearest and
+        # quietly produced a different picture. Which coordinates it samples
+        # on rides in kernel_shape, the way Concat carries its axis.
+        if op.attrs.get("mode", "nearest") == "linear":
+            op.op_type = "ResizeLinear"
+            asymmetric = op.attrs.get(
+                "coordinate_transformation_mode") == "asymmetric"
+            op.attrs["kernel_shape"] = [1 if asymmetric else 0]
+
         # Strip constant inputs (roi, scales, sizes) - keep only X
         for inp_name in op.inputs[1:]:
             if inp_name and inp_name in ag.weight_data:
@@ -1626,43 +2690,28 @@ def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _normalize_concat_axis(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Translate Concat axis from NCHW to NHWC convention.
+    """Restate the Concat axis in the order the runtime stores the tensor.
 
-    ONNX Concat has an ``axis`` attribute. For 4D tensors, NCHW axis=1
-    (channel concat) maps to NHWC axis=3. The axis is stored in
-    ``kernel_shape`` for packing into spatial.kernel_h.
+    ONNX names the axis in the model's own order. The runtime reads it out of
+    ``kernel_shape`` and applies it to the stored shape, so an image tensor's
+    channel axis 1 has to come through as the last axis, and a tensor that
+    already states its own order keeps the axis it was given. The layout map
+    says which, so this runs once layouts are assigned.
     """
     for op in ag.ops:
         if op.op_type != "Concat":
             continue
-
-        axis = op.attrs.get("axis", 1)
-
-        # Normalize negative axes for 4D
+        result = ag.tensors.get(op.outputs[0]) if op.outputs else None
+        if result is None:
+            continue
+        rank = len(result.shape)
+        axis = int(op.attrs.get("axis", 1))
         if axis < 0:
-            axis = 4 + axis
-
-        # Map NCHW axis to NHWC
-        if axis == 1:
-            nhwc_axis = 3  # channel axis
-        elif axis == 0:
-            nhwc_axis = 0  # batch (rare)
-        elif axis == 2:
-            nhwc_axis = 1  # H
-        elif axis == 3:
-            nhwc_axis = 2  # W
-        else:
-            nhwc_axis = axis
-
-        # Store axis in kernel_shape so _pack_spatial_attrs writes kernel_h
-        op.attrs["kernel_shape"] = [nhwc_axis]
-        # Clear pads/strides/dilations to avoid spurious spatial packing
-        op.attrs.pop("pads", None)
-        op.attrs.pop("strides", None)
-        op.attrs.pop("dilations", None)
-
+            axis += rank
+        if not 0 <= axis < rank:
+            continue
+        op.attrs["kernel_shape"] = [serialized_axis_map(rank, result.layout)[axis]]
     return ag
-
 
 def _validate_transposes(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Validate Transpose permutations retained in the deployment plan."""

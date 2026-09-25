@@ -35,8 +35,32 @@ SECTION_TYPES = (
     SEC_OP_ATTRIBUTES,
 )
 
-# Per-operator attribute kinds stored in SEC_OP_ATTRIBUTES.
-OP_ATTR_TRANSPOSE_PERM = 1
+# Per-operator attribute kinds stored in SEC_OP_ATTRIBUTES. The loader refuses
+# a kind it does not know, so the whole set is declared at the schema version
+# that introduces the mechanism for them rather than one kind per version.
+# Payloads are little-endian, and their length is the record's data_len.
+OP_ATTR_TRANSPOSE_PERM = 1   # uint8[rank], the serialized axis permutation
+OP_ATTR_EPSILON = 2          # float32, a normalization's variance floor
+OP_ATTR_ALPHA = 3            # float32, a leaky activation's negative slope
+OP_ATTR_CLIP_BOUNDS = 4      # float32[2], a clip's lower then upper bound
+OP_ATTR_PADS = 5             # int32[2 * rank], leading then trailing per axis
+OP_ATTR_AXES = 6             # uint8[n], the axes a reduction collapses
+# Which of the two swapped axes a layout conversion's band runs along, in the
+# tile plan's flags field.
+TILE_FLAG_BAND_ON_COLUMNS = 0x0001
+
+OP_ATTR_BINARY_REQUANT = 7   # int32[6], three Q0.31 (multiplier, shift) pairs:
+                             # the first operand's, the second's, the result's
+
+OP_ATTR_KINDS = (
+    OP_ATTR_TRANSPOSE_PERM,
+    OP_ATTR_EPSILON,
+    OP_ATTR_ALPHA,
+    OP_ATTR_CLIP_BOUNDS,
+    OP_ATTR_PADS,
+    OP_ATTR_AXES,
+    OP_ATTR_BINARY_REQUANT,
+)
 
 # Compression types
 COMPRESS_NONE = 0
@@ -79,6 +103,11 @@ OP_TYPE_MAP: dict[str, int] = {
     "Resize": 30,
     "GlobalMaxPool": 31,
     "Conv1D": 32,
+    "LayerNormalization": 33,
+    "Erf": 34,
+    "Split": 35,
+    "ResizeLinear": 36,
+    "HardSwish": 37,
 }
 OP_TYPE_UNKNOWN = 255
 
@@ -110,7 +139,7 @@ OP_WEIGHT_BIAS_STRUCT = struct.Struct("<HH")
 OP_ACTIVATION_STRUCT = struct.Struct("<Bbbx")
 
 STAGE_STRUCT = struct.Struct("<I12H")
-TILE_PLAN_STRUCT = struct.Struct("<BB5H3I")
+TILE_PLAN_STRUCT = struct.Struct("<BB5H2I2H")
 WEIGHT_ENTRY_STRUCT = struct.Struct("<III")
 QUANT_PARAM_STRUCT = struct.Struct("<fiHHHH")
 WEIGHT_BLOCK_STRUCT = struct.Struct("<HHHHIII")

@@ -28,9 +28,8 @@ TILE_PLAN_STRUCT = struct.Struct("<BBHHHHHIII")  # matches tigris_tile_plan_t (2
 def _build_high_res_conv(h: int, w: int, c: int) -> onnx.ModelProto:
     """A single 3x3 stride-1 pad-1 Conv on a [1,c,h,w] float32 activation.
 
-    Same channel count in and out so the stage's live-tensor peak is exactly
-    two copies of the [1,c,h,w] tensor, matching the proportional tile model
-    used by solve_2d_tile.
+    Same channel count in and out, so the stage's live-tensor peak is exactly
+    two copies of the [1,c,h,w] tensor.
     """
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, c, h, w])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, c, h, w])

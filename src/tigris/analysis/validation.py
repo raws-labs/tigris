@@ -2,15 +2,23 @@
 
 from dataclasses import dataclass
 
-from tigris.analysis.lifetime import compute_lifetimes
+from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
+from tigris.analysis.lifetime import compute_lifetimes, pure_reinterpretations
 from tigris.analysis.partition_spatial import (
     _back_propagate_tile_heights,
     _chain_fast_bytes,
     _get_stage_spatial_params,
+    _row_view,
+    _stage_is_row_tiled,
 )
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
-from tigris.graph.ir import AnalyzedGraph, Layout, Stage
+from tigris.graph.ir import (
+    AnalyzedGraph,
+    Layout,
+    Stage,
+    serialized_axis_map,
+)
 
 
 _FLOAT32 = 1
@@ -235,10 +243,14 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if any(value != 1 for value in dilations):
                 reasons.append("pooling dilation is not implemented")
 
-        if op.op_type == "AveragePool" and int(
-            op.attrs.get("count_include_pad", 0)
-        ) != 0:
-            reasons.append("count_include_pad=1 is not encoded")
+        # Without padding every window lies inside the input, so counting the
+        # padded positions changes nothing: PyTorch states the flag by default.
+        if (
+            op.op_type == "AveragePool"
+            and int(op.attrs.get("count_include_pad", 0)) != 0
+            and any(int(pad) != 0 for pad in op.attrs.get("pads", []))
+        ):
+            reasons.append("count_include_pad=1 with padding is not encoded")
 
         if op.op_type == "MaxPool":
             if int(op.attrs.get("storage_order", 0)) != 0:
@@ -246,9 +258,9 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if len(op.outputs) != 1:
                 reasons.append("MaxPool indices output is not implemented")
 
-        if op.op_type == "Softmax":
+        if op.op_type in ("Softmax", "LayerNormalization"):
             input_tensor = (
-                ag.tensors.get(op.inputs[0]) if len(op.inputs) == 1 else None
+                ag.tensors.get(op.inputs[0]) if op.inputs else None
             )
             if input_tensor is None or not input_tensor.shape:
                 reasons.append("runtime requires one concrete, non-scalar input")
@@ -266,32 +278,142 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     runtime_final_axis = rank - 1
                 if normalized_axis != runtime_final_axis:
                     reasons.append(
-                        "Softmax axis must map to the runtime's final dimension "
-                        f"(axis {runtime_final_axis} for rank {rank} in "
-                        f"{input_tensor.layout.value} layout)"
+                        f"{op.op_type} axis must map to the runtime's final "
+                        f"dimension (axis {runtime_final_axis} for rank {rank} "
+                        f"in {input_tensor.layout.value} layout)"
                     )
+
+        if op.op_type == "LayerNormalization":
+            # Scale is a weight and bias an optional one; both are indexed by
+            # position along the normalized axis, so neither may be an
+            # activation the plan would have to route.
+            if not 2 <= len(op.inputs) <= 3:
+                reasons.append(
+                    "runtime requires a scale and an optional bias, both "
+                    "constant"
+                )
+            elif any(name not in ag.weight_data for name in op.inputs[1:]):
+                reasons.append("scale and bias must be constants")
+            if len(op.outputs) != 1:
+                reasons.append(
+                    "the mean and inverse-deviation outputs are not implemented"
+                )
+            if int(op.attrs.get("stash_type", 1)) != 1:
+                reasons.append("stash_type other than float32 is not encoded")
+
+        if op.op_type == "Gemm":
+            if int(op.attrs.get("transA", 0)) != 0:
+                reasons.append(
+                    "transA transposes an activation, which the plan has no "
+                    "field for and no constant can absorb")
+            for name in ("alpha", "beta"):
+                if float(op.attrs.get(name, 1.0)) != 1.0:
+                    reasons.append(
+                        f"{name} is not 1 and could not be folded into a "
+                        "constant, and the plan has no field for it")
+
+        if op.op_type == "Sub":
+            dynamic = [
+                name for name in op.inputs
+                if name in ag.tensors and not ag.tensors[name].is_constant
+            ]
+            if len(dynamic) != 2:
+                reasons.append(
+                    "Sub does not commute and the plan does not record which "
+                    "side a constant was on; a constant subtrahend is rewritten "
+                    "as an added negation, a constant minuend is not expressible"
+                )
 
         if op.op_type == "Concat":
             tensors = [ag.tensors.get(name) for name in op.inputs]
+            result = ag.tensors.get(op.outputs[0]) if op.outputs else None
             normalized_axis = op.attrs.get("kernel_shape", [])
-            if (
-                not tensors
-                or any(tensor is None or len(tensor.shape) != 4 for tensor in tensors)
-                or normalized_axis != [3]
+            rank = len(result.shape) if result is not None else 0
+            if not tensors or result is None or any(
+                tensor is None or len(tensor.shape) != rank for tensor in tensors
             ):
-                reasons.append("runtime supports rank-4 channel-axis Concat only")
-
-        if op.op_type == "Resize":
-            if op.attrs.get("mode", "nearest") != "nearest":
-                reasons.append("Resize mode must be 'nearest'")
-            if op.attrs.get("coordinate_transformation_mode", "half_pixel") != (
-                "asymmetric"
+                reasons.append("Concat operands are not runtime tensors")
+            elif rank == 4:
+                if normalized_axis != [3]:
+                    reasons.append(
+                        "runtime concatenates a rank-4 tensor on its channel "
+                        "axis only"
+                    )
+            elif any(
+                name in ag.weight_data
+                for name in op.inputs[1:]
             ):
                 reasons.append(
-                    "Resize coordinate_transformation_mode must be 'asymmetric'"
+                    "a constant Concat operand is only expressible as the "
+                    "leading part"
                 )
-            if op.attrs.get("nearest_mode", "round_prefer_floor") != "floor":
-                reasons.append("Resize nearest_mode must be 'floor'")
+            elif op.inputs[0] in ag.weight_data and (
+                ag.tensors[op.outputs[0]].quant is not None
+            ):
+                reasons.append(
+                    "a quantized Concat carries no scale for a constant part"
+                )
+            elif rank == 3:
+                # The runtime walks the positions ahead of the last stored
+                # axis and copies one run per input, so that is the only axis
+                # it can cut.
+                if normalized_axis != [2]:
+                    reasons.append(
+                        "runtime concatenates a rank-3 tensor on its last "
+                        "stored axis only"
+                    )
+            else:
+                reasons.append("runtime concatenates rank-3 and rank-4 only")
+
+        if op.op_type == "Split":
+            source = ag.tensors.get(op.inputs[0])
+            parts = [ag.tensors.get(name) for name in op.outputs]
+            axis = int(op.attrs.get("axis", 0))
+            if source is None or any(part is None for part in parts):
+                reasons.append("Split operands are not runtime tensors")
+            else:
+                rank = len(source.shape)
+                stored = serialized_axis_map(rank, source.layout)
+                # Only the outermost stored axis leaves every part a
+                # contiguous run of the input; anything else interleaves.
+                if rank == 0 or stored[axis % rank] != 0:
+                    reasons.append(
+                        "runtime splits only along the outermost stored axis"
+                    )
+                elif any(
+                    len(part.shape) != rank
+                    or tuple(part.shape[1:]) != tuple(source.shape[1:])
+                    for part in parts
+                ):
+                    reasons.append(
+                        "every Split part keeps the shape it was cut from"
+                    )
+
+        if op.op_type in {"Resize", "ResizeLinear"}:
+            linear = op.op_type == "ResizeLinear"
+            if linear:
+                # Both conventions execute: half-pixel places a sample at
+                # (o + 0.5) / scale - 0.5, asymmetric at o / scale. The
+                # loader has already resolved which one the opset means.
+                if op.attrs.get("coordinate_transformation_mode",
+                                "half_pixel") not in {
+                    "half_pixel", "asymmetric"
+                }:
+                    reasons.append(
+                        "bilinear Resize coordinate_transformation_mode must "
+                        "be 'half_pixel' or 'asymmetric'"
+                    )
+            else:
+                if op.attrs.get("mode", "nearest") != "nearest":
+                    reasons.append("Resize mode must be 'nearest'")
+                if op.attrs.get("coordinate_transformation_mode",
+                                "half_pixel") != "asymmetric":
+                    reasons.append(
+                        "Resize coordinate_transformation_mode must be "
+                        "'asymmetric'"
+                    )
+                if op.attrs.get("nearest_mode", "round_prefer_floor") != "floor":
+                    reasons.append("Resize nearest_mode must be 'floor'")
             if "axes" in op.attrs:
                 reasons.append("Resize axes is not encoded")
 
@@ -347,11 +469,46 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 reference_shape = dynamic_inputs[0].shape
                 if output.shape != reference_shape:
                     reasons.append("output shape must match the first operand exactly")
-                if any(
-                    tensor.shape != reference_shape
+                per_channel = [
+                    tensor
                     for tensor in dynamic_inputs[1:]
+                    if tensor.shape != reference_shape
+                ]
+                # The runtime takes a per-channel operand at the full
+                # operand's rank; a constant may be written shorter, a
+                # dynamic tensor may not.
+                if any(
+                    len(tensor.shape) != len(reference_shape)
+                    or not _is_per_channel_constant(
+                        tuple(tensor.shape), dynamic_inputs[0])
+                    for tensor in per_channel
                 ):
-                    reasons.append("dynamic operand broadcasting is not implemented")
+                    reasons.append(
+                        "a dynamic second operand must have the first "
+                        "operand's shape or one value per channel"
+                    )
+                elif per_channel:
+                    stage = next(
+                        (candidate for candidate in ag.stages
+                         if candidate.stage_id == op.stage),
+                        None,
+                    )
+                    # One row high, a per-channel operand is loaded whole
+                    # for every band of a rank-4 height stripe. No other tile
+                    # executor has that rule.
+                    tiled = stage is not None and stage.tile_plan is not None \
+                        and stage.tile_plan.tileable
+                    if stage is not None and (
+                        stage.chain_id != 0xFFFF
+                        or (tiled and (
+                            stage.tile_plan.tile_width != 0
+                            or stage.tile_plan.axis != TILE_AXIS_HEIGHT_OR_LENGTH
+                            or len(dynamic_inputs[0].shape) != 4))
+                    ):
+                        reasons.append(
+                            "a per-channel operand is banded only by a "
+                            "rank-4 height stripe"
+                        )
 
                 if constant_names:
                     if ag.is_quantized:
@@ -386,7 +543,14 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                             full_shape_constant = (
                                 tuple(constant.shape) == reference_shape
                             )
-                            if constant.size != 1 and not full_shape_constant:
+                            per_channel = _is_per_channel_constant(
+                                tuple(constant.shape), dynamic_inputs[0]
+                            )
+                            if (
+                                constant.size != 1
+                                and not full_shape_constant
+                                and not per_channel
+                            ):
                                 reasons.append(
                                     f"constant operand {name!r} requires unsupported "
                                     "broadcasting"
@@ -547,12 +711,169 @@ class SlowMemoryUsage:
         )
 
 
-def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
-    """Slow/PSRAM residency for tiled stages. Empty overflow_stage_ids == fits.
+def _is_per_channel_constant(
+    constant_shape: tuple[int, ...], operand
+) -> bool:
+    """Whether a constant carries one value per channel of the operand.
 
-    A stage needs tiling when its peak exceeds the TOTAL fast pool
-    (fast + reserve), so compressed and uncompressed compiles gate identically
-    and match analyze (where reserve is 0).
+    Every tensor reaches the runtime with its channels innermost, so a
+    constant of that length repeats on its own wherever a tile starts and
+    needs no shape of its own in the plan. The constant has to say so in the
+    model's own axis order: one extent on the channel axis and one everywhere
+    else, which is how an exporter writes an input normalization.
+    """
+    shape = tuple(int(dim) for dim in operand.shape)
+    if not shape or not constant_shape:
+        return False
+    axis = len(shape) - 1 if operand.layout is Layout.LINEAR else 1
+    if axis >= len(shape):
+        return False
+    channels = shape[axis]
+    if channels <= 1:
+        return False
+    padded = (1,) * (len(shape) - len(constant_shape)) + tuple(constant_shape)
+    if len(padded) != len(shape):
+        return False
+    return all(
+        dim == (channels if index == axis else 1)
+        for index, dim in enumerate(padded)
+    )
+
+
+def _runs_whole(ag: AnalyzedGraph, stage: Stage, fast_total: int) -> bool:
+    """Whether the runtime executes this stage in one pass rather than in tiles.
+
+    A stage reaches the tiled path only when it carries a usable tile plan and
+    its own boundary tensors do not fit the fast pool together, which is the
+    test the executor makes before it picks a path.
+    """
+    if stage.chain_len >= 2:
+        return False
+    plan = stage.tile_plan
+    if plan is None or not plan.tileable:
+        return True
+    names = dict.fromkeys([*stage.input_tensors, *stage.output_tensors])
+    total_io = sum(
+        ag.tensors[n].size_bytes for n in names if n in ag.tensors
+    )
+    return total_io <= fast_total
+
+
+def untiled_stage_spill(
+    ag: AnalyzedGraph, stage: Stage, fast_total: int
+) -> int:
+    """Bytes a stage run in one pass pushes into slow memory on its own.
+
+    The executor allocates each operator's output in the fast pool, compacts
+    when that fails, and falls back to slow when it still does not fit. What
+    lands in slow stays there for the rest of the stage: nothing compacts the
+    slow pool until the stage is over. So a stage whose working set exceeds
+    the fast pool leaves a trail of intermediates in slow that no boundary
+    tensor accounts for, and a budget check that counts only boundary tensors
+    reads far too low.
+
+    This walks the stage the way the executor does, holding live bytes rather
+    than a bump pointer because compaction is what makes those equivalent.
+    """
+    alias = pure_reinterpretations(ag)
+    align = ag.tensor_alignment
+
+    def sized(name: str) -> int:
+        info = ag.tensors.get(name)
+        if info is None:
+            return 0
+        return (info.size_bytes + align - 1) & ~(align - 1)
+
+    ops = [ag.ops[i] for i in stage.op_indices]
+    outputs = set(stage.output_tensors)
+    last_use: dict[str, int] = {}
+    for position, op in enumerate(ops):
+        for name in op.inputs:
+            if name in ag.tensors and not ag.tensors[name].is_constant:
+                last_use[name] = position
+
+    live: dict[str, int] = {}
+    for name in dict.fromkeys(stage.input_tensors):
+        live[name] = sized(name)
+    placed = set(live)
+    spilled = 0
+
+    for position, op in enumerate(ops):
+        for name in op.outputs:
+            if name in placed or name not in ag.tensors:
+                continue
+            if alias.get(name) is not None:
+                placed.add(name)
+                continue
+            size = sized(name)
+            if sum(live.values()) + size <= fast_total:
+                live[name] = size
+            elif name not in outputs:
+                # A stage output that lands in slow is already counted as a
+                # tensor crossing the boundary; only the intermediates the
+                # stage leaves behind are extra.
+                spilled += size
+            placed.add(name)
+        for name in op.inputs:
+            if last_use.get(name) == position and name not in outputs:
+                live.pop(name, None)
+    return spilled
+
+
+def row_band_aliases(ag: AnalyzedGraph, fast_total: int) -> dict[str, str]:
+    """Stage outputs the runtime writes over their own input, output -> input.
+
+    A row-banded stage gathers a band out of its input before any op runs and
+    scatters the result back to the same rows, so one buffer can carry both
+    tensors. The runtime does that whenever the two agree on size and on row
+    view, nothing after the stage reads the input, and the input is not a
+    model input, whose buffer belongs to the caller. Mirrored here so the slow
+    pool is not sized for a pair that never coexists.
+
+    The rule is deliberately the narrower of the two: every condition the
+    runtime tests is tested here, plus the same total-I/O threshold that sends
+    a stage down the banded path at all. Claiming an alias the runtime does
+    not make would under-size the pool.
+    """
+    last_reader: dict[str, int] = {}
+    for stage in ag.stages:
+        for name in stage.input_tensors:
+            last_reader[name] = stage.stage_id
+    model_inputs = set(ag.model_inputs)
+
+    aliases: dict[str, str] = {}
+    for stage in ag.stages:
+        if len(stage.input_tensors) != 1 or len(stage.output_tensors) != 1:
+            continue
+        src, dst = stage.input_tensors[0], stage.output_tensors[0]
+        if src in model_inputs or last_reader.get(src) != stage.stage_id:
+            continue
+        plan = stage.tile_plan
+        if plan is None or not plan.tileable or plan.axis != TILE_AXIS_HEIGHT_OR_LENGTH:
+            continue
+        stage_ops = [ag.ops[i] for i in stage.op_indices]
+        if not _stage_is_row_tiled(ag, stage, stage_ops):
+            continue
+        in_info, out_info = ag.tensors.get(src), ag.tensors.get(dst)
+        if in_info is None or out_info is None:
+            continue
+        if in_info.size_bytes != out_info.size_bytes:
+            continue
+        if _row_view(in_info) != _row_view(out_info):
+            continue
+        total_io = in_info.size_bytes + out_info.size_bytes
+        if total_io <= fast_total:
+            continue
+        aliases[dst] = src
+    return aliases
+
+
+def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
+    """Slow/PSRAM residency. Empty overflow_stage_ids == fits.
+
+    Every stage spills its outputs to slow memory and loads its inputs back
+    from there, tiled or not, so residency is measured over every stage rather
+    than only the ones that need tiling.
 
     The slow-resident set is every tensor that crosses a stage boundary (a
     stage's input or output tensor). PSRAM is freed at STAGE granularity, not
@@ -581,29 +902,73 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
     fast_total = ag.budget.fast + ag.budget.fast_reserve
     ag = compute_lifetimes(ag)
 
+    # Stages execute one group at a time: a chain runs as a unit, everything
+    # else on its own. Slow residency is held for the whole group, so a chain
+    # is measured over its whole op interval rather than stage by stage.
+    groups: list[list[Stage]] = []
+    index = 0
+    while index < len(ag.stages):
+        stage = ag.stages[index]
+        span = stage.chain_len if (
+            stage.chain_len >= 2 and stage.chain_id == stage.stage_id
+        ) else 1
+        groups.append(ag.stages[index:index + span])
+        index += span
+
+    # A chain streams every tensor it produces short of its last stage, so
+    # those never reach slow memory at all.
+    streamed: set[str] = set()
+    for group in groups:
+        for stage in group[:-1]:
+            streamed.update(stage.output_tensors)
+
     # Slow-resident set: every tensor that crosses a stage boundary.
     slow_names: set[str] = set()
     for s in ag.stages:
         slow_names.update(s.input_tensors)
         slow_names.update(s.output_tensors)
-    slow_lifetimes = [ag.lifetimes[n] for n in slow_names if n in ag.lifetimes]
+    slow_names -= streamed
+
+    # A stage that writes its output over its own input holds one buffer, not
+    # two, so the pair counts once over the union of their lifetimes.
+    aliases = row_band_aliases(ag, fast_total)
+    buffers: list[tuple[int, int, int]] = []  # birth, death, size
+    merged: set[str] = set()
+    for dst, src in aliases.items():
+        if dst not in ag.lifetimes or src not in ag.lifetimes:
+            continue
+        a, b = ag.lifetimes[src], ag.lifetimes[dst]
+        buffers.append((
+            min(a.birth_step, b.birth_step),
+            max(a.death_step, b.death_step),
+            max(a.size_bytes, b.size_bytes),
+        ))
+        merged.add(dst)
+        merged.add(src)
+    for n in slow_names:
+        if n in ag.lifetimes and n not in merged:
+            lt = ag.lifetimes[n]
+            buffers.append((lt.birth_step, lt.death_step, lt.size_bytes))
 
     def interval_bytes(first: int, last: int) -> int:
         return sum(
-            lt.size_bytes
-            for lt in slow_lifetimes
-            if lt.birth_step <= last and lt.death_step >= first
+            size
+            for birth, death, size in buffers
+            if birth <= last and death >= first
         )
 
     peak = 0
     overflow: list[int] = []
-    for s in ag.stages:
-        if s.peak_bytes <= fast_total or not s.op_indices:
+    for group in groups:
+        steps = [i for s in group for i in s.op_indices]
+        if not steps:
             continue
-        stage_peak = interval_bytes(min(s.op_indices), max(s.op_indices))
-        peak = max(peak, stage_peak)
-        if stage_peak > slow_budget:
-            overflow.append(s.stage_id)
+        group_peak = interval_bytes(min(steps), max(steps))
+        if len(group) == 1 and _runs_whole(ag, group[0], fast_total):
+            group_peak += untiled_stage_spill(ag, group[0], fast_total)
+        peak = max(peak, group_peak)
+        if group_peak > slow_budget:
+            overflow.append(group[0].stage_id)
     return SlowMemoryUsage(peak, slow_budget, tuple(overflow))
 
 
