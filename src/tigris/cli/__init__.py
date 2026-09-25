@@ -141,8 +141,23 @@ def _run_pipeline(
     return ag, total_budget
 
 
+def _show_version(ctx, param, value):
+    if not value or ctx.resilient_parsing:
+        return
+    from importlib.metadata import version
+    from tigris.runtime import runtime_version
+
+    try:
+        runtime = runtime_version()
+    except ValueError:
+        runtime = "unavailable"
+    click.echo(f"tigris, version {version('tigris-ml')} (runtime {runtime})")
+    ctx.exit()
+
+
 @click.group()
-@click.version_option(package_name="tigris-ml")
+@click.option("--version", is_flag=True, is_eager=True, expose_value=False,
+              callback=_show_version, help="Show compiler and host runtime versions.")
 def cli():
     """TiGrIS - Tiled Graph Inference Scheduler"""
 
@@ -155,6 +170,8 @@ def main():
 from tigris.cli.analyze import analyze  # noqa: E402, F401
 from tigris.cli.codegen import codegen  # noqa: E402, F401
 from tigris.cli.compile import compile  # noqa: E402, F401
+from tigris.cli.inspect import inspect  # noqa: E402, F401
 from tigris.cli.plan import plan  # noqa: E402, F401
+from tigris.cli.run import run  # noqa: E402, F401
 from tigris.cli.simulate import simulate  # noqa: E402, F401
 from tigris.cli.zoo import zoo  # noqa: E402, F401

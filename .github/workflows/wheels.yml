@@ -1,0 +1,131 @@
+name: Host wheels
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      builds: ${{ steps.matrix.outputs.builds }}
+      tests: ${{ steps.matrix.outputs.tests }}
+    steps:
+      - id: matrix
+        env:
+          FULL_MATRIX: ${{ github.event_name != 'pull_request' }}
+        shell: python
+        run: |
+          import json, os
+          hosts = [
+              {"runner": "ubuntu-22.04", "platform": "manylinux_2_28_x86_64"},
+              {"runner": "ubuntu-24.04-arm", "platform": "manylinux_2_28_aarch64"},
+              {"runner": "macos-15-intel", "platform": "macosx_11_0_x86_64"},
+              {"runner": "macos-14", "platform": "macosx_11_0_arm64"},
+              {"runner": "windows-2022", "platform": "win_amd64"},
+          ]
+          full = os.environ["FULL_MATRIX"] == "true"
+          hosts = hosts if full else hosts[:1]
+          versions = ["3.10", "3.11", "3.12", "3.13"] if full else ["3.12"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("builds=" + json.dumps({"include": hosts}) + "\n")
+              output.write("tests=" + json.dumps({"include": [dict(host, python=v) for host in hosts for v in versions]}) + "\n")
+
+  build:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.builds) }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build packaging setuptools-scm
+      - uses: ./.github/actions/runtime
+        if: github.ref_type != 'tag'
+        with:
+          build-host: 'true'
+      - name: Stage pinned release archive
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/runtime_bundle.py --platform ${{ matrix.platform }} --expect-release "$RELEASE_TAG"
+      - run: python -m build --wheel
+        env:
+          TIGRIS_WHEEL_VARIANT: native
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  test:
+    needs: [matrix, build]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.tests) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist
+      - name: Install and test outside the checkout
+        shell: bash
+        env:
+          TIGRIS_REQUIRE_HOST: "1"
+          OMP_NUM_THREADS: "2"
+          MKL_NUM_THREADS: "2"
+        run: |
+          python -m pip install dist/*.whl pytest onnxruntime
+          mkdir -p "$RUNNER_TEMP/wheel-tests/schema_compat"
+          cp tests/conftest.py tests/test_host_runtime.py tests/test_inspect.py "$RUNNER_TEMP/wheel-tests/"
+          cp tests/schema_compat/*.tgrs "$RUNNER_TEMP/wheel-tests/schema_compat/"
+          cd "$RUNNER_TEMP/wheel-tests"
+          python -c 'import tigris; from pathlib import Path; assert "site-packages" in str(Path(tigris.__file__).resolve())'
+          tigris --version
+          python -m pytest -q
+
+  pure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build
+      - name: Build source distribution and pure wheel
+        env:
+          TIGRIS_WHEEL_VARIANT: pure
+        run: python -m build
+      - name: Install and test the pure wheel outside the checkout
+        env:
+          TIGRIS_REQUIRE_PURE: "1"
+        run: |
+          python -m pip install dist/*-py3-none-any.whl pytest
+          mkdir -p "$RUNNER_TEMP/pure-tests"
+          cp tests/conftest.py tests/test_pure_wheel.py "$RUNNER_TEMP/pure-tests/"
+          cd "$RUNNER_TEMP/pure-tests"
+          python -m pytest -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-pure
+          path: |
+            dist/*-py3-none-any.whl
+            dist/*.tar.gz
+          if-no-files-found: error

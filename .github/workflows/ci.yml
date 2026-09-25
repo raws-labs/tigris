@@ -9,6 +9,10 @@ permissions:
   contents: read
 
 jobs:
+  wheels:
+    if: github.event_name == 'pull_request' || github.event_name == 'release' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/wheels.yml
+
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
@@ -26,61 +30,32 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
+      - uses: ./.github/actions/runtime
+        with:
+          build-host: 'true'
       - run: python -m pytest -q
 
   quality-and-package:
-    name: Lint, package, CLI, and generated C
+    name: Lint, CLI, and generated C
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/checkout@v4
-        with:
-          repository: raws-labs/tigris-runtime
-          path: tigris-runtime
-          # Develop is the integration baseline.  A same-named runtime branch,
-          # when present, is selected below for coordinated wire-format work.
-          ref: develop
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
-      - name: Use matching runtime integration branch when available
-        # On a release tag the counterpart is the released runtime, which is the
-        # tip of its main; the two version independently and never share a tag
-        # name. Otherwise a same-named runtime branch, for coordinated
-        # wire-format work. The ref is matched by its full path: ls-remote
-        # patterns match a ref's tail, so a bare name matches any branch ending
-        # in it, and a tag paired against a stale release/<tag> branch once.
-        env:
-          RUNTIME_REF: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
-          RUNTIME_REF_TYPE: ${{ github.ref_type }}
-        run: |
-          if [ "$RUNTIME_REF_TYPE" = "tag" ]; then
-            remote_ref="refs/heads/main"
-          else
-            remote_ref="refs/heads/$RUNTIME_REF"
-          fi
-          if git -C tigris-runtime ls-remote --exit-code --refs origin "$remote_ref"; then
-            git -C tigris-runtime fetch --depth=1 origin "$remote_ref"
-            git -C tigris-runtime checkout --detach FETCH_HEAD
-          elif [ "$RUNTIME_REF_TYPE" = "tag" ]; then
-            echo "Runtime main must exist to pair with a compiler release tag" >&2
-            exit 1
-          fi
-      - run: python -m ruff check src tests scripts
+      - uses: ./.github/actions/runtime
+      - run: python -m ruff check src tests scripts setup.py
       - run: python -m pytest -q tests/test_codegen_c_syntax.py
-      - run: python -m build
-      - run: python -m venv /tmp/tigris-wheel-smoke
-      - run: /tmp/tigris-wheel-smoke/bin/python -m pip install dist/*.whl
-      - run: /tmp/tigris-wheel-smoke/bin/tigris --help
+      - run: tigris --help
       - run: python scripts/ci_codegen_smoke.py /tmp/tigris-smoke.c
       - run: >-
           cc -std=c99 -Wall -Wextra -Werror -fsyntax-only
-          -Itigris-runtime/include /tmp/tigris-smoke.c
+          -Iruntime-source/include /tmp/tigris-smoke.c
       - name: Verify generated plan-schema package
         # Named from SCHEMA_VERSION so a bump cannot leave this step checking
         # the previous version's artifact while the current one goes unverified.
@@ -93,8 +68,8 @@ jobs:
           python scripts/generate_capability_matrix.py
           --check src/tigris/schema/operator-capabilities-v1.json
       - name: Audit capability package against runtime dispatch
-        run: python scripts/validate_runtime_capabilities.py --runtime tigris-runtime
+        run: python scripts/validate_runtime_capabilities.py --runtime runtime-source
       - name: Verify compiler/runtime compatibility metadata
-        run: python scripts/validate_compatibility.py --runtime tigris-runtime
+        run: python scripts/validate_compatibility.py --runtime runtime-source
       - name: Run compiler/runtime differential contract
-        run: python scripts/crossrepo_contract.py --runtime tigris-runtime
+        run: python scripts/crossrepo_contract.py --runtime runtime-source
