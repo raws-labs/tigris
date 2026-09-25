@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=77.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -55,9 +55,10 @@ tigris = "tigris.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+exclude = ["tigris.native"]
 
 [tool.setuptools.package-data]
-tigris = ["schema/*.json"]
+tigris = ["schema/*.json", "native/*"]
 
 [tool.setuptools_scm]
 version_file = "src/tigris/_version.py"

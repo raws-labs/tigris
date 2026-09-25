@@ -20,6 +20,7 @@ from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import partition_spatial
 from tigris.analysis.partition_temporal import partition_temporal
+from tigris.emitters.binary import defs
 from tigris.emitters.binary.defs import (
     HEADER_SIZE,
     MAGIC,
@@ -546,6 +547,63 @@ def test_missing_required_section_is_rejected_cleanly(linear_3op_path):
     struct.pack_into("<II", data, HEADER_SIZE, 0, 0)
 
     with pytest.raises(ValueError, match="Missing required section type"):
+        read_binary_plan(bytes(data))
+
+
+@pytest.fixture
+def reader_plan():
+    data = bytearray((Path(__file__).parent / "schema_compat" / "schema-v3-qdq-conv.tgrs").read_bytes())
+    header = list(defs.HEADER_STRUCT.unpack_from(data))
+    sections = {}
+    for offset in range(header[3], len(data), defs.SECTION_ENTRY_SIZE):
+        kind, start = defs.SECTION_ENTRY_STRUCT.unpack_from(data, offset)
+        if not kind:
+            break
+        sections[kind] = start
+    return data, header, sections
+
+
+def test_reader_rejects_directory_overlapping_header(reader_plan):
+    data, header, _ = reader_plan
+    header[3] = HEADER_SIZE - 1
+    defs.HEADER_STRUCT.pack_into(data, 0, *header)
+    with pytest.raises(ValueError, match="Section directory overlaps header"):
+        read_binary_plan(bytes(data))
+
+
+def test_reader_rejects_section_overlapping_directory(reader_plan):
+    data, header, _ = reader_plan
+    defs.SECTION_ENTRY_STRUCT.pack_into(data, header[3], defs.SEC_TENSORS,
+                                       header[3] + defs.SECTION_ENTRY_SIZE)
+    with pytest.raises(ValueError, match="Section overlaps header or directory"):
+        read_binary_plan(bytes(data))
+
+
+@pytest.mark.parametrize("field, kind, size", [
+    (4, defs.SEC_TENSORS, defs.TENSOR_SIZE),
+    (5, defs.SEC_OPS, defs.OP_SIZE),
+    (6, defs.SEC_STAGES, defs.STAGE_SIZE),
+    (7, defs.SEC_TILE_PLANS, defs.TILE_PLAN_SIZE),
+    (14, defs.SEC_WEIGHTS, defs.WEIGHT_ENTRY_SIZE),
+])
+def test_reader_rejects_count_crossing_section_end(reader_plan, field, kind, size):
+    data, header, sections = reader_plan
+    start = sections[kind]
+    end = min(offset for offset in sections.values() if offset > start)
+    header[field] = (end - start) // size + 1
+    assert start + header[field] * size <= len(data)
+    defs.HEADER_STRUCT.pack_into(data, 0, *header)
+    with pytest.raises(ValueError, match=f"Data exceeds section {kind}"):
+        read_binary_plan(bytes(data))
+
+
+def test_reader_rejects_unterminated_string(reader_plan):
+    data, _, sections = reader_plan
+    start = sections[defs.SEC_STRINGS]
+    end = min(offset for offset in sections.values() if offset > start)
+    data[start:end] = b"x" * (end - start)
+    assert 0 in data[end:]
+    with pytest.raises(ValueError):
         read_binary_plan(bytes(data))
 
 

@@ -14,6 +14,18 @@ On an embedded device with a few hundred KB of SRAM, most interesting models sim
 
 TiGrIS takes the other approach. It keeps the model you trained and rearranges the *computation* so that only a small working set lives in SRAM at any moment. Weights and intermediate spills go to flash or PSRAM. What comes out is a binary plan that the runtime executes as a flat sequence of kernel calls, with no interpreter, no tensor allocator, and no dynamic memory at all.
 
+## Installation
+
+`pip install tigris-ml` selects a wheel for the host. Native wheels include the
+portable reference runtime for Linux x86-64 and ARM64 with glibc >= 2.28,
+macOS x86-64 and ARM64, and Windows x86-64. The Linux wheels use
+`manylinux_2_28`; older glibc, musllinux, Windows ARM, and 32-bit ARM Linux
+install the pure Python wheel instead. A source distribution is also available.
+
+The pure wheel supports inspection, compilation, analysis, code generation, and zoo downloads.
+`run` reports "Bundled host runtime is unavailable" without the native
+library. Neither installation nor execution downloads a runtime separately.
+
 ## Quick start
 
 ```bash
@@ -91,6 +103,7 @@ account. List available builds before choosing a model:
 tigris zoo list --category classification
 tigris zoo list --runtime 0.9.1 --backend reference -m 256K
 tigris zoo fetch MODEL -o downloaded-model
+tigris inspect downloaded-model/model.tgrs
 tigris codegen downloaded-model/model.tgrs --format core -o model.c
 ```
 
@@ -100,7 +113,7 @@ Tested releases are reported separately. Matching a range does not claim that
 every release in it has been tested. `-m` limits the fast arena, a second
 `-m` limits the slow arena, and `-f` limits plan bytes. These are not total
 application RAM or flash limits. Unspecified resources remain unconstrained.
-The runtime is supplied separately.
+The runtime for deployment on a device is supplied separately.
 
 Use `fetch --artifact ID` to pin a build. Withdrawn builds are excluded from
 automatic selection but remain explicitly retrievable with a warning. Downloads
@@ -110,6 +123,60 @@ runtime constraints, tested releases, and pinned catalog revision; use it for
 dependency integration. Catalog updates do not change artifact publication dates
 or rebuild models. `tigris zoo --offline ...` uses the HF cache;
 `tigris zoo --catalog catalog.json ...` reads a local zoo snapshot.
+
+## Inspect a model
+
+```bash
+tigris inspect model.onnx
+tigris inspect model.tgrs -v
+tigris inspect model.tgrs --json
+```
+
+`inspect` detects the format from file contents. It reads declared ONNX inputs,
+outputs, operators, and initializers, or compiled plan interfaces, stages, tiling,
+quantization, and memory records. `-v` adds details; `--json` emits complete
+metadata with an `inspection_version` field and exact byte counts, without weight
+values. Inspection is offline: it does not compile, execute, infer shapes, or load
+external ONNX tensor data. Recorded plan memory is not measured runtime peak or
+total application RAM. Plan schemas do not imply runtime version requirements.
+Inspection does not validate kernel numerics. `run` checks the portable reference
+path; neither command validates ESP-NN or CMSIS-NN numerics or on-device latency.
+
+## Run a compiled model
+
+Platform wheels include the reference C runtime. Run preprocessed tensors in
+the stored axis order and declared interface dtype reported by `inspect`:
+
+```bash
+tigris run downloaded-model/model.tgrs --input downloaded-model/example-input.bin --output prediction.bin
+tigris run model.tgrs --input input.npy --output prediction.npy
+tigris --version
+```
+
+For multiple inputs, repeat `--input NAME=FILE`. Use `.npz` for multiple named
+outputs. Raw `.bin` files contain contiguous little-endian elements; `.npy`
+inputs retain their declared shape and dtype. Output files must not exist.
+`--json` reports execution metadata and arena peaks. These peaks exclude the
+plan, executor workspace, and Python process memory. Host execution uses
+only the portable float32 reference and int8 reference kernels. It checks plan
+execution on that path, not ESP-NN or CMSIS-NN numerics or on-device latency.
+It does not preprocess photos or CSV files.
+
+```python
+import numpy as np
+from tigris.runtime import Session
+
+with Session("model.tgrs") as session:
+    outputs = session.run({"input": np.load("input.npy", allow_pickle=False)})
+    print(session.runtime_version, session.memory)
+```
+
+Compiler and runtime releases share a version identifying the tested pair.
+Execution checks matching zoo dependency records when present and lets the C
+loader validate the plan. Schema versions, accepted schema ranges, and the host
+ABI retain their own compatibility meanings.
+Downloading and generating deployment code remain independent of the host runtime.
+See [Contributing](CONTRIBUTING.md) for native-library staging and wheel builds.
 
 ## Further reading
 

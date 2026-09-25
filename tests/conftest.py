@@ -253,7 +253,7 @@ def qdq_conv_path(tmp_path):
 
     # Nodes: weight Q/DQ
     n_w_q = helper.make_node("QuantizeLinear", ["W_float", "w_scale", "w_zp"],
-                             ["W_q"], name="w_ql")
+                             ["W_q"], name="w_ql", axis=0)
     n_w_dq = helper.make_node("DequantizeLinear", ["W_q", "w_scale", "w_zp"],
                               ["W_dq"], name="w_dql", axis=0)
 

@@ -1,0 +1,38 @@
+name: Paired runtime source
+description: Select the matching runtime ref and optionally build its host library
+inputs:
+  build-host:
+    description: Build and stage the host library
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: raws-labs/tigris-runtime
+        path: runtime-source
+        ref: develop
+    - name: Select paired ref
+      shell: bash
+      env:
+        PAIR_REF: ${{ github.head_ref || github.ref_name }}
+        PAIR_TYPE: ${{ github.ref_type }}
+      run: |
+        if [ "$PAIR_TYPE" = tag ]; then
+          remote_ref="refs/tags/$PAIR_REF"
+        else
+          remote_ref="refs/heads/$PAIR_REF"
+        fi
+        if git -C runtime-source ls-remote --exit-code --refs origin "$remote_ref"; then
+          git -C runtime-source fetch --depth=1 origin "$remote_ref"
+          git -C runtime-source checkout --detach FETCH_HEAD
+        elif [ "$PAIR_TYPE" = tag ]; then
+          echo "The matching runtime release tag must exist" >&2
+          exit 1
+        fi
+    - uses: ilammy/msvc-dev-cmd@v1
+      if: inputs.build-host == 'true' && runner.os == 'Windows'
+    - name: Build and stage paired host library
+      if: inputs.build-host == 'true'
+      shell: bash
+      run: python scripts/runtime_bundle.py --source runtime-source

@@ -57,8 +57,8 @@ from .defs import (
 )
 
 
-def read_binary_plan(data: bytes) -> dict:
-    """Parse a binary plan file into a dict for test validation.
+def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
+    """Parse a binary plan, optionally leaving weight blocks compressed.
 
     Returns a dict with keys: magic, version, file_size, num_tensors, num_ops,
     num_stages, num_tile_plans, budget, peak, model_name, tensors, ops, stages,
@@ -89,6 +89,8 @@ def read_binary_plan(data: bytes) -> dict:
         raise ValueError(f"File size mismatch: header says {file_size}, got {len(data)}")
 
     # Parse section directory
+    if section_dir_off < HEADER_SIZE:
+        raise ValueError("Section directory overlaps header")
     sections: dict[int, int] = {}
     off = section_dir_off
     found_sentinel = False
@@ -110,6 +112,17 @@ def read_binary_plan(data: bytes) -> dict:
 
     if not found_sentinel:
         raise ValueError("Section directory has no sentinel")
+    if any(start and start < off for start in sections.values()):
+        raise ValueError("Section overlaps header or directory")
+
+    section_ends = {
+        kind: min((end for end in sections.values() if end > start), default=len(data))
+        for kind, start in sections.items()
+    }
+
+    def _check_range(kind: int, pos: int, size: int) -> None:
+        if pos < sections[kind] or size < 0 or pos + size > section_ends[kind]:
+            raise ValueError(f"Data exceeds section {kind}")
 
     required_sections = {
         SEC_TENSORS,
@@ -134,20 +147,33 @@ def read_binary_plan(data: bytes) -> dict:
     if missing:
         raise ValueError(f"Missing required section type(s): {missing}")
 
+    for kind, count, size in (
+        (SEC_TENSORS, num_tensors, TENSOR_SIZE),
+        (SEC_OPS, num_ops, OP_SIZE),
+        (SEC_STAGES, num_stages, STAGE_SIZE),
+        (SEC_TILE_PLANS, num_tile_plans, TILE_PLAN_SIZE),
+        (SEC_WEIGHTS, num_weights, WEIGHT_ENTRY_SIZE),
+    ):
+        if count:
+            _check_range(kind, sections[kind], count * size)
+
     def _read_string(str_off: int) -> str:
         base = sections[SEC_STRINGS]
         pos = base + str_off
-        end = data.index(0, pos)
+        _check_range(SEC_STRINGS, pos, 1)
+        end = data.index(0, pos, section_ends[SEC_STRINGS])
         return data[pos:end].decode("utf-8")
 
     def _read_index_pool(pool_off: int, count: int) -> list[int]:
         base = sections[SEC_INDEX_POOL]
         pos = base + pool_off * 2
+        _check_range(SEC_INDEX_POOL, pos, count * 2)
         return list(struct.unpack_from(f"<{count}H", data, pos))
 
     def _read_shape(shape_off: int, ndim: int) -> list[int]:
         base = sections[SEC_SHAPE_POOL]
         pos = base + shape_off * 4
+        _check_range(SEC_SHAPE_POOL, pos, ndim * 4)
         return list(struct.unpack_from(f"<{ndim}i", data, pos))
 
     model_name = _read_string(model_name_str)
@@ -221,7 +247,7 @@ def read_binary_plan(data: bytes) -> dict:
             out_off, out_count,
             tile_idx, _pad,
             chain_id, chain_len,
-            chain_tile_h, _reserved1,
+            chain_tile_h, stage_flags,
         ) = STAGE_STRUCT.unpack_from(data, pos)
         stages.append({
             "peak_bytes": peak_bytes,
@@ -232,6 +258,7 @@ def read_binary_plan(data: bytes) -> dict:
             "chain_id": chain_id,
             "chain_len": chain_len,
             "chain_tile_h": chain_tile_h,
+            "flags": stage_flags,
         })
 
     # Schema v5 makes the stage table authoritative.  The byte retained in
@@ -287,6 +314,8 @@ def read_binary_plan(data: bytes) -> dict:
         for i in range(num_weights):
             pos = w_base + i * WEIGHT_ENTRY_SIZE
             w_name_off, w_offset, w_size = WEIGHT_ENTRY_STRUCT.unpack_from(data, pos)
+            if not sections.get(SEC_WEIGHT_BLOCKS):
+                _check_range(SEC_WEIGHTS, blob_base + w_offset, w_size)
             weights.append({
                 "name": _read_string(w_name_off),
                 "offset": w_offset,
@@ -298,8 +327,12 @@ def read_binary_plan(data: bytes) -> dict:
     quant_params = []
     qp_base = sections.get(SEC_QUANT_PARAMS, 0)
     if qp_base:
+        _check_range(SEC_QUANT_PARAMS, qp_base, QUANT_SECTION_HEADER_STRUCT.size)
         nqp, _qd_field = QUANT_SECTION_HEADER_STRUCT.unpack_from(data, qp_base)
+        if nqp != num_quant_params:
+            raise ValueError("Quantization count differs from header")
         entries_start = qp_base + QUANT_SECTION_HEADER_STRUCT.size
+        _check_range(SEC_QUANT_PARAMS, entries_start, nqp * QUANT_PARAM_SIZE)
         data_start = entries_start + nqp * QUANT_PARAM_SIZE
         if version != 2:
             quant_end = min(
@@ -326,6 +359,8 @@ def read_binary_plan(data: bytes) -> dict:
                 page_base = 0 if version == 2 else page * (1 << 16)
                 m_pos = data_start + (page_base + mult_off) * 4
                 s_pos = data_start + (page_base + shift_off) * 4
+                _check_range(SEC_QUANT_PARAMS, m_pos, num_ch * 4)
+                _check_range(SEC_QUANT_PARAMS, s_pos, num_ch * 4)
                 qp_entry["multipliers"] = list(struct.unpack_from(f"<{num_ch}i", data, m_pos))
                 qp_entry["shifts"] = list(struct.unpack_from(f"<{num_ch}i", data, s_pos))
             quant_params.append(qp_entry)
@@ -335,11 +370,15 @@ def read_binary_plan(data: bytes) -> dict:
     weight_blocks_compression = 0
     wb_base = sections.get(SEC_WEIGHT_BLOCKS, 0)
     if wb_base:
+        _check_range(SEC_WEIGHT_BLOCKS, wb_base, WEIGHT_BLOCK_SECTION_HEADER_STRUCT.size)
         num_blocks, compression_type = WEIGHT_BLOCK_SECTION_HEADER_STRUCT.unpack_from(
             data, wb_base
         )
         weight_blocks_compression = compression_type
+        if compression_type not in (0, 1):
+            raise ValueError(f"Unknown weight compression: {compression_type}")
         entries_start = wb_base + WEIGHT_BLOCK_SECTION_HEADER_STRUCT.size
+        _check_range(SEC_WEIGHT_BLOCKS, entries_start, num_blocks * WEIGHT_BLOCK_SIZE)
         blobs_start = entries_start + num_blocks * WEIGHT_BLOCK_SIZE
         for i in range(num_blocks):
             pos = entries_start + i * WEIGHT_BLOCK_SIZE
@@ -353,6 +392,10 @@ def read_binary_plan(data: bytes) -> dict:
                 "compressed_size": comp_sz,
                 "uncompressed_size": uncomp_sz,
             }
+            _check_range(SEC_WEIGHT_BLOCKS, blobs_start + blob_off, comp_sz)
+            if not decompress_weights:
+                weight_blocks.append(block_entry)
+                continue
             # Decompress for validation
             comp_data = data[blobs_start + blob_off : blobs_start + blob_off + comp_sz]
             if compression_type == 1:  # LZ4
@@ -369,6 +412,7 @@ def read_binary_plan(data: bytes) -> dict:
     op_attributes = []
     attrs_base = sections.get(SEC_OP_ATTRIBUTES, 0)
     if attrs_base:
+        _check_range(SEC_OP_ATTRIBUTES, attrs_base, OP_ATTRIBUTE_SECTION_HEADER_STRUCT.size)
         num_attrs, _reserved = OP_ATTRIBUTE_SECTION_HEADER_STRUCT.unpack_from(
             data, attrs_base
         )
