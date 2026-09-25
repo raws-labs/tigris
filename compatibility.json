@@ -31,6 +31,23 @@
     {
       "status": "supported",
       "runtime": {
+        "tag": "v0.10.2",
+        "commit": "5078c339e0ea9c45e37019d08f5c39a0ca1d5b0c",
+        "accepts_schemas": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      }
+    },
+    {
+      "status": "supported",
+      "runtime": {
         "tag": "v0.10.1",
         "commit": "0838dd0b6d0cd4d5b7387b25da7a62c9a1ea6a08",
         "accepts_schemas": [
