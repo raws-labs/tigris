@@ -1,4 +1,20 @@
 {
-  "release": null,
-  "artifacts": {}
+  "release": "v0.11.0",
+  "artifacts": {
+    "macosx_11_0_arm64": {
+      "sha256": "0e6cea666038cdbf6ba7f481fcd1245f5ef3a81e221315062cbe0c7f9a60d59e"
+    },
+    "macosx_11_0_x86_64": {
+      "sha256": "9aecbbe5cbb28bb9d9a19a088bab703a57f2cadd9c965a934f65a16f2404af77"
+    },
+    "manylinux_2_28_aarch64": {
+      "sha256": "7c2438c030821a42f5c94f89f3c7b14fcf39dc7d96058ebf6bb8460f803b7e22"
+    },
+    "manylinux_2_28_x86_64": {
+      "sha256": "817b2a754027f4ba36d0799ea62cc0eff5a21b58af9a4d2c69146b26a8f0c019"
+    },
+    "win_amd64": {
+      "sha256": "6572024f87d5e81769910797551976e01d1fc096d585473ab3d7d44569fcab42"
+    }
+  }
 }
