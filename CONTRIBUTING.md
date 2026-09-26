@@ -1,8 +1,9 @@
 # Contributing
 
-Use topic branches from `develop` and target pull requests there. Install
-development dependencies with `pip install -e ".[dev]"`. Stage the host library
-as described below before running `pytest`; also run
+`develop` is the default branch. Use topic branches from `develop` and target
+pull requests there. Pull requests use rebase-merge only; linear history is
+required. Install development dependencies with `pip install -e ".[dev]"`.
+Stage the host library as described below before running `pytest`; also run
 `ruff check src tests scripts setup.py` before submitting changes.
 
 ## Host library and wheels
@@ -38,6 +39,10 @@ not source CI. Publishing uploads the tested wheels and source distribution.
 
 ## Releasing
 
+`main` only fast-forwards to a tested `develop` commit through the "Promote to
+main" workflow (`.github/workflows/promote.yml`), with no release or back-merge
+pull requests. The release tag is created with the GitHub release on that commit.
+
 Compiler and runtime release as a pair with the same version, starting with
 `v0.11.0`. The number identifies the tested combination. The plan schema,
 accepted schema range, host ABI, `compatibility.json`, and zoo runtime ranges
@@ -46,13 +51,18 @@ replace those checks.
 
 1. Prepare both components with the same release number and test them together.
    The runtime's `scripts/check_version_sources.py --expect X.Y.Z` must pass.
-2. Publish runtime `vX.Y.Z` first. Wait for `host.yml` to attach all native
-   archives and SHA-256 files. For the first pair this is `v0.11.0`;
-   `v0.10.2` has no host archives.
+2. Promote the runtime's tested `develop` commit through "Promote to main"
+   (`.github/workflows/promote.yml`), with a dry run first. Then create the GitHub
+   release `vX.Y.Z` with its tag on that commit. Publish the runtime first and
+   wait for `host.yml` to attach all native archives and SHA-256 files. For the
+   first pair this is `v0.11.0`; `v0.10.2` has no host archives.
 3. Pin `runtime-host.json` to that tag and its per-platform archive hashes.
    Review the downloaded manifests and run the wheel tests.
-4. Tag and publish compiler `vX.Y.Z`. Its tag and setuptools-scm version must
-   agree with the runtime pin; release-wheel builds enforce this equality.
+4. Promote the compiler's tested `develop` commit through "Promote to main"
+   (`.github/workflows/promote.yml`), with a dry run first. Then create the GitHub
+   release `vX.Y.Z` with its tag on that commit. Its tag and setuptools-scm
+   version must agree with the runtime pin; release-wheel builds enforce this
+   equality.
 
 A compiler-only change still releases both components, including a new ESP
 component version. Its runtime release note says: "No runtime implementation
