@@ -25,31 +25,31 @@ tigris analyze mobilenetv2.onnx -m 256K -f 16M
 
 ```text
 warning: input axis 0 (batch_size) is unset; using 1 (--input-shape overrides)
-+------------------------ TiGrIS - mobilenetv2 ------------------------+
-| Operators            65                                              |
-| Tensors              244 (66 activations)                            |
-| Peak memory (naive)  5.74 MiB                                        |
-| Largest tensor       1x96x112x112 (4.59 MiB)                         |
-| Dtype                float32                                         |
-| Input                input 1x3x224x224 float32                       |
-| Output               output 1x1000 float32                           |
-+----------------------------------------------------------------------+
-+-------------------------------- SRAM --------------------------------+
-| Budget              256.00 KiB                                       |
-| Scheduled peak      252.00 KiB (4.3% of naive peak)                  |
-| Stages              58                                               |
-| Spill / reload I/O  26.21 MiB / 27.55 MiB                            |
-|                                                                      |
-| Need tiling         47 of 58 stages                                  |
-|   tileable          11 (138 tiles, max halo 2)                       |
-+----------------  PASS - tiling resolves all stages  -----------------+
-+------------------------------- Flash --------------------------------+
-| Budget            16.00 MiB                                          |
-| Weight data       13.30 MiB                                          |
-| Plan overhead      0.01 MiB                                          |
-| Plan (est.)       13.31 MiB                                          |
-| Plan INT8 (est.)   3.34 MiB                                          |
-+-------------------------  PASS - plan fits  -------------------------+
+╭──────────────────────── TiGrIS - mobilenetv2 ────────────────────────╮
+│ Operators            65                                              │
+│ Tensors              244 (66 activations)                            │
+│ Peak memory (naive)  5.74 MiB                                        │
+│ Largest tensor       1x96x112x112 (4.59 MiB)                         │
+│ Dtype                float32                                         │
+│ Input                input 1x3x224x224 float32                       │
+│ Output               output 1x1000 float32                           │
+╰──────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────── SRAM ────────────────────────────────╮
+│ Budget              256.00 KiB                                       │
+│ Scheduled peak      252.00 KiB (4.3% of naive peak)                  │
+│ Stages              58                                               │
+│ Spill / reload I/O  26.21 MiB / 27.55 MiB                            │
+│                                                                      │
+│ Need tiling         47 of 58 stages                                  │
+│   tileable          11 (138 tiles, max halo 2)                       │
+╰────────────────  PASS - tiling resolves all stages  ─────────────────╯
+╭─────────────────────────────── Flash ────────────────────────────────╮
+│ Budget            16.00 MiB                                          │
+│ Weight data       13.30 MiB                                          │
+│ Plan overhead      0.01 MiB                                          │
+│ Plan (est.)       13.31 MiB                                          │
+│ Plan INT8 (est.)   3.34 MiB                                          │
+╰─────────────────────────  PASS - plan fits  ─────────────────────────╯
 ```
 
 The naive peak is 5.74 MiB. TiGrIS schedules it into 256 KiB through temporal partitioning and spatial tiling. `analyze` runs on your laptop; no hardware required.
