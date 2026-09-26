@@ -49,6 +49,12 @@ accepted schema range, host ABI, `compatibility.json`, and zoo runtime ranges
 retain their separate compatibility meanings; matching release numbers do not
 replace those checks.
 
+A plan schema version changes only with the plan layout. A fix or addition that
+needs information the existing encoding lacks adds an operator attribute kind
+instead: the loader refuses kinds it does not know, so an older runtime rejects
+such a plan rather than running it with different semantics, and the change can
+ship in a patch release.
+
 1. Prepare both components with the same release number and test them together.
    The runtime's `scripts/check_version_sources.py --expect X.Y.Z` must pass.
 2. Promote the runtime's tested `develop` commit through "Promote to main"

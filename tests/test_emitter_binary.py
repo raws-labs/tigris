@@ -728,3 +728,63 @@ def test_a_mean_over_a_stored_axis_is_emitted_where_the_runtime_holds_it(
     axes = [a for a in plan["op_attributes"] if a["type"] == OP_ATTR_AXES]
     assert len(axes) == 1
     assert list(axes[0]["data"]) == [2]
+
+
+def _pool_model(path, pool, quantized):
+    """A [1, 4, 5, 3] map pooled to [1, 4, 1, 1], optionally wrapped in QDQ."""
+    nodes, inits = [], []
+    source = "input"
+    if quantized:
+        inits += [numpy_helper.from_array(np.array(0.05, np.float32), "s"),
+                  numpy_helper.from_array(np.array(-3, np.int8), "z")]
+        nodes += [helper.make_node("QuantizeLinear", ["input", "s", "z"], ["iq"]),
+                  helper.make_node("DequantizeLinear", ["iq", "s", "z"], ["idq"])]
+        source = "idq"
+    if pool == "AveragePool":
+        nodes.append(helper.make_node("AveragePool", [source], ["pooled"],
+                                      kernel_shape=[5, 3], strides=[1, 1]))
+    else:
+        nodes.append(helper.make_node("GlobalAveragePool", [source], ["pooled"]))
+    result = "pooled"
+    if quantized:
+        nodes += [helper.make_node("QuantizeLinear", ["pooled", "s", "z"], ["oq"]),
+                  helper.make_node("DequantizeLinear", ["oq", "s", "z"], ["odq"])]
+        result = "odq"
+    if quantized:
+        nodes += [helper.make_node("Flatten", [result], ["flat"], axis=1),
+                  helper.make_node("QuantizeLinear", ["flat", "s", "z"], ["fq"]),
+                  helper.make_node("DequantizeLinear", ["fq", "s", "z"], ["output"])]
+    else:
+        nodes.append(helper.make_node("Flatten", [result], ["output"], axis=1))
+    model = helper.make_model(
+        helper.make_graph(
+            nodes, "pool",
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 5, 3])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])], inits),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.save(model, path)
+    return path
+
+
+def _pool_rounding_records(tmp_path, pool, quantized):
+    ag = _full_pipeline(_pool_model(tmp_path / "pool.onnx", pool, quantized))
+    assert "GlobalAveragePool" in [op.op_type for op in ag.ops]
+    plan = read_binary_plan(emit_binary_bytes(ag))
+    return [a for a in plan["op_attributes"] if a["type"] == defs.OP_ATTR_POOL_ROUNDING]
+
+
+def test_an_int8_whole_map_average_pool_keeps_average_pool_rounding(tmp_path):
+    """The rewrite to a global pool must not turn AVERAGE_POOL_2D rounding into
+    a mean's: the emitted pool carries the attribute that selects it."""
+    records = _pool_rounding_records(tmp_path, "AveragePool", quantized=True)
+    assert len(records) == 1
+    assert list(records[0]["data"]) == [defs.POOL_ROUNDING_AVERAGE]
+
+
+def test_a_float_whole_map_average_pool_carries_no_rounding(tmp_path):
+    assert _pool_rounding_records(tmp_path, "AveragePool", quantized=False) == []
+
+
+def test_an_int8_global_average_pool_stays_a_mean(tmp_path):
+    assert _pool_rounding_records(tmp_path, "GlobalAveragePool", quantized=True) == []

@@ -35,6 +35,8 @@ from .defs import (
     NO_WEIGHT,
     OP_ATTR_AXES,
     OP_ATTR_BINARY_REQUANT,
+    OP_ATTR_POOL_ROUNDING,
+    POOL_ROUNDING_AVERAGE,
     OP_ATTR_EPSILON,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ACTIVATION_STRUCT,
@@ -798,6 +800,11 @@ def _build_op_attributes(
             payload = _binary_requant_payload(ag, op)
             if payload is not None:
                 records.append((op_index, OP_ATTR_BINARY_REQUANT, payload))
+            continue
+        if op.op_type == "GlobalAveragePool":
+            if op.attrs.get("pool_rounding") == "average":
+                records.append((
+                    op_index, OP_ATTR_POOL_ROUNDING, bytes([POOL_ROUNDING_AVERAGE])))
             continue
         if op.op_type == "ReduceMean":
             axes = op.attrs.get("axes")
