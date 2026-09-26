@@ -29,6 +29,7 @@ def schema_package() -> dict[str, object]:
             "clip_bounds": defs.OP_ATTR_CLIP_BOUNDS,
             "epsilon": defs.OP_ATTR_EPSILON,
             "pads": defs.OP_ATTR_PADS,
+            "pool_rounding": defs.OP_ATTR_POOL_ROUNDING,
             "transpose_perm": defs.OP_ATTR_TRANSPOSE_PERM,
         },
         "op_attribute_contract": {

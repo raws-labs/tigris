@@ -36,9 +36,10 @@ SECTION_TYPES = (
 )
 
 # Per-operator attribute kinds stored in SEC_OP_ATTRIBUTES. The loader refuses
-# a kind it does not know, so the whole set is declared at the schema version
-# that introduces the mechanism for them rather than one kind per version.
-# Payloads are little-endian, and their length is the record's data_len.
+# a kind it does not know, so an older runtime rejects a plan that carries a
+# newer kind instead of running it with different semantics; kinds can be added
+# without a schema version. Payloads are little-endian, and their length is the
+# record's data_len.
 OP_ATTR_TRANSPOSE_PERM = 1   # uint8[rank], the serialized axis permutation
 OP_ATTR_EPSILON = 2          # float32, a normalization's variance floor
 OP_ATTR_ALPHA = 3            # float32, a leaky activation's negative slope
@@ -51,6 +52,9 @@ TILE_FLAG_BAND_ON_COLUMNS = 0x0001
 
 OP_ATTR_BINARY_REQUANT = 7   # int32[6], three Q0.31 (multiplier, shift) pairs:
                              # the first operand's, the second's, the result's
+OP_ATTR_POOL_ROUNDING = 8    # uint8[1], POOL_ROUNDING_AVERAGE on an int8 global
+                             # average pool that rounds like AVERAGE_POOL_2D
+POOL_ROUNDING_AVERAGE = 1
 
 OP_ATTR_KINDS = (
     OP_ATTR_TRANSPOSE_PERM,
@@ -60,6 +64,7 @@ OP_ATTR_KINDS = (
     OP_ATTR_PADS,
     OP_ATTR_AXES,
     OP_ATTR_BINARY_REQUANT,
+    OP_ATTR_POOL_ROUNDING,
 )
 
 # Compression types

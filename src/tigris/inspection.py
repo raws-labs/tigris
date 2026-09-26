@@ -105,6 +105,7 @@ def _plan_attribute(attr: dict) -> dict:
         defs.OP_ATTR_PADS: ("pads", "i"),
         defs.OP_ATTR_AXES: ("axes", "B"),
         defs.OP_ATTR_BINARY_REQUANT: ("binary_requant", "i"),
+        defs.OP_ATTR_POOL_ROUNDING: ("pool_rounding", "B"),
     }
     name, code = kinds.get(attr["type"], (f"unknown({attr['type']})", "B"))
     size = struct.calcsize(code)

@@ -2425,7 +2425,8 @@ def _whole_map_average_pool_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
     to the input's height and width. With no padding it averages the same
     samples by the same count as GlobalAveragePool, which the compiler streams
     through fast memory a band at a time; as a pooling window it spans the
-    whole height, so no band could be smaller than the input.
+    whole height, so no band could be smaller than the input. An int8 pool is
+    marked so it keeps AveragePool rounding, which differs from a mean's.
     """
     for op in ag.ops:
         if op.op_type != "AveragePool" or len(op.inputs) != 1:
@@ -2445,7 +2446,10 @@ def _whole_map_average_pool_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
         if tuple(result.shape[2:]) != (1, 1):
             continue
         op.op_type = "GlobalAveragePool"
-        op.attrs = {}
+        # An int8 AveragePool rounds its integer mean like TFLite
+        # AVERAGE_POOL_2D, a global pool like TFLite MEAN; the attribute keeps
+        # the pool's own rounding after the rewrite.
+        op.attrs = {"pool_rounding": "average"} if source.quant is not None else {}
     return ag
 
 
