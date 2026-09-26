@@ -22,8 +22,9 @@ from tigris.utils import fmt_bytes
               help="Output .bin/.npy for one tensor, or .npz for named outputs.")
 @click.option("--json", "as_json", is_flag=True, help="Print execution metadata as JSON.")
 def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
-    """Execute MODEL using the packaged reference runtime.
+    """Execute MODEL using the selected host reference runtime.
 
+    Set TIGRIS_HOST_LIBRARY to select a library instead of the bundled runtime.
     Inputs use the stored axis order and declared interface dtype shown by
     inspect. Binary files contain little-endian, contiguous tensor elements.
     Execution checks the portable float32/int8 reference path, not ESP-NN or
@@ -74,7 +75,8 @@ def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
                 else:
                     value = next(iter(outputs.values()))
                     stream.write(value.astype(value.dtype.newbyteorder("<"), copy=False).tobytes())
-            report = {"runtime_version": session.runtime_version, "backend": "reference",
+            report = {"runtime_version": session.runtime_version, "runtime_source": session.runtime_source,
+                      "backend": "reference",
                       "output": str(output), "memory": session.memory,
                       "tensors": [{"name": name, "dtype": str(value.dtype), "shape": list(value.shape)}
                                   for name, value in outputs.items()]}
@@ -83,7 +85,8 @@ def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
     if as_json:
         click.echo(json.dumps(report, indent=2))
     else:
-        _panel("TiGrIS Run", [("Runtime", report["runtime_version"]), ("Backend", "Host reference"),
+        _panel("TiGrIS Run", [("Runtime", report["runtime_version"]), ("Source", report["runtime_source"]),
+                              ("Backend", "Host reference"),
                               ("Output", output),
                               ("Fast arena peak", fmt_bytes(report["memory"]["fast_peak_bytes"])),
                               ("Slow arena peak", fmt_bytes(report["memory"]["slow_peak_bytes"]))])

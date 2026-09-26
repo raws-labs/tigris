@@ -1,6 +1,7 @@
 """CLI entry point: ``tigris analyze model.onnx --mem 256K``."""
 
 from dataclasses import replace
+import os
 from pathlib import Path
 
 import click
@@ -145,11 +146,14 @@ def _show_version(ctx, param, value):
     if not value or ctx.resilient_parsing:
         return
     from importlib.metadata import version
-    from tigris.runtime import runtime_version
+    from tigris.runtime import runtime_info
 
     try:
-        runtime = runtime_version()
-    except ValueError:
+        info = runtime_info()
+        runtime = f"{info['version']}; {info['source']}"
+    except ValueError as exc:
+        if "TIGRIS_HOST_LIBRARY" in os.environ:
+            raise click.ClickException(str(exc)) from exc
         runtime = "unavailable"
     click.echo(f"tigris, version {version('tigris-ml')} (runtime {runtime})")
     ctx.exit()
@@ -157,7 +161,7 @@ def _show_version(ctx, param, value):
 
 @click.group()
 @click.option("--version", is_flag=True, is_eager=True, expose_value=False,
-              callback=_show_version, help="Show compiler and host runtime versions.")
+              callback=_show_version, help="Show compiler and host runtime versions and runtime origin.")
 def cli():
     """TiGrIS - Tiled Graph Inference Scheduler"""
 

@@ -26,6 +26,13 @@ The pure wheel supports inspection, compilation, analysis, code generation, and 
 `run` reports "Bundled host runtime is unavailable" without the native
 library. Neither installation nor execution downloads a runtime separately.
 
+On platforms without a native wheel, build the host library from the matching
+[tigris-runtime release](https://github.com/raws-labs/tigris-runtime/releases):
+run `cmake -S . -B build-host -DTIGRIS_BUILD_HOST=ON`, then
+`cmake --build build-host --target tigris_host`, and set `TIGRIS_HOST_LIBRARY`
+to the resulting shared library file. `tigris --version` and `tigris run --json`
+report the runtime's version and origin; an invalid override fails without falling back.
+
 ## Quick start
 
 ```bash

@@ -113,9 +113,13 @@ jobs:
         env:
           TIGRIS_WHEEL_VARIANT: pure
         run: python -m build
+      - uses: ./.github/actions/runtime
+        with:
+          build-host: 'true'
       - name: Install and test the pure wheel outside the checkout
         env:
           TIGRIS_REQUIRE_PURE: "1"
+          TIGRIS_TEST_HOST_LIBRARY: ${{ github.workspace }}/runtime-source/build-host-ci/host/libtigris_host.so
         run: |
           python -m pip install dist/*-py3-none-any.whl pytest
           mkdir -p "$RUNNER_TEMP/pure-tests"

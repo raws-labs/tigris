@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -13,11 +14,13 @@ from click.testing import CliRunner
 from tigris.cli import cli, _run_pipeline
 from tigris.cli.compile import _run_compressed_pipeline
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.runtime import Session, runtime_version
+from tigris import runtime
+from tigris.runtime import Session, runtime_info, runtime_version
 
 
 @pytest.fixture(autouse=True)
-def require_library():
+def require_library(monkeypatch):
+    monkeypatch.delenv("TIGRIS_HOST_LIBRARY", raising=False)
     import tigris
     if not (Path(tigris.__file__).parent / "native" / "manifest.json").exists():
         if os.environ.get("TIGRIS_REQUIRE_HOST"):
@@ -33,7 +36,85 @@ def linear_plan(linear_3op_path, tmp_path):
     return path
 
 
+@pytest.fixture
+def override_library(tmp_path):
+    directory = Path(runtime.__file__).with_name("native")
+    manifest = json.loads((directory / "manifest.json").read_text())
+    return Path(shutil.copy2(directory / manifest["library"], tmp_path / manifest["library"]))
+
+
+def test_override_execution_and_origin(linear_plan, override_library, monkeypatch, tmp_path):
+    expected_version = runtime_version()
+    monkeypatch.setenv("TIGRIS_HOST_LIBRARY", str(override_library))
+    source = f"TIGRIS_HOST_LIBRARY={override_library.resolve()}"
+    assert runtime_info() == {"version": expected_version, "source": source}
+    x = np.arange(-32, 32, dtype=np.float32).reshape(1, 64)
+    with Session(linear_plan) as session:
+        monkeypatch.delenv("TIGRIS_HOST_LIBRARY")
+        assert session.runtime_source == source
+        np.testing.assert_array_equal(session.run({"input": x})["output"], np.maximum(x, 0))
+    monkeypatch.setenv("TIGRIS_HOST_LIBRARY", str(override_library))
+    result = CliRunner().invoke(cli, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert source in result.output
+    assert expected_version in result.output
+    np.save(tmp_path / "input.npy", x)
+    result = CliRunner().invoke(cli, ["run", str(linear_plan), "--input", str(tmp_path / "input.npy"),
+                                     "--output", str(tmp_path / "result.npy"), "--json"])
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    assert report["runtime_source"] == source
+    assert report["runtime_version"] == expected_version
+    np.testing.assert_array_equal(np.load(tmp_path / "result.npy"), np.maximum(x, 0))
+
+
+@pytest.mark.parametrize("kind", ["missing", "unloadable", "empty"])
+def test_invalid_override_never_falls_back(kind, linear_plan, monkeypatch, tmp_path):
+    path = tmp_path / "library"
+    if kind == "unloadable":
+        path.write_text("Not a shared library")
+    monkeypatch.setenv("TIGRIS_HOST_LIBRARY", "" if kind == "empty" else str(path))
+    with pytest.raises(ValueError, match="Cannot load TIGRIS_HOST_LIBRARY"):
+        Session(linear_plan)
+    result = CliRunner().invoke(cli, ["--version"])
+    assert result.exit_code == 1
+    assert "Cannot load TIGRIS_HOST_LIBRARY" in result.output
+
+
+def test_override_rejects_wrong_abi(override_library, monkeypatch):
+    lib = runtime.ct.CDLL(str(override_library))
+    lib.tigris_host_abi = lambda: 999
+    monkeypatch.setattr(runtime.ct, "CDLL", lambda path: lib)
+    monkeypatch.setenv("TIGRIS_HOST_LIBRARY", str(override_library))
+    with pytest.raises(ValueError, match="Unsupported host library ABI.*TIGRIS_HOST_LIBRARY"):
+        runtime_info()
+
+
+def test_unresolvable_override_names_variable(monkeypatch):
+    monkeypatch.setenv("TIGRIS_HOST_LIBRARY", "library")
+
+    def unresolved(path, **kwargs):
+        raise RuntimeError("Cannot resolve library path")
+
+    monkeypatch.setattr(Path, "resolve", unresolved)
+    with pytest.raises(ValueError, match="Cannot load TIGRIS_HOST_LIBRARY"):
+        runtime_info()
+
+
+def test_override_reports_library_version(linear_plan, override_library, monkeypatch):
+    lib = runtime.ct.CDLL(str(override_library))
+    lib.tigris_host_version = lambda: b"9.8.7"
+    monkeypatch.setattr(runtime.ct, "CDLL", lambda path: lib)
+    monkeypatch.setenv("TIGRIS_HOST_LIBRARY", str(override_library))
+    assert runtime_version() == "9.8.7"
+    with Session(linear_plan) as session:
+        assert session.runtime_version == "9.8.7"
+
+
 def test_float_inference_and_repeated_calls(linear_plan):
+    result = CliRunner().invoke(cli, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert "; bundled" in result.output
     x = np.arange(-32, 32, dtype=np.float32).reshape(1, 64)
     with Session(linear_plan) as session:
         assert session.runtime_version == runtime_version()
@@ -125,6 +206,7 @@ def test_cli_execution(linear_plan, tmp_path, suffix):
     result = CliRunner().invoke(cli, args)
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["runtime_version"] == runtime_version()
+    assert json.loads(result.output)["runtime_source"] == "bundled"
     if suffix == ".bin":
         actual = np.fromfile(output, dtype="<f4").reshape(x.shape)
     elif suffix == ".npy":
