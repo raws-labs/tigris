@@ -74,13 +74,13 @@ jobs:
           SHA: ${{ inputs.sha }}
           DRY_RUN: ${{ inputs.dry_run }}
           DEPLOY_KEY: ${{ secrets.PROMOTE_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/promote
           chmod 600 ~/.ssh/promote
-          curl -fsSL https://api.github.com/meta | python3 -c \
-            'import json, sys; print("\n".join("github.com " + k for k in json.load(sys.stdin)["ssh_keys"]))' \
-            > ~/.ssh/known_hosts
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > ~/.ssh/known_hosts
+          [ -s ~/.ssh/known_hosts ] || { echo "no GitHub SSH host keys" >&2; exit 1; }
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/promote -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
           args=()
           [ "$DRY_RUN" = true ] && args+=(--dry-run)
