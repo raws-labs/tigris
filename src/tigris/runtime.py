@@ -1,8 +1,10 @@
-"""Host inference through the packaged C library."""
+"""Host inference through a bundled or explicitly selected C library."""
 
+import builtins
 import ctypes as ct
 import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -15,18 +17,32 @@ class RuntimeError(ValueError):
 
 
 def _library():
-    directory = Path(__file__).with_name("native")
-    try:
-        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-        name = manifest["library"]
-        if name not in {"libtigris_host.so", "libtigris_host.dylib", "tigris_host.dll"}:
-            raise RuntimeError("Invalid bundled library name")
-        path = directory / name
-        if hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sha256"]:
-            raise RuntimeError("Bundled runtime checksum mismatch")
-        lib = ct.CDLL(str(path))
-    except (OSError, KeyError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Bundled host runtime is unavailable. Install a supported platform wheel.") from exc
+    override = os.environ.get("TIGRIS_HOST_LIBRARY")
+    manifest = None
+    source = "bundled"
+    if override is not None:
+        try:
+            path = Path(override).expanduser().resolve(strict=True)
+            if not override or not path.is_file():
+                raise OSError("Expected a shared library file")
+            lib = ct.CDLL(str(path))
+        except (OSError, builtins.RuntimeError) as exc:
+            raise RuntimeError(f"Cannot load TIGRIS_HOST_LIBRARY={override!r}: {exc}") from exc
+        source = f"TIGRIS_HOST_LIBRARY={path}"
+    else:
+        directory = Path(__file__).with_name("native")
+        try:
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            name = manifest["library"]
+            if name not in {"libtigris_host.so", "libtigris_host.dylib", "tigris_host.dll"}:
+                raise RuntimeError("Invalid bundled library name")
+            path = directory / name
+            if hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sha256"]:
+                raise RuntimeError("Bundled runtime checksum mismatch")
+            lib = ct.CDLL(str(path))
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Bundled host runtime is unavailable. Install a supported platform wheel "
+                               "or set TIGRIS_HOST_LIBRARY.") from exc
     signatures = {
         "abi": (ct.c_uint32, []), "version": (ct.c_char_p, []),
         "create": (ct.c_char_p, [ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.POINTER(ct.c_void_p)]),
@@ -42,21 +58,29 @@ def _library():
         "metric": (ct.c_uint64, [ct.c_void_p, ct.c_uint32]),
     }
     try:
+        lib.tigris_host_abi.restype = ct.c_uint32
+        lib.tigris_host_abi.argtypes = []
+        if lib.tigris_host_abi() != 1 or (manifest is not None and manifest["abi"] != 1):
+            raise RuntimeError(f"Unsupported host library ABI ({source})")
         for name, (result, arguments) in signatures.items():
             function = getattr(lib, f"tigris_host_{name}")
             function.restype, function.argtypes = result, arguments
-        if lib.tigris_host_abi() != 1 or manifest["abi"] != 1:
-            raise RuntimeError("Unsupported host library ABI")
-        if lib.tigris_host_version().decode("ascii") != manifest["version"]:
+        version = lib.tigris_host_version().decode("ascii")
+        if manifest is not None and version != manifest["version"]:
             raise RuntimeError("Bundled runtime version differs from its manifest")
-    except (AttributeError, KeyError) as exc:
-        raise RuntimeError("Invalid host library interface") from exc
-    return lib
+    except (AttributeError, KeyError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"Invalid host library interface ({source})") from exc
+    return lib, {"version": version, "source": source}
+
+
+def runtime_info() -> dict[str, str]:
+    """Return the loaded host runtime's version and origin."""
+    return _library()[1]
 
 
 def runtime_version() -> str:
     """Return the loaded host runtime's version."""
-    return _library().tigris_host_version().decode("ascii")
+    return runtime_info()["version"]
 
 
 class Session:
@@ -71,8 +95,9 @@ class Session:
             raise RuntimeError("Slow capacity must fit uint32 bytes")
         self._lock = threading.RLock()
         self._handle = ct.c_void_p()
-        self._lib = _library()
-        self.runtime_version = self._lib.tigris_host_version().decode("ascii")
+        self._lib, info = _library()
+        self.runtime_version = info["version"]
+        self.runtime_source = info["source"]
         path = Path(model)
         data = path.read_bytes()
         if len(data) > 0xFFFFFFFF:
