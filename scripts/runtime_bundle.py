@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -83,15 +84,44 @@ def stage(data: bytes, checksum: str, destination: Path, *, release=None, platfo
     return manifest
 
 
+def pin_release(release):
+    """Record a published runtime release and the SHA-256 of each platform archive."""
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", release):
+        raise SystemExit("--pin takes a release tag vX.Y.Z")
+    path = ROOT / "runtime-host.json"
+    platforms = sorted(json.loads(path.read_text())["artifacts"])
+    if not platforms:
+        raise SystemExit("runtime-host.json lists no platforms to pin")
+    artifacts = {}
+    for platform in platforms:
+        filename = f"tigris-host-{release[1:]}-{platform}.tar.gz"
+        url = f"https://github.com/raws-labs/tigris-runtime/releases/download/{release}/{filename}.sha256"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                checksum, name = response.read().decode("ascii").split()
+        except urllib.error.HTTPError as exc:
+            raise SystemExit(f"Runtime {release} has no published {filename}.sha256 ({exc.code})") from exc
+        if name != filename or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise SystemExit(f"Unexpected checksum file for {filename}")
+        artifacts[platform] = {"sha256": checksum}
+    path.write_text(json.dumps({"release": release, "artifacts": artifacts}, indent=2) + "\n")
+    print(f"Pinned runtime {release} for {', '.join(platforms)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--archive", type=Path, help="Use a locally built archive")
     source.add_argument("--source", type=Path, help="Build, test, and stage a runtime source checkout")
+    source.add_argument("--pin", metavar="vX.Y.Z",
+                        help="Pin runtime-host.json to this runtime release and its archive checksums")
     parser.add_argument("--sha256", help="Required checksum for --archive")
     parser.add_argument("--platform", help="Select a platform from the release pin")
     parser.add_argument("--expect-release", help="Require the pin and compiler tag to name this release")
     args = parser.parse_args()
+    if args.pin:
+        pin_release(args.pin)
+        return
     if args.source:
         manifest = build_source(args.source)
     elif args.archive:

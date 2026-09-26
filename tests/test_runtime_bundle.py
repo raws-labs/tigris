@@ -93,3 +93,28 @@ def test_release_requires_matching_pin_tag_and_scm(tmp_path, monkeypatch, pin, t
     with pytest.raises(SystemExit) as failure:
         runtime_bundle.main()
     assert failure.value.code == 2
+
+
+def test_pin_records_release_and_archive_checksums(tmp_path, monkeypatch):
+    (tmp_path / "runtime-host.json").write_text(json.dumps(
+        {"release": "v0.1.0", "artifacts": {"plat_a": {"sha256": "0" * 64}, "plat_b": {"sha256": "0" * 64}}}))
+    monkeypatch.setattr(runtime_bundle, "ROOT", tmp_path)
+    requested = []
+
+    def fake_urlopen(url, timeout):
+        requested.append(url)
+        name = url.rsplit("/", 1)[1].removesuffix(".sha256")
+        return io.BytesIO(f"{hashlib.sha256(name.encode()).hexdigest()}  {name}\n".encode())
+
+    monkeypatch.setattr(runtime_bundle.urllib.request, "urlopen", fake_urlopen)
+    runtime_bundle.pin_release("v1.2.3")
+    pin = json.loads((tmp_path / "runtime-host.json").read_text())
+    assert pin["release"] == "v1.2.3"
+    assert pin["artifacts"]["plat_a"]["sha256"] == hashlib.sha256(b"tigris-host-1.2.3-plat_a.tar.gz").hexdigest()
+    assert set(pin["artifacts"]) == {"plat_a", "plat_b"}
+    assert all("/releases/download/v1.2.3/" in url for url in requested)
+
+
+def test_pin_refuses_a_malformed_release():
+    with pytest.raises(SystemExit):
+        runtime_bundle.pin_release("0.11.0")
