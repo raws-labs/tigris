@@ -1,0 +1,87 @@
+name: Promote to main
+
+# Fast-forwards main to a tested develop commit for a release. main never gets
+# its own commits, so it stays an ancestor of develop and a release tag on main
+# is reachable from develop. The tag itself is created with the GitHub release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full develop commit to release
+        required: true
+      version:
+        description: Release version X.Y.Z
+        required: true
+      dry_run:
+        description: Run every check and test the push without moving main
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  checks: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: promote
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Check inputs and ancestry
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be a full commit SHA" >&2; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be X.Y.Z" >&2; exit 1; }
+          git merge-base --is-ancestor "$SHA" origin/develop || { echo "$SHA is not on develop" >&2; exit 1; }
+          git merge-base --is-ancestor origin/main "$SHA" || { echo "main cannot fast-forward to $SHA" >&2; exit 1; }
+
+      - name: Check the release version
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          git checkout --quiet --detach "$SHA"
+          if [ -f scripts/check_version_sources.py ]; then
+            python3 scripts/check_version_sources.py --expect "$VERSION"
+          elif [ -f runtime-host.json ]; then
+            pinned="$(python3 -c 'import json; print(json.load(open("runtime-host.json"))["release"])')"
+            [ "$pinned" = "v$VERSION" ] || { echo "runtime-host.json pins $pinned, not v$VERSION" >&2; exit 1; }
+          fi
+
+      - name: Check that CI passed on the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs" \
+            --jq '.check_runs[] | select(.name != "promote") | [.name, .status, (.conclusion // "")] | @tsv' > runs.tsv
+          cat runs.tsv
+          [ -s runs.tsv ] || { echo "no CI runs on $SHA" >&2; exit 1; }
+          if awk -F'\t' '$2 != "completed" || ($3 != "success" && $3 != "skipped" && $3 != "neutral")' runs.tsv | grep -q .; then
+            echo "CI has not passed on $SHA" >&2
+            exit 1
+          fi
+
+      - name: Fast-forward main
+        env:
+          SHA: ${{ inputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          DEPLOY_KEY: ${{ secrets.PROMOTE_DEPLOY_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/promote
+          chmod 600 ~/.ssh/promote
+          curl -fsSL https://api.github.com/meta | python3 -c \
+            'import json, sys; print("\n".join("github.com " + k for k in json.load(sys.stdin)["ssh_keys"]))' \
+            > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/promote -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          args=()
+          [ "$DRY_RUN" = true ] && args+=(--dry-run)
+          git push "${args[@]}" "git@github.com:$GITHUB_REPOSITORY.git" "$SHA:refs/heads/main"
