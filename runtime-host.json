@@ -1,20 +1,20 @@
 {
-  "release": "v0.11.2",
+  "release": "v0.11.3",
   "artifacts": {
     "macosx_11_0_arm64": {
-      "sha256": "8dff6d5b7a23a1f5fb450debb5c3c590dc1811d5c90832317ebf3edad0d61b75"
+      "sha256": "00733b10648f141454da4d379a187ddd9d9fc4444cb2cbd2d4c4380c2d5dd5c7"
     },
     "macosx_11_0_x86_64": {
-      "sha256": "40c7ca3f9b9e31932f67481eda43f8a5526feb36268795e1efbdda2ec431d0fc"
+      "sha256": "46e7079509124377945112bdc6d8e8d0578c36fd0e861b39aa68f07aaee68589"
     },
     "manylinux_2_28_aarch64": {
-      "sha256": "25bd0685aabada85c8ac85aa9122eb78ec95811f0bb878b3b45118cde5abd92f"
+      "sha256": "a5a0dbebaacd8ff7ebe32ba31d83c24e950211698e3ff6b16d332d2d12a0ccdc"
     },
     "manylinux_2_28_x86_64": {
-      "sha256": "ae30fbd0beb3646e42e82b112f7fc24cbbb85a97949c52f70b0293e1b62af1ff"
+      "sha256": "0b8c79c0a38168b896af00d808abd64995d34a775b73100c44f14d6d2972f818"
     },
     "win_amd64": {
-      "sha256": "59b21cb22523a5acf87d54b8609e0a99f75928442ca6948eb0b794a7e920bdc6"
+      "sha256": "d20516eedb113374dc9079ff4bffae0e29d99b9672d7b76f90f20a5501f17ecc"
     }
   }
 }
