@@ -187,6 +187,17 @@ def test_float_model_no_quant_params(linear_3op_path):
         assert t["quant_param_idx"] == NO_QUANT_PARAM
 
 
+def test_qdq_plan_keeps_the_declared_output_name(qdq_conv_path):
+    """Folding the Q/DQ pair behind the output keeps the ONNX output name."""
+    ag = _full_pipeline_qdq(qdq_conv_path)
+    assert ag.model_outputs == ["output"]
+    assert ag.tensors["output"].quant is not None
+
+    plan = read_binary_plan(emit_binary_bytes(ag))
+    names = [plan["tensors"][index]["name"] for index in plan["model_outputs"]]
+    assert names == ["output"]
+
+
 def _qdq_gemm_bias_model(tmp_path, shared_scale: bool):
     """A quantized Gemm whose bias arrives as an unfused float Add."""
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])
