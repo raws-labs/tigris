@@ -38,6 +38,35 @@ def test_dropout_and_identity_are_removed(tmp_path):
     assert ag.ops[0].inputs[0] == "x"
 
 
+def test_removed_identity_keeps_the_declared_output_name(tmp_path):
+    """An Identity feeding the graph output goes, but the output keeps its name."""
+    ag = _compile_graph(
+        tmp_path, "trailing_identity",
+        [
+            helper.make_node("Relu", ["x"], ["activation"], name="relu1"),
+            helper.make_node("Identity", ["activation"], ["y"], name="id1"),
+        ],
+        [_vi("x", [1, 8])], [_vi("y", [1, 8])])
+
+    assert [op.op_type for op in ag.ops] == ["Relu"]
+    assert ag.model_outputs == ["y"]
+    assert ag.ops[0].outputs == ["y"]
+    assert "activation" not in ag.tensors
+
+
+def test_output_that_is_also_an_input_keeps_the_input_name(tmp_path):
+    """One tensor cannot carry two names, so an input passed through stays."""
+    ag = _compile_graph(
+        tmp_path, "passthrough",
+        [
+            helper.make_node("Identity", ["x"], ["y"], name="id1"),
+            helper.make_node("Relu", ["x"], ["z"], name="relu1"),
+        ],
+        [_vi("x", [1, 8])], [_vi("y", [1, 8]), _vi("z", [1, 8])])
+
+    assert ag.model_outputs == ["x", "z"]
+
+
 def test_dropout_keeping_its_mask_is_left_alone(tmp_path):
     """The mask output only exists for training; an op whose mask is read stays."""
     ag = _compile_graph(

@@ -53,6 +53,7 @@ from tigris.graph.ir import (
 
 def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
+    declared_outputs = list(ag.model_outputs)
     ag = _drop_inference_identities(ag)
     ag = _fold_constant_ops(ag)
     ag = _fold_static_subgraphs(ag)
@@ -86,6 +87,36 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _relabel_shape_ops_to_reshape(ag)
     ag = _lower_linear_matmul(ag)
     ag = _drop_unreferenced_weights(ag)
+    ag = _restore_output_names(ag, declared_outputs)
+    return ag
+
+
+def _restore_output_names(ag: AnalyzedGraph, declared: list[str]) -> AnalyzedGraph:
+    """Give each model output back the name the ONNX graph declares.
+
+    Removing an Identity, or the Q/DQ pair behind an output, makes the tensor
+    that produced it the output under its own name. The interface keeps the
+    declared name instead, unless that tensor is also a model input or another
+    output, where one tensor cannot carry both names.
+    """
+    if len(declared) != len(ag.model_outputs):
+        return ag
+    for current, name in zip(list(ag.model_outputs), declared):
+        if (
+            current == name
+            or name in ag.tensors
+            or current not in ag.tensors
+            or current in ag.model_inputs
+            or ag.model_outputs.count(current) != 1
+        ):
+            continue
+        info = ag.tensors.pop(current)
+        info.name = name
+        ag.tensors[name] = info
+        for op in ag.ops:
+            op.inputs = [name if n == current else n for n in op.inputs]
+            op.outputs = [name if n == current else n for n in op.outputs]
+        ag.model_outputs = [name if n == current else n for n in ag.model_outputs]
     return ag
 
 
