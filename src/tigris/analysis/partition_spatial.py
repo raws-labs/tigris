@@ -714,6 +714,7 @@ def _solve_row_tile(
     if working_set(1) > budget:
         return TilePlan(
             tileable=False,
+            min_tile_bytes=working_set(1),
             warnings=[
                 f"Stage {stage.stage_id} minimum row band still exceeds "
                 f"budget ({budget:,} bytes)"
@@ -827,6 +828,7 @@ def _solve_global_reduction(
     if working_set(1) > budget:
         return TilePlan(
             tileable=False,
+            min_tile_bytes=working_set(1),
             warnings=[
                 f"Stage {stage.stage_id} minimum reduction band still "
                 f"exceeds budget ({budget:,} bytes)"
@@ -939,6 +941,7 @@ def _solve_layout_conversion(
     if working_set(1) > budget:
         return TilePlan(
             tileable=False,
+            min_tile_bytes=working_set(1),
             warnings=[
                 f"Stage {stage.stage_id} minimum conversion band still "
                 f"exceeds budget ({budget:,} bytes)"
@@ -1128,6 +1131,7 @@ def _solve_output_tile_2d(
     if working_set(1, 1) > budget:
         return TilePlan(
             tileable=False,
+            min_tile_bytes=working_set(1, 1),
             warnings=[
                 f"Stage {stage.stage_id} minimum 2D {what} still exceeds "
                 f"budget ({budget:,} bytes)"

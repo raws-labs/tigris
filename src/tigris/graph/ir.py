@@ -183,6 +183,9 @@ class TilePlan:
     # Distinguishes this case from the generic 1D minimum-tile shortfall so
     # the compiler can surface a diagnostic naming the 2D tile explicitly.
     min_2d_tile_infeasible: bool = False
+    # When tileable is False only because even the smallest tile exceeds the
+    # budget, that smallest tile's working set; 0 otherwise.
+    min_tile_bytes: int = 0
 
 
 @dataclass
