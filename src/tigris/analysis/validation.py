@@ -689,6 +689,8 @@ def _execution_unit_requirement(
     tile_plan = stage.tile_plan
     if tile_plan is not None:
         if not tile_plan.tileable:
+            if tile_plan.min_tile_bytes > 0 and not tile_plan.untileable_ops:
+                return tile_plan.min_tile_bytes, "smallest tile", False
             detail = ", ".join(tile_plan.untileable_ops)
             reason = f"untileable operators: {detail}" if detail else "stage is not tileable"
             return stage.peak_bytes, reason, True

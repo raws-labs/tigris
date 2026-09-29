@@ -22,10 +22,11 @@ class BudgetRow:
 
 
 @dataclass
-class UntileableStage:
+class BlockingStage:
+    """An execution unit that does not fit the budget, with what it needs."""
     stage_id: int
-    peak_bytes: int
-    op_types: list[str]
+    required_bytes: int
+    reason: str
 
 
 @dataclass
@@ -61,8 +62,11 @@ class Findings:
     total_tiles: int = 0
     max_halo: int = 0
     untileable_op_types: list[str] = field(default_factory=list)
-    untileable_stages: list[UntileableStage] = field(default_factory=list)
-    min_untileable_peak: int = 0
+    # Execution units over budget in the partition chosen for this budget, and
+    # the smallest fast arena that partition needs. Another budget can
+    # partition differently, so this is not a floor across budgets.
+    blocking_stages: list[BlockingStage] = field(default_factory=list)
+    min_fast_for_partition: int = 0
     feasibility_errors: list[str] = field(default_factory=list)
     unsupported_operators: list[str] = field(default_factory=list)
     dtype_errors: list[str] = field(default_factory=list)
@@ -353,9 +357,10 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0) -> Findings:
                 f.total_tiles += s.tile_plan.num_tiles
                 if s.tile_plan.halo > f.max_halo:
                     f.max_halo = s.tile_plan.halo
-            else:
+            elif s.tile_plan.untileable_ops:
+                # Only an operator that cannot tile makes a stage untileable;
+                # a stage whose smallest tile is too large is still tileable.
                 f.stages_untileable += 1
-                stage_op_types = []
                 for op_desc in s.tile_plan.untileable_ops:
                     # op_desc is "name (OpType)" - extract the type
                     if "(" in op_desc:
@@ -363,16 +368,9 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0) -> Findings:
                     else:
                         op_type = op_desc
                     untileable_ops.add(op_type)
-                    stage_op_types.append(op_type)
-                f.untileable_stages.append(UntileableStage(
-                    stage_id=s.stage_id,
-                    peak_bytes=s.peak_bytes,
-                    op_types=stage_op_types,
-                ))
+            else:
+                f.stages_tileable += 1
     f.untileable_op_types = sorted(untileable_ops)
-    if f.untileable_stages:
-        f.untileable_stages.sort(key=lambda u: -u.peak_bytes)
-        f.min_untileable_peak = f.untileable_stages[0].peak_bytes
 
     # Analysis and deployment share one execution-unit validator, so a CLI
     # PASS cannot disagree with `tigris compile` about memory feasibility.
@@ -381,6 +379,15 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0) -> Findings:
     validation = validate_memory_plan(ag)
     f.scheduled_peak_bytes = validation.scheduled_peak_bytes
     f.feasibility_errors = [issue.describe() for issue in validation.issues]
+    # The same requirements compile checks, so the report cannot name a
+    # smaller or larger need than the error compile would raise.
+    f.blocking_stages = sorted(
+        (BlockingStage(issue.stage_id, issue.required_bytes, issue.reason)
+         for issue in validation.issues),
+        key=lambda stage: -stage.required_bytes,
+    )
+    if f.blocking_stages:
+        f.min_fast_for_partition = f.blocking_stages[0].required_bytes
 
     # Verdict
     if budget > 0:

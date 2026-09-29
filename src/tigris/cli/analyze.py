@@ -156,15 +156,15 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
                     "  untileable",
                     f"[red]{findings.stages_untileable}[/] - blocked by: {ops}",
                 )
+            if findings.blocking_stages:
                 sram.add_row(
-                    "  min SRAM (hard floor)",
-                    fmt_bytes(findings.min_untileable_peak),
+                    "  min SRAM (this partition)",
+                    fmt_bytes(findings.min_fast_for_partition),
                 )
-                for us in findings.untileable_stages:
-                    ops_str = ", ".join(us.op_types)
+                for blocking in findings.blocking_stages[:3]:
                     sram.add_row(
-                        f"    stage {us.stage_id}",
-                        f"{fmt_bytes(us.peak_bytes)} ({ops_str})",
+                        f"    stage {blocking.stage_id}",
+                        f"{fmt_bytes(blocking.required_bytes)} ({blocking.reason})",
                     )
 
         if findings.feasibility_errors:
