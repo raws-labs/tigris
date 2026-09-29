@@ -15,8 +15,9 @@ def test_expand_single_plus_token():
     assert _expand_mem(None, None, ("256K+4M",)) == ("256K", "4M")
 
 
-def test_expand_mixes_with_repeated_flags():
-    assert _expand_mem(None, None, ("256K+4M", "8M")) == ("256K", "4M", "8M")
+def test_expand_rejects_a_third_pool():
+    with pytest.raises(BadParameter, match="3 memory pools"):
+        _expand_mem(None, None, ("256K+4M", "8M"))
 
 
 def test_expand_passthrough_without_plus():

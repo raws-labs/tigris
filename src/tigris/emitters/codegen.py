@@ -73,6 +73,11 @@ def _cmsis_weight_decompression_overhead(plan: dict) -> int:
     return _weight_decompression_overhead(plan, _CMSIS_TENSOR_ALIGN)
 
 
+# The operators the executor reserves per-op tiling state for in a chain
+# (is_height_spatial_op in the runtime executor).
+_HEIGHT_SPATIAL_OPS = frozenset({"Conv", "DepthwiseConv", "MaxPool", "AveragePool"})
+
+
 def _executor_workspace_limits(plan: dict) -> tuple[int, int, int, int, int]:
     """Return runtime workspace dimensions derived from the serialized plan."""
     stages = plan.get("stages", [])
@@ -91,8 +96,7 @@ def _executor_workspace_limits(plan: dict) -> tuple[int, int, int, int, int]:
         max_chain = max(max_chain, chain_len)
         for member in stages[stage_idx : stage_idx + chain_len]:
             spatial = sum(
-                OP_TYPE_BY_CODE.get(ops[op_idx]["op_type"])
-                in {"Conv", "DepthwiseConv"}
+                OP_TYPE_BY_CODE.get(ops[op_idx]["op_type"]) in _HEIGHT_SPATIAL_OPS
                 for op_idx in member["ops"]
             )
             max_spatial = max(max_spatial, spatial)

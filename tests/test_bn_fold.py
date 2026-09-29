@@ -319,3 +319,62 @@ def test_reshape_has_one_nonconst_input():
         assert len(non_const_inputs) == 1, (
             f"Reshape '{op.name}' has {len(non_const_inputs)} non-constant inputs, expected 1"
         )
+
+
+def _quantized_conv_bn(tmp_path, weight, gamma):
+    """QDQ Conv (int8 weights, scale 0.01) followed by a float BatchNormalization."""
+    channels = weight.shape[0]
+    scalars = {"x_s": 0.1, "w_s": 0.01, "y_s": 0.1}
+    initializers = [onnx.numpy_helper.from_array(weight.astype(np.float32), "w")]
+    for name, value in scalars.items():
+        initializers.append(onnx.numpy_helper.from_array(np.array(value, np.float32), name))
+    initializers += [
+        onnx.numpy_helper.from_array(np.array(0, np.int8), "zero"),
+        onnx.numpy_helper.from_array(gamma.astype(np.float32), "gamma"),
+        onnx.numpy_helper.from_array(np.full(channels, 0.5, np.float32), "beta"),
+        onnx.numpy_helper.from_array(np.zeros(channels, np.float32), "mean"),
+        onnx.numpy_helper.from_array(np.ones(channels, np.float32), "var"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "x_s", "zero"], ["xq"]),
+        helper.make_node("DequantizeLinear", ["xq", "x_s", "zero"], ["x"]),
+        helper.make_node("QuantizeLinear", ["w", "w_s", "zero"], ["wq"]),
+        helper.make_node("DequantizeLinear", ["wq", "w_s", "zero"], ["wdq"]),
+        helper.make_node("Conv", ["x", "wdq"], ["raw"], kernel_shape=[1, 1]),
+        helper.make_node("BatchNormalization", ["raw", "gamma", "beta", "mean", "var"], ["normed"]),
+        helper.make_node("QuantizeLinear", ["normed", "y_s", "zero"], ["yq"]),
+        helper.make_node("DequantizeLinear", ["yq", "y_s", "zero"], ["output"]),
+    ]
+    model = helper.make_model(helper.make_graph(
+        nodes, "qconv_bn",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, weight.shape[1], 2, 2])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 2, 2])],
+        initializers), opset_imports=[helper.make_opsetid("", 13)])
+    path = tmp_path / "qconv_bn.onnx"
+    onnx.save(model, path)
+    return bn_fold(load_model(str(path)))
+
+
+def test_quantized_bn_moves_into_weight_scale_and_bias(tmp_path):
+    """A negative gamma negates the channel's int8 weights; |a| scales its weight scale."""
+    weight = np.array([[[[0.5]], [[-0.25]]], [[[0.3]], [[0.1]]]])
+    ag = _quantized_conv_bn(tmp_path, weight, np.array([2.0, -0.5]))
+    assert [op.op_type for op in ag.ops] == ["Conv"]
+    conv = ag.ops[0]
+    w_q = ag.weight_data[conv.inputs[1]]
+    a = np.array([2.0, -0.5]) / np.sqrt(1.0 + 1e-5)
+    assert w_q[:, :, 0, 0].tolist() == [[50, -25], [-30, -10]]
+    np.testing.assert_allclose(ag.tensors[conv.inputs[1]].quant.scale, 0.01 * np.abs(a), rtol=1e-6)
+    bias = ag.weight_data[conv.inputs[2]]
+    np.testing.assert_array_equal(bias, np.round(0.5 / (0.1 * 0.01 * np.abs(a))).astype(np.int32))
+
+
+def test_quantized_bn_that_cannot_fold_exactly_is_rejected(tmp_path):
+    """-128 has no int8 negation, so a negative gamma on it leaves the BN, which validation refuses."""
+    from tigris.analysis.validation import validate_operator_support
+
+    weight = np.array([[[[-1.28]], [[0.1]]], [[[0.3]], [[0.1]]]])
+    ag = _quantized_conv_bn(tmp_path, weight, np.array([-1.0, 1.0]))
+    assert "BatchNormalization" in [op.op_type for op in ag.ops]
+    issues = validate_operator_support(ag).issues
+    assert any(issue.op_type == "BatchNormalization" for issue in issues)

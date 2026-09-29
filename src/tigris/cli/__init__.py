@@ -30,6 +30,11 @@ def _expand_mem(ctx, param, value: tuple[str, ...]) -> tuple[str, ...]:
                     f"invalid memory budget {token!r}: empty memory pool"
                 )
             expanded.append(part.strip())
+    if len(expanded) > 2:
+        raise click.BadParameter(
+            f"{len(expanded)} memory pools given; the planner supports a fast "
+            "and a slow pool"
+        )
     return tuple(expanded)
 
 

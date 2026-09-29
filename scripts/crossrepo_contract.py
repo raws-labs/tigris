@@ -28,9 +28,10 @@ from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris import TILE_AXIS_HW
-from tigris.analysis.validation import validate_memory_plan
+from tigris.analysis.validation import slow_pool_usage, validate_memory_plan
 from tigris.capabilities import KERNEL_CAPABILITIES, OP_TYPE_BY_CODE
 from tigris.cli import _run_pipeline
+from tigris.emitters.codegen import _executor_workspace_limits
 from tigris.emitters.binary.defs import (
     COMPRESS_LZ4,
     FLAG_XIP,
@@ -742,6 +743,45 @@ def _qdq_bilinear_upsample_case() -> ContractCase:
     )
     return ContractCase("int8_bilinear_upsample", model, copy.deepcopy(model), {"input": data},
                         ("ResizeLinear",), mem_budget="512", expect_tiled=True)
+
+
+def _quantized_batchnorm_case() -> ContractCase:
+    """A quantized Conv followed by an unfolded float BatchNormalization.
+
+    The BN sits between the Conv and the output quantization with a mixed-sign
+    gamma, so the fold has to move it into the int8 weights, their per-channel
+    scales and the int32 bias instead of dropping it.
+    """
+    rng = np.random.default_rng(31)
+    channels = 4
+    weight = (rng.normal(size=(channels, 3, 3, 3)) * 0.3).astype(np.float32)
+    bias = np.round(rng.normal(size=channels) * 400).astype(np.int32)
+    initializers = [
+        numpy_helper.from_array(weight, "weight"),
+        numpy_helper.from_array(bias, "bias_q"),
+        numpy_helper.from_array(np.array(0.02 * 0.01, dtype=np.float32), "b_s"),
+        numpy_helper.from_array(np.array(0, dtype=np.int32), "b_z"),
+        numpy_helper.from_array(np.array([1.5, -0.75, 0.5, -2.0], dtype=np.float32), "gamma"),
+        numpy_helper.from_array(np.array([0.1, -0.2, 0.3, 0.0], dtype=np.float32), "beta"),
+        numpy_helper.from_array(np.array([0.05, -0.1, 0.0, 0.2], dtype=np.float32), "mean"),
+        numpy_helper.from_array(np.array([0.5, 1.0, 2.0, 0.25], dtype=np.float32), "var"),
+    ] + _scalars(inp=(0.02, 0), w=(0.01, 0), out=(0.04, 3))
+    nodes = [
+        *_qdq("input", "inp_s", "inp_z", "x"),
+        *_qdq("weight", "w_s", "w_z", "wdq"),
+        helper.make_node("DequantizeLinear", ["bias_q", "b_s", "b_z"], ["bdq"]),
+        helper.make_node("Conv", ["x", "wdq", "bdq"], ["raw"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        helper.make_node("BatchNormalization", ["raw", "gamma", "beta", "mean", "var"], ["normed"]),
+        *_qdq("normed", "out_s", "out_z", "output"),
+    ]
+    model = _model(
+        "int8_conv_batchnorm", nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 8, 8])],
+        initializers,
+    )
+    data = rng.uniform(-1.0, 1.0, size=(1, 3, 8, 8)).astype(np.float32)
+    return ContractCase("int8_conv_batchnorm", model, copy.deepcopy(model), {"input": data}, ("Conv",))
 
 
 def _quantized_boundary_case() -> ContractCase:
@@ -1847,6 +1887,26 @@ def _softmax_axis_case(*, rank: int, last_axis: bool) -> ContractCase:
         {"input": data},
         operators,
     )
+
+
+def _legacy_softmax_case(*, shape: list[int], axis: int | None,
+                         operators: tuple[str, ...]) -> ContractCase:
+    """Softmax from opset 11, which normalizes everything from `axis` on.
+
+    The older operator flattens the axes from `axis` (default 1) into one row,
+    unlike opset 13's single axis, so the compiler has to keep that meaning.
+    """
+    attrs = {} if axis is None else {"axis": axis}
+    model = _model(
+        "legacy_softmax",
+        [helper.make_node("Softmax", ["input"], ["output"], **attrs)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        opset=11,
+    )
+    data = np.linspace(-2.0, 2.0, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    label = f"float_opset11_softmax_rank{len(shape)}_{'default' if axis is None else axis}_axis"
+    return ContractCase(label, model, model, {"input": data}, operators)
 
 
 def _tiled_softmax_case() -> ContractCase:
@@ -5233,6 +5293,7 @@ def _compile_plan(
     plan = read_binary_plan(plan_bytes)
     plan["_compiler_scheduled_peak"] = validation.scheduled_peak_bytes
     plan["_compiler_slow_budget"] = graph.budget.slow
+    plan["_compiler_slow_peak"] = slow_pool_usage(graph).slow_peak_bytes
     plan["_plan_bytes"] = plan_bytes
     return plan
 
@@ -5399,6 +5460,12 @@ def _assert_memory_contract(
     # The slow pool is sized by the compiler and filled by the runtime, and
     # each derives what shares a buffer from the plan on its own. A case that
     # names a slow budget is the check that those two rules still agree.
+    predicted = int(plan["_compiler_slow_peak"])
+    if slow_peak > predicted:
+        raise AssertionError(
+            f"{case.name}: runtime slow peak {slow_peak} exceeds the compiler's "
+            f"slow requirement {predicted}"
+        )
     slow_budget = int(plan["_compiler_slow_budget"])
     if slow_budget > 0 and slow_peak > slow_budget:
         raise AssertionError(
@@ -5588,6 +5655,9 @@ def _run_case(
             str(inputs_path),
             str(outputs_path),
             str(plan["_compiler_scheduled_peak"]),
+            # Run with exactly the workspace generated code would reserve.
+            "--workspace-limits=" + ",".join(
+                str(value) for value in _executor_workspace_limits(plan)),
         ],
         f"{case.name} runtime execution",
     )
@@ -5893,6 +5963,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _squeeze_excitation_case(quantized=True),
         _qdq_bilinear_upsample_case(),
         _quantized_boundary_case(),
+        _quantized_batchnorm_case(),
         _whole_map_average_pool_case(),
         _traced_shape_scale_case(),
         _unfolded_feature_map_case(),
@@ -5924,6 +5995,11 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _softmax_axis_case(rank=3, last_axis=False),
         _softmax_axis_case(rank=4, last_axis=True),
         _softmax_axis_case(rank=4, last_axis=False),
+        _legacy_softmax_case(shape=[1, 2, 3], axis=None,
+                             operators=("Transpose", "Reshape", "Softmax", "Reshape", "Transpose")),
+        _legacy_softmax_case(shape=[1, 4, 3, 5], axis=2,
+                             operators=("Transpose", "Reshape", "Softmax", "Reshape", "Transpose")),
+        _legacy_softmax_case(shape=[1, 4, 6], axis=2, operators=("Transpose", "Softmax", "Transpose")),
         _tiled_softmax_case(),
         _subtract_case(),
         _qdq_subtract_case(),

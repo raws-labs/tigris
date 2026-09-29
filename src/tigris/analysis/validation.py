@@ -228,6 +228,15 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         } and auto_pad not in ("", "NOTSET"):
             reasons.append(f"auto_pad={auto_pad!r} requires explicit pads")
 
+        if op.op_type in {"Conv", "Conv1D"}:
+            # Depthwise grouping was relabeled already; any other grouping
+            # has no kernel.
+            group = int(op.attrs.get("group", 1))
+            if group != 1:
+                reasons.append(
+                    f"group={group} is not implemented (group=1, or one filter per "
+                    "input channel as a depthwise convolution)")
+
         if op.op_type == "ConvTranspose":
             group = int(op.attrs.get("group", 1))
             if group != 1:
@@ -897,10 +906,15 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
     fail-closed budget check.
     """
     slow_budget = ag.budget.slow
-    if slow_budget <= 0 or not ag.stages:
+    if not ag.stages:
         return SlowMemoryUsage(0, slow_budget, ())
     fast_total = ag.budget.fast + ag.budget.fast_reserve
     ag = compute_lifetimes(ag)
+    # The runtime rounds every allocation up to the tensor alignment.
+    align = ag.tensor_alignment
+
+    def aligned(size: int) -> int:
+        return (size + align - 1) & ~(align - 1)
 
     # Stages execute one group at a time: a chain runs as a unit, everything
     # else on its own. Slow residency is held for the whole group, so a chain
@@ -941,14 +955,22 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
         buffers.append((
             min(a.birth_step, b.birth_step),
             max(a.death_step, b.death_step),
-            max(a.size_bytes, b.size_bytes),
+            aligned(max(a.size_bytes, b.size_bytes)),
         ))
         merged.add(dst)
         merged.add(src)
+    # A pure reinterpretation shares its source's buffer in the fast pool, so
+    # its lifetime carries no bytes. When it and its source both cross the
+    # stage boundary, the runtime spills each to a slow buffer of its own.
+    reinterpreted = pure_reinterpretations(ag)
     for n in slow_names:
-        if n in ag.lifetimes and n not in merged:
-            lt = ag.lifetimes[n]
-            buffers.append((lt.birth_step, lt.death_step, lt.size_bytes))
+        if n not in ag.lifetimes or n in merged:
+            continue
+        lt = ag.lifetimes[n]
+        size = lt.size_bytes
+        if n in reinterpreted and reinterpreted[n] in slow_names and n in ag.tensors:
+            size = ag.tensors[n].size_bytes
+        buffers.append((lt.birth_step, lt.death_step, aligned(size)))
 
     def interval_bytes(first: int, last: int) -> int:
         return sum(
@@ -967,7 +989,9 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
         if len(group) == 1 and _runs_whole(ag, group[0], fast_total):
             group_peak += untiled_stage_spill(ag, group[0], fast_total)
         peak = max(peak, group_peak)
-        if group_peak > slow_budget:
+        # Without a slow budget the requirement is still reported, but there
+        # is no capacity to overflow.
+        if slow_budget > 0 and group_peak > slow_budget:
             overflow.append(group[0].stage_id)
     return SlowMemoryUsage(peak, slow_budget, tuple(overflow))
 
