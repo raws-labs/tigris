@@ -12,7 +12,7 @@ Give it an ONNX model and a memory budget. It partitions the compute graph into 
 
 On an embedded device with a few hundred KB of SRAM, most interesting models simply don't fit. The usual answer is to shrink the model: quantize harder, prune, pick a smaller architecture, and hope the accuracy hit is acceptable.
 
-TiGrIS takes the other approach. It keeps the model you trained and rearranges the *computation* so that only a small working set lives in SRAM at any moment. Weights and intermediate spills go to flash or PSRAM. What comes out is a binary plan that the runtime executes as a flat sequence of kernel calls, with no interpreter, no tensor allocator, and no dynamic memory at all.
+TiGrIS takes the other approach. It keeps the model you trained and rearranges the *computation* so that only a small working set lives in SRAM at any moment. Weights can stay in flash, and intermediate results that do not fit spill to slower writable memory such as PSRAM. What comes out is a binary plan that the runtime executes as a flat sequence of kernel calls, with no interpreter: activations get their addresses from caller-provided fast and slow arenas by bounded bump allocation, and inference never calls a general-purpose allocator.
 
 ## Installation
 

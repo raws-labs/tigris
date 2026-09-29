@@ -190,7 +190,7 @@
     },
     {
       "constraints": [
-        "final axis only; untiled execution"
+        "final axis only; tiling on serialized axis 1, each tile holding whole rows"
       ],
       "opcode": 10,
       "operator": "Softmax",
@@ -252,7 +252,7 @@
         "cmsis-nn": "falls back when tiled or when input/output quantization differs"
       },
       "constraints": [
-        "untiled execution"
+        "rank-4 height tiling: each band of rows is added into the per-channel sums"
       ],
       "opcode": 15,
       "operator": "GlobalAveragePool",

@@ -90,7 +90,8 @@ def test_public_qualifications_reference_real_native_routes():
     assert "length tiling" in OPERATOR_CONSTRAINTS["Conv1D"][0]
     assert "length tiling" in OPERATOR_CONSTRAINTS["Tanh"][0]
     assert "length tiling" in OPERATOR_CONSTRAINTS["Add"][1]
-    assert "untiled execution" in OPERATOR_CONSTRAINTS["GlobalAveragePool"][0]
+    assert "height tiling" in OPERATOR_CONSTRAINTS["GlobalAveragePool"][0]
+    assert "tiling on serialized axis 1" in OPERATOR_CONSTRAINTS["Softmax"][0]
     assert "height tiling" in OPERATOR_CONSTRAINTS["Resize"][0]
     assert "never in a chain" in OPERATOR_CONSTRAINTS["ResizeLinear"][0]
 
