@@ -148,9 +148,14 @@ def load_model(
             elif hasattr(val, "__len__") and not isinstance(val, str):
                 val = list(val)
             attrs[attr.name] = val
+        # An operator from another domain is a different operator that may
+        # share a standard name; qualifying it keeps every pass and the
+        # support check from reading it as the standard one.
+        op_type = (node.op_type if node.domain in ("", "ai.onnx")
+                   else f"{node.domain}::{node.op_type}")
         op = OpNode(
             name=name,
-            op_type=node.op_type,
+            op_type=op_type,
             inputs=list(node.input),
             outputs=list(node.output),
             attrs=attrs,

@@ -22,6 +22,11 @@ from tigris.graph.ir import (
 )
 
 
+def _aligned(size: int) -> int:
+    """The size the runtime's slow allocator takes for a tensor."""
+    return (size + 31) & ~31
+
+
 def build_long_lived_skip_graph() -> AnalyzedGraph:
     """Four single-op stages. "skip" is born at stage 0's output and only
     consumed by stage 3, so it stays slow-resident through stage 1 and
@@ -106,12 +111,10 @@ def build_long_lived_skip_graph() -> AnalyzedGraph:
 
 
 def test_slow_pool_counts_long_lived_skip_concurrently():
-    # Interval-overlap over each single-op stage's op-step interval reproduces
-    # the same concurrent peak (3064) the closed-closed per-step model gave for
-    # this all-single-op graph, so this expectation is unchanged by the
-    # multi-op interval-overlap fix.
-    expected_concurrent_peak = 3064
-    old_coarse_peak = 2064
+    # skip, mid1 and a 64-byte stage tensor are resident together; each is
+    # counted at the 32-byte-aligned size the runtime allocates.
+    expected_concurrent_peak = _aligned(1000) + _aligned(2000) + _aligned(64)  # 3104
+    old_coarse_peak = _aligned(2000) + _aligned(64)
     assert expected_concurrent_peak > old_coarse_peak
 
     ag = build_long_lived_skip_graph()
@@ -167,10 +170,10 @@ def build_multi_op_tiled_stage_graph() -> AnalyzedGraph:
 
 
 def test_slow_pool_counts_multi_op_stage_boundaries_concurrently():
-    in_bytes = 1000
-    out_bytes = 1000
-    concurrent = in_bytes + out_bytes           # 2000, interval-overlap
-    per_op_step = max(in_bytes, out_bytes)       # 1000, the old under-count
+    in_bytes = _aligned(1000)
+    out_bytes = _aligned(1000)
+    concurrent = in_bytes + out_bytes           # 2048, interval-overlap
+    per_op_step = max(in_bytes, out_bytes)       # 1024, the old under-count
     assert concurrent > per_op_step
 
     ag = build_multi_op_tiled_stage_graph()
@@ -238,3 +241,42 @@ def test_a_model_input_is_never_written_over(tmp_path):
     assert set(row_band_aliases(
         ag, ag.budget.fast + ag.budget.fast_reserve).values()
     ).isdisjoint(ag.model_inputs)
+
+
+def _softmax_model(path, shape):
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node("Softmax", ["input"], ["output"], axis=-1)], "softmax",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)]),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.save(model, path)
+
+
+def test_slow_requirement_counts_allocation_alignment(tmp_path):
+    """Two 24-byte boundary tensors take 32 bytes each in the runtime's pool."""
+    from click.testing import CliRunner
+    from tigris.cli import cli
+
+    path = tmp_path / "softmax.onnx"
+    _softmax_model(path, [1, 2, 3])
+    ag, _ = _run_pipeline(str(path), ("16K", "64"))
+    assert slow_pool_usage(ag).slow_peak_bytes == 64
+
+    short = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-m", "48",
+                                     "-o", str(tmp_path / "short.tgrs")])
+    assert short.exit_code != 0
+    assert not (tmp_path / "short.tgrs").exists()
+    exact = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-m", "64",
+                                     "-o", str(tmp_path / "exact.tgrs")])
+    assert exact.exit_code == 0, exact.output
+
+
+def test_slow_requirement_is_reported_without_a_slow_budget(tmp_path):
+    """An unconstrained slow pool still has a requirement; it is not zero."""
+    path = tmp_path / "softmax.onnx"
+    _softmax_model(path, [1, 2, 3])
+    ag, _ = _run_pipeline(str(path), ("16K",))
+    usage = slow_pool_usage(ag)
+    assert usage.slow_peak_bytes == 64
+    assert usage.fits

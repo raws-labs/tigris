@@ -712,3 +712,63 @@ def test_hardswish_and_int8_bilinear_have_kernels():
     for backend in ("reference", "s8_ref", "esp-nn", "cmsis-nn"):
         assert "HardSwish" in effective_operators(backend)
         assert "ResizeLinear" in effective_operators(backend)
+
+
+def test_operator_from_another_domain_is_not_the_standard_one(tmp_path):
+    """A model-local Relu whose body is Neg must not compile as ONNX Relu."""
+    function = helper.make_function(
+        "custom", "Relu", ["x"], ["y"], [helper.make_node("Neg", ["x"], ["y"])],
+        [helper.make_opsetid("", 13)])
+    graph = helper.make_graph(
+        [helper.make_node("Relu", ["input"], ["output"], name="custom_relu", domain="custom")],
+        "custom_domain",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])])
+    model = helper.make_model(
+        graph, functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("custom", 1)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "custom_domain.onnx"
+    onnx.save(model, path)
+    output = tmp_path / "should-not-exist.tgrs"
+
+    result = CliRunner().invoke(cli, ["compile", str(path), "-m", "4K", "-o", str(output)])
+
+    assert result.exit_code != 0
+    assert "custom_relu (custom::Relu)" in result.output
+    assert not output.exists()
+
+
+def test_grouped_convolution_is_rejected_at_compile_time(tmp_path):
+    """group=2 over four channels is neither ordinary nor depthwise; the runtime has no kernel."""
+    weight = np.ones((4, 2, 1, 1), dtype=np.float32)
+    graph = helper.make_graph(
+        [helper.make_node("Conv", ["input", "weight"], ["output"], name="grouped", group=2)],
+        "grouped_conv",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 2, 2])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 2, 2])],
+        [numpy_helper.from_array(weight, "weight")])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "grouped_conv.onnx"
+    onnx.save(model, path)
+    output = tmp_path / "should-not-exist.tgrs"
+
+    result = CliRunner().invoke(cli, ["compile", str(path), "-m", "4K", "-o", str(output)])
+
+    assert result.exit_code != 0
+    assert "group=2 is not implemented" in result.output
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("pools", [["-m", "16K", "-m", "1M", "-m", "1"], ["-m", "16K+1M+1"]])
+def test_more_memory_pools_than_the_planner_has_are_rejected(sin_model_path, tmp_path, pools):
+    output = tmp_path / "should-not-exist.tgrs"
+
+    result = CliRunner().invoke(cli, ["compile", str(sin_model_path), *pools, "-o", str(output)])
+
+    assert result.exit_code != 0
+    assert "3 memory pools given" in result.output
+    assert not output.exists()

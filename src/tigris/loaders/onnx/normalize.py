@@ -55,6 +55,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
     declared_outputs = list(ag.model_outputs)
     ag = _drop_inference_identities(ag)
+    ag = _lower_legacy_softmax(ag)
     ag = _fold_constant_ops(ag)
     ag = _fold_static_subgraphs(ag)
     ag = _fold_qdq(ag)
@@ -88,6 +89,60 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _lower_linear_matmul(ag)
     ag = _drop_unreferenced_weights(ag)
     ag = _restore_output_names(ag, declared_outputs)
+    return ag
+
+
+def _lower_legacy_softmax(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Restate a Softmax from before opset 13 in the later operator's terms.
+
+    Up to opset 12, Softmax flattens every axis from ``axis`` onward into one
+    row and normalizes that row, with ``axis`` defaulting to 1. From opset 13
+    it normalizes the single axis ``axis``, defaulting to -1. The two agree
+    when ``axis`` is the last one; otherwise the old operator becomes a Reshape
+    to [outer, inner], a Softmax over the inner axis and a Reshape back.
+    """
+    if ag.opset == 0 or ag.opset >= 13:
+        return ag
+    rewritten: list[OpNode] = []
+    for op in ag.ops:
+        if op.op_type != "Softmax":
+            rewritten.append(op)
+            continue
+        info = ag.tensors.get(op.inputs[0])
+        out_info = ag.tensors.get(op.outputs[0])
+        if info is None or out_info is None or not info.shape:
+            raise ValueError(
+                f"Softmax '{op.name}' before opset 13 needs a known input shape")
+        rank = len(info.shape)
+        axis = int(op.attrs.get("axis", 1))
+        axis = axis + rank if axis < 0 else axis
+        if not 0 <= axis < rank:
+            raise ValueError(f"Softmax '{op.name}' has axis {axis} outside rank {rank}")
+        if axis == rank - 1:
+            op.attrs = {**op.attrs, "axis": -1}
+            rewritten.append(op)
+            continue
+        outer = int(np.prod(info.shape[:axis], dtype=np.int64))
+        inner = int(np.prod(info.shape[axis:], dtype=np.int64))
+        flat_in, flat_out = f"{op.name}_rows_in", f"{op.name}_rows_out"
+        ag.tensors[flat_in] = TensorInfo(
+            name=flat_in, shape=(outer, inner), dtype=info.dtype,
+            quant=info.quant, layout=Layout.LINEAR)
+        ag.tensors[flat_out] = TensorInfo(
+            name=flat_out, shape=(outer, inner), dtype=out_info.dtype,
+            quant=out_info.quant, layout=Layout.LINEAR)
+        rewritten.append(OpNode(
+            name=f"{op.name}_rows", op_type="Reshape",
+            inputs=[op.inputs[0]], outputs=[flat_in]))
+        rewritten.append(OpNode(
+            name=op.name, op_type="Softmax",
+            inputs=[flat_in], outputs=[flat_out], attrs={"axis": -1}))
+        rewritten.append(OpNode(
+            name=f"{op.name}_shape", op_type="Reshape",
+            inputs=[flat_out], outputs=[op.outputs[0]]))
+    ag.ops = rewritten
+    for step, op in enumerate(ag.ops):
+        op.step = step
     return ag
 
 
@@ -1461,6 +1516,79 @@ def _order_broadcast_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _fold_bn_into_quantized_conv(ag: AnalyzedGraph, conv_op: OpNode, gamma, beta,
+                                 mean, var, eps: float) -> bool:
+    """Fold y = a * x + c, the BN after a quantized Conv, into the Conv.
+
+    The Conv output is s_in * s_w[k] * (acc + bias[k]) per output channel k, so
+    a moves into the weight scale and c into the int32 bias at the new
+    accumulator scale; only the bias rounds. A negative a negates the channel's
+    int8 weights, which -128 cannot follow. Returns False, changing nothing,
+    when the Conv is not in that form.
+    """
+    x_info = ag.tensors.get(conv_op.inputs[0])
+    w_name = conv_op.inputs[1]
+    w_info = ag.tensors.get(w_name)
+    weights = ag.weight_data[w_name]
+    if (weights.dtype != np.int8 or x_info is None or x_info.quant is None
+            or w_info is None or w_info.quant is None
+            or x_info.quant.scale.size != 1):
+        return False
+    channels = weights.shape[0]
+    a = (np.asarray(gamma, np.float64) / np.sqrt(np.asarray(var, np.float64) + eps)).reshape(-1)
+    c = (np.asarray(beta, np.float64) - np.asarray(mean, np.float64) * a).reshape(-1)
+    w_scale = np.broadcast_to(np.asarray(w_info.quant.scale, np.float64), (channels,))
+    w_zero = np.broadcast_to(np.asarray(w_info.quant.zero_point), (channels,))
+    if a.size != channels or np.any(w_zero != 0) or np.any(a == 0):
+        return False
+    negative = a < 0
+    if np.any(weights[negative] == -128):
+        return False
+
+    s_in = float(np.asarray(x_info.quant.scale).reshape(-1)[0])
+    has_bias = len(conv_op.inputs) >= 3 and conv_op.inputs[2] in ag.weight_data
+    if has_bias:
+        b_info = ag.tensors.get(conv_op.inputs[2])
+        raw = ag.weight_data[conv_op.inputs[2]]
+        if raw.dtype == np.int32:
+            if b_info is None or b_info.quant is None:
+                return False
+            b_scale = np.broadcast_to(np.asarray(b_info.quant.scale, np.float64), (channels,))
+            bias = raw.astype(np.float64).reshape(-1) * b_scale
+        else:
+            bias = raw.astype(np.float64).reshape(-1)
+    else:
+        bias = np.zeros(channels)
+
+    new_scale = w_scale * np.abs(a)
+    folded = weights.copy()
+    folded[negative] = -folded[negative]
+    accumulator_scale = s_in * new_scale
+    new_bias = np.round((a * bias + c) / accumulator_scale)
+    if np.any(np.abs(new_bias) > np.iinfo(np.int32).max):
+        return False
+
+    ag.weight_data[w_name] = folded
+    w_info.quant = QuantParam(scale=new_scale.astype(np.float32),
+                              zero_point=np.zeros(channels, dtype=np.int8), axis=0)
+    bias_quant = QuantParam(scale=accumulator_scale.astype(np.float32),
+                            zero_point=np.zeros(channels, dtype=np.int32), axis=0)
+    if has_bias:
+        b_name = conv_op.inputs[2]
+    else:
+        b_name = w_name + "_bn_bias"
+        conv_op.inputs = list(conv_op.inputs[:2]) + [b_name] + list(conv_op.inputs[3:])
+    ag.weight_data[b_name] = new_bias.astype(np.int32)
+    b_info = ag.tensors.get(b_name)
+    if b_info is None:
+        ag.tensors[b_name] = TensorInfo(name=b_name, shape=(channels,), dtype=6,
+                                        is_constant=True, quant=bias_quant)
+    else:
+        b_info.dtype = 6  # INT32
+        b_info.quant = bias_quant
+    return True
+
+
 def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Fold Conv -> BatchNormalization into a single Conv with updated weights."""
     # Build output->op index map
@@ -1523,8 +1651,13 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
         conv_w_name = conv_op.inputs[1]
         W = ag.weight_data[conv_w_name]
 
-        # Quantized weights (int8/int32): just remove BN, don't touch weights
+        # Quantized weights: fold the BN into the per-channel weight scale and
+        # the int32 bias. A BN the fold cannot express stays in the graph, and
+        # validation rejects it as unsupported.
         if W.dtype in (np.int8, np.int32):
+            if not _fold_bn_into_quantized_conv(
+                    ag, conv_op, gamma, beta, mean, var, eps):
+                continue
             # Rewire: conv's output becomes the BN's output
             bn_output = op.outputs[0]
             conv_op.outputs = [bn_output]
