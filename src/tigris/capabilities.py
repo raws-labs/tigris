@@ -125,7 +125,9 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "standalone rank-3 length tiling on serialized axis 1; may compose with "
         "shape-preserving unary pointwise operators",
     ),
-    "GlobalAveragePool": ("untiled execution",),
+    "GlobalAveragePool": (
+        "rank-4 height tiling: each band of rows is added into the per-channel sums",
+    ),
     "Split": (
         "contiguous parts along the outermost stored axis; untiled execution",
     ),
@@ -142,7 +144,10 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "coordinates; height tiling as the stage's single spatial op, never "
         "in a chain",
     ),
-    "Softmax": ("final axis only; untiled execution",),
+    "Softmax": (
+        "final axis only; tiling on serialized axis 1, each tile holding whole "
+        "rows",
+    ),
     "Relu": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Relu6": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Sigmoid": ("rank-3 pointwise length tiling on serialized axis 1",),
