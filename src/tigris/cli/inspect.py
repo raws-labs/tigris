@@ -99,9 +99,13 @@ def _tensors(title, tensors, *, plan=False):
     console.print(Panel(table, title=Text(title, style="bold"), border_style="blue"))
 
 
+_FORMATS = {"tgrs": "TiGrIS execution plan", "onnx": "ONNX graph", "tflite": "TFLite model"}
+
+
 def _render(report, verbose):
     is_plan = report["format"] == "tgrs"
-    rows = [("Format", "TiGrIS execution plan" if is_plan else "ONNX graph"),
+    is_tflite = report["format"] == "tflite"
+    rows = [("Format", _FORMATS[report["format"]]),
             ("File size", fmt_bytes(report["file_size_bytes"]))]
     if is_plan:
         plan = report["plan"]
@@ -114,9 +118,13 @@ def _render(report, verbose):
         defaults = {item["name"] for item in graph["initializers"] + graph["sparse_initializers"]}
         inputs = [{**item, "initializer_default": item["name"] in defaults} for item in graph["inputs"]]
         outputs = graph["outputs"]
-        rows.extend([("IR version", report["ir_version"]),
-                     ("Opsets", ", ".join(f"{item['domain'] or 'ai.onnx'}: {item['version']}"
-                                          for item in report["opsets"]))])
+        if is_tflite:
+            rows.extend([("Schema version", report["tflite_version"]),
+                         ("Subgraphs", report["subgraphs"])])
+        else:
+            rows.extend([("IR version", report["ir_version"]),
+                         ("Opsets", ", ".join(f"{item['domain'] or 'ai.onnx'}: {item['version']}"
+                                              for item in report["opsets"]))])
     for label, items in (("Input", inputs), ("Output", outputs)):
         for item in items:
             rows.append((label, _interface(item, plan=is_plan)))
@@ -130,6 +138,16 @@ def _render(report, verbose):
                      for index, stage in enumerate(plan["stages"]))
         count = len(plan["stages"])
         rows.append(("Schedule", f"{count} {'stage' if count == 1 else 'stages'}, {tiled} tiled, {chains} chains"))
+    elif is_tflite:
+        constants = graph["initializers"]
+        rows.append(("Constants", f"{len(constants)}, "
+                     f"{fmt_bytes(sum(item['size_bytes'] for item in constants))}"))
+        reasons = report["unsupported"]
+        rows.append(("Converts to a plan", "yes" if not reasons else f"no, {len(reasons)} reason(s)"))
+        for reason in reasons[:5]:
+            rows.append(("", reason))
+        if len(reasons) > 5:
+            rows.append(("", f"... and {len(reasons) - 5} more (--json lists all)"))
     else:
         initializers = graph["initializers"]
         external = sum(item["storage"] == "external" for item in initializers)
@@ -146,9 +164,16 @@ def _render(report, verbose):
             ("Weight storage", f"{storage}, {compression}"),
         ])
         console.print(Text("Memory values are compiler records, not measured runtime peak or total RAM.", style="dim"))
+    elif is_tflite:
+        console.print(Text("Model metadata as stored in the file.", style="dim"))
     else:
         console.print(Text("Declared graph metadata. Shapes are not inferred; external tensor data is not loaded.", style="dim"))
     if not verbose:
+        return
+    if is_tflite:
+        _operators(enumerate(graph["operators"]))
+        if graph["initializers"]:
+            _tensors("Constants", graph["initializers"])
         return
     if not is_plan:
         _operators(enumerate(graph["operators"]))

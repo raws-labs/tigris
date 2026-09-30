@@ -6,7 +6,7 @@
 
 **Tiled Graph Inference Scheduler.** An ahead-of-time compiler that tiles ML models to fit embedded devices with hard memory budgets.
 
-Give it an ONNX model and a memory budget. It partitions the compute graph into stages, tiles spatial operations, and emits a flat binary plan that the [tigris-runtime](https://github.com/raws-labs/tigris-runtime) executes with zero dynamic allocation.
+Give it an ONNX or a TFLite model and a memory budget. It partitions the compute graph into stages, tiles spatial operations, and emits a flat binary plan that the [tigris-runtime](https://github.com/raws-labs/tigris-runtime) executes with zero dynamic allocation.
 
 ## The problem
 
@@ -139,7 +139,9 @@ tigris inspect model.tgrs -v
 tigris inspect model.tgrs --json
 ```
 
-`inspect` detects the format from file contents. It reads declared ONNX inputs,
+`inspect` detects the format from file contents: ONNX, TFLite, or a compiled
+plan. For a TFLite file it also states whether the model converts, and if not,
+what stops it. It reads declared ONNX inputs,
 outputs, operators, and initializers, or compiled plan interfaces, stages, tiling,
 quantization, and memory records. `-v` adds details; `--json` emits complete
 metadata with an `inspection_version` field and exact byte counts, without weight

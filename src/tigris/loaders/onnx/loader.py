@@ -6,6 +6,7 @@ import onnx
 from onnx import helper as onnx_helper
 from onnx import numpy_helper, shape_inference
 
+from tigris.frontends import load_onnx
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders.onnx.shapes import bind_free_dims, fold_shape_subgraph
 
@@ -85,7 +86,7 @@ def load_model(
     performs a DFS topological sort favouring early tensor consumption.
     ``input_shapes`` maps a model input name to the full shape to compile for.
     """
-    model = onnx.load(str(path))
+    model = load_onnx(path)
     bindings = resolve_shapes(model, input_shapes)
 
     graph = model.graph
