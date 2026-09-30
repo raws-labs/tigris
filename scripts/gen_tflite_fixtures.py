@@ -17,9 +17,11 @@ import sys
 from importlib.metadata import version
 from pathlib import Path
 
+import flatbuffers
 import numpy as np
 import tensorflow as tf
 from tflite_micro.python.tflite_micro import runtime as micro
+from tflite_micro.tensorflow.lite.python import schema_py_generated as schema
 
 OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "tflite" / "ops"
 SAMPLES = 4
@@ -122,6 +124,11 @@ CASES.update({
     "sub_broadcast_first": _binary(tf.subtract, (1, 1, 6, 4), _MAP),
     "add_constant_rows": _unary(lambda x: x + _ROWS, _MAP),
 })
+CASES.update({
+    "pad": _unary(lambda x: tf.pad(x, [[0, 0], [1, 2], [0, 1], [0, 0]]), _MAP),
+    "padv2": _unary(lambda x: tf.pad(x, [[0, 0], [1, 1], [2, 0], [0, 0]], constant_values=0.75),
+                    _MAP),
+})
 # Converted without quantization: TFLite Micro runs these in float only.
 FLOAT_MODELS = {
     "float_abs": _unary(tf.abs, _MAP),
@@ -158,6 +165,51 @@ RANGES = {
     "float_floor_mod": [(-3.0, 3.0), _DIVISOR], "float_div_constant_first": [_DIVISOR],
     "float_div_broadcast": [(-3.0, 3.0), _DIVISOR],
 }
+
+
+def _as_operator(kind: str):
+    """Rewrites the converter's one RESHAPE into SQUEEZE or EXPAND_DIMS, which
+    the converter never emits itself, keeping its tensors."""
+    def rewrite(model: bytes) -> bytes:
+        tree = schema.ModelT.InitFromPackedBuf(model, 0)
+        graph = tree.subgraphs[0]
+        op = graph.operators[0]
+        code = tree.operatorCodes[op.opcodeIndex]
+        code.builtinCode = getattr(schema.BuiltinOperator, kind)
+        code.deprecatedBuiltinCode = min(code.builtinCode, 127)
+        code.version = 1
+        source = graph.tensors[op.inputs[0]].shape
+        target = graph.tensors[op.outputs[0]].shape
+        if kind == "SQUEEZE":
+            op.inputs = op.inputs[:1]
+            op.builtinOptionsType = schema.BuiltinOptions.SqueezeOptions
+            op.builtinOptions = schema.SqueezeOptionsT()
+            op.builtinOptions.squeezeDims = [i for i, d in enumerate(source) if d == 1][:1]
+        else:
+            axis = next(i for i, (a, b) in enumerate(zip(list(source) + [None], target)) if a != b)
+            buffer = schema.BufferT()
+            buffer.data = np.array([axis], np.int32).tobytes()
+            tree.buffers.append(buffer)
+            tensor = schema.TensorT()
+            tensor.shape = np.array([1], np.int32)
+            tensor.type = schema.TensorType.INT32
+            tensor.buffer = len(tree.buffers) - 1
+            tensor.name = b"axis"
+            graph.tensors.append(tensor)
+            op.inputs = np.array([op.inputs[0], len(graph.tensors) - 1], np.int32)
+            op.builtinOptionsType = schema.BuiltinOptions.ExpandDimsOptions
+            op.builtinOptions = schema.ExpandDimsOptionsT()
+        builder = flatbuffers.Builder(4096)
+        builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
+        return bytes(builder.Output())
+    return rewrite
+
+
+REWRITES = {"squeeze_op": _as_operator("SQUEEZE"), "expand_dims_op": _as_operator("EXPAND_DIMS")}
+CASES.update({
+    "squeeze_op": _unary(lambda x: tf.squeeze(x, [1]), (1, 1, 8, 6)),
+    "expand_dims_op": _unary(lambda x: tf.expand_dims(x, 1), (1, 8, 6)),
+})
 
 
 def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):
@@ -198,6 +250,8 @@ def generate(name: str) -> bool:
     ranges = RANGES.get(name)
     model = _convert(fn, shapes, ranges or [(-3.0, 3.0)] * len(shapes), rng,
                      float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS)
+    if name in REWRITES:
+        model = REWRITES[name](model)
     try:
         reference = tf.lite.Interpreter(
             model_content=model,

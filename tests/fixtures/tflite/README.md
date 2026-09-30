@@ -17,3 +17,5 @@ Micro runs in float only.
 `div` keeps its numerators off 0 and -1 after the zero point, where TFLite's
 int8 arithmetic shifts a 32-bit value by 32 or more; the runtime's own tests
 cover that range.
+`squeeze_op` and `expand_dims_op` rewrite the converter's RESHAPE into the SQUEEZE
+and EXPAND_DIMS operators, which the converter never emits itself.

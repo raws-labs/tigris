@@ -38,6 +38,7 @@ from .defs import (
     OP_ATTR_AXES,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
+    OP_ATTR_PADS,
     OP_ATTR_POOL_ROUNDING,
     OP_ATTR_RESIZE_SCALES,
     POOL_ROUNDING_AVERAGE,
@@ -867,6 +868,17 @@ def _build_op_attributes(
             scales = op.attrs.get("resize_scales")
             if scales is not None:
                 records.append((op_index, OP_ATTR_RESIZE_SCALES, struct.pack("<2f", *scales)))
+            continue
+        if op.op_type == "Pad" and "pad_amounts" in op.attrs:
+            # Leading then trailing per axis, in the order the runtime stores.
+            info = ag.tensors[op.inputs[0]]
+            rank = len(info.shape)
+            amounts = op.attrs["pad_amounts"]
+            axis_map = serialized_axis_map(rank, info.layout)
+            onnx_axis = sorted(range(rank), key=lambda axis: axis_map[axis])
+            pairs = [value for axis in onnx_axis
+                     for value in (amounts[axis], amounts[rank + axis])]
+            records.append((op_index, OP_ATTR_PADS, struct.pack(f"<{2 * rank}i", *pairs)))
             continue
         if op.op_type == "LayerNormalization":
             records.append((

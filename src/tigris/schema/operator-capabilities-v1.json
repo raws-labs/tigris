@@ -245,13 +245,16 @@
       }
     },
     {
+      "constraints": [
+        "constant mode with non-negative pads and a constant fill; int8 keeps its quantization; untiled execution"
+      ],
       "opcode": 14,
       "operator": "Pad",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
-        "reference": "unsupported",
-        "s8_ref": "unsupported"
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
       }
     },
     {

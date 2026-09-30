@@ -33,6 +33,7 @@ class KernelCapabilities:
 
 
 _FLOAT_REFERENCE_OPERATORS = frozenset({
+    "Pad",
     "Conv",
     "ConvTranspose",
     "DepthwiseConv",
@@ -165,6 +166,10 @@ _CONSTANT_OPERAND = (
 )
 
 OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
+    "Pad": (
+        "constant mode with non-negative pads and a constant fill; int8 keeps its "
+        "quantization; untiled execution",
+    ),
     "Add": (
         f"{_BROADCAST}; {_CONSTANT_OPERAND}",
         "standalone rank-3 pointwise length tiling on serialized axis 1",

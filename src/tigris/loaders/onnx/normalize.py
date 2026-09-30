@@ -79,6 +79,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_shape_ops(ag)
     ag = _resolve_resize_conventions(ag)
     ag = _extract_resize_scales(ag)
+    ag = _lift_pad_operands(ag)
     ag = _strip_metadata_inputs(ag)
     ag = _validate_transposes(ag)
     ag = _order_broadcast_operands(ag)
@@ -184,13 +185,49 @@ def _restore_output_names(ag: AnalyzedGraph, declared: list[str]) -> AnalyzedGra
 # on the op makes the emitter bind an index vector as the operator's weight.
 _METADATA_INPUTS: dict[str, int] = {
     "Clip": 1,
-    "Pad": 1,
     "ReduceMean": 1,
     "Reshape": 1,
     "Resize": 1,
     "Squeeze": 1,
     "Unsqueeze": 1,
 }
+
+
+def _lift_pad_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Move a constant Pad's widths into an attribute and keep its fill as
+    the operator's weight.
+
+    The fill is stored in the output's encoding, quantized to it for int8. A
+    fill of zero is dropped: the runtime pads with 0, or the output's zero
+    point, by default.
+    """
+    for op in ag.ops:
+        if op.op_type != "Pad" or len(op.inputs) < 2 or len(op.outputs) != 1:
+            continue
+        amounts = ag.weight_data.get(op.inputs[1])
+        fill_name = op.inputs[2] if len(op.inputs) > 2 and op.inputs[2] else None
+        fill = ag.weight_data.get(fill_name) if fill_name else None
+        if amounts is None or (fill_name and fill is None):
+            continue
+        op.attrs["pad_amounts"] = [int(v) for v in amounts.reshape(-1)]
+        op.inputs = [op.inputs[0]]
+        value = float(fill.reshape(-1)[0]) if fill is not None and fill.size else 0.0
+        if value == 0.0:
+            continue
+        output = ag.tensors.get(op.outputs[0])
+        name = f"{op.name}_fill"
+        if output is not None and output.quant is not None:
+            scale = float(output.quant.scale[0])
+            zero_point = int(output.quant.zero_point[0])
+            data = np.array([np.clip(np.round(value / scale) + zero_point, -128, 127)], np.int8)
+            dtype = 3
+        else:
+            data = np.array([value], np.float32)
+            dtype = 1
+        ag.weight_data[name] = data
+        ag.tensors[name] = TensorInfo(name=name, shape=(1,), dtype=dtype, is_constant=True)
+        op.inputs.append(name)
+    return ag
 
 
 def _strip_metadata_inputs(ag: AnalyzedGraph) -> AnalyzedGraph:

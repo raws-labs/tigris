@@ -360,6 +360,21 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         f"{name} is not 1 and could not be folded into a "
                         "constant, and the plan has no field for it")
 
+        if op.op_type == "Pad":
+            amounts = op.attrs.get("pad_amounts")
+            source = ag.tensors.get(op.inputs[0]) if op.inputs else None
+            result = ag.tensors.get(op.outputs[0]) if op.outputs else None
+            if op.attrs.get("mode", "constant") != "constant":
+                reasons.append("only constant padding is executable")
+            elif amounts is None or source is None or result is None or \
+                    len(amounts) != 2 * len(source.shape) or min(amounts) < 0:
+                reasons.append("Pad requires constant, non-negative widths and fill")
+            elif source.quant is not None and (
+                    result.quant is None
+                    or float(result.quant.scale[0]) != float(source.quant.scale[0])
+                    or int(result.quant.zero_point[0]) != int(source.quant.zero_point[0])):
+                reasons.append("int8 Pad keeps its quantization")
+
         if op.op_type == "Concat":
             tensors = [ag.tensors.get(name) for name in op.inputs]
             result = ag.tensors.get(op.outputs[0]) if op.outputs else None
