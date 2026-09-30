@@ -55,6 +55,9 @@ OP_ATTR_BINARY_REQUANT = 7   # int32[6], three Q0.31 (multiplier, shift) pairs:
 OP_ATTR_POOL_ROUNDING = 8    # uint8[1], POOL_ROUNDING_AVERAGE on an int8 global
                              # average pool that rounds like AVERAGE_POOL_2D
 POOL_ROUNDING_AVERAGE = 1
+OP_ATTR_CONSTANT_OPERAND = 9  # uint8[4]: the constant operand's position (0 or 1),
+                              # a zero byte, and its quant param index (u16 LE,
+                              # NO_QUANT_PARAM for float)
 
 OP_ATTR_KINDS = (
     OP_ATTR_TRANSPOSE_PERM,
@@ -65,6 +68,7 @@ OP_ATTR_KINDS = (
     OP_ATTR_AXES,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_POOL_ROUNDING,
+    OP_ATTR_CONSTANT_OPERAND,
 )
 
 # Compression types

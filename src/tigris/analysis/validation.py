@@ -16,6 +16,7 @@ from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
+    OpNode,
     Stage,
 )
 
@@ -224,7 +225,14 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             "Floor", "Ceil", "Round", "Sin", "Cos",
         }
         elementwise_binary = {"Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod"}
-        if op.op_type in elementwise_unary | elementwise_binary:
+        constant_operand = (
+            op.op_type in elementwise_binary
+            and len(op.inputs) == 2
+            and sum(_is_constant_operand(ag, name) for name in op.inputs) == 1
+        )
+        if constant_operand:
+            reasons.extend(_constant_operand_reasons(ag, op))
+        elif op.op_type in elementwise_unary | elementwise_binary:
             count = 2 if op.op_type in elementwise_binary else 1
             tensors = [ag.tensors.get(name) for name in op.inputs + op.outputs]
             if (len(op.inputs) != count or len(op.outputs) != 1
@@ -346,18 +354,6 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         f"{name} is not 1 and could not be folded into a "
                         "constant, and the plan has no field for it")
 
-        if op.op_type == "Sub":
-            dynamic = [
-                name for name in op.inputs
-                if name in ag.tensors and not ag.tensors[name].is_constant
-            ]
-            if len(dynamic) != 2:
-                reasons.append(
-                    "Sub does not commute and the plan does not record which "
-                    "side a constant was on; a constant subtrahend is rewritten "
-                    "as an added negation, a constant minuend is not expressible"
-                )
-
         if op.op_type == "Concat":
             tensors = [ag.tensors.get(name) for name in op.inputs]
             result = ag.tensors.get(op.outputs[0]) if op.outputs else None
@@ -470,7 +466,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         "Resize requires unchanged N/C and integer H/W upscaling"
                     )
 
-        if op.op_type in {"Add", "Mul"}:
+        if op.op_type in {"Add", "Sub", "Mul"}:
             dynamic_inputs = [
                 ag.tensors[name]
                 for name in op.inputs
@@ -536,55 +532,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         )
 
                 if constant_names:
-                    if ag.is_quantized:
-                        reasons.append(
-                            "quantized constant operands lack shape/quant metadata"
-                        )
-                    else:
-                        stage = next(
-                            (
-                                candidate
-                                for candidate in ag.stages
-                                if candidate.stage_id == op.stage
-                            ),
-                            None,
-                        )
-                        tiled_execution = stage is not None and (
-                            stage.chain_id != 0xFFFF
-                            or (
-                                stage.tile_plan is not None
-                                and stage.tile_plan.tileable
-                            )
-                        )
-                        for name in constant_names:
-                            constant = ag.weight_data.get(name)
-                            if constant is None:
-                                reasons.append(f"constant operand {name!r} has no data")
-                                continue
-                            if str(constant.dtype) in {"int8", "int32"}:
-                                reasons.append(
-                                    f"constant operand {name!r} is not float data"
-                                )
-                            full_shape_constant = (
-                                tuple(constant.shape) == reference_shape
-                            )
-                            per_channel = _is_per_channel_constant(
-                                tuple(constant.shape), dynamic_inputs[0]
-                            )
-                            if (
-                                constant.size != 1
-                                and not full_shape_constant
-                                and not per_channel
-                            ):
-                                reasons.append(
-                                    f"constant operand {name!r} requires unsupported "
-                                    "broadcasting"
-                                )
-                            elif full_shape_constant and tiled_execution:
-                                reasons.append(
-                                    f"constant operand {name!r} cannot be offset "
-                                    "for tiled execution"
-                                )
+                    reasons.extend(_constant_operand_reasons(ag, op))
 
         if reasons:
             issues.append(
@@ -736,6 +684,58 @@ class SlowMemoryUsage:
             f"({fmt_bytes(self.slow_peak_bytes)} needed, "
             f"{fmt_bytes(self.slow_budget)} available)"
         )
+
+
+def _is_constant_operand(ag: AnalyzedGraph, name: str) -> bool:
+    return name in ag.weight_data or (name in ag.tensors and ag.tensors[name].is_constant)
+
+
+def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
+    """Why a binary operator's constant operand is not expressible.
+
+    The plan holds the constant as the operator's weight and names its side
+    and, for int8, its quantization in the constant-operand attribute. The
+    runtime repeats it by its length alone: one value, one per channel, or
+    one per element, the last only untiled because it carries no row offset.
+    """
+    constants = [name for name in op.inputs if _is_constant_operand(ag, name)]
+    dynamic = [ag.tensors.get(name) for name in op.inputs
+               if not _is_constant_operand(ag, name)]
+    if len(constants) != 1 or len(dynamic) != 1 or dynamic[0] is None:
+        return ["runtime requires one tensor operand and at most one constant"]
+    name, operand = constants[0], dynamic[0]
+    output = ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
+    constant = ag.weight_data.get(name)
+    if output is None or output.shape != operand.shape:
+        return ["output shape must match the tensor operand exactly"]
+    if constant is None:
+        return [f"constant operand {name!r} has no data"]
+    reasons = []
+    if ag.is_quantized:
+        quant = ag.tensors[name].quant if name in ag.tensors else None
+        if str(constant.dtype) != "int8" or quant is None or quant.scale.size != 1:
+            reasons.append(f"constant operand {name!r} is not per-tensor int8")
+        elif op.op_type in {"Max", "Min"} and any(
+            info.quant is None
+            or float(info.quant.scale[0]) != float(quant.scale[0])
+            or int(info.quant.zero_point[0]) != int(quant.zero_point[0])
+            for info in (operand, output)
+        ):
+            reasons.append("Max/Min requires identical input and output quantization")
+    elif str(constant.dtype) != "float32":
+        reasons.append(f"constant operand {name!r} is not float data")
+    full = tuple(constant.shape) == tuple(operand.shape)
+    if constant.size != 1 and not full and not _is_per_channel_constant(
+            tuple(constant.shape), operand):
+        reasons.append(f"constant operand {name!r} requires unsupported broadcasting")
+    elif full and constant.size != 1:
+        stage = next((candidate for candidate in ag.stages
+                      if candidate.stage_id == op.stage), None)
+        if stage is not None and (
+                stage.chain_id != 0xFFFF
+                or (stage.tile_plan is not None and stage.tile_plan.tileable)):
+            reasons.append(f"constant operand {name!r} cannot be offset for tiled execution")
+    return reasons
 
 
 def _is_per_channel_constant(

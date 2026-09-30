@@ -401,7 +401,7 @@ def test_dynamic_elementwise_broadcasting_is_rejected():
     assert "one value per channel" in validation.describe()
 
 
-def test_quantized_constant_elementwise_operand_is_rejected():
+def test_quantized_constant_operand_without_its_quantization_is_rejected():
     graph = AnalyzedGraph(
         is_quantized=True,
         ops=[
@@ -425,7 +425,7 @@ def test_quantized_constant_elementwise_operand_is_rejected():
     validation = validate_operator_support(graph)
 
     assert not validation.supported
-    assert "lack shape/quant metadata" in validation.describe()
+    assert "is not per-tensor int8" in validation.describe()
 
 
 def test_exact_constant_elementwise_operand_is_rejected_when_tiled():

@@ -35,6 +35,7 @@ from .defs import (
     NO_WEIGHT,
     OP_ATTR_AXES,
     OP_ATTR_BINARY_REQUANT,
+    OP_ATTR_CONSTANT_OPERAND,
     OP_ATTR_POOL_ROUNDING,
     POOL_ROUNDING_AVERAGE,
     OP_ATTR_EPSILON,
@@ -285,14 +286,38 @@ def _build_weight_op_map(ag: AnalyzedGraph) -> dict[str, str]:
     return result
 
 
+_BINARY_OPS = frozenset({"Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min",
+                         "FloorDiv", "FloorMod"})
+
+
+def _binary_constant_layouts(ag: AnalyzedGraph) -> dict[str, "Layout"]:
+    """The layout of the tensor each binary operator's constant pairs with.
+
+    The runtime reads a constant element by element against that tensor, so
+    the constant is stored in the same axis order.
+    """
+    layouts = {}
+    for op in ag.ops:
+        if op.op_type not in _BINARY_OPS or len(op.inputs) != 2:
+            continue
+        constants = [name for name in op.inputs if name in ag.weight_data]
+        tensors = [ag.tensors.get(name) for name in op.inputs if name not in ag.weight_data]
+        if len(constants) == 1 and len(tensors) == 1 and tensors[0] is not None:
+            layouts[constants[0]] = tensors[0].layout
+    return layouts
+
+
+def _stored_like(arr: np.ndarray, layout) -> np.ndarray:
+    """A constant in the axis order its partner tensor is stored in."""
+    if arr.ndim < 3:
+        return arr
+    axis_map = serialized_axis_map(arr.ndim, layout)
+    order = sorted(range(arr.ndim), key=lambda axis: axis_map[axis])
+    return np.ascontiguousarray(arr.transpose(order))
+
+
 def _transpose_weight_nhwc(arr: np.ndarray, op_type: str | None) -> np.ndarray:
     """Transpose weight from NCHW convention to NHWC convention at emission time."""
-    if op_type in {"Add", "Mul"}:
-        if arr.ndim == 4:
-            return arr.transpose(0, 2, 3, 1)
-        if arr.ndim == 3:
-            return arr.transpose(0, 2, 1)
-
     if arr.ndim == 4 and op_type == "DepthwiseConv":
         # ONNX depthwise: [C, 1, KH, KW] -> OHWI gives [C, KH, KW, 1]
         # Then reshape to [C, KH, KW] and transpose to [KH, KW, C] (HWC)
@@ -433,6 +458,7 @@ def _build_weights(
 
     weight_op_map = _build_weight_op_map(ag)
     fc_layout_shapes = _build_fc_layout_permutations(ag)
+    binary_layouts = _binary_constant_layouts(ag)
 
     weight_idx: dict[str, int] = {}
     entries_buf = bytearray()
@@ -441,7 +467,10 @@ def _build_weights(
     for idx, (name, arr) in enumerate(ag.weight_data.items()):
         weight_idx[name] = idx
         op_type = weight_op_map.get(name)
-        arr = _transpose_weight_nhwc(arr, op_type)
+        if name in binary_layouts:
+            arr = _stored_like(arr, binary_layouts[name])
+        else:
+            arr = _transpose_weight_nhwc(arr, op_type)
         # Preserve ONNX flatten/reshape order across the internal layout change.
         if name in fc_layout_shapes:
             arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
@@ -518,6 +547,7 @@ def _build_weights_compressed(
 
     weight_op_map = _build_weight_op_map(ag)
     fc_layout_shapes = _build_fc_layout_permutations(ag)
+    binary_layouts = _binary_constant_layouts(ag)
 
     # First pass: prepare all weights (same transform as _build_weights)
     weight_idx: dict[str, int] = {}
@@ -528,7 +558,10 @@ def _build_weights_compressed(
         arr = ag.weight_data[name]
         weight_idx[name] = idx
         op_type = weight_op_map.get(name)
-        arr = _transpose_weight_nhwc(arr, op_type)
+        if name in binary_layouts:
+            arr = _stored_like(arr, binary_layouts[name])
+        else:
+            arr = _transpose_weight_nhwc(arr, op_type)
         if name in fc_layout_shapes:
             arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
         if arr.dtype in (np.int8, np.int32):
@@ -758,8 +791,7 @@ def _binary_requant_payload(ag: AnalyzedGraph, op: OpNode) -> bytes | None:
     if len(op.inputs) != 2 or len(op.outputs) != 1:
         return None
     tensors = [ag.tensors.get(name) for name in (*op.inputs, op.outputs[0])]
-    if any(info is None or info.is_constant or info.quant is None
-           for info in tensors):
+    if any(info is None or info.quant is None for info in tensors):
         return None
     scales = []
     for info in tensors:
@@ -778,8 +810,35 @@ def _binary_requant_payload(ag: AnalyzedGraph, op: OpNode) -> bytes | None:
     return struct.pack("<6i", *(value for pair in pairs for value in pair))
 
 
+def _constant_operand_payload(
+    ag: AnalyzedGraph, op: OpNode, quant_idx_map: dict[str, int]
+) -> bytes | None:
+    """Which operand of a binary operator is its weight, and its quantization.
+
+    A float Add or Mul with its constant second is left without one: every
+    runtime reads that form, older ones included.
+    """
+    if op.op_type not in _BINARY_OPS or len(op.inputs) != 2:
+        return None
+    positions = [i for i, name in enumerate(op.inputs) if name in ag.weight_data]
+    if len(positions) != 1:
+        return None
+    position = positions[0]
+    name = op.inputs[position]
+    if ag.is_quantized:
+        if name not in quant_idx_map:
+            raise ValueError(f"constant operand {name!r} of {op.name!r} has no quantization")
+        index = quant_idx_map[name]
+    elif op.op_type in ("Add", "Mul") and position == 1:
+        return None
+    else:
+        index = NO_QUANT_PARAM
+    return struct.pack("<BBH", position, 0, index)
+
+
 def _build_op_attributes(
-    ag: AnalyzedGraph, tensor_idx: dict[str, int]
+    ag: AnalyzedGraph, tensor_idx: dict[str, int],
+    quant_idx_map: dict[str, int] | None = None,
 ) -> bytes:
     """Build optional, typed per-operator attributes.
 
@@ -789,6 +848,9 @@ def _build_op_attributes(
     """
     records: list[tuple[int, int, bytes]] = []
     for op_index, op in enumerate(ag.ops):
+        constant = _constant_operand_payload(ag, op, quant_idx_map or {})
+        if constant is not None:
+            records.append((op_index, OP_ATTR_CONSTANT_OPERAND, constant))
         if op.op_type == "LayerNormalization":
             records.append((
                 op_index,
@@ -1469,7 +1531,7 @@ def emit_binary_bytes(
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
     op_attributes_data = _build_op_attributes(
-        ag, tensor_idx
+        ag, tensor_idx, quant_idx_map
     )
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
     tile_data, stage_to_tile = _build_tile_plans(ag)

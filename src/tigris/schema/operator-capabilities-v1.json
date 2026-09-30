@@ -155,7 +155,7 @@
     },
     {
       "constraints": [
-        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a float constant operand is one value, one per channel, or one per element",
+        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8",
         "standalone rank-3 pointwise length tiling on serialized axis 1"
       ],
       "opcode": 7,
@@ -169,7 +169,7 @@
     },
     {
       "constraints": [
-        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a float constant operand is one value, one per channel, or one per element",
+        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8",
         "standalone rank-3 pointwise length tiling on serialized axis 1"
       ],
       "opcode": 8,
@@ -287,6 +287,9 @@
       }
     },
     {
+      "constraints": [
+        "a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8"
+      ],
       "opcode": 18,
       "operator": "Sub",
       "routes": {
@@ -298,7 +301,7 @@
     },
     {
       "constraints": [
-        "two dynamic operands with identical shapes; int8 requires per-tensor quantization",
+        "two dynamic operands with identical shapes, or a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8; int8 requires per-tensor quantization",
         "int8 rejects zero centered denominators and negative rounding exponents; rounding exponents >= 32 use wide mask/remainder/threshold arithmetic"
       ],
       "opcode": 19,
@@ -542,7 +545,7 @@
     },
     {
       "constraints": [
-        "two dynamic operands with identical shapes",
+        "two dynamic operands with identical shapes, or a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8",
         "int8 requantization must stay within the 32-bit reference arithmetic domain"
       ],
       "opcode": 40,
@@ -556,7 +559,7 @@
     },
     {
       "constraints": [
-        "two dynamic operands with identical shapes; int8 quantization must match"
+        "two dynamic operands with identical shapes, or a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8; int8 quantization must match"
       ],
       "opcode": 41,
       "operator": "Max",
@@ -569,7 +572,7 @@
     },
     {
       "constraints": [
-        "two dynamic operands with identical shapes; int8 quantization must match"
+        "two dynamic operands with identical shapes, or a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8; int8 quantization must match"
       ],
       "opcode": 42,
       "operator": "Min",
@@ -682,7 +685,7 @@
     },
     {
       "constraints": [
-        "two dynamic operands with identical shapes; zero denominators are rejected"
+        "two dynamic operands with identical shapes, or a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8; zero denominators are rejected"
       ],
       "opcode": 53,
       "operator": "FloorDiv",
@@ -695,7 +698,7 @@
     },
     {
       "constraints": [
-        "two dynamic operands with identical shapes"
+        "two dynamic operands with identical shapes, or a constant operand, on either side, holding one value, one per channel, or one per element (untiled), float or per-tensor int8"
       ],
       "opcode": 54,
       "operator": "FloorMod",

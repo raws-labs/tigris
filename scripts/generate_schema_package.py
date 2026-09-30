@@ -26,7 +26,9 @@ def schema_package() -> dict[str, object]:
         "op_attribute_types": {
             "alpha": defs.OP_ATTR_ALPHA,
             "axes": defs.OP_ATTR_AXES,
+            "binary_requant": defs.OP_ATTR_BINARY_REQUANT,
             "clip_bounds": defs.OP_ATTR_CLIP_BOUNDS,
+            "constant_operand": defs.OP_ATTR_CONSTANT_OPERAND,
             "epsilon": defs.OP_ATTR_EPSILON,
             "pads": defs.OP_ATTR_PADS,
             "pool_rounding": defs.OP_ATTR_POOL_ROUNDING,

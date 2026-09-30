@@ -13,7 +13,9 @@
   "op_attribute_types": {
     "alpha": 3,
     "axes": 6,
+    "binary_requant": 7,
     "clip_bounds": 4,
+    "constant_operand": 9,
     "epsilon": 2,
     "pads": 5,
     "pool_rounding": 8,

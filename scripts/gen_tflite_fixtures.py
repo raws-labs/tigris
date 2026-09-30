@@ -96,6 +96,19 @@ CASES.update({
     "minimum": _binary(tf.minimum, _MAP, _MAP),
     "div": _binary(tf.divide, _MAP, _MAP),
 })
+_CHANNELS = np.linspace(-1.5, 2.0, 4).astype(np.float32)
+_DIVISORS = np.linspace(0.6, 2.4, 4).astype(np.float32)
+_FULL = np.random.default_rng(7).uniform(-2.0, 2.0, (1, 6, 6, 4)).astype(np.float32)
+CASES.update({
+    "add_constant_channels": _unary(lambda x: x + _CHANNELS, _MAP),
+    "add_constant_full": _unary(lambda x: x + _FULL, _MAP),
+    "mul_constant_scalar": _unary(lambda x: x * 0.37, _MAP),
+    "sub_constant_second": _unary(lambda x: x - _CHANNELS, _MAP),
+    "sub_constant_first": _unary(lambda x: 1.25 - x, _MAP),
+    "div_constant": _unary(lambda x: x / _DIVISORS, _MAP),
+    "squared_difference_constant": _unary(
+        lambda x: tf.math.squared_difference(x, _CHANNELS), _MAP),
+})
 # Converted without quantization: TFLite Micro runs these in float only.
 FLOAT_MODELS = {
     "float_abs": _unary(tf.abs, _MAP),
@@ -116,6 +129,9 @@ FLOAT_MODELS = {
     "float_cos": _unary(tf.cos, _MAP),
     "float_floor_div": _binary(tf.math.floordiv, _MAP, _MAP),
     "float_floor_mod": _binary(tf.math.floormod, _MAP, _MAP),
+    "float_div_constant_first": _unary(lambda x: 2.5 / x, _MAP),
+    "float_floor_mod_constant": _unary(lambda x: tf.math.floormod(x, _DIVISORS), _MAP),
+    "float_maximum_constant": _unary(lambda x: tf.maximum(x, _CHANNELS), _MAP),
 }
 CASES.update(FLOAT_MODELS)
 # Input ranges per operand where the default [-3, 3] leaves the domain.
@@ -124,7 +140,7 @@ RANGES = {
     "rsqrt": [_POSITIVE], "float_rsqrt": [_POSITIVE], "float_log": [_POSITIVE],
     "float_sqrt": [(0.0, 4.0)],
     "div": [(-3.0, 3.0), _DIVISOR], "float_div": [(-3.0, 3.0), _DIVISOR], "float_floor_div": [(-3.0, 3.0), _DIVISOR],
-    "float_floor_mod": [(-3.0, 3.0), _DIVISOR],
+    "float_floor_mod": [(-3.0, 3.0), _DIVISOR], "float_div_constant_first": [_DIVISOR],
 }
 
 
