@@ -83,7 +83,6 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
 })
 
 _S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS - frozenset({
-    "Div",
     "Neg",
     "Exp",
     "Log",
@@ -189,7 +188,11 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "HardSwish": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Abs": ("int8 requantization must stay within the 32-bit reference arithmetic domain",),
     "Rsqrt": ("int8 requires nonnegative centered inputs and reference shifts in range",),
-    "Div": ("two dynamic operands with identical shapes; float32 only",),
+    "Div": (
+        "two dynamic operands with identical shapes; int8 requires per-tensor quantization",
+        "int8 rejects zero centered denominators and negative rounding exponents; "
+        "rounding exponents >= 32 use wide mask/remainder/threshold arithmetic",
+    ),
     "SquaredDifference": (
         "two dynamic operands with identical shapes",
         "int8 requantization must stay within the 32-bit reference arithmetic domain",

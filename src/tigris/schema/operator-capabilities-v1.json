@@ -298,15 +298,16 @@
     },
     {
       "constraints": [
-        "two dynamic operands with identical shapes; float32 only"
+        "two dynamic operands with identical shapes; int8 requires per-tensor quantization",
+        "int8 rejects zero centered denominators and negative rounding exponents; rounding exponents >= 32 use wide mask/remainder/threshold arithmetic"
       ],
       "opcode": 19,
       "operator": "Div",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
         "reference": "native",
-        "s8_ref": "unsupported"
+        "s8_ref": "native"
       }
     },
     {

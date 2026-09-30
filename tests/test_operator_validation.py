@@ -716,10 +716,10 @@ def test_hardswish_and_int8_bilinear_have_kernels():
 
 @pytest.mark.parametrize("kind", [
     "Neg", "Exp", "Log", "Sqrt", "Square", "Floor", "Ceil", "Round",
-    "Sin", "Cos", "Div", "FloorDiv", "FloorMod",
+    "Sin", "Cos", "FloorDiv", "FloorMod",
 ])
 def test_elementwise_without_int8_kernel_rejects_quantized_plans(kind):
-    binary = kind in {"Div", "FloorDiv", "FloorMod"}
+    binary = kind in {"FloorDiv", "FloorMod"}
     quant = QuantParam(np.array([0.125], np.float32), np.array([-17], np.int8))
     ag = AnalyzedGraph(
         ops=[OpNode(name="math", op_type=kind,
@@ -730,9 +730,9 @@ def test_elementwise_without_int8_kernel_rejects_quantized_plans(kind):
     assert "no s8_ref runtime kernel" in validate_operator_support(ag).describe()
 
 
-@pytest.mark.parametrize("kind", ["Abs", "Rsqrt", "SquaredDifference", "Max", "Min"])
+@pytest.mark.parametrize("kind", ["Abs", "Rsqrt", "SquaredDifference", "Max", "Min", "Div"])
 def test_elementwise_int8_requires_matching_shapes_and_quantization(kind):
-    binary = kind in {"SquaredDifference", "Max", "Min"}
+    binary = kind in {"SquaredDifference", "Max", "Min", "Div"}
     tensors = {
         name: TensorInfo(name, (1, 4), 3, quant=QuantParam(
             np.array([0.125], np.float32), np.array([-17], np.int8)))
@@ -744,6 +744,12 @@ def test_elementwise_int8_requires_matching_shapes_and_quantization(kind):
         tensors=tensors, is_quantized=True,
     )
     assert validate_operator_support(ag).supported
+    if kind == "Div":
+        tensors["b"].quant.scale[0] = 0.25
+        tensors["b"].quant.zero_point[0] = 31
+        tensors["y"].quant.scale[0] = 0.0625
+        tensors["y"].quant.zero_point[0] = -63
+        assert validate_operator_support(ag).supported
     tensors["y"].shape = (2, 2)
     assert "identical shapes" in validate_operator_support(ag).describe()
     tensors["y"].shape = (1, 4)
