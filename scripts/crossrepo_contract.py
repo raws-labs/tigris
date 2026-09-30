@@ -77,6 +77,10 @@ class ContractCase:
     expect_2d: bool = False
     recompute_metric: bool = False
     force_one_op_stages: bool = False
+    # Evaluate the reference operator by operator. ONNX Runtime's graph
+    # optimizer can replace a quantized graph with a fused integer kernel
+    # whose result depends on the host CPU.
+    reference_unoptimized: bool = False
 
 
 def _model(
@@ -566,7 +570,9 @@ def _hardswish_case(*, quantized: bool) -> ContractCase:
 
 def _depthwise_multiplier_case(*, quantized: bool) -> ContractCase:
     """A depthwise convolution writing two output channels per input channel,
-    banded by height."""
+    banded by height. ONNX Runtime fuses the quantized form into an integer
+    grouped convolution whose result varies with the host CPU, so the
+    reference runs unfused."""
     channels, multiplier, side = 4, 2, 16
     rng = np.random.default_rng(22)
     weight = (rng.normal(size=(channels * multiplier, 1, 3, 3)) * 0.4).astype(np.float32)
@@ -592,7 +598,8 @@ def _depthwise_multiplier_case(*, quantized: bool) -> ContractCase:
         initializers, opset=14,
     )
     return ContractCase(label, model, copy.deepcopy(model), {"input": data},
-                        ("DepthwiseConv",), mem_budget="2K", expect_tiled=True)
+                        ("DepthwiseConv",), mem_budget="2K", expect_tiled=True,
+                        reference_unoptimized=quantized)
 
 
 def _inner_axis_concat_case(*, axis: int, quantized: bool) -> ContractCase:
@@ -5657,9 +5664,7 @@ def _run_metric_case(
         xip=case.xip,
     )
     _assert_plan_mode(case, plan)
-    session = ort.InferenceSession(
-        str(reference_path), providers=["CPUExecutionProvider"]
-    )
+    session = _reference_session(case, reference_path)
     reference_outputs = session.run(None, case.inputs)
     inputs_path.write_bytes(_pack_inputs(plan, case.inputs))
     limit = str(plan["_compiler_scheduled_peak"])
@@ -5723,6 +5728,13 @@ def _run_metric_case(
     )
 
 
+def _reference_session(case: ContractCase, path: Path) -> ort.InferenceSession:
+    options = ort.SessionOptions()
+    if case.reference_unoptimized:
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
+
+
 def _run_case(
     case: ContractCase, runner: Path, work_dir: Path
 ) -> Path:
@@ -5746,9 +5758,7 @@ def _run_case(
         force_one_op_stages=case.force_one_op_stages,
     )
     _assert_plan_mode(case, plan)
-    session = ort.InferenceSession(
-        str(reference_path), providers=["CPUExecutionProvider"]
-    )
+    session = _reference_session(case, reference_path)
     reference_outputs = session.run(None, case.inputs)
     inputs_path.write_bytes(_pack_inputs(plan, case.inputs))
     completed = _run(
