@@ -82,11 +82,11 @@
     },
     {
       "conditional_fallbacks": {
-        "cmsis-nn": "falls back for dilation other than 1",
-        "esp-nn": "falls back for dilation other than 1"
+        "cmsis-nn": "falls back for tiled dilation other than 1; channel multipliers fall back with CMSIS_NN_USE_SINGLE_ROUNDING",
+        "esp-nn": "falls back for dilation other than 1; channel multipliers require batch 1"
       },
       "constraints": [
-        "one group per input channel with a channel multiplier; a multiplier other than 1 runs on s8_ref under the accelerated backends"
+        "one group per input channel with a channel multiplier"
       ],
       "opcode": 2,
       "operator": "DepthwiseConv",
@@ -168,6 +168,10 @@
       }
     },
     {
+      "conditional_fallbacks": {
+        "cmsis-nn": "falls back for constants, broadcasting, non-per-tensor quantization, requantization shifts outside [-31, 15], width, row or rolled tiles, or CMSIS_NN_USE_SINGLE_ROUNDING",
+        "esp-nn": "falls back for constants, broadcasting, non-per-tensor quantization, requantization shifts outside [-31, 15], or width, row or rolled tiles"
+      },
       "constraints": [
         "each operand has the output's shape or broadcasts to it, a tensor operand at the output's rank; tiled only when every operand is dense, a repeating constant, or one value per channel as the second operand; a constant operand, on either side, float or per-tensor int8; one per element runs untiled",
         "standalone rank-3 pointwise length tiling on serialized axis 1"
@@ -175,8 +179,8 @@
       "opcode": 8,
       "operator": "Mul",
       "routes": {
-        "cmsis-nn": "fallback:s8_ref",
-        "esp-nn": "fallback:s8_ref",
+        "cmsis-nn": "native",
+        "esp-nn": "native",
         "reference": "native",
         "s8_ref": "native"
       }
@@ -558,26 +562,32 @@
       }
     },
     {
+      "conditional_fallbacks": {
+        "cmsis-nn": "falls back unless dynamic operands have identical shapes and both inputs and output have equal per-tensor scales and zero points; width, row and rolled tiles fall back"
+      },
       "constraints": [
         "each operand has the output's shape or broadcasts to it, a tensor operand at the output's rank; tiled only when every operand is dense, a repeating constant, or one value per channel as the second operand; a constant operand, on either side, float or per-tensor int8; one per element runs untiled; int8 quantization must match"
       ],
       "opcode": 41,
       "operator": "Max",
       "routes": {
-        "cmsis-nn": "fallback:s8_ref",
+        "cmsis-nn": "native",
         "esp-nn": "fallback:s8_ref",
         "reference": "native",
         "s8_ref": "native"
       }
     },
     {
+      "conditional_fallbacks": {
+        "cmsis-nn": "falls back unless dynamic operands have identical shapes and both inputs and output have equal per-tensor scales and zero points; width, row and rolled tiles fall back"
+      },
       "constraints": [
         "each operand has the output's shape or broadcasts to it, a tensor operand at the output's rank; tiled only when every operand is dense, a repeating constant, or one value per channel as the second operand; a constant operand, on either side, float or per-tensor int8; one per element runs untiled; int8 quantization must match"
       ],
       "opcode": 42,
       "operator": "Min",
       "routes": {
-        "cmsis-nn": "fallback:s8_ref",
+        "cmsis-nn": "native",
         "esp-nn": "fallback:s8_ref",
         "reference": "native",
         "s8_ref": "native"
