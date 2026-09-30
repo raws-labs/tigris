@@ -1211,14 +1211,25 @@ def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
         op = producers.get(name)
         return op if op is not None and op.op_type == kind and len(op.inputs) == arity else None
 
+    def constant(name: str) -> bool:
+        source = producers.get(name)
+        if source is not None and source.op_type == "DequantizeLinear" and source.inputs:
+            name = source.inputs[0]
+        info = ag.tensors.get(name)
+        return name in ag.weight_data or (info is not None and info.is_constant)
+
     def zero(name: str) -> bool:
         value = ag.weight_data.get(name)
         return value is not None and value.size == 1 and float(value.reshape(-1)[0]) == 0.0
 
     def replace(root: OpNode, kind: str, inputs: list[str], parts: list[OpNode]) -> None:
+        # One operand may be a constant, dequantized or not; the binary
+        # checks judge its extent.
         operands = [ag.tensors.get(name) for name in inputs]
-        if (any(t is None or t.is_constant for t in operands)
-                or any(t.shape != operands[0].shape for t in operands[1:])):
+        dynamic = [t for name, t in zip(inputs, operands)
+                   if t is not None and not constant(name)]
+        if (any(t is None for t in operands) or not dynamic
+                or any(t.shape != dynamic[0].shape for t in dynamic[1:])):
             return
         names = {name for part in parts for name in part.outputs}
         group = {id(part) for part in parts} | {id(root)}

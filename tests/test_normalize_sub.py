@@ -50,8 +50,8 @@ def test_two_activations_stay_a_subtraction(tmp_path):
     assert validate_operator_support(ag).supported
 
 
-def test_constant_minuend_is_refused(tmp_path):
-    """c - x has no commutative equivalent the plan can express."""
+def test_constant_minuend_stays_a_subtraction(tmp_path):
+    """c - x has no commutative equivalent; the plan states the constant's side."""
     ag = _normalized(
         tmp_path,
         [helper.make_node("Sub", ["constant", "x"], ["y"], name="sub1")],
@@ -59,9 +59,8 @@ def test_constant_minuend_is_refused(tmp_path):
         [_constant([0.5, -1.0, 2.0, 0.25])])
 
     assert [op.op_type for op in ag.ops] == ["Sub"]
-    support = validate_operator_support(ag)
-    assert not support.supported
-    assert "does not commute" in support.describe()
+    assert ag.ops[0].inputs[0] == "constant"
+    assert validate_operator_support(ag).supported
 
 
 def test_neg_uses_its_unary_kernel(tmp_path):
@@ -91,13 +90,13 @@ def test_squared_difference_preserves_shared_intermediate(tmp_path, expose_diffe
     assert "difference" in ag.tensors
 
 
-def test_constant_squared_difference_keeps_supported_composition(tmp_path):
+def test_constant_squared_difference_folds_with_its_constant(tmp_path):
     ag = _normalized(tmp_path,
                      [helper.make_node("Sub", ["a", "constant"], ["difference"]),
                       helper.make_node("Mul", ["difference", "difference"], ["y"])],
                      [_vi("a", [1, 4])], [_vi("y", [1, 4])],
                      [_constant([0.5, -1, 2, 0.25])])
-    assert [op.op_type for op in ag.ops] == ["Add", "Square"]
+    assert [op.op_type for op in ag.ops] == ["SquaredDifference"]
     assert validate_operator_support(ag).supported
 
 

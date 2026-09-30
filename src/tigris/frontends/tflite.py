@@ -276,9 +276,11 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         for operand in ins:
             if not _is_constant(operand) and len(operand.shape) != rank:
                 return "operands of different rank"
-    if op.kind in _ELEMENTWISE_BINARY and (
-            any(_is_constant(t) for t in ins) or ins[0].shape != ins[1].shape):
-        return "only two non-constant operands of the same shape convert"
+    if op.kind in _ELEMENTWISE_BINARY:
+        dynamic = [t for t in ins if not _is_constant(t)]
+        if not dynamic or len(dynamic[0].shape) != rank or (
+                len(dynamic) == 2 and dynamic[0].shape != dynamic[1].shape):
+            return "operands of different shape"
     if op.kind == "CONCATENATION":
         if any(t.scale[0] != outs[0].scale[0] or t.zero_point[0] != outs[0].zero_point[0] for t in data):
             return "inputs quantized differently from the output"
@@ -382,6 +384,11 @@ class _Converter:
         return self.b.dequantized_constant(array, tensor.scale, tensor.zero_point, tensor.name,
                                            axis=axis)
 
+    def operands(self, op: _Operator) -> list[str]:
+        """A binary operator's operands, a constant aligned to the output's rank."""
+        rank = len(self.tensors[op.outputs[0]].shape)
+        return [self.value(i, rank if i not in self.values else None) for i in op.inputs]
+
     def ints(self, index: int) -> list[int]:
         return [int(v) for v in self.tensors[index].array().reshape(-1)]
 
@@ -448,9 +455,7 @@ class _Converter:
                        tag, kernel_shape=[kh, kw], strides=[sh, sw],
                        pads=[top, left, bottom, right], **attributes)
         elif kind in ("ADD", "SUB", "MUL"):
-            rank = len(out.shape)
-            y = b.node({"ADD": "Add", "SUB": "Sub", "MUL": "Mul"}[kind],
-                       [self.value(i, rank if i not in self.values else None) for i in ins], tag)
+            y = b.node({"ADD": "Add", "SUB": "Sub", "MUL": "Mul"}[kind], self.operands(op), tag)
         elif kind == "CONCATENATION":
             y = b.node("Concat", [self.value(i) for i in ins], tag,
                        axis=_onnx_axis(op.option(0, "i"), len(out.shape)))
@@ -463,15 +468,14 @@ class _Converter:
             y = b.node("Mul", [x, x], tag)
         elif kind in ("DIV", "MAXIMUM", "MINIMUM"):
             y = b.node({"DIV": "Div", "MAXIMUM": "Max", "MINIMUM": "Min"}[kind],
-                       [self.value(i) for i in ins], tag)
+                       self.operands(op), tag)
         elif kind == "SQUARED_DIFFERENCE":
-            difference = b.node("Sub", [self.value(i) for i in ins], tag + "_difference")
+            difference = b.node("Sub", self.operands(op), tag + "_difference")
             y = b.node("Mul", [difference, difference], tag)
         elif kind == "FLOOR_DIV":
-            y = b.node("Floor", [b.node("Div", [self.value(i) for i in ins], tag + "_quotient")],
-                       tag)
+            y = b.node("Floor", [b.node("Div", self.operands(op), tag + "_quotient")], tag)
         elif kind == "FLOOR_MOD":
-            y = self._floor_mod(self.value(ins[0]), self.value(ins[1]), tag)
+            y = self._floor_mod(*self.operands(op), tag)
         elif kind in _UNARY:
             y = b.node(_UNARY[kind], [self.value(ins[0])], tag)
         elif kind == "RELU6":
