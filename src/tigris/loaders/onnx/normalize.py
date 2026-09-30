@@ -40,7 +40,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from tigris.analysis.broadcast import GENERAL, PERIODIC, stored_operands
+from tigris.analysis.broadcast import DENSE, GENERAL, PERIODIC, stored_operands
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
@@ -2963,8 +2963,11 @@ def _mark_untileable_broadcasts(ag: AnalyzedGraph) -> AnalyzedGraph:
         if operands is None:
             continue
         untileable = False
-        for position, (_, constant, stored, how) in enumerate(operands):
+        for position, (name, constant, stored, how) in enumerate(operands):
             if how == GENERAL:
+                untileable = True
+            elif how == DENSE and constant and ag.weight_data[name].size > 1:
+                # One constant value per element carries no row offset.
                 untileable = True
             elif how == PERIODIC and not constant and not (
                     position == 1 and all(dim == 1 for dim in stored[:-1])):

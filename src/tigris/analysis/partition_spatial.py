@@ -21,6 +21,7 @@ from tigris.graph.ir import (
     OpNode,
     Stage,
     TilePlan,
+    serialized_axis_map,
     serialized_shape,
     serialized_transpose_perm,
 )
@@ -1511,15 +1512,24 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             )
             continue
 
-        # Solve for tile height
+        # Solve for tile height. The proportional share of the stage peak
+        # ignores each band buffer's alignment, which dominates small bands,
+        # so the band also has to fit as the runtime allocates it.
         peak = stage.peak_bytes
+
+        def band_peak(rows: int) -> int:
+            return max(int(peak * (rows + halo) / input_h),
+                       _stage_band_bytes(ag, stage, rows + halo))
+
         tile_h = math.floor(budget * input_h / peak) - halo
-        tile_h = max(tile_h, 1)
+        tile_h = max(min(tile_h, input_h), 1)
+        while tile_h > 1 and band_peak(tile_h) > budget:
+            tile_h -= 1
 
         num_tiles = math.ceil(input_h / tile_h)
 
         # Estimate tiled peak memory
-        tiled_peak = int(peak * (tile_h + halo) / input_h)
+        tiled_peak = band_peak(tile_h)
 
         # A single-row height tile that still overflows the budget cannot be
         # rescued by any smaller height-only tile: height is already at its
@@ -2024,6 +2034,42 @@ def _back_propagate_tile_heights(
 def _align_up(x: int, align: int) -> int:
     """Round up to the deployment memory model's tensor alignment."""
     return (x + align - 1) & ~(align - 1)
+
+
+def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int) -> int:
+    """Fast memory one band of a height-striped stage takes, as the runtime
+    allocates it: every stage input and every op output its own aligned band,
+    op heights carried forward through the spatial ops."""
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+    weight_shapes = _ag_weight_shapes(ag)
+
+    def band(info, rows: int) -> int:
+        # The band cuts serialized axis 1, whichever model axis that holds.
+        if len(info.shape) not in (3, 4):
+            return _align_up(info.size_bytes, align)
+        axis_map = serialized_axis_map(len(info.shape), info.layout)
+        height = int(info.shape[axis_map.index(1)])
+        if height <= 0:
+            return _align_up(info.size_bytes, align)
+        return _align_up(-(-info.size_bytes * min(rows, height) // height), align)
+
+    total = 0
+    for name in stage.input_tensors:
+        info = ag.tensors.get(name)
+        if info is not None and not info.is_constant:
+            total += band(info, in_rows)
+    rows = in_rows
+    for op_i in stage.op_indices:
+        op = ag.ops[op_i]
+        if op_category(op) in (TileCategory.CONV, TileCategory.POOL):
+            kh = _get_kernel_h(op, weight_shapes)
+            ekh = _get_dilation_h(op) * (kh - 1) + 1
+            rows = max((rows - ekh) // _get_stride_h(op) + 1, 1)
+        for name in op.outputs:
+            info = ag.tensors.get(name)
+            if info is not None:
+                total += band(info, rows)
+    return total
 
 
 def _chain_fast_bytes(

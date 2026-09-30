@@ -59,12 +59,15 @@ def _session():
     return Session
 
 
-def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path):
+def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path,
+                                 tight: bool = False):
     """Runs the compiled plan on TFLite Micro's recorded inputs, in the
     model's own dtypes, and compares the outputs bit for bit."""
     Session = _session()
     plan_path = tmp_path / "model.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", budget, "-o", str(plan_path)])
+    if tight and result.exit_code != 0 and "fast-memory budget" in result.output:
+        pytest.skip("does not fit the tight budget: " + result.output.strip().splitlines()[-1])
     assert result.exit_code == 0, result.output
     _, graphs = tflite._read(model.read_bytes())
     _, tensors, inputs, outputs, _ = graphs[0]
@@ -95,6 +98,14 @@ def test_plan_reproduces_tflite_micro_outputs(tmp_path):
 def test_single_operator_matches_tflite_micro(model, tmp_path):
     assert tflite.unsupported(model.read_bytes()) == []
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256K", tmp_path)
+
+
+@pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("*.tflite")), ids=lambda p: p.stem)
+def test_single_operator_matches_tflite_micro_when_tiled(model, tmp_path):
+    """The same comparison at a budget that forces tiling wherever the
+    operator tiles; one that cannot fit it untiled is reported as a skip."""
+    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path,
+                                 tight=True)
 
 
 @pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("resize_*_down.tflite")), ids=lambda p: p.stem)
