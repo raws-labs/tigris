@@ -246,23 +246,28 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     if op.kind in _WEIGHTED:
         source, position, bias_position = _WEIGHTED[op.kind]
         weights = ins[position]
-        if weights.type != "INT8" or np.any(weights.zero_point != 0) or not _is_constant(weights):
-            return "weights must be constant symmetric int8"
         bias = ins[bias_position] if bias_position < len(ins) else None
-        if bias is not None and bias.type != "INT32":
-            return "bias must be int32"
         data = [ins[source]]
+        if data[0].type == "FLOAT32":
+            if weights.type != "FLOAT32" or not _is_constant(weights):
+                return "weights of a float32 operator must be constant float32"
+            if bias is not None and bias.type != "FLOAT32":
+                return "bias of a float32 operator must be float32"
+        else:
+            if weights.type != "INT8" or np.any(weights.zero_point != 0) or not _is_constant(weights):
+                return "weights must be constant symmetric int8"
+            if bias is not None and bias.type != "INT32":
+                return "bias must be int32"
     if op.kind == "QUANTIZE":
         if data[0].type not in ("INT8", "FLOAT32") or outs[0].type != "INT8":
             return "only float or int8 to int8 converts"
     elif op.kind == "DEQUANTIZE":
         if data[0].type != "INT8" or outs[0].type != "FLOAT32":
             return "only int8 to float converts"
-    elif op.kind in _ELEMENTWISE and all(t.type == "FLOAT32" for t in [*data, *outs]):
+    elif all(t.type == "FLOAT32" for t in [*data, *outs]):
         pass
     elif any(t.type != "INT8" for t in [*data, *outs]):
-        return ("activations must be all int8 or all float32" if op.kind in _ELEMENTWISE
-                else "only int8 activations convert")
+        return "activations must be all int8 or all float32"
     elif op.kind in _ELEMENTWISE and op.kind not in _INT8_ELEMENTWISE:
         return "TFLite Micro runs it in float32 only"
     if any(len(t.scale) != 1 for t in [*data, *outs] if t.type == "INT8"):
@@ -280,7 +285,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         dynamic = [t for t in ins if not _is_constant(t)]
         if not dynamic or any(len(t.shape) != rank for t in dynamic):
             return "operands of different rank"
-    if op.kind == "CONCATENATION":
+    if op.kind == "CONCATENATION" and outs[0].type == "INT8":
         if any(t.scale[0] != outs[0].scale[0] or t.zero_point[0] != outs[0].zero_point[0] for t in data):
             return "inputs quantized differently from the output"
     if op.kind == "SOFTMAX" and op.option(0, "f", 1.0) != 1.0:
@@ -515,8 +520,12 @@ class _Converter:
             pads = b.constant(np.asarray([pairs[a, 0] for a in order] + [pairs[a, 1] for a in order],
                                          np.int64), tag + "_pads")
             source = self.tensors[ins[0]]
-            fill = (float((int(self.ints(ins[2])[0]) - source.zero_point[0]) * source.scale[0])
-                    if kind == "PADV2" and len(ins) > 2 else 0.0)
+            if kind != "PADV2" or len(ins) < 3:
+                fill = 0.0
+            elif source.type == "FLOAT32":
+                fill = float(self.tensors[ins[2]].array().reshape(-1)[0])
+            else:
+                fill = float((int(self.ints(ins[2])[0]) - source.zero_point[0]) * source.scale[0])
             y = b.node("Pad", [self.value(ins[0]), pads, b.constant(np.float32(fill), tag + "_fill")],
                        tag, mode="constant")
         elif kind == "BATCH_MATMUL":
@@ -571,13 +580,20 @@ class _Converter:
         shifted = b.node("Add", [remainder, divisor], tag + "_shifted")
         return b.node("Where", [condition, shifted, remainder], tag)
 
+    def weights(self, tensor: _Tensor, array: np.ndarray, axis: int,
+                zero_dtype=np.int8) -> str:
+        """A weight or bias: float32 as it is, int8 or int32 behind a
+        DequantizeLinear with symmetric zero points."""
+        if tensor.type == "FLOAT32":
+            return self.b.constant(array.astype(np.float32), tensor.name)
+        return self.b.dequantized_constant(array, tensor.scale, np.zeros_like(tensor.zero_point),
+                                           tensor.name, axis=axis, zero_dtype=zero_dtype)
+
     def _bias(self, op: _Operator, position: int, name: str) -> str | None:
         if position >= len(op.inputs) or op.inputs[position] < 0:
             return None
         tensor = self.tensors[op.inputs[position]]
-        return self.b.dequantized_constant(tensor.array(), tensor.scale,
-                                           np.zeros_like(tensor.zero_point), tensor.name,
-                                           axis=0, zero_dtype=np.int32)
+        return self.weights(tensor, tensor.array(), 0, np.int32)
 
     def _conv(self, op: _Operator, tag: str) -> str:
         depthwise = op.kind == "DEPTHWISE_CONV_2D"
@@ -590,9 +606,7 @@ class _Converter:
             op.option(4, "i", 1), op.option(5, "i", 1))
         top, bottom = same_padding(source.shape[1], out.shape[1], (kh - 1) * dh + 1, sh)
         left, right = same_padding(source.shape[2], out.shape[2], (kw - 1) * dw + 1, sw)
-        w = self.b.dequantized_constant(weights, weights_tensor.scale,
-                                        np.zeros_like(weights_tensor.zero_point),
-                                        weights_tensor.name, axis=0)
+        w = self.weights(weights_tensor, weights, 0)
         operands = [self.value(op.inputs[0]), w]
         bias = self._bias(op, 2, tag)
         if bias:
@@ -609,9 +623,7 @@ class _Converter:
         sw, sh = op.option(1, "i", 1), op.option(2, "i", 1)
         top, bottom = same_padding(out.shape[1], source.shape[1], kh, sh)
         left, right = same_padding(out.shape[2], source.shape[2], kw, sw)
-        w = self.b.dequantized_constant(weights, weights_tensor.scale,
-                                        np.zeros_like(weights_tensor.zero_point),
-                                        weights_tensor.name, axis=1)
+        w = self.weights(weights_tensor, weights, 1)
         operands = [self.value(op.inputs[2]), w]
         bias = self._bias(op, 3, tag)
         if bias:
@@ -622,9 +634,7 @@ class _Converter:
     def _fully_connected(self, op: _Operator, tag: str) -> str:
         source, weights_tensor = self.tensors[op.inputs[0]], self.tensors[op.inputs[1]]
         out = self.tensors[op.outputs[0]]
-        w = self.b.dequantized_constant(weights_tensor.array(), weights_tensor.scale,
-                                        np.zeros_like(weights_tensor.zero_point),
-                                        weights_tensor.name, axis=0)
+        w = self.weights(weights_tensor, weights_tensor.array(), 0)
         bias = self._bias(op, 2, tag) or self.b.constant(
             np.zeros(weights_tensor.shape[0], np.float32), out.name + "_bias")
         x = self.value(op.inputs[0])
