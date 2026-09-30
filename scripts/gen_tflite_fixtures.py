@@ -226,6 +226,7 @@ CASES.update({
         lambda x: tf.space_to_batch_nd(x, [2, 2], [[1, 1], [0, 2]]), (1, 4, 4, 3)),
     "batch_to_space": _unary(
         lambda x: tf.batch_to_space(x, [2, 2], [[0, 1], [1, 0]]), (4, 3, 3, 3)),
+    "broadcast_to": _unary(lambda x: tf.broadcast_to(x, (1, 6, 6, 4)), (1, 1, 6, 4)),
 })
 # The tier-1 cases again, converted without quantization.
 _FLOAT_TIER1 = (
@@ -236,7 +237,7 @@ _FLOAT_TIER1 = (
     "depthwise_multiplier", "transpose_conv", "batch_matmul", "fully_connected_rank3",
     "pad_conv", "pad", "padv2", "squeeze_op", "expand_dims_op", "softmax", "pack", "unpack",
     "slice", "strided_slice", "strided_slice_shrink", "gather", "gather_scalar",
-    "space_to_depth", "depth_to_space", "space_to_batch", "batch_to_space",
+    "space_to_depth", "depth_to_space", "space_to_batch", "batch_to_space", "broadcast_to",
 )
 for _name in _FLOAT_TIER1:
     FLOAT_MODELS[f"float_{_name}"] = CASES[_name]

@@ -219,7 +219,7 @@ _ELEMENTWISE = (*_ELEMENTWISE_UNARY, *_ELEMENTWISE_BINARY, "RSQRT", "SQUARE")
 _INT8_ELEMENTWISE = ("ABS", "RSQRT", "SQUARED_DIFFERENCE", "MAXIMUM", "MINIMUM", "DIV")
 # Data movement built from Split, Concat, Reshape and Transpose.
 _DATA_MOVEMENT = ("SLICE", "STRIDED_SLICE", "GATHER", "PACK", "UNPACK", "SPACE_TO_DEPTH",
-                  "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND")
+                  "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND", "BROADCAST_TO")
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, "RELU6",
               "SOFTMAX", "MEAN",
               "TRANSPOSE",
@@ -232,7 +232,8 @@ _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V":
                       "PAD": (1,), "PADV2": (1, 2), "RESHAPE": (1,), "EXPAND_DIMS": (1,),
                       "RESIZE_NEAREST_NEIGHBOR": (1,), "RESIZE_BILINEAR": (1,),
                       "TRANSPOSE_CONV": (0,), "SLICE": (1, 2), "STRIDED_SLICE": (1, 2, 3),
-                      "GATHER": (1,), "SPACE_TO_BATCH_ND": (1, 2), "BATCH_TO_SPACE_ND": (1, 2)}
+                      "GATHER": (1,), "SPACE_TO_BATCH_ND": (1, 2), "BATCH_TO_SPACE_ND": (1, 2),
+                      "BROADCAST_TO": (1,)}
 
 
 def _is_constant(tensor: _Tensor) -> bool:
@@ -691,6 +692,22 @@ class _Converter:
             y = b.node("Transpose", [y], tag, perm=_to_first(4))
         elif kind in ("SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND"):
             y = self._batch_space(op, tag)
+        elif kind == "BROADCAST_TO":
+            # Leading axes by reshape, then each broadcast axis as copies.
+            source = list(self.tensors[ins[0]].shape)
+            shape = [1] * (len(out.shape) - len(source)) + source
+            y = self.value(ins[0])
+            if shape != source:
+                y = self.held(self.reshape(y, source, shape, tag + "_rank", ins[0]), ins[0],
+                              tag + "_rank_q")
+            axes = [a for a, (d, t) in enumerate(zip(shape, out.shape)) if d != t]
+            for step, axis in enumerate(axes):
+                y = b.node("Concat", [y] * out.shape[axis], f"{tag}_axis{axis}",
+                           axis=_onnx_axis(axis, len(shape)))
+                if step < len(axes) - 1:
+                    y = self.held(y, ins[0], f"{tag}_axis{axis}_q")
+            if not axes:
+                y = b.node("Identity", [y], tag)
         elif kind == "BATCH_MATMUL":
             # The matrices are the last two TFLite axes, so the product runs
             # in TFLite's own axis order.
