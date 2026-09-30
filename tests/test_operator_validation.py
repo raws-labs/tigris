@@ -280,7 +280,7 @@ def test_unrepresentable_pool_attributes_are_rejected(
                 "input": TensorInfo("input", (1, 3, 4, 4), TensorProto.FLOAT),
                 "output": TensorInfo("output", (1, 3, 8, 8), TensorProto.FLOAT),
             },
-            "Resize mode must be 'nearest'",
+            "must state a TFLite sampling convention",
         ),
         (
             OpNode(
@@ -294,11 +294,11 @@ def test_unrepresentable_pool_attributes_are_rejected(
                 "input": TensorInfo("input", (1, 3, 4, 4), TensorProto.FLOAT),
                 "output": TensorInfo("output", (1, 3, 8, 8), TensorProto.FLOAT),
             },
-            "coordinate_transformation_mode must be 'asymmetric'",
+            "must state a TFLite sampling convention",
         ),
         (
             OpNode(
-                name="fractional_resize",
+                name="channel_resize",
                 op_type="Resize",
                 inputs=["input"],
                 outputs=["output"],
@@ -310,9 +310,9 @@ def test_unrepresentable_pool_attributes_are_rejected(
             ),
             {
                 "input": TensorInfo("input", (1, 3, 4, 4), TensorProto.FLOAT),
-                "output": TensorInfo("output", (1, 3, 7, 8), TensorProto.FLOAT),
+                "output": TensorInfo("output", (1, 4, 7, 8), TensorProto.FLOAT),
             },
-            "integer H/W upscaling",
+            "unchanged N/C",
         ),
     ],
 )
@@ -399,6 +399,20 @@ def test_dynamic_elementwise_broadcasting_is_rejected():
 
     assert not validation.supported
     assert "a tensor operand at the output's rank" in validation.describe()
+
+
+@pytest.mark.parametrize("height,supported", [(2049, True), (4096, False)])
+def test_bilinear_reference_coordinate_range(height, supported):
+    quant = QuantParam(scale=np.array([0.125], np.float32), zero_point=np.array([-17], np.int8))
+    graph = AnalyzedGraph(
+        ops=[OpNode("resize", "ResizeLinear", ["input"], ["output"],
+                    attrs={"coordinate_transformation_mode": "align_corners"})],
+        tensors={"input": TensorInfo("input", (1, 1, 3, 1), TensorProto.INT8, quant=quant),
+                 "output": TensorInfo("output", (1, 1, height, 1), TensorProto.INT8, quant=quant)})
+    result = validate_operator_support(graph)
+    assert result.supported == supported
+    if not supported:
+        assert "defined TFLite reference coordinate range" in result.describe()
 
 
 def test_quantized_constant_operand_without_its_quantization_is_rejected():

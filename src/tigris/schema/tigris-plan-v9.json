@@ -19,6 +19,7 @@
     "epsilon": 2,
     "pads": 5,
     "pool_rounding": 8,
+    "resize_scales": 10,
     "transpose_perm": 1
   },
   "op_types": {

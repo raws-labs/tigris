@@ -182,11 +182,12 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "over both spatial axes is rewritten to GlobalAveragePool instead",
     ),
     "Resize": (
-        "rank-4 nearest-neighbor integer H/W upscaling; height tiling as the "
+        "rank-4 nearest-neighbor H/W resizing with asymmetric floor, "
+        "half-pixel centers or align-corners rounding; height tiling as the "
         "stage's single spatial op, never in a chain",
     ),
     "ResizeLinear": (
-        "rank-4 bilinear integer H/W upscaling with half-pixel or asymmetric "
+        "rank-4 bilinear H/W resizing with half-pixel, asymmetric or align-corners "
         "coordinates; height tiling as the stage's single spatial op, never "
         "in a chain",
     ),

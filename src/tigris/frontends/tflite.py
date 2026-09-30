@@ -293,11 +293,8 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         align, half_pixel = ((op.option(2, "?", False), op.option(3, "?", False))
                              if op.kind == "RESIZE_BILINEAR" else
                              (op.option(0, "?", False), op.option(1, "?", False)))
-        if align:
-            return "align_corners"
-        if op.kind == "RESIZE_NEAREST_NEIGHBOR" and half_pixel and any(
-                o % i for i, o in zip(ins[0].shape[1:3], outs[0].shape[1:3])):
-            return "half-pixel centers with a non-integer scale"
+        if align and half_pixel:
+            return "align_corners and half_pixel_centers together"
     return ""
 
 
@@ -543,15 +540,15 @@ class _Converter:
                            perm=_to_first(rank))
         elif kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
             sizes = b.constant(np.asarray(_onnx_shape(out.shape), np.int64), tag + "_sizes")
+            align = op.option(2 if kind == "RESIZE_BILINEAR" else 0, "?", False)
             half_pixel = op.option(3 if kind == "RESIZE_BILINEAR" else 1, "?", False)
             if kind == "RESIZE_BILINEAR":
-                attributes = {"mode": "linear", "coordinate_transformation_mode":
-                              "half_pixel" if half_pixel else "asymmetric"}
+                coordinate = "align_corners" if align else "half_pixel" if half_pixel else "asymmetric"
+                attributes = {"mode": "linear", "coordinate_transformation_mode": coordinate}
             else:
-                # With an integer scale, half-pixel centers pick the same source
-                # pixel as the asymmetric floor rule.
-                attributes = {"mode": "nearest", "coordinate_transformation_mode": "asymmetric",
-                              "nearest_mode": "floor"}
+                coordinate = "align_corners" if align else "tf_half_pixel_for_nn" if half_pixel else "asymmetric"
+                attributes = {"mode": "nearest", "coordinate_transformation_mode": coordinate,
+                              "nearest_mode": "round_prefer_ceil" if align else "floor"}
             y = b.node("Resize", [self.value(ins[0]), "", "", sizes], tag, **attributes)
         elif kind in ("QUANTIZE", "DEQUANTIZE"):
             y = self.value(ins[0])

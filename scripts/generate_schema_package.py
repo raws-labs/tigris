@@ -24,6 +24,7 @@ def schema_package() -> dict[str, object]:
         "endianness": "little",
         "magic_ascii": defs.MAGIC.decode("ascii"),
         "op_attribute_types": {
+            "resize_scales": defs.OP_ATTR_RESIZE_SCALES,
             "alpha": defs.OP_ATTR_ALPHA,
             "axes": defs.OP_ATTR_AXES,
             "binary_requant": defs.OP_ATTR_BINARY_REQUANT,
