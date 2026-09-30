@@ -875,6 +875,46 @@ def _broadcast_case(*, op_type: str, quantized: bool, other_shape: list[int],
                         mem_budget="16K")
 
 
+def _standalone_pad_case(*, quantized: bool) -> ContractCase:
+    """A Pad that no convolution absorbs, with a nonzero fill, padding both
+    spatial axes unevenly."""
+    channels, side = 3, 6
+    rng = np.random.default_rng(27)
+    weight = (rng.normal(size=(channels, channels, 3, 3)) * 0.25).astype(np.float32)
+    data = rng.uniform(-1.0, 1.0, size=(1, channels, side, side)).astype(np.float32)
+    initializers = [
+        numpy_helper.from_array(weight, "weight"),
+        numpy_helper.from_array(np.array([0, 0, 1, 0, 0, 0, 2, 1], np.int64), "pads"),
+        numpy_helper.from_array(np.array(0.75, np.float32), "fill"),
+    ]
+    conv = dict(kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    if quantized:
+        initializers += _scalars(inp=(0.008, 0), w=(0.01, 0), act=(0.03, -5))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            *_qdq("weight", "w_s", "w_z", "wdq"),
+            helper.make_node("Conv", ["x", "wdq"], ["raw"], **conv),
+            *_qdq("raw", "act_s", "act_z", "c"),
+            helper.make_node("Pad", ["c", "pads", "fill"], ["padded"], mode="constant"),
+            *_qdq("padded", "act_s", "act_z", "output"),
+        ]
+    else:
+        nodes = [
+            helper.make_node("Conv", ["input", "weight"], ["c"], **conv),
+            helper.make_node("Pad", ["c", "pads", "fill"], ["output"], mode="constant"),
+        ]
+    label = f"{'int8' if quantized else 'float'}_standalone_pad"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT,
+                                       [1, channels, side + 3, side + 1])],
+        initializers, opset=14,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data}, ("Conv", "Pad"),
+                        mem_budget="16K")
+
+
 def _split_chain_case(*, quantized: bool) -> ContractCase:
     """A strided stem feeding wide layers, too big to stream as one chain.
 
@@ -6297,6 +6337,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _broadcast_case(op_type="Mul", quantized=False, other_shape=[1, 1, 12, 1], first=True),
         _broadcast_case(op_type="Add", quantized=True, other_shape=[1, 1, 12, 1], first=False,
                         constant=True),
+        _standalone_pad_case(quantized=False),
+        _standalone_pad_case(quantized=True),
         _depthwise_multiplier_case(quantized=False),
         _depthwise_multiplier_case(quantized=True),
         _inner_axis_concat_case(axis=2, quantized=False),

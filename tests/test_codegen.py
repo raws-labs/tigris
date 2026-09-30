@@ -35,7 +35,7 @@ from tigris.loaders import load_model
 def unsupported_operator_plan(tmp_path):
     """A QDQ plan holding an operator no dispatcher can execute.
 
-    Pad has a schema opcode and no kernel on any backend, and normalization
+    InstanceNormalization has a schema opcode and no kernel on any backend, and normalization
     leaves it alone, so it reaches the plan intact. The operator itself is not
     the point: this fixture exists so codegen's capability check has something
     to refuse. The assertion below says so, because three earlier exemplars
@@ -45,13 +45,14 @@ def unsupported_operator_plan(tmp_path):
 
     routed = frozenset().union(
         *(effective_operators(backend) for backend in KERNEL_CAPABILITIES))
-    assert "Pad" not in routed, (
-        "Pad now has a kernel; pick another unrouted operator for this fixture")
+    assert "InstanceNormalization" not in routed, (
+        "InstanceNormalization now has a kernel; pick another unrouted operator "
+        "for this fixture")
     model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 4]
+        "input", TensorProto.FLOAT, [1, 4, 2]
     )
     model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 4]
+        "output", TensorProto.FLOAT, [1, 4, 2]
     )
     input_scale = numpy_helper.from_array(
         np.array([0.05], dtype=np.float32), "input_scale"
@@ -59,9 +60,8 @@ def unsupported_operator_plan(tmp_path):
     input_zp = numpy_helper.from_array(
         np.array([0], dtype=np.int8), "input_zp"
     )
-    pads = numpy_helper.from_array(
-        np.array([0, 0, 0, 0], dtype=np.int64), "pads"
-    )
+    norm_scale = numpy_helper.from_array(np.ones(4, dtype=np.float32), "norm_scale")
+    norm_bias = numpy_helper.from_array(np.zeros(4, dtype=np.float32), "norm_bias")
     output_scale = numpy_helper.from_array(
         np.array([0.1], dtype=np.float32), "output_scale"
     )
@@ -81,7 +81,8 @@ def unsupported_operator_plan(tmp_path):
             ["input_dq"],
         ),
         helper.make_node(
-            "Pad", ["input_dq", "pads"], ["padded"], name="unsupported"
+            "InstanceNormalization", ["input_dq", "norm_scale", "norm_bias"],
+            ["padded"], name="unsupported"
         ),
         helper.make_node(
             "QuantizeLinear",
@@ -102,7 +103,8 @@ def unsupported_operator_plan(tmp_path):
         initializer=[
             input_scale,
             input_zp,
-            pads,
+            norm_scale,
+            norm_bias,
             output_scale,
             output_zp,
         ],
@@ -117,10 +119,10 @@ def unsupported_operator_plan(tmp_path):
     onnx.save(model, model_path)
     analyzed = _full_pipeline(model_path, budget=4096)
     assert analyzed.is_quantized
-    assert [op.op_type for op in analyzed.ops] == ["Pad"]
+    assert [op.op_type for op in analyzed.ops] == ["InstanceNormalization"]
 
     plan_path = tmp_path / "quantized_unsupported.tgrs"
-    # Pad has no runtime route on any backend, so validate_operator_support
+    # InstanceNormalization has no runtime route on any backend, so validate_operator_support
     # now correctly rejects it at compile time (the fail-closed gate this
     # fixture predates). This fixture exists to exercise codegen's own,
     # separate defense-in-depth capability check against an already-serialized
@@ -521,7 +523,7 @@ def test_unsupported_operator_codegen_fails_before_output(
 
     assert result.exit_code != 0
     assert f"Backend '{backend}' cannot execute this int8 plan" in result.output
-    assert "unsupported (Pad)" in result.output
+    assert "unsupported (InstanceNormalization)" in result.output
     assert not output.exists()
 
 
