@@ -217,7 +217,11 @@ _ELEMENTWISE_BINARY = ("DIV", "MAXIMUM", "MINIMUM", "SQUARED_DIFFERENCE", "FLOOR
 _ELEMENTWISE = (*_ELEMENTWISE_UNARY, *_ELEMENTWISE_BINARY, "RSQRT", "SQUARE")
 # The ones TFLite Micro also runs in int8; the others are float only there.
 _INT8_ELEMENTWISE = ("ABS", "RSQRT", "SQUARED_DIFFERENCE", "MAXIMUM", "MINIMUM", "DIV")
-_SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, "RELU6", "SOFTMAX", "MEAN",
+# Data movement built from Split, Concat, Reshape and Transpose.
+_DATA_MOVEMENT = ("SLICE", "STRIDED_SLICE", "GATHER", "PACK", "UNPACK", "SPACE_TO_DEPTH",
+                  "DEPTH_TO_SPACE")
+_SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, "RELU6",
+              "SOFTMAX", "MEAN",
               "TRANSPOSE",
               "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
               "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE")
@@ -227,7 +231,8 @@ _WEIGHTED = {"CONV_2D": (0, 1, 2), "DEPTHWISE_CONV_2D": (0, 1, 2), "FULLY_CONNEC
 _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V": (1, 2),
                       "PAD": (1,), "PADV2": (1, 2), "RESHAPE": (1,), "EXPAND_DIMS": (1,),
                       "RESIZE_NEAREST_NEIGHBOR": (1,), "RESIZE_BILINEAR": (1,),
-                      "TRANSPOSE_CONV": (0,)}
+                      "TRANSPOSE_CONV": (0,), "SLICE": (1, 2), "STRIDED_SLICE": (1, 2, 3),
+                      "GATHER": (1,)}
 
 
 def _is_constant(tensor: _Tensor) -> bool:
@@ -288,6 +293,10 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     if op.kind == "CONCATENATION" and outs[0].type == "INT8":
         if any(t.scale[0] != outs[0].scale[0] or t.zero_point[0] != outs[0].zero_point[0] for t in data):
             return "inputs quantized differently from the output"
+    if op.kind in _DATA_MOVEMENT:
+        reason = _data_movement_reason(op, ins, outs)
+        if reason:
+            return reason
     if op.kind == "SOFTMAX" and op.option(0, "f", 1.0) != 1.0:
         return "beta other than 1"
     if op.kind == "FULLY_CONNECTED" and op.option(1, "b") != 0:
@@ -300,6 +309,62 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                              (op.option(0, "?", False), op.option(1, "?", False)))
         if align and half_pixel:
             return "align_corners and half_pixel_centers together"
+    return ""
+
+
+def _same_quantization(tensors) -> bool:
+    first = tensors[0]
+    return all(t.type == first.type and np.array_equal(t.scale, first.scale)
+               and np.array_equal(t.zero_point, first.zero_point) for t in tensors[1:])
+
+
+def _strided_slice_bounds(op: _Operator, ins: list[_Tensor]):
+    """Per axis (begin, size, shrink) of a stride-1 STRIDED_SLICE, or None."""
+    shape = ins[0].shape
+    begins, ends, strides = (list(ins[i].array().reshape(-1)) for i in (1, 2, 3))
+    begin_mask, end_mask = op.option(0, "i"), op.option(1, "i")
+    shrink_mask = op.option(4, "i")
+    if (op.option(2, "i") or op.option(3, "i") or op.option(5, "?", False)
+            or len(begins) != len(shape) or any(int(v) != 1 for v in strides)):
+        return None
+    bounds = []
+    for axis, extent in enumerate(shape):
+        begin = 0 if begin_mask >> axis & 1 else int(begins[axis])
+        end = extent if end_mask >> axis & 1 else int(ends[axis])
+        begin = min(max(begin + extent if begin < 0 else begin, 0), extent)
+        end = min(max(end + extent if end < 0 else end, 0), extent)
+        shrink = bool(shrink_mask >> axis & 1)
+        if shrink:
+            end = begin + 1
+        if end <= begin:
+            return None
+        bounds.append((begin, end - begin, shrink))
+    return bounds
+
+
+def _gather_run(op: _Operator, ins: list[_Tensor]):
+    """(axis, first, count, scalar) when a GATHER takes a contiguous run of one
+    axis, or None."""
+    indices = [int(v) for v in ins[1].array().reshape(-1)]
+    axis = op.option(0, "i") % len(ins[0].shape)
+    extent = ins[0].shape[axis]
+    indices = [i + extent if i < 0 else i for i in indices]
+    if (op.option(1, "i") or not indices or any(not 0 <= i < extent for i in indices)
+            or indices != list(range(indices[0], indices[0] + len(indices)))):
+        return None
+    return axis, indices[0], len(indices), len(ins[1].shape) == 0
+
+
+def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
+    data = [t for t in ins if not _is_constant(t)]
+    if not _same_quantization([*data, *outs]):
+        return "inputs and outputs quantized differently"
+    if op.kind == "STRIDED_SLICE" and _strided_slice_bounds(op, ins) is None:
+        return "only stride-1 slices without ellipsis or new axes convert"
+    if op.kind == "GATHER" and _gather_run(op, ins) is None:
+        return "only a contiguous run of constant indices converts"
+    if op.kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE") and len(ins[0].shape) != 4:
+        return "only rank-4 inputs convert"
     return ""
 
 
@@ -389,6 +454,31 @@ class _Converter:
         """A binary operator's operands, a constant aligned to the output's rank."""
         rank = len(self.tensors[op.outputs[0]].shape)
         return [self.value(i, rank if i not in self.values else None) for i in op.inputs]
+
+    def slice_axis(self, x: str, shape, axis: int, begin: int, size: int, tag: str,
+                   index: int, hold: bool) -> str:
+        """[begin, begin + size) of TFLite axis `axis` of `x`: the middle part of
+        a Split. Every part is held as tensor `index` is quantized except the
+        one returned when `hold` is False."""
+        extent = shape[axis]
+        if begin == 0 and size == extent:
+            return x
+        sizes = [part for part in (begin, size, extent - begin - size) if part > 0]
+        names = [f"{tag}_part{i}" for i in range(len(sizes))]
+        parts = self.b.multi_node("Split", [x, self.b.constant(np.asarray(sizes, np.int64),
+                                                                tag + "_sizes")],
+                                  names, axis=_onnx_axis(axis, len(shape)))
+        chosen = 1 if begin > 0 else 0
+        held = [part if (i == chosen and not hold) else self.held(part, index, part + "_q")
+                for i, part in enumerate(parts)]
+        return held[chosen]
+
+    def last_to_last(self, x: str, rank: int, tag: str, index: int, to_tflite: bool) -> str:
+        """`x` moved between the ONNX and the TFLite axis order, held."""
+        if rank < 3:
+            return x
+        perm = _to_last(rank) if to_tflite else _to_first(rank)
+        return self.held(self.b.node("Transpose", [x], tag, perm=perm), index, tag + "_q")
 
     def ints(self, index: int) -> list[int]:
         return [int(v) for v in self.tensors[index].array().reshape(-1)]
@@ -528,6 +618,76 @@ class _Converter:
                 fill = float((int(self.ints(ins[2])[0]) - source.zero_point[0]) * source.scale[0])
             y = b.node("Pad", [self.value(ins[0]), pads, b.constant(np.float32(fill), tag + "_fill")],
                        tag, mode="constant")
+        elif kind in ("SLICE", "STRIDED_SLICE", "GATHER"):
+            source = self.tensors[ins[0]]
+            if kind == "SLICE":
+                sizes = self.ints(ins[2])
+                bounds = [(begin, (extent - begin) if size == -1 else size, False)
+                          for begin, size, extent in zip(self.ints(ins[1]), sizes, source.shape)]
+            elif kind == "STRIDED_SLICE":
+                bounds = _strided_slice_bounds(op, [self.tensors[i] for i in ins])
+            else:
+                axis, first, count, scalar = _gather_run(op, [self.tensors[i] for i in ins])
+                bounds = [(0, extent, False) for extent in source.shape]
+                bounds[axis] = (first, count, scalar)
+            cut = [axis for axis, (begin, size, _) in enumerate(bounds)
+                   if not (begin == 0 and size == source.shape[axis])]
+            y, shape = self.value(ins[0]), list(source.shape)
+            for step, axis in enumerate(cut):
+                begin, size, _ = bounds[axis]
+                y = self.slice_axis(y, shape, axis, begin, size, f"{tag}_slice{step}", ins[0],
+                                    hold=step < len(cut) - 1)
+                shape[axis] = size
+            if list(shape) != list(out.shape):
+                if cut:
+                    y = self.held(y, ins[0], tag + "_sliced")
+                y = self.reshape(y, shape, out.shape, tag, outs[0])
+            elif not cut:
+                y = b.node("Identity", [y], tag)
+        elif kind == "PACK":
+            axis = op.option(1, "i") % len(out.shape)
+            parts = []
+            for step, i in enumerate(ins):
+                shape = list(self.tensors[i].shape)
+                expanded = shape[:axis] + [1] + shape[axis:]
+                parts.append(self.held(self.reshape(self.value(i), shape, expanded,
+                                                    f"{tag}_part{step}", i), i,
+                                       f"{tag}_part{step}_q"))
+            y = b.node("Concat", parts, tag, axis=_onnx_axis(axis, len(out.shape)))
+        elif kind == "UNPACK":
+            source = self.tensors[ins[0]]
+            axis = op.option(1, "i") % len(source.shape)
+            names = [f"{self.tensors[i].name}_float_part" for i in outs]
+            sizes = b.constant(np.ones(len(outs), np.int64), tag + "_sizes")
+            parts = b.multi_node("Split", [self.value(ins[0]), sizes], names,
+                                 axis=_onnx_axis(axis, len(source.shape)))
+            shape = list(source.shape)
+            shape[axis] = 1
+            for part, index in zip(parts, outs):
+                name = self.tensors[index].name + "_float"
+                held = self.held(part, index, name + "_part_q")
+                self.finish(self.reshape(held, shape, self.tensors[index].shape, name, index),
+                            index)
+            return
+        elif kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE"):
+            # Reshape to six axes, swap the two in the middle, reshape back,
+            # all in TFLite's own axis order.
+            block = op.option(0, "i")
+            n, h, w, c = self.tensors[ins[0]].shape
+            if kind == "SPACE_TO_DEPTH":
+                split = [n, h // block, block, w // block, block, c]
+            else:
+                split = [n, h, w, block, block, c // (block * block)]
+            y = self.last_to_last(self.value(ins[0]), 4, tag + "_nhwc", ins[0], True)
+            y = self.held(b.node("Reshape", [y, b.constant(np.asarray(split, np.int64),
+                                                           tag + "_split")], tag + "_six"),
+                          ins[0], tag + "_six_q")
+            y = self.held(b.node("Transpose", [y], tag + "_swap", perm=[0, 1, 3, 2, 4, 5]),
+                          ins[0], tag + "_swap_q")
+            y = self.held(b.node("Reshape", [y, b.constant(np.asarray(out.shape, np.int64),
+                                                           tag + "_joined")], tag + "_four"),
+                          ins[0], tag + "_four_q")
+            y = b.node("Transpose", [y], tag, perm=_to_first(4))
         elif kind == "BATCH_MATMUL":
             # The matrices are the last two TFLite axes, so the product runs
             # in TFLite's own axis order.
