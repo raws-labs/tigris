@@ -543,7 +543,12 @@ def _elementwise_case(kind: str, *, quantized: bool = False) -> ContractCase:
     initializers = []
     a, b = "input", "second"
     if quantized:
-        initializers += _scalars(a=(0.03125, -17), b=(0.03125, -17), y=(0.03125, -17))
+        if kind == "Div":
+            initializers += _scalars(a=(0.125, 0), b=(0.25, 0), y=(0.125, 0))
+            data.reshape(-1)[0] = 0.0
+            other.reshape(-1)[0] = 19 * 0.25
+        else:
+            initializers += _scalars(a=(0.03125, -17), b=(0.03125, -17), y=(0.03125, -17))
         nodes += _qdq(a, "a_s", "a_z", "a_float")
         a = "a_float"
         if binary:
@@ -6113,7 +6118,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
             "Div", "Max", "Min", "Floor", "Ceil", "Round", "Sin", "Cos", "FloorDiv", "FloorMod",
         )],
         *[_elementwise_case(kind, quantized=True) for kind in (
-            "Abs", "Rsqrt", "SquaredDifference", "Max", "Min",
+            "Abs", "Rsqrt", "SquaredDifference", "Max", "Min", "Div",
         )],
         _constant_add_case(),
         _add_relu_fusion_case(),
