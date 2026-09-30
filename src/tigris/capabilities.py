@@ -130,21 +130,26 @@ CONDITIONAL_FALLBACKS: dict[str, dict[str, str]] = {
 # contract.  The compiler's semantic validator remains authoritative for
 # individual models; these concise notes prevent the public matrix from being
 # mistaken for support for every ONNX attribute combination.
+_BROADCAST = (
+    "each operand has the output's shape or broadcasts to it, a tensor operand at the "
+    "output's rank; tiled only when every operand is dense, a repeating constant, or one "
+    "value per channel as the second operand"
+)
 _CONSTANT_OPERAND = (
-    "a constant operand, on either side, holding one value, one per channel, or one per "
-    "element (untiled), float or per-tensor int8"
+    "a constant operand, on either side, float or per-tensor int8; one per element runs "
+    "untiled"
 )
 
 OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "Add": (
-        f"a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; {_CONSTANT_OPERAND}",
+        f"{_BROADCAST}; {_CONSTANT_OPERAND}",
         "standalone rank-3 pointwise length tiling on serialized axis 1",
     ),
     "Sub": (
-        f"a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; {_CONSTANT_OPERAND}",
+        f"{_BROADCAST}; {_CONSTANT_OPERAND}",
     ),
     "Mul": (
-        f"a dynamic second operand has the first operand's shape or holds one value per channel, and a per-channel one runs untiled; {_CONSTANT_OPERAND}",
+        f"{_BROADCAST}; {_CONSTANT_OPERAND}",
         "standalone rank-3 pointwise length tiling on serialized axis 1",
     ),
     "AveragePool": (
@@ -197,18 +202,18 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "Abs": ("int8 requantization must stay within the 32-bit reference arithmetic domain",),
     "Rsqrt": ("int8 requires nonnegative centered inputs and reference shifts in range",),
     "Div": (
-        f"two dynamic operands with identical shapes, or {_CONSTANT_OPERAND}; int8 requires per-tensor quantization",
+        f"{_BROADCAST}; {_CONSTANT_OPERAND}; int8 requires per-tensor quantization",
         "int8 rejects zero centered denominators and negative rounding exponents; "
         "rounding exponents >= 32 use wide mask/remainder/threshold arithmetic",
     ),
     "SquaredDifference": (
-        f"two dynamic operands with identical shapes, or {_CONSTANT_OPERAND}",
+        f"{_BROADCAST}; {_CONSTANT_OPERAND}",
         "int8 requantization must stay within the 32-bit reference arithmetic domain",
     ),
-    "Max": (f"two dynamic operands with identical shapes, or {_CONSTANT_OPERAND}; int8 quantization must match",),
-    "Min": (f"two dynamic operands with identical shapes, or {_CONSTANT_OPERAND}; int8 quantization must match",),
-    "FloorDiv": (f"two dynamic operands with identical shapes, or {_CONSTANT_OPERAND}; zero denominators are rejected",),
-    "FloorMod": (f"two dynamic operands with identical shapes, or {_CONSTANT_OPERAND}",),
+    "Max": (f"{_BROADCAST}; {_CONSTANT_OPERAND}; int8 quantization must match",),
+    "Min": (f"{_BROADCAST}; {_CONSTANT_OPERAND}; int8 quantization must match",),
+    "FloorDiv": (f"{_BROADCAST}; {_CONSTANT_OPERAND}; zero denominators are rejected",),
+    "FloorMod": (f"{_BROADCAST}; {_CONSTANT_OPERAND}",),
     "Transpose": ("a concrete, valid permutation is stored in schema 4+ plans",),
 }
 

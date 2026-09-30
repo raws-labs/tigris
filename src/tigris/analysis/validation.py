@@ -11,6 +11,7 @@ from tigris.analysis.partition_spatial import (
     _row_view,
     _stage_is_row_tiled,
 )
+from tigris.analysis.broadcast import DENSE, PERIODIC, stored_operands
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.graph.ir import (
@@ -238,8 +239,10 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if (len(op.inputs) != count or len(op.outputs) != 1
                     or any(t is None or t.is_constant for t in tensors)):
                 reasons.append(f"runtime requires {count} dynamic operands and one output")
-            elif any(t.shape != tensors[0].shape for t in tensors[1:]):
-                reasons.append("elementwise operands and output must have identical shapes")
+            elif (count == 1 and tensors[0].shape != tensors[1].shape) or (
+                    count == 2 and any(how is None for *_, how in stored_operands(ag, op) or [(None,)])):
+                reasons.append("each operand must broadcast to the output, a tensor "
+                               "operand at the output's rank")
             elif ag.is_quantized:
                 if any(t.quant is None or t.quant.scale.size != 1
                        or t.quant.zero_point.size != 1 for t in tensors):
@@ -487,26 +490,16 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             elif len(op.outputs) != 1 or output is None:
                 reasons.append("runtime requires one concrete output tensor")
             else:
-                reference_shape = dynamic_inputs[0].shape
-                if output.shape != reference_shape:
-                    reasons.append("output shape must match the first operand exactly")
-                per_channel = [
-                    tensor
-                    for tensor in dynamic_inputs[1:]
-                    if tensor.shape != reference_shape
-                ]
-                # The runtime takes a per-channel operand at the full
-                # operand's rank; a constant may be written shorter, a
-                # dynamic tensor may not.
-                if any(
-                    len(tensor.shape) != len(reference_shape)
-                    or not _is_per_channel_constant(
-                        tuple(tensor.shape), dynamic_inputs[0])
-                    for tensor in per_channel
-                ):
+                operands = stored_operands(ag, op)
+                per_channel = operands is not None and len(dynamic_inputs) == 2 and \
+                    operands[1][3] == PERIODIC and \
+                    all(dim == 1 for dim in operands[1][2][:-1])
+                # A tensor operand has the output's rank; a constant may be
+                # written shorter.
+                if operands is None or any(how is None for *_, how in operands):
                     reasons.append(
-                        "a dynamic second operand must have the first "
-                        "operand's shape or one value per channel"
+                        "each operand must broadcast to the output, a tensor "
+                        "operand at the output's rank"
                     )
                 elif per_channel:
                     stage = next(
@@ -693,21 +686,21 @@ def _is_constant_operand(ag: AnalyzedGraph, name: str) -> bool:
 def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     """Why a binary operator's constant operand is not expressible.
 
-    The plan holds the constant as the operator's weight and names its side
-    and, for int8, its quantization in the constant-operand attribute. The
-    runtime repeats it by its length alone: one value, one per channel, or
-    one per element, the last only untiled because it carries no row offset.
+    The plan holds the constant as the operator's weight, aligned to the
+    output's rank in its layout, and names its side, its quantization for
+    int8, and its shape where the length alone does not say it. One per
+    element carries no row offset, so it runs only untiled.
     """
     constants = [name for name in op.inputs if _is_constant_operand(ag, name)]
     dynamic = [ag.tensors.get(name) for name in op.inputs
                if not _is_constant_operand(ag, name)]
     if len(constants) != 1 or len(dynamic) != 1 or dynamic[0] is None:
         return ["runtime requires one tensor operand and at most one constant"]
-    name, operand = constants[0], dynamic[0]
+    name = constants[0]
     output = ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
     constant = ag.weight_data.get(name)
-    if output is None or output.shape != operand.shape:
-        return ["output shape must match the tensor operand exactly"]
+    if output is None:
+        return ["runtime requires one concrete output tensor"]
     if constant is None:
         return [f"constant operand {name!r} has no data"]
     reasons = []
@@ -719,16 +712,16 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
             info.quant is None
             or float(info.quant.scale[0]) != float(quant.scale[0])
             or int(info.quant.zero_point[0]) != int(quant.zero_point[0])
-            for info in (operand, output)
+            for info in (dynamic[0], output)
         ):
             reasons.append("Max/Min requires identical input and output quantization")
     elif str(constant.dtype) != "float32":
         reasons.append(f"constant operand {name!r} is not float data")
-    full = tuple(constant.shape) == tuple(operand.shape)
-    if constant.size != 1 and not full and not _is_per_channel_constant(
-            tuple(constant.shape), operand):
-        reasons.append(f"constant operand {name!r} requires unsupported broadcasting")
-    elif full and constant.size != 1:
+    operands = stored_operands(ag, op)
+    how = next((entry[3] for entry in operands or () if entry[0] == name), None)
+    if how is None:
+        reasons.append(f"constant operand {name!r} does not broadcast to the output")
+    elif how == DENSE and constant.size != 1:
         stage = next((candidate for candidate in ag.stages
                       if candidate.stage_id == op.stage), None)
         if stage is not None and (
@@ -736,35 +729,6 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
                 or (stage.tile_plan is not None and stage.tile_plan.tileable)):
             reasons.append(f"constant operand {name!r} cannot be offset for tiled execution")
     return reasons
-
-
-def _is_per_channel_constant(
-    constant_shape: tuple[int, ...], operand
-) -> bool:
-    """Whether a constant carries one value per channel of the operand.
-
-    Every tensor reaches the runtime with its channels innermost, so a
-    constant of that length repeats on its own wherever a tile starts and
-    needs no shape of its own in the plan. The constant has to say so in the
-    model's own axis order: one extent on the channel axis and one everywhere
-    else, which is how an exporter writes an input normalization.
-    """
-    shape = tuple(int(dim) for dim in operand.shape)
-    if not shape or not constant_shape:
-        return False
-    axis = len(shape) - 1 if operand.layout is Layout.LINEAR else 1
-    if axis >= len(shape):
-        return False
-    channels = shape[axis]
-    if channels <= 1:
-        return False
-    padded = (1,) * (len(shape) - len(constant_shape)) + tuple(constant_shape)
-    if len(padded) != len(shape):
-        return False
-    return all(
-        dim == (channels if index == axis else 1)
-        for index, dim in enumerate(padded)
-    )
 
 
 def _runs_whole(ag: AnalyzedGraph, stage: Stage, fast_total: int) -> bool:
