@@ -219,7 +219,7 @@ _ELEMENTWISE = (*_ELEMENTWISE_UNARY, *_ELEMENTWISE_BINARY, "RSQRT", "SQUARE")
 _INT8_ELEMENTWISE = ("ABS", "RSQRT", "SQUARED_DIFFERENCE", "MAXIMUM", "MINIMUM", "DIV")
 # Data movement built from Split, Concat, Reshape and Transpose.
 _DATA_MOVEMENT = ("SLICE", "STRIDED_SLICE", "GATHER", "PACK", "UNPACK", "SPACE_TO_DEPTH",
-                  "DEPTH_TO_SPACE")
+                  "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND")
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, "RELU6",
               "SOFTMAX", "MEAN",
               "TRANSPOSE",
@@ -232,7 +232,7 @@ _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V":
                       "PAD": (1,), "PADV2": (1, 2), "RESHAPE": (1,), "EXPAND_DIMS": (1,),
                       "RESIZE_NEAREST_NEIGHBOR": (1,), "RESIZE_BILINEAR": (1,),
                       "TRANSPOSE_CONV": (0,), "SLICE": (1, 2), "STRIDED_SLICE": (1, 2, 3),
-                      "GATHER": (1,)}
+                      "GATHER": (1,), "SPACE_TO_BATCH_ND": (1, 2), "BATCH_TO_SPACE_ND": (1, 2)}
 
 
 def _is_constant(tensor: _Tensor) -> bool:
@@ -363,7 +363,8 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
         return "only stride-1 slices without ellipsis or new axes convert"
     if op.kind == "GATHER" and _gather_run(op, ins) is None:
         return "only a contiguous run of constant indices converts"
-    if op.kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE") and len(ins[0].shape) != 4:
+    if op.kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND",
+                   "BATCH_TO_SPACE_ND") and len(ins[0].shape) != 4:
         return "only rank-4 inputs convert"
     return ""
 
@@ -688,6 +689,8 @@ class _Converter:
                                                            tag + "_joined")], tag + "_four"),
                           ins[0], tag + "_four_q")
             y = b.node("Transpose", [y], tag, perm=_to_first(4))
+        elif kind in ("SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND"):
+            y = self._batch_space(op, tag)
         elif kind == "BATCH_MATMUL":
             # The matrices are the last two TFLite axes, so the product runs
             # in TFLite's own axis order.
@@ -724,6 +727,57 @@ class _Converter:
         else:
             raise ValueError(f"no conversion for {kind}")
         self.finish(b.fused_activation(y, fused, tag), outs[0])
+
+    def _six(self, x: str, split, perm, joined, tag: str, index: int) -> str:
+        """Reshape to six axes, permute, reshape back, in TFLite's axis order,
+        each step held as tensor `index` is quantized."""
+        b = self.b
+        y = self.held(b.node("Reshape", [x, b.constant(np.asarray(split, np.int64),
+                                                       tag + "_split")], tag + "_six"),
+                      index, tag + "_six_q")
+        y = self.held(b.node("Transpose", [y], tag + "_perm", perm=list(perm)), index,
+                      tag + "_perm_q")
+        return self.held(b.node("Reshape", [y, b.constant(np.asarray(joined, np.int64),
+                                                          tag + "_joined")], tag + "_four"),
+                         index, tag + "_four_q")
+
+    def _batch_space(self, op: _Operator, tag: str) -> str:
+        """SPACE_TO_BATCH_ND pads then folds blocks into the batch;
+        BATCH_TO_SPACE_ND unfolds them and crops."""
+        b = self.b
+        ins, source = op.inputs, self.tensors[op.inputs[0]]
+        out = self.tensors[op.outputs[0]]
+        bh, bw = self.ints(ins[1])
+        edges = self.ints(ins[2])
+        x = self.value(ins[0])
+        if op.kind == "SPACE_TO_BATCH_ND":
+            top, bottom, left, right = edges
+            if any(edges):
+                pads = b.constant(np.asarray([0, 0, top, left, 0, 0, bottom, right], np.int64),
+                                  tag + "_pads")
+                x = self.held(b.node("Pad", [x, pads, b.constant(np.float32(0.0), tag + "_fill")],
+                                     tag + "_padded", mode="constant"), ins[0], tag + "_padded_q")
+            n, h, w, c = source.shape
+            h, w = h + top + bottom, w + left + right
+            x = self.last_to_last(x, 4, tag + "_nhwc", ins[0], True)
+            x = self._six(x, [n, h // bh, bh, w // bw, bw, c], [2, 4, 0, 1, 3, 5], out.shape,
+                          tag, ins[0])
+            return b.node("Transpose", [x], tag, perm=_to_first(4))
+        n, h, w, c = source.shape
+        batch = n // (bh * bw)
+        x = self.last_to_last(x, 4, tag + "_nhwc", ins[0], True)
+        whole = [batch, h * bh, w * bw, c]
+        x = self._six(x, [bh, bw, batch, h, w, c], [2, 3, 0, 4, 1, 5], whole, tag, ins[0])
+        x = b.node("Transpose", [x], tag + "_first", perm=_to_first(4))
+        top, bottom, left, right = edges
+        shape = list(whole)
+        for axis, (begin, end) in ((1, (top, bottom)), (2, (left, right))):
+            if begin or end:
+                x = self.held(x, ins[0], f"{tag}_crop{axis}_q")
+                x = self.slice_axis(x, shape, axis, begin, shape[axis] - begin - end,
+                                    f"{tag}_crop{axis}", ins[0], hold=False)
+                shape[axis] -= begin + end
+        return x
 
     def _floor_mod(self, a: str, divisor: str, tag: str) -> str:
         """TFLite's FLOOR_MOD: the truncated remainder, plus the divisor where

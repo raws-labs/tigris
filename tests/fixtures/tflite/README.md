@@ -9,12 +9,16 @@ them, so the frontend can be checked bit for bit without TFLite Micro installed.
 `ops/` holds one-operator models and their reference outputs, written by
 `scripts/gen_tflite_fixtures.py` (needs tensorflow and tflite-micro). Each
 `.npz` holds seeded inputs and the outputs TFLite Micro produces for them.
-Where TFLite Micro disagrees with TFLite's reference kernels, the reference
-kernels' outputs are recorded instead; `relu6` is the one such case, because
-TFLite Micro's int8 RELU6 ignores the output quantization.
 The `float_` models are converted without quantization.
+
+Where TFLite Micro disagrees with TFLite's reference kernels, the reference
+kernels' outputs are recorded instead. Two cases do: `relu6`, because TFLite
+Micro's int8 RELU6 ignores the output quantization, and `space_to_batch`,
+because its SPACE_TO_BATCH_ND leaves the padded positions unwritten, holding
+whatever the arena held before.
+
 `div` keeps its numerators off 0 and -1 after the zero point, where TFLite's
 int8 arithmetic shifts a 32-bit value by 32 or more; the runtime's own tests
-cover that range.
-`squeeze_op` and `expand_dims_op` rewrite the converter's RESHAPE into the SQUEEZE
-and EXPAND_DIMS operators, which the converter never emits itself.
+cover that range. `squeeze_op` and `expand_dims_op` rewrite the converter's
+RESHAPE into the SQUEEZE and EXPAND_DIMS operators, which the converter never
+emits itself.
