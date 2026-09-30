@@ -212,6 +212,17 @@ CASES.update({
 })
 
 CASES["softmax"] = _unary(tf.nn.softmax, (1, 10))
+CASES.update({
+    "pack": _binary(lambda x, y: tf.stack([x, y], axis=1), (1, 4, 6), (1, 4, 6)),
+    "unpack": _unary(lambda x: tf.unstack(x, axis=1), (1, 3, 4, 6)),
+    "slice": _unary(lambda x: tf.slice(x, [0, 1, 2, 0], [1, 3, 3, 4]), _MAP),
+    "strided_slice": _unary(lambda x: x[:, 1:5, :, 1:3], _MAP),
+    "strided_slice_shrink": _unary(lambda x: x[:, 2, :, :], _MAP),
+    "gather": _unary(lambda x: tf.gather(x, [2, 3, 4], axis=2), _MAP),
+    "gather_scalar": _unary(lambda x: tf.gather(x, 1, axis=3), _MAP),
+    "space_to_depth": _unary(lambda x: tf.nn.space_to_depth(x, 2), (1, 4, 6, 3)),
+    "depth_to_space": _unary(lambda x: tf.nn.depth_to_space(x, 2), (1, 3, 3, 8)),
+})
 # The tier-1 cases again, converted without quantization.
 _FLOAT_TIER1 = (
     "max_pool_valid", "max_pool_same", "avg_pool_valid", "avg_pool_same", "concat_channels",
@@ -219,7 +230,9 @@ _FLOAT_TIER1 = (
     "relu6", "mean_spatial", "mean_spatial_flat", "resize_nearest", "resize_bilinear",
     "resize_bilinear_asymmetric", "transpose", "split", "split_v", "reshape", "conv_dilated",
     "depthwise_multiplier", "transpose_conv", "batch_matmul", "fully_connected_rank3",
-    "pad_conv", "pad", "padv2", "squeeze_op", "expand_dims_op", "softmax",
+    "pad_conv", "pad", "padv2", "squeeze_op", "expand_dims_op", "softmax", "pack", "unpack",
+    "slice", "strided_slice", "strided_slice_shrink", "gather", "gather_scalar",
+    "space_to_depth", "depth_to_space",
 )
 for _name in _FLOAT_TIER1:
     FLOAT_MODELS[f"float_{_name}"] = CASES[_name]

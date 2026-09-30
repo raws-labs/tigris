@@ -157,3 +157,14 @@ def test_an_input_shape_the_file_does_not_state_is_refused():
     other = CliRunner().invoke(cli, ["analyze", str(KWS), "-m", "16K", "--input-shape", "input_1:1x1x49x10"])
     assert other.exit_code != 0
     assert "fixes every tensor shape" in other.output
+
+
+def test_a_strided_slice_with_a_stride_is_refused():
+    model = (FIXTURES / "ops" / "strided_slice.tflite").read_bytes()
+    _, graphs = tflite._read(model)
+    _, tensors, _, _, operators = graphs[0]
+    strides = tensors[operators[0].inputs[3]]
+    data = bytearray(model)
+    offset = model.index(strides.data)
+    data[offset + 4:offset + 8] = np.array([2], np.int32).tobytes()
+    assert any("only stride-1 slices" in reason for reason in tflite.unsupported(bytes(data)))
