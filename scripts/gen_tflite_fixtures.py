@@ -109,6 +109,13 @@ CASES.update({
     "squared_difference_constant": _unary(
         lambda x: tf.math.squared_difference(x, _CHANNELS), _MAP),
 })
+_ROWS = np.linspace(-1.0, 1.5, 6).reshape(1, 6, 1, 1).astype(np.float32)
+CASES.update({
+    "add_broadcast_rows": _binary(tf.add, _MAP, (1, 6, 1, 4)),
+    "mul_broadcast_both": _binary(tf.multiply, (1, 6, 1, 4), (1, 1, 6, 4)),
+    "sub_broadcast_first": _binary(tf.subtract, (1, 1, 6, 4), _MAP),
+    "add_constant_rows": _unary(lambda x: x + _ROWS, _MAP),
+})
 # Converted without quantization: TFLite Micro runs these in float only.
 FLOAT_MODELS = {
     "float_abs": _unary(tf.abs, _MAP),
@@ -132,6 +139,8 @@ FLOAT_MODELS = {
     "float_div_constant_first": _unary(lambda x: 2.5 / x, _MAP),
     "float_floor_mod_constant": _unary(lambda x: tf.math.floormod(x, _DIVISORS), _MAP),
     "float_maximum_constant": _unary(lambda x: tf.maximum(x, _CHANNELS), _MAP),
+    "float_div_broadcast": _binary(tf.divide, _MAP, (1, 1, 6, 4)),
+    "float_maximum_broadcast": _binary(tf.maximum, (1, 6, 1, 4), (1, 1, 6, 4)),
 }
 CASES.update(FLOAT_MODELS)
 # Input ranges per operand where the default [-3, 3] leaves the domain.
@@ -141,6 +150,7 @@ RANGES = {
     "float_sqrt": [(0.0, 4.0)],
     "div": [(-3.0, 3.0), _DIVISOR], "float_div": [(-3.0, 3.0), _DIVISOR], "float_floor_div": [(-3.0, 3.0), _DIVISOR],
     "float_floor_mod": [(-3.0, 3.0), _DIVISOR], "float_div_constant_first": [_DIVISOR],
+    "float_div_broadcast": [(-3.0, 3.0), _DIVISOR],
 }
 
 

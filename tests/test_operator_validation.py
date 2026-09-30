@@ -398,7 +398,7 @@ def test_dynamic_elementwise_broadcasting_is_rejected():
     validation = validate_operator_support(graph)
 
     assert not validation.supported
-    assert "one value per channel" in validation.describe()
+    assert "a tensor operand at the output's rank" in validation.describe()
 
 
 def test_quantized_constant_operand_without_its_quantization_is_rejected():
@@ -495,13 +495,8 @@ def test_scalar_float_constant_elementwise_operand_is_supported():
 
 
 def test_equal_numel_different_shape_constant_is_rejected():
-    """Matching element counts is not a broadcast the runtime can read.
-
-    The wire format gives a constant operand a byte size and nothing else, so
-    the runtime reads it as one value, one per channel, or one per element. A
-    (2, 2) constant against a (1, 4) operand is none of those even though the
-    counts agree.
-    """
+    """Matching element counts is not a broadcast: a (2, 2) constant against a
+    (1, 4) operand does not broadcast even though the counts agree."""
     graph = AnalyzedGraph(
         ops=[
             OpNode(
@@ -524,7 +519,7 @@ def test_equal_numel_different_shape_constant_is_rejected():
     validation = validate_operator_support(graph)
 
     assert not validation.supported
-    assert "requires unsupported broadcasting" in validation.describe()
+    assert "does not broadcast to the output" in validation.describe()
 
 
 def test_a_per_channel_constant_is_accepted():
@@ -555,8 +550,9 @@ def test_a_per_channel_constant_is_accepted():
     assert validate_operator_support(graph).supported
 
 
-def test_a_constant_on_the_wrong_axis_is_rejected():
-    """A per-row constant does not repeat every channel, so it is refused."""
+def test_a_per_row_constant_is_accepted():
+    """A per-row constant is a broadcast inside the operand, read by output
+    coordinate."""
     graph = AnalyzedGraph(
         ops=[
             OpNode(
@@ -576,9 +572,7 @@ def test_a_constant_on_the_wrong_axis_is_rejected():
         weight_data={"scale": np.ones((1, 1, 8, 1), dtype=np.float32)},
     )
 
-    validation = validate_operator_support(graph)
-    assert not validation.supported
-    assert "requires unsupported broadcasting" in validation.describe()
+    assert validate_operator_support(graph).supported
 
 
 def test_qoperator_model_names_the_format_and_the_fix(tmp_path):
@@ -698,12 +692,12 @@ def test_per_channel_dynamic_operand_is_accepted(tmp_path):
     assert emit_binary_bytes(ag)
 
 
-def test_other_dynamic_broadcast_is_refused(tmp_path):
-    """A row-wise operand repeats every row, not every channel: not executable."""
+def test_a_row_wise_dynamic_operand_is_emitted(tmp_path):
+    """A row-wise operand is a broadcast inside the operand, read by output
+    coordinate and never tiled."""
     ag, _ = _run_pipeline(str(_gate_path(tmp_path, [1, 1, 5, 1])), ("64K",),
                           report_bindings=False)
-    with pytest.raises(ValueError, match="one value per channel"):
-        emit_binary_bytes(ag)
+    assert emit_binary_bytes(ag)
 
 
 def test_hardswish_and_int8_bilinear_have_kernels():
@@ -751,7 +745,7 @@ def test_elementwise_int8_requires_matching_shapes_and_quantization(kind):
         tensors["y"].quant.zero_point[0] = -63
         assert validate_operator_support(ag).supported
     tensors["y"].shape = (2, 2)
-    assert "identical shapes" in validate_operator_support(ag).describe()
+    assert "broadcast to the output" in validate_operator_support(ag).describe()
     tensors["y"].shape = (1, 4)
     if kind in {"Max", "Min"}:
         tensors["b"].quant.scale[0] = 0.25

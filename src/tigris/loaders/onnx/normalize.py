@@ -40,6 +40,7 @@ from dataclasses import replace
 
 import numpy as np
 
+from tigris.analysis.broadcast import GENERAL, PERIODIC, stored_operands
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
@@ -85,6 +86,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_split_into_its_weight(ag)
     ag = _assign_tensor_layouts(ag)
     ag = _normalize_concat_axis(ag)
+    ag = _mark_untileable_broadcasts(ag)
     ag = _gather_one_index_to_split(ag)
     ag = _relabel_shape_ops_to_reshape(ag)
     ag = _lower_linear_matmul(ag)
@@ -2930,6 +2932,29 @@ def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
                 del ag.tensors[inp_name]
         op.inputs = [op.inputs[0]]
 
+    return ag
+
+
+def _mark_untileable_broadcasts(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Mark a binary operator a tile cannot carry.
+
+    A tile offsets a dense operand by its rows and reads a repeating constant
+    whole. An operand read by output coordinate has neither, and a tensor
+    operand that is not dense is banded only in the one audited form, one value
+    per channel as the second operand.
+    """
+    for op in ag.ops:
+        operands = stored_operands(ag, op)
+        if operands is None:
+            continue
+        untileable = False
+        for position, (_, constant, stored, how) in enumerate(operands):
+            if how == GENERAL:
+                untileable = True
+            elif how == PERIODIC and not constant and not (
+                    position == 1 and all(dim == 1 for dim in stored[:-1])):
+                untileable = True
+        op.attrs["broadcast_untileable"] = untileable
     return ag
 
 

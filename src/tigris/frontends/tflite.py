@@ -278,9 +278,8 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                 return "operands of different rank"
     if op.kind in _ELEMENTWISE_BINARY:
         dynamic = [t for t in ins if not _is_constant(t)]
-        if not dynamic or len(dynamic[0].shape) != rank or (
-                len(dynamic) == 2 and dynamic[0].shape != dynamic[1].shape):
-            return "operands of different shape"
+        if not dynamic or any(len(t.shape) != rank for t in dynamic):
+            return "operands of different rank"
     if op.kind == "CONCATENATION":
         if any(t.scale[0] != outs[0].scale[0] or t.zero_point[0] != outs[0].zero_point[0] for t in data):
             return "inputs quantized differently from the output"

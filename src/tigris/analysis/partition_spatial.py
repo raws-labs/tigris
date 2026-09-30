@@ -193,6 +193,8 @@ def op_category(op: OpNode) -> TileCategory:
     band would cut the axis being joined."""
     if op.op_type == "Concat" and not op.attrs.get("concat_last_axis", True):
         return TileCategory.UNTILEABLE
+    if op.attrs.get("broadcast_untileable", False):
+        return TileCategory.UNTILEABLE
     return classify_op(op.op_type)
 
 

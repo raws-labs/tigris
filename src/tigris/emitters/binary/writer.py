@@ -12,11 +12,13 @@ from tigris import (
     TILE_AXIS_HW,
     TILE_AXIS_NONE,
 )
+from tigris.analysis.broadcast import BINARY_OPS, padded
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
     OpNode,
     serialized_axis_map,
+    serialized_shape,
     serialized_transpose_perm,
 )
 
@@ -286,29 +288,27 @@ def _build_weight_op_map(ag: AnalyzedGraph) -> dict[str, str]:
     return result
 
 
-_BINARY_OPS = frozenset({"Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min",
-                         "FloorDiv", "FloorMod"})
+def _binary_constant_layouts(ag: AnalyzedGraph) -> dict[str, tuple]:
+    """The output layout and rank each binary operator's constant is stored in.
 
-
-def _binary_constant_layouts(ag: AnalyzedGraph) -> dict[str, "Layout"]:
-    """The layout of the tensor each binary operator's constant pairs with.
-
-    The runtime reads a constant element by element against that tensor, so
-    the constant is stored in the same axis order.
+    The runtime reads a constant against the output, so it is aligned to the
+    output's rank and held in the output's axis order.
     """
     layouts = {}
     for op in ag.ops:
-        if op.op_type not in _BINARY_OPS or len(op.inputs) != 2:
+        if op.op_type not in BINARY_OPS or len(op.inputs) != 2 or len(op.outputs) != 1:
             continue
         constants = [name for name in op.inputs if name in ag.weight_data]
-        tensors = [ag.tensors.get(name) for name in op.inputs if name not in ag.weight_data]
-        if len(constants) == 1 and len(tensors) == 1 and tensors[0] is not None:
-            layouts[constants[0]] = tensors[0].layout
+        output = ag.tensors.get(op.outputs[0])
+        if len(constants) == 1 and output is not None:
+            layouts[constants[0]] = (output.layout, len(output.shape))
     return layouts
 
 
-def _stored_like(arr: np.ndarray, layout) -> np.ndarray:
-    """A constant in the axis order its partner tensor is stored in."""
+def _stored_like(arr: np.ndarray, placement) -> np.ndarray:
+    """A constant aligned to the output's rank, in the output's axis order."""
+    layout, rank = placement
+    arr = arr.reshape(padded(arr.shape, rank)) if arr.ndim < rank else arr
     if arr.ndim < 3:
         return arr
     axis_map = serialized_axis_map(arr.ndim, layout)
@@ -818,22 +818,33 @@ def _constant_operand_payload(
     A float Add or Mul with its constant second is left without one: every
     runtime reads that form, older ones included.
     """
-    if op.op_type not in _BINARY_OPS or len(op.inputs) != 2:
+    if op.op_type not in BINARY_OPS or len(op.inputs) != 2:
         return None
     positions = [i for i, name in enumerate(op.inputs) if name in ag.weight_data]
-    if len(positions) != 1:
+    output = ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
+    if len(positions) != 1 or output is None:
         return None
     position = positions[0]
     name = op.inputs[position]
+    # One value, one per channel, or one per element is known by its length;
+    # any other broadcast states the constant's stored shape.
+    stored_output = serialized_shape(output.shape, output.layout)
+    stored = serialized_shape(padded(ag.weight_data[name].shape, len(output.shape)),
+                              output.layout)
+    by_length = (all(dim == 1 for dim in stored) or stored == stored_output or (
+        all(dim == 1 for dim in stored[:-1]) and stored[-1] == stored_output[-1]))
     if ag.is_quantized:
         if name not in quant_idx_map:
             raise ValueError(f"constant operand {name!r} of {op.name!r} has no quantization")
         index = quant_idx_map[name]
-    elif op.op_type in ("Add", "Mul") and position == 1:
+    elif op.op_type in ("Add", "Mul") and position == 1 and by_length:
         return None
     else:
         index = NO_QUANT_PARAM
-    return struct.pack("<BBH", position, 0, index)
+    payload = struct.pack("<BBH", position, 0, index)
+    if not by_length:
+        payload += struct.pack(f"<{len(stored)}i", *stored)
+    return payload
 
 
 def _build_op_attributes(

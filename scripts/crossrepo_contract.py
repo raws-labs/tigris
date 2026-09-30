@@ -793,6 +793,61 @@ def _constant_operand_case(*, op_type: str, quantized: bool, extent: str,
                         expect_chain=tiled, expect_line_buffered=tiled)
 
 
+def _broadcast_case(*, op_type: str, quantized: bool, other_shape: list[int],
+                    first: bool, constant: bool = False) -> ContractCase:
+    """A binary operator whose operands broadcast to a larger output, behind a
+    convolution. Any broadcast but one over leading stored axes, or a tensor
+    operand that repeats ahead of the full one, runs untiled."""
+    channels, side = 4, 12
+    rng = np.random.default_rng(26)
+    weight = (rng.normal(size=(channels, channels, 3, 3)) * 0.25).astype(np.float32)
+    data = rng.uniform(-1.0, 1.0, size=(1, channels, side, side)).astype(np.float32)
+    other = rng.uniform(0.5, 1.5, size=other_shape).astype(np.float32)
+    initializers = [numpy_helper.from_array(weight, "weight")]
+    inputs = [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])]
+    feeds = {"input": data}
+    conv = dict(kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    operands = ["o", "c"] if first else ["c", "o"]
+    if constant and quantized:
+        initializers.append(numpy_helper.from_array(
+            np.clip(np.round(other / 0.01), -127, 127).astype(np.int8), "other"))
+    elif constant:
+        initializers.append(numpy_helper.from_array(other, "other"))
+    else:
+        inputs.append(helper.make_tensor_value_info("other", TensorProto.FLOAT, other_shape))
+        feeds["other"] = other
+    if quantized:
+        initializers += _scalars(inp=(0.008, 0), w=(0.01, 0), conv=(0.03, 0), o=(0.01, 0),
+                                 out=(0.05, -3))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            *_qdq("weight", "w_s", "w_z", "wdq"),
+            helper.make_node("Conv", ["x", "wdq"], ["raw"], **conv),
+            *_qdq("raw", "conv_s", "conv_z", "c"),
+            (helper.make_node("DequantizeLinear", ["other", "o_s", "o_z"], ["o"]) if constant
+             else _qdq("other", "o_s", "o_z", "o")),
+            helper.make_node(op_type, operands, ["y"]),
+            *_qdq("y", "out_s", "out_z", "output"),
+        ]
+        nodes = [n for item in nodes for n in (item if isinstance(item, list) else [item])]
+    else:
+        nodes = [
+            helper.make_node("Conv", ["input", "weight"], ["c"], **conv),
+            helper.make_node("Identity", ["other"], ["o"]),
+            helper.make_node(op_type, operands, ["output"]),
+        ]
+    shape_tag = "x".join(str(d) for d in other_shape)
+    label = (f"{'int8' if quantized else 'float'}_{op_type.lower()}_broadcast_{shape_tag}"
+             f"{'_constant' if constant else ''}_{'first' if first else 'second'}")
+    model = _model(
+        label, nodes, inputs,
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, side, side])],
+        initializers, opset=14,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), feeds, ("Conv", op_type),
+                        mem_budget="16K")
+
+
 def _split_chain_case(*, quantized: bool) -> ContractCase:
     """A strided stem feeding wide layers, too big to stream as one chain.
 
@@ -6204,6 +6259,12 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _constant_operand_case(op_type="Sub", quantized=False, extent="channels", first=True),
         _constant_operand_case(op_type="Div", quantized=False, extent="scalar", first=True),
         _constant_operand_case(op_type="Max", quantized=False, extent="channels", first=False),
+        _broadcast_case(op_type="Add", quantized=False, other_shape=[1, 4, 12, 1], first=False),
+        _broadcast_case(op_type="Add", quantized=True, other_shape=[1, 4, 12, 1], first=False),
+        _broadcast_case(op_type="Sub", quantized=True, other_shape=[1, 1, 12, 12], first=True),
+        _broadcast_case(op_type="Mul", quantized=False, other_shape=[1, 1, 12, 1], first=True),
+        _broadcast_case(op_type="Add", quantized=True, other_shape=[1, 1, 12, 1], first=False,
+                        constant=True),
         _depthwise_multiplier_case(quantized=False),
         _depthwise_multiplier_case(quantized=True),
         _inner_axis_concat_case(axis=2, quantized=False),
