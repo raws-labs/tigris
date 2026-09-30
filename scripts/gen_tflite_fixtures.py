@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Generate one-operator TFLite models and their reference outputs.
+
+Each case is converted to an int8 TFLite model and run on seeded inputs through
+TFLite Micro and through TFLite's reference kernels. The recorded outputs are
+TFLite Micro's; where TFLite Micro disagrees with the reference kernels, the
+reference kernels' are recorded and the case is named as a deviation. Models and
+outputs go to tests/fixtures/tflite/ops/ so the frontend tests need neither
+package. Needs tensorflow and tflite-micro, which are not project dependencies:
+
+    python scripts/gen_tflite_fixtures.py [case ...]
+"""
+
+from __future__ import annotations
+
+import sys
+from importlib.metadata import version
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+from tflite_micro.python.tflite_micro import runtime as micro
+
+OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "tflite" / "ops"
+SAMPLES = 4
+
+
+def _weights(seed: int, *shape: int) -> tf.Tensor:
+    return tf.constant(np.random.default_rng(seed).normal(0.0, 0.5, shape).astype(np.float32))
+
+
+def _unary(fn, shape):
+    return [shape], lambda x: fn(x)
+
+
+def _binary(fn, a, b):
+    return [a, b], lambda x, y: fn(x, y)
+
+
+CASES = {
+    "max_pool_valid": _unary(lambda x: tf.nn.max_pool2d(x, 2, 2, "VALID"), (1, 8, 8, 4)),
+    "max_pool_same": _unary(lambda x: tf.nn.max_pool2d(x, 3, 2, "SAME"), (1, 9, 9, 4)),
+    "avg_pool_valid": _unary(lambda x: tf.nn.avg_pool2d(x, 2, 2, "VALID"), (1, 8, 8, 4)),
+    "avg_pool_same": _unary(lambda x: tf.nn.avg_pool2d(x, 3, 1, "SAME"), (1, 7, 7, 4)),
+    "concat_channels": _binary(lambda x, y: tf.concat([x, y], -1), (1, 6, 6, 3), (1, 6, 6, 5)),
+    "concat_rows": _binary(lambda x, y: tf.concat([x, y], 1), (1, 4, 6, 3), (1, 2, 6, 3)),
+    "add_broadcast": _binary(tf.add, (1, 5, 5, 4), (1, 1, 1, 4)),
+    "mul": _binary(tf.multiply, (1, 5, 5, 4), (1, 5, 5, 4)),
+    "mul_broadcast": _binary(tf.multiply, (1, 5, 5, 4), (1, 1, 1, 4)),
+    "sub": _binary(tf.subtract, (1, 5, 5, 4), (1, 5, 5, 4)),
+    "logistic": _unary(tf.sigmoid, (1, 6, 6, 4)),
+    "tanh": _unary(tf.tanh, (1, 6, 6, 4)),
+    "hard_swish": _unary(lambda x: x * tf.nn.relu6(x + 3.0) / 6.0, (1, 6, 6, 4)),
+    "relu": _unary(tf.nn.relu, (1, 6, 6, 4)),
+    "relu6": _unary(tf.nn.relu6, (1, 6, 6, 4)),
+    "mean_spatial": _unary(lambda x: tf.reduce_mean(x, [1, 2], keepdims=True), (1, 6, 6, 4)),
+    "mean_spatial_flat": _unary(lambda x: tf.reduce_mean(x, [1, 2]), (1, 6, 6, 4)),
+    "resize_nearest": _unary(lambda x: tf.image.resize(x, (8, 8), "nearest"), (1, 4, 4, 3)),
+    "resize_bilinear": _unary(lambda x: tf.image.resize(x, (8, 8), "bilinear"), (1, 4, 4, 3)),
+    "resize_bilinear_asymmetric": _unary(
+        lambda x: tf.compat.v1.image.resize_bilinear(x, (8, 8)), (1, 4, 4, 3)),
+    "resize_nearest_asymmetric": _unary(
+        lambda x: tf.compat.v1.image.resize_nearest_neighbor(x, (8, 12)), (1, 4, 4, 3)),
+    "transpose": _unary(lambda x: tf.transpose(x, [0, 2, 1, 3]), (1, 4, 6, 3)),
+    "split": _unary(lambda x: tf.split(x, 2, axis=-1), (1, 4, 4, 6)),
+    "split_v": _unary(lambda x: tf.split(x, [2, 4], axis=-1), (1, 4, 4, 6)),
+    "reshape": _unary(lambda x: tf.reshape(x, (1, 8, 12)), (1, 4, 4, 6)),
+    "squeeze": _unary(lambda x: tf.squeeze(x, [1]), (1, 1, 8, 6)),
+    "expand_dims": _unary(lambda x: tf.expand_dims(x, 1), (1, 8, 6)),
+    "conv_dilated": _unary(
+        lambda x: tf.nn.conv2d(x, _weights(1, 3, 3, 4, 6), 1, "SAME", dilations=2), (1, 9, 9, 4)),
+    "depthwise_multiplier": _unary(
+        lambda x: tf.nn.depthwise_conv2d(x, _weights(2, 3, 3, 4, 2), [1, 1, 1, 1], "SAME"),
+        (1, 6, 6, 4)),
+    "transpose_conv": _unary(
+        lambda x: tf.nn.conv2d_transpose(x, _weights(3, 3, 3, 5, 4), (1, 8, 8, 5), 2, "SAME"),
+        (1, 4, 4, 4)),
+    "batch_matmul": _binary(tf.matmul, (1, 6, 8), (1, 8, 5)),
+    "fully_connected_rank3": _unary(
+        lambda x: tf.tensordot(x, _weights(4, 8, 5), 1), (1, 6, 8)),
+    "pad_conv": _unary(
+        lambda x: tf.nn.conv2d(tf.pad(x, [[0, 0], [1, 1], [2, 2], [0, 0]]),
+                               _weights(5, 3, 3, 4, 4), 1, "VALID"), (1, 6, 6, 4)),
+}
+
+
+FLOAT_BOUNDARIES = {"float_boundaries": _unary(lambda x: tf.nn.relu(x) * x, (1, 6, 6, 4))}
+CASES.update(FLOAT_BOUNDARIES)
+
+
+def _convert(fn, shapes, rng, float_io=False):
+    specs = [tf.TensorSpec(shape, tf.float32) for shape in shapes]
+    concrete = tf.function(fn).get_concrete_function(*specs)
+
+    def representative():
+        for _ in range(64):
+            yield [rng.uniform(-3.0, 3.0, shape).astype(np.float32) for shape in shapes]
+
+    converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete], tf.function(fn))
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.float32 if float_io else tf.int8
+    converter.inference_output_type = tf.float32 if float_io else tf.int8
+    return converter.convert()
+
+
+def _inputs(details, rng):
+    if details["dtype"] == np.float32:
+        return rng.uniform(-3.0, 3.0, (SAMPLES, *details["shape"])).astype(np.float32)
+    return rng.integers(-128, 128, (SAMPLES, *details["shape"]), dtype=np.int8)
+
+
+def generate(name: str) -> bool:
+    """Writes the case; True when TFLite Micro deviates from the reference kernels."""
+    shapes, fn = CASES[name]
+    rng = np.random.default_rng(sum(name.encode()))
+    model = _convert(fn, shapes, rng, float_io=name in FLOAT_BOUNDARIES)
+    reference = tf.lite.Interpreter(
+        model_content=model,
+        experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
+    reference.allocate_tensors()
+    inputs = [_inputs(details, rng) for details in reference.get_input_details()]
+    output_details = reference.get_output_details()
+    micro_interpreter = micro.Interpreter.from_bytes(model, arena_size=1024 * 1024)
+    micro_outputs, reference_outputs = [], []
+    for sample in range(SAMPLES):
+        for index, values in enumerate(inputs):
+            micro_interpreter.set_input(values[sample], index)
+            reference.set_tensor(reference.get_input_details()[index]["index"], values[sample])
+        micro_interpreter.invoke()
+        reference.invoke()
+        micro_outputs.append([micro_interpreter.get_output(i).copy() for i in range(len(output_details))])
+        reference_outputs.append([reference.get_tensor(d["index"]).copy() for d in output_details])
+    deviates = any(not np.array_equal(m, r) for ms, rs in zip(micro_outputs, reference_outputs)
+                   for m, r in zip(ms, rs))
+    outputs = reference_outputs if deviates else micro_outputs
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / f"{name}.tflite").write_bytes(model)
+    arrays = {f"input_{i}": values for i, values in enumerate(inputs)}
+    for index in range(len(output_details)):
+        arrays[f"output_{index}"] = np.stack([sample[index] for sample in outputs])
+    np.savez_compressed(OUT / f"{name}.npz", **arrays)
+    print(f"{name}: {len(model)} bytes" + (", TFLite Micro deviates" if deviates else ""))
+    return deviates
+
+
+def main(names: list[str]) -> None:
+    deviations = [name for name in names or sorted(CASES) if generate(name)]
+    if deviations:
+        print("recorded from the reference kernels: " + ", ".join(deviations))
+    print(f"tensorflow {tf.__version__}, tflite-micro {version('tflite-micro')}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

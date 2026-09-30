@@ -85,6 +85,9 @@
         "cmsis-nn": "falls back for dilation other than 1",
         "esp-nn": "falls back for dilation other than 1"
       },
+      "constraints": [
+        "one group per input channel with a channel multiplier; a multiplier other than 1 runs on s8_ref under the accelerated backends"
+      ],
       "opcode": 2,
       "operator": "DepthwiseConv",
       "routes": {
@@ -226,7 +229,7 @@
     },
     {
       "constraints": [
-        "rank-3 and rank-4 concatenation on the last stored axis; a constant part only as the leading operand of a float concatenation"
+        "rank-3 and rank-4 concatenation on any stored axis but the batch axis, tiled only on the last one; a constant part only as the leading operand of a float concatenation on the last stored axis"
       ],
       "opcode": 13,
       "operator": "Concat",
@@ -470,7 +473,7 @@
     },
     {
       "constraints": [
-        "contiguous parts along the outermost stored axis; untiled execution"
+        "parts along any stored axis; untiled execution"
       ],
       "opcode": 35,
       "operator": "Split",

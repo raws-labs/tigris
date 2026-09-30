@@ -249,6 +249,11 @@ class AnalyzedGraph:
     model_input_dtypes: list[int] = field(default_factory=list)
     model_output_dtypes: list[int] = field(default_factory=list)
 
+    # Populated by loader - True when the model states that every input and
+    # output of rank 3 or more is held channels-last, a terminal Transpose
+    # included. A plain ONNX model keeps a terminal Transpose in ONNX order.
+    channels_last_boundaries: bool = False
+
     # Populated by loader - raw weight arrays keyed by initializer name
     weight_data: dict[str, np.ndarray] = field(default_factory=dict)
 

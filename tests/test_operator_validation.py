@@ -251,18 +251,18 @@ def test_unrepresentable_pool_attributes_are_rejected(
         ),
         (
             OpNode(
-                name="spatial_concat",
+                name="batch_concat",
                 op_type="Concat",
                 inputs=["left", "right"],
                 outputs=["output"],
-                attrs={"kernel_shape": [1]},
+                attrs={"kernel_shape": [0]},
             ),
             {
                 "left": TensorInfo("left", (1, 2, 3, 4), TensorProto.FLOAT),
                 "right": TensorInfo("right", (1, 2, 3, 4), TensorProto.FLOAT),
-                "output": TensorInfo("output", (1, 2, 6, 4), TensorProto.FLOAT),
+                "output": TensorInfo("output", (2, 2, 3, 4), TensorProto.FLOAT),
             },
-            "concatenates a rank-4 tensor on its channel axis only",
+            "does not concatenate on the batch axis",
         ),
         (
             OpNode(

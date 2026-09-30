@@ -155,6 +155,15 @@ def classify_op(op_type: str) -> TileCategory:
     return _OP_CATEGORY.get(op_type, TileCategory.UNTILEABLE)
 
 
+def op_category(op: OpNode) -> TileCategory:
+    """The tile category of one operator. A Concat is pointwise only along the
+    last stored axis, the one every tile holds whole; along any other axis a
+    band would cut the axis being joined."""
+    if op.op_type == "Concat" and not op.attrs.get("concat_last_axis", True):
+        return TileCategory.UNTILEABLE
+    return classify_op(op.op_type)
+
+
 # Receptive field computation
 
 
@@ -181,7 +190,7 @@ def compute_receptive_field(
     jump_w = 1
 
     for op in reversed(ops):
-        cat = classify_op(op.op_type)
+        cat = op_category(op)
         if cat is TileCategory.UPSAMPLE:
             # Measured in input rows, a nearest resample reads one row per
             # output row and a bilinear one reads the pair around it. With
@@ -362,7 +371,7 @@ def _has_post_spatial_binary(stage_ops: list[OpNode]) -> bool:
     """
     spatial_idx = next(
         (i for i, o in enumerate(stage_ops)
-         if classify_op(o.op_type) in (TileCategory.CONV, TileCategory.POOL)),
+         if op_category(o) in (TileCategory.CONV, TileCategory.POOL)),
         None,
     )
     if spatial_idx is None:
@@ -399,7 +408,7 @@ def _stage_2d_eligible(
     spatial_count = sum(
         1
         for op in stage_ops
-        if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL)
+        if op_category(op) in (TileCategory.CONV, TileCategory.POOL)
     )
     if spatial_count > 1:
         return False
@@ -451,7 +460,7 @@ def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
             continue
         if op.op_type in _BINARY_OPS or op.op_type == "Concat":
             return False
-        if classify_op(op.op_type) != TileCategory.POINTWISE:
+        if op_category(op) != TileCategory.POINTWISE:
             return False
     return True
 
@@ -1183,7 +1192,7 @@ def _solve_forward_2d(
     """
     spatial = next(
         (op for op in stage_ops
-         if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL)),
+         if op_category(op) in (TileCategory.CONV, TileCategory.POOL)),
         None,
     )
     out_h = _find_output_extent(ag, stage)
@@ -1335,7 +1344,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         # Check if all ops are tileable
         untileable: list[str] = []
         for op in stage_ops:
-            cat = classify_op(op.op_type)
+            cat = op_category(op)
             if (cat == TileCategory.UNTILEABLE
                     or not _op_supports_axis(op, tile_axis)
                     or (_has_unequal_binary_operands(ag, op)
@@ -1507,7 +1516,7 @@ def _op_supports_axis(op: OpNode, axis: int) -> bool:
             return False
         # A resample is cut along its height only; the 2D tiler does not
         # invert its rectangle.
-        if classify_op(op.op_type) is TileCategory.UPSAMPLE:
+        if op_category(op) is TileCategory.UPSAMPLE:
             return False
         return op.op_type in _OP_CATEGORY
     return False
@@ -1626,7 +1635,7 @@ def _external_outputs_keep_their_rows(
     seen_external = False
     for op in stage_ops:
         if seen_external:
-            cat = classify_op(op.op_type)
+            cat = op_category(op)
             if cat in (TileCategory.CONV, TileCategory.POOL) and (
                 _get_stride_h(op) != 1
             ):
@@ -1651,7 +1660,7 @@ def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
     the head axis as an image.
     """
     for op_i in stage.op_indices:
-        cat = classify_op(ag.ops[op_i].op_type)
+        cat = op_category(ag.ops[op_i])
         # A resample stays out of a chain: the chain executor composes one
         # receptive field across its members and has no fractional stride.
         if cat in (TileCategory.UNTILEABLE, TileCategory.UPSAMPLE):
@@ -1698,7 +1707,7 @@ def _stage_producer(ag: AnalyzedGraph) -> dict[str, int]:
 
 def _has_height_spatial_op(ag: AnalyzedGraph, stage: Stage) -> bool:
     return any(
-        classify_op(ag.ops[i].op_type) in (TileCategory.CONV, TileCategory.POOL)
+        op_category(ag.ops[i]) in (TileCategory.CONV, TileCategory.POOL)
         for i in stage.op_indices
     )
 
@@ -1724,7 +1733,7 @@ def _skip_rows_still_line_up(
         op = ag.ops[op_index]
         if name in op.inputs:
             return True
-        if classify_op(op.op_type) in (TileCategory.CONV, TileCategory.POOL):
+        if op_category(op) in (TileCategory.CONV, TileCategory.POOL):
             return False
     return True
 
@@ -1845,7 +1854,7 @@ def _get_stage_spatial_params(ag: AnalyzedGraph, stage: Stage) -> tuple[int, int
     weight_shapes = _ag_weight_shapes(ag)
     for op_i in stage.op_indices:
         op = ag.ops[op_i]
-        cat = classify_op(op.op_type)
+        cat = op_category(op)
         if cat in (TileCategory.CONV, TileCategory.POOL):
             kh = _get_kernel_h(op, weight_shapes)
             sh = _get_stride_h(op)
@@ -1930,7 +1939,7 @@ def _chain_fast_bytes(
         cur_h = heights[s_idx][0]  # start with stage input height
         for op_i in stage.op_indices:
             op = ag.ops[op_i]
-            cat = classify_op(op.op_type)
+            cat = op_category(op)
             # Spatial ops reduce height
             if cat in (TileCategory.CONV, TileCategory.POOL):
                 kh = _get_kernel_h(op, weight_shapes)

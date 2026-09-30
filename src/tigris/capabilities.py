@@ -118,8 +118,13 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "explicit padding, floor output sizing, unit dilation, and no indices output",
     ),
     "Concat": (
-        "rank-3 and rank-4 concatenation on the last stored axis; a constant "
-        "part only as the leading operand of a float concatenation",
+        "rank-3 and rank-4 concatenation on any stored axis but the batch "
+        "axis, tiled only on the last one; a constant part only as the "
+        "leading operand of a float concatenation on the last stored axis",
+    ),
+    "DepthwiseConv": (
+        "one group per input channel with a channel multiplier; a multiplier "
+        "other than 1 runs on s8_ref under the accelerated backends",
     ),
     "Conv1D": (
         "standalone rank-3 length tiling on serialized axis 1; may compose with "
@@ -129,7 +134,7 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "rank-4 height tiling: each band of rows is added into the per-channel sums",
     ),
     "Split": (
-        "contiguous parts along the outermost stored axis; untiled execution",
+        "parts along any stored axis; untiled execution",
     ),
     "ReduceMean": (
         "rank-3 mean over serialized axis 1; untiled execution. A rank-4 mean "

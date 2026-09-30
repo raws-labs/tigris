@@ -564,6 +564,109 @@ def _hardswish_case(*, quantized: bool) -> ContractCase:
                         expect_chain=quantized, expect_line_buffered=quantized)
 
 
+def _depthwise_multiplier_case(*, quantized: bool) -> ContractCase:
+    """A depthwise convolution writing two output channels per input channel,
+    banded by height."""
+    channels, multiplier, side = 4, 2, 16
+    rng = np.random.default_rng(22)
+    weight = (rng.normal(size=(channels * multiplier, 1, 3, 3)) * 0.4).astype(np.float32)
+    data = rng.uniform(-1.0, 1.0, size=(1, channels, side, side)).astype(np.float32)
+    initializers = [numpy_helper.from_array(weight, "weight")]
+    conv = dict(kernel_shape=[3, 3], pads=[1, 1, 1, 1], group=channels)
+    if quantized:
+        initializers += _scalars(inp=(0.008, 0), w=(0.01, 0), conv=(0.02, 3))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            *_qdq("weight", "w_s", "w_z", "wdq"),
+            helper.make_node("Conv", ["x", "wdq"], ["raw"], **conv),
+            *_qdq("raw", "conv_s", "conv_z", "output"),
+        ]
+    else:
+        nodes = [helper.make_node("Conv", ["input", "weight"], ["output"], **conv)]
+    label = f"{'int8' if quantized else 'float'}_depthwise_multiplier"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+        [helper.make_tensor_value_info(
+            "output", TensorProto.FLOAT, [1, channels * multiplier, side, side])],
+        initializers, opset=14,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data},
+                        ("DepthwiseConv",), mem_budget="2K", expect_tiled=True)
+
+
+def _inner_axis_concat_case(*, axis: int, quantized: bool) -> ContractCase:
+    """Two feature maps joined along height or width behind a convolution.
+    No band holds the joined axis whole, so the stage runs untiled."""
+    channels, height, width = 4, 12, 12
+    rng = np.random.default_rng(23 + axis)
+    weight = (rng.normal(size=(channels, channels, 3, 3)) * 0.25).astype(np.float32)
+    data = rng.uniform(-1.0, 1.0, size=(1, channels, height, width)).astype(np.float32)
+    other = rng.uniform(-1.0, 1.0, size=(1, channels, height, width)).astype(np.float32)
+    initializers = [numpy_helper.from_array(weight, "weight")]
+    conv = dict(kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    if quantized:
+        initializers += _scalars(inp=(0.008, 0), w=(0.01, 0), act=(0.03, 0))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            *_qdq("other", "act_s", "act_z", "y"),
+            *_qdq("weight", "w_s", "w_z", "wdq"),
+            helper.make_node("Conv", ["x", "wdq"], ["raw"], **conv),
+            *_qdq("raw", "act_s", "act_z", "c"),
+            helper.make_node("Concat", ["c", "y"], ["joined"], axis=axis),
+            *_qdq("joined", "act_s", "act_z", "output"),
+        ]
+    else:
+        nodes = [
+            helper.make_node("Conv", ["input", "weight"], ["c"], **conv),
+            helper.make_node("Concat", ["c", "other"], ["output"], axis=axis),
+        ]
+    shape = [1, channels, height, width]
+    shape[axis] *= 2
+    label = f"{'int8' if quantized else 'float'}_concat_axis{axis}"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, height, width]),
+         helper.make_tensor_value_info("other", TensorProto.FLOAT, [1, channels, height, width])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        initializers, opset=14,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data, "other": other},
+                        ("Conv", "Concat"), mem_budget="16K")
+
+
+def _channel_split_case(*, quantized: bool) -> ContractCase:
+    """A feature map cut into unequal channel groups, each an interleaved run
+    per pixel, recombined by a product."""
+    rng = np.random.default_rng(24)
+    data = rng.uniform(-1.0, 1.0, size=(1, 6, 5, 5)).astype(np.float32)
+    initializers = [numpy_helper.from_array(np.array([3, 3], np.int64), "parts")]
+    if quantized:
+        initializers += _scalars(inp=(0.008, 0), prod=(0.0001, -5))
+        nodes = [
+            *_qdq("input", "inp_s", "inp_z", "x"),
+            helper.make_node("Split", ["x", "parts"], ["a", "b"], axis=1),
+            *_qdq("a", "inp_s", "inp_z", "aq"),
+            *_qdq("b", "inp_s", "inp_z", "bq"),
+            helper.make_node("Mul", ["aq", "bq"], ["prod"]),
+            *_qdq("prod", "prod_s", "prod_z", "output"),
+        ]
+    else:
+        nodes = [
+            helper.make_node("Split", ["input", "parts"], ["a", "b"], axis=1),
+            helper.make_node("Mul", ["a", "b"], ["output"]),
+        ]
+    label = f"{'int8' if quantized else 'float'}_channel_split"
+    model = _model(
+        label, nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 6, 5, 5])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 5, 5])],
+        initializers, opset=14,
+    )
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data},
+                        ("Split", "Mul"))
+
+
 def _split_chain_case(*, quantized: bool) -> ContractCase:
     """A strided stem feeding wide layers, too big to stream as one chain.
 
@@ -5828,7 +5931,7 @@ def _assert_compile_rejected(work_dir: Path) -> None:
             "unsupported_concat_axis",
             [
                 helper.make_node(
-                    "Concat", ["left", "right"], ["output"], axis=2
+                    "Concat", ["left", "right"], ["output"], axis=0
                 )
             ],
             [
@@ -5841,7 +5944,7 @@ def _assert_compile_rejected(work_dir: Path) -> None:
             ],
             [
                 helper.make_tensor_value_info(
-                    "output", TensorProto.FLOAT, [1, 2, 6, 4]
+                    "output", TensorProto.FLOAT, [2, 2, 3, 4]
                 )
             ],
         ),
@@ -5959,6 +6062,14 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _inferred_kernel_chain_case(quantized=True),
         _hardswish_case(quantized=False),
         _hardswish_case(quantized=True),
+        _depthwise_multiplier_case(quantized=False),
+        _depthwise_multiplier_case(quantized=True),
+        _inner_axis_concat_case(axis=2, quantized=False),
+        _inner_axis_concat_case(axis=2, quantized=True),
+        _inner_axis_concat_case(axis=3, quantized=False),
+        _inner_axis_concat_case(axis=3, quantized=True),
+        _channel_split_case(quantized=False),
+        _channel_split_case(quantized=True),
         _squeeze_excitation_case(quantized=False),
         _squeeze_excitation_case(quantized=True),
         _qdq_bilinear_upsample_case(),

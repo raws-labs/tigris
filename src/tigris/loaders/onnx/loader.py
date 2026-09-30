@@ -7,6 +7,7 @@ from onnx import helper as onnx_helper
 from onnx import numpy_helper, shape_inference
 
 from tigris.frontends import load_onnx
+from tigris.frontends.tflite import BOUNDARY_LAYOUT_KEY
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders.onnx.shapes import bind_free_dims, fold_shape_subgraph
 
@@ -92,6 +93,9 @@ def load_model(
     graph = model.graph
     ag = AnalyzedGraph()
     ag.model_name = Path(path).stem
+    ag.channels_last_boundaries = any(
+        prop.key == BOUNDARY_LAYOUT_KEY and prop.value == "channels_last"
+        for prop in model.metadata_props)
     ag.shape_bindings = bindings
     ag.opset = next(
         (entry.version for entry in model.opset_import if entry.domain in ("", "ai.onnx")),

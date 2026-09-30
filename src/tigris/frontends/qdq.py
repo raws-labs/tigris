@@ -34,6 +34,11 @@ class GraphBuilder:
         self.nodes.append(helper.make_node(op_type, inputs, [output], **attributes))
         return output
 
+    def multi_node(self, op_type: str, inputs: list[str], names: list[str], **attributes) -> list[str]:
+        outputs = [self.unique(name) for name in names]
+        self.nodes.append(helper.make_node(op_type, inputs, outputs, **attributes))
+        return outputs
+
     def dequantized_constant(self, values, scale, zero_point, name: str, *, axis=None,
                              zero_dtype=np.int8) -> str:
         """An integer constant behind a DequantizeLinear, per-channel when
