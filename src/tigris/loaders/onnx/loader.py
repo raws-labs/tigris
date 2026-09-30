@@ -77,6 +77,31 @@ def resolve_shapes(
     return [binding.describe() for binding in bindings]
 
 
+def _file_shapes_only(
+    model: onnx.ModelProto, input_shapes: dict[str, tuple[int, ...]]
+) -> dict[str, tuple[int, ...]]:
+    """Check shapes given for a channels-last file against the file.
+
+    The conversion fixed every tensor shape from the file, so a different input
+    shape would not describe the same model. A shape is given in the file's own
+    order; the graph carries it channels-first.
+    """
+    declared = {vi.name: tuple(d.dim_value for d in vi.type.tensor_type.shape.dim)
+                for vi in model.graph.input}
+    result = {}
+    for name, shape in input_shapes.items():
+        graph_shape = (shape[0], shape[-1], *shape[1:-1]) if len(shape) >= 3 else tuple(shape)
+        if name in declared and graph_shape != declared[name]:
+            file_shape = declared[name]
+            if len(file_shape) >= 3:
+                file_shape = (file_shape[0], *file_shape[2:], file_shape[1])
+            raise ValueError(
+                f"Input {name!r} is {'x'.join(map(str, file_shape))} in the model file, "
+                "which fixes every tensor shape; it cannot be compiled for another shape")
+        result[name] = graph_shape
+    return result
+
+
 def load_model(
     path: str | Path,
     input_shapes: dict[str, tuple[int, ...]] | None = None,
@@ -88,14 +113,17 @@ def load_model(
     ``input_shapes`` maps a model input name to the full shape to compile for.
     """
     model = load_onnx(path)
+    channels_last = any(
+        prop.key == BOUNDARY_LAYOUT_KEY and prop.value == "channels_last"
+        for prop in model.metadata_props)
+    if channels_last and input_shapes:
+        input_shapes = _file_shapes_only(model, input_shapes)
     bindings = resolve_shapes(model, input_shapes)
 
     graph = model.graph
     ag = AnalyzedGraph()
     ag.model_name = Path(path).stem
-    ag.channels_last_boundaries = any(
-        prop.key == BOUNDARY_LAYOUT_KEY and prop.value == "channels_last"
-        for prop in model.metadata_props)
+    ag.channels_last_source = channels_last
     ag.shape_bindings = bindings
     ag.opset = next(
         (entry.version for entry in model.opset_import if entry.domain in ("", "ai.onnx")),

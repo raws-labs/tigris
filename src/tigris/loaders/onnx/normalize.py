@@ -491,7 +491,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
     # Model inputs and outputs keep the convention callers already rely on, so
     # a boundary that ended up linear is converted back. Internal tensors are
     # free to be either; the interface is not.
-    terminal_transpose = set() if ag.channels_last_boundaries else {
+    terminal_transpose = set() if ag.channels_last_source else {
         op.outputs[0]
         for op in ag.ops
         if op.op_type == "Transpose" and len(op.outputs) == 1
