@@ -108,14 +108,38 @@ CONDITIONAL_FALLBACKS: dict[str, dict[str, str]] = {
             "falls back for dilation other than 1; asymmetric padding falls "
             "back when its preparation-time workspace is insufficient"
         ),
-        "DepthwiseConv": "falls back for dilation other than 1",
+        "DepthwiseConv": (
+            "falls back for dilation other than 1; channel multipliers require batch 1"
+        ),
+        "Mul": (
+            "falls back for constants, broadcasting, non-per-tensor quantization, "
+            "requantization shifts outside [-31, 15], or width, row or rolled tiles"
+        ),
         "AveragePool": (
             "falls back when tiled or when input/output quantization differs"
         ),
     },
     "cmsis-nn": {
         "Conv": "falls back for dilation other than 1",
-        "DepthwiseConv": "falls back for dilation other than 1",
+        "DepthwiseConv": (
+            "falls back for tiled dilation other than 1; channel multipliers "
+            "fall back with CMSIS_NN_USE_SINGLE_ROUNDING"
+        ),
+        "Mul": (
+            "falls back for constants, broadcasting, non-per-tensor quantization, "
+            "requantization shifts outside [-31, 15], width, row or rolled tiles, "
+            "or CMSIS_NN_USE_SINGLE_ROUNDING"
+        ),
+        "Max": (
+            "falls back unless dynamic operands have identical shapes and both inputs "
+            "and output have equal per-tensor scales and zero points; "
+            "width, row and rolled tiles fall back"
+        ),
+        "Min": (
+            "falls back unless dynamic operands have identical shapes and both inputs "
+            "and output have equal per-tensor scales and zero points; "
+            "width, row and rolled tiles fall back"
+        ),
         "AveragePool": (
             "falls back when tiled or when input/output quantization differs"
         ),
@@ -164,8 +188,7 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "leading operand of a float concatenation on the last stored axis",
     ),
     "DepthwiseConv": (
-        "one group per input channel with a channel multiplier; a multiplier "
-        "other than 1 runs on s8_ref under the accelerated backends",
+        "one group per input channel with a channel multiplier",
     ),
     "Conv1D": (
         "standalone rank-3 length tiling on serialized axis 1; may compose with "
@@ -238,6 +261,7 @@ KERNEL_CAPABILITIES: dict[str, KernelCapabilities] = {
             "DepthwiseConv",
             "Gemm",
             "AveragePool",
+            "Mul",
         }),
         fallback="s8_ref",
     ),
@@ -250,6 +274,9 @@ KERNEL_CAPABILITIES: dict[str, KernelCapabilities] = {
             "Gemm",
             "AveragePool",
             "GlobalAveragePool",
+            "Mul",
+            "Max",
+            "Min",
         }),
         fallback="s8_ref",
     ),
