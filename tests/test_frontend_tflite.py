@@ -135,3 +135,18 @@ def test_an_int8_operator_tflite_micro_runs_in_float_only_is_refused():
     data = _with_operator_replaced((FIXTURES / "ops" / "abs.tflite").read_bytes(), "ABS", negate)
     assert any("NEG: TFLite Micro runs it in float32 only" in reason
                for reason in tflite.unsupported(data))
+
+
+def test_analyze_reports_shapes_in_the_files_axis_order():
+    result = CliRunner().invoke(cli, ["analyze", str(KWS), "-m", "16K"])
+    assert result.exit_code == 0, result.output
+    assert "input_1 1x49x10x1" in result.output
+    assert "1x25x5x64" in result.output
+
+
+def test_an_input_shape_the_file_does_not_state_is_refused():
+    same = CliRunner().invoke(cli, ["analyze", str(KWS), "-m", "16K", "--input-shape", "input_1:1x49x10x1"])
+    assert same.exit_code == 0, same.output
+    other = CliRunner().invoke(cli, ["analyze", str(KWS), "-m", "16K", "--input-shape", "input_1:1x1x49x10"])
+    assert other.exit_code != 0
+    assert "fixes every tensor shape" in other.output

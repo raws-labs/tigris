@@ -9,7 +9,7 @@ import numpy as np
 
 from tigris.graph.ir import AnalyzedGraph
 from tigris.analysis.partition_temporal import partition_temporal
-from tigris.utils import fmt_bytes
+from tigris.utils import fmt_bytes, source_shape
 
 
 @dataclass
@@ -341,7 +341,7 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0) -> Findings:
     f.largest_tensor_name = largest.tensor_name
     f.largest_tensor_bytes = largest.size_bytes
     if largest_info:
-        f.largest_tensor_shape = "x".join(str(d) for d in largest_info.shape)
+        f.largest_tensor_shape = "x".join(str(d) for d in source_shape(ag, largest_info.shape))
 
     # Min budget to avoid tiling
     f.min_budget_no_tiling = max(

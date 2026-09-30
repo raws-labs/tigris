@@ -15,6 +15,15 @@ def fmt_bytes(b: int, *, unit_ref: int | None = None) -> str:
 _DTYPE_NAMES = {1: "float32", 2: "uint8", 3: "int8", 6: "int32", 7: "int64"}
 
 
+def source_shape(ag, shape) -> tuple[int, ...]:
+    """A shape in the axis order of the model file: channels-last for a
+    tensor of rank 3 or more from a file that states it so, as TFLite does."""
+    shape = tuple(shape)
+    if getattr(ag, "channels_last_source", False) and len(shape) >= 3:
+        return (shape[0], *shape[2:], shape[1])
+    return shape
+
+
 def describe_interface(ag) -> list[tuple[str, str]]:
     """One (label, description) per model input and output.
 
@@ -32,7 +41,7 @@ def describe_interface(ag) -> list[tuple[str, str]]:
             info = ag.tensors.get(name)
             if info is None:
                 continue
-            shape = "x".join(str(dim) for dim in info.shape) or "scalar"
+            shape = "x".join(str(dim) for dim in source_shape(ag, info.shape)) or "scalar"
             declared = (
                 declared_dtypes[index]
                 if index < len(declared_dtypes)
