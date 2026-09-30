@@ -9,6 +9,7 @@ from pathlib import Path
 import onnx
 from google.protobuf.message import DecodeError
 
+from tigris.frontends import tflite
 from tigris import SCHEMA_VERSION_INTERFACE_DTYPE, SCHEMA_VERSION_TENSOR_LAYOUT
 from tigris.emitters.binary import defs
 from tigris.emitters.binary.reader import read_binary_plan
@@ -205,6 +206,13 @@ def inspect_file(path: str | Path) -> dict:
             raise ValueError(f"Invalid TiGrIS plan: {exc}") from exc
         report.update(format="tgrs", name=plan["model_name"], plan=plan)
         operators = plan["ops"]
+    elif tflite.is_tflite(data):
+        try:
+            model = tflite.describe(data)
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"Invalid TFLite model: {exc}") from exc
+        report.update(format="tflite", **model)
+        operators = model["graph"]["operators"]
     else:
         try:
             model = onnx.load_model_from_string(data)

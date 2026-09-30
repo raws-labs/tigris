@@ -6,8 +6,10 @@ from tigris.graph.ir import AnalyzedGraph
 
 __all__ = ["load_model"]
 
+# Every format reaches the ONNX loader through tigris.frontends.
 _EXTENSION_MAP = {
     ".onnx": "tigris.loaders.onnx",
+    ".tflite": "tigris.loaders.onnx",
 }
 
 
