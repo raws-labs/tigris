@@ -71,6 +71,24 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     # argument that admits Softmax.
     "Erf": TileCategory.POINTWISE,
     "HardSwish": TileCategory.POINTWISE,
+    "Abs": TileCategory.POINTWISE,
+    "Rsqrt": TileCategory.POINTWISE,
+    "Neg": TileCategory.POINTWISE,
+    "Exp": TileCategory.POINTWISE,
+    "Log": TileCategory.POINTWISE,
+    "Sqrt": TileCategory.POINTWISE,
+    "Square": TileCategory.POINTWISE,
+    "Floor": TileCategory.POINTWISE,
+    "Ceil": TileCategory.POINTWISE,
+    "Round": TileCategory.POINTWISE,
+    "Sin": TileCategory.POINTWISE,
+    "Cos": TileCategory.POINTWISE,
+    "Div": TileCategory.POINTWISE,
+    "SquaredDifference": TileCategory.POINTWISE,
+    "Max": TileCategory.POINTWISE,
+    "Min": TileCategory.POINTWISE,
+    "FloorDiv": TileCategory.POINTWISE,
+    "FloorMod": TileCategory.POINTWISE,
     "LayerNormalization": TileCategory.POINTWISE,
     # Resampling along the height: the runtime cuts the output into bands and
     # reads the source band each one needs. Only the height axis, and only on
@@ -89,7 +107,9 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 # the wrong region or size from its second operand. Safe only in stages with
 # no spatial op. Shared between the rank-3 and rank-4 eligibility checks
 # below since the hazard is the same in both.
-_BINARY_OPS = frozenset({"Add", "Sub", "Mul"})
+_BINARY_OPS = frozenset({
+    "Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod",
+})
 
 # Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
 # NHWC stages.  Unary pointwise operators preserve the current length and may
@@ -104,6 +124,18 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Softmax",
     "Erf",
     "HardSwish",
+    "Abs",
+    "Rsqrt",
+    "Neg",
+    "Exp",
+    "Log",
+    "Sqrt",
+    "Square",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Sin",
+    "Cos",
     "LayerNormalization",
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
@@ -551,6 +583,18 @@ _ROW_TILING_OPS = frozenset({
     "Tanh",
     "Erf",
     "HardSwish",
+    "Abs",
+    "Rsqrt",
+    "Neg",
+    "Exp",
+    "Log",
+    "Sqrt",
+    "Square",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Sin",
+    "Cos",
     "Softmax",
     "LayerNormalization",
     "Reshape",

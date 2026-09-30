@@ -216,6 +216,32 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             continue
 
         reasons: list[str] = []
+        backend = "s8_ref" if ag.is_quantized else "reference"
+        if op.op_type not in effective_operators(backend):
+            reasons.append(f"{op.op_type} has no {backend} runtime kernel")
+        elementwise_unary = {
+            "Abs", "Rsqrt", "Neg", "Exp", "Log", "Sqrt", "Square",
+            "Floor", "Ceil", "Round", "Sin", "Cos",
+        }
+        elementwise_binary = {"Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod"}
+        if op.op_type in elementwise_unary | elementwise_binary:
+            count = 2 if op.op_type in elementwise_binary else 1
+            tensors = [ag.tensors.get(name) for name in op.inputs + op.outputs]
+            if (len(op.inputs) != count or len(op.outputs) != 1
+                    or any(t is None or t.is_constant for t in tensors)):
+                reasons.append(f"runtime requires {count} dynamic operands and one output")
+            elif any(t.shape != tensors[0].shape for t in tensors[1:]):
+                reasons.append("elementwise operands and output must have identical shapes")
+            elif ag.is_quantized:
+                if any(t.quant is None or t.quant.scale.size != 1
+                       or t.quant.zero_point.size != 1 for t in tensors):
+                    reasons.append("elementwise int8 requires per-tensor quantization")
+                elif op.op_type in {"Max", "Min"} and any(
+                    t.quant.scale[0] != tensors[0].quant.scale[0]
+                    or t.quant.zero_point[0] != tensors[0].quant.zero_point[0]
+                    for t in tensors[1:]
+                ):
+                    reasons.append("Max/Min requires identical input and output quantization")
         auto_pad = op.attrs.get("auto_pad", "NOTSET")
         if op.op_type in {
             "Conv",

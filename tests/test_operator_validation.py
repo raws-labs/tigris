@@ -13,11 +13,11 @@ from tigris.analysis.validation import (
 )
 from tigris.cli import _run_pipeline, cli
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.graph.ir import AnalyzedGraph, OpNode, Stage, TensorInfo, TilePlan
+from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, Stage, TensorInfo, TilePlan
 
 
 @pytest.fixture
-def sin_model_path(tmp_path):
+def acos_model_path(tmp_path):
     """A valid one-op ONNX model whose operator is not in OP_TYPE_MAP."""
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 4]
@@ -26,10 +26,10 @@ def sin_model_path(tmp_path):
         "output", TensorProto.FLOAT, [1, 4]
     )
     node = helper.make_node(
-        "Sin", ["input"], ["output"], name="unsupported_sin"
+        "Acos", ["input"], ["output"], name="unsupported_acos"
     )
     graph = helper.make_graph(
-        [node], "unsupported_sin", [model_input], [model_output]
+        [node], "unsupported_acos", [model_input], [model_output]
     )
     model = helper.make_model(
         graph, opset_imports=[helper.make_opsetid("", 13)]
@@ -37,7 +37,7 @@ def sin_model_path(tmp_path):
     model.ir_version = 8
     onnx.checker.check_model(model)
 
-    path = tmp_path / "unsupported_sin.onnx"
+    path = tmp_path / "unsupported_acos.onnx"
     onnx.save(model, path)
     return path
 
@@ -102,52 +102,52 @@ def mixed_dtype_model_path(tmp_path):
     return path
 
 
-def test_normalized_unknown_operator_is_reported(sin_model_path):
-    graph, _ = _run_pipeline(str(sin_model_path), ("4K",))
+def test_normalized_unknown_operator_is_reported(acos_model_path):
+    graph, _ = _run_pipeline(str(acos_model_path), ("4K",))
 
     validation = validate_operator_support(graph)
     findings = compute_findings(graph)
 
     assert not validation.supported
     assert [issue.describe() for issue in validation.issues] == [
-        "unsupported_sin (Sin)"
+        "unsupported_acos (Acos)"
     ]
     assert findings.verdict == "needs_work"
-    assert findings.unsupported_operators == ["unsupported_sin (Sin)"]
+    assert findings.unsupported_operators == ["unsupported_acos (Acos)"]
 
 
-def test_analyze_lists_unsupported_operator_as_failure(sin_model_path):
+def test_analyze_lists_unsupported_operator_as_failure(acos_model_path):
     result = CliRunner().invoke(
-        cli, ["analyze", str(sin_model_path), "-m", "4K"]
+        cli, ["analyze", str(acos_model_path), "-m", "4K"]
     )
 
     assert result.exit_code == 0, result.output
     assert "FAIL" in result.output
-    assert "unsupported_sin (Sin)" in result.output
+    assert "unsupported_acos (Acos)" in result.output
 
 
 def test_compile_rejects_unsupported_operator_without_output(
-    sin_model_path, tmp_path
+    acos_model_path, tmp_path
 ):
     output = tmp_path / "should-not-exist.tgrs"
 
     result = CliRunner().invoke(
         cli,
-        ["compile", str(sin_model_path), "-m", "4K", "-o", str(output)],
+        ["compile", str(acos_model_path), "-m", "4K", "-o", str(output)],
     )
 
     assert result.exit_code != 0
     assert "Cannot compile a plan with unsupported operators" in result.output
-    assert "unsupported_sin (Sin)" in result.output
+    assert "unsupported_acos (Acos)" in result.output
     assert not output.exists()
 
 
-def test_writer_rejects_unsupported_operator(sin_model_path):
-    graph, _ = _run_pipeline(str(sin_model_path), ("4K",))
+def test_writer_rejects_unsupported_operator(acos_model_path):
+    graph, _ = _run_pipeline(str(acos_model_path), ("4K",))
 
     with pytest.raises(
         ValueError,
-        match="Cannot emit a plan with unsupported operators: unsupported_sin",
+        match="Cannot emit a plan with unsupported operators: unsupported_acos",
     ):
         emit_binary_bytes(graph)
 
@@ -714,6 +714,46 @@ def test_hardswish_and_int8_bilinear_have_kernels():
         assert "ResizeLinear" in effective_operators(backend)
 
 
+@pytest.mark.parametrize("kind", [
+    "Neg", "Exp", "Log", "Sqrt", "Square", "Floor", "Ceil", "Round",
+    "Sin", "Cos", "Div", "FloorDiv", "FloorMod",
+])
+def test_elementwise_without_int8_kernel_rejects_quantized_plans(kind):
+    binary = kind in {"Div", "FloorDiv", "FloorMod"}
+    quant = QuantParam(np.array([0.125], np.float32), np.array([-17], np.int8))
+    ag = AnalyzedGraph(
+        ops=[OpNode(name="math", op_type=kind,
+                    inputs=["a", "b"] if binary else ["a"], outputs=["y"])],
+        tensors={name: TensorInfo(name, (1, 4), 3, quant=quant) for name in ("a", "b", "y")},
+        is_quantized=True,
+    )
+    assert "no s8_ref runtime kernel" in validate_operator_support(ag).describe()
+
+
+@pytest.mark.parametrize("kind", ["Abs", "Rsqrt", "SquaredDifference", "Max", "Min"])
+def test_elementwise_int8_requires_matching_shapes_and_quantization(kind):
+    binary = kind in {"SquaredDifference", "Max", "Min"}
+    tensors = {
+        name: TensorInfo(name, (1, 4), 3, quant=QuantParam(
+            np.array([0.125], np.float32), np.array([-17], np.int8)))
+        for name in ("a", "b", "y")
+    }
+    ag = AnalyzedGraph(
+        ops=[OpNode(name="math", op_type=kind,
+                    inputs=["a", "b"] if binary else ["a"], outputs=["y"])],
+        tensors=tensors, is_quantized=True,
+    )
+    assert validate_operator_support(ag).supported
+    tensors["y"].shape = (2, 2)
+    assert "identical shapes" in validate_operator_support(ag).describe()
+    tensors["y"].shape = (1, 4)
+    if kind in {"Max", "Min"}:
+        tensors["b"].quant.scale[0] = 0.25
+        assert "identical input and output quantization" in validate_operator_support(ag).describe()
+    tensors["a"].quant = None
+    assert "per-tensor quantization" in validate_operator_support(ag).describe()
+
+
 def test_operator_from_another_domain_is_not_the_standard_one(tmp_path):
     """A model-local Relu whose body is Neg must not compile as ONNX Relu."""
     function = helper.make_function(
@@ -764,10 +804,10 @@ def test_grouped_convolution_is_rejected_at_compile_time(tmp_path):
 
 
 @pytest.mark.parametrize("pools", [["-m", "16K", "-m", "1M", "-m", "1"], ["-m", "16K+1M+1"]])
-def test_more_memory_pools_than_the_planner_has_are_rejected(sin_model_path, tmp_path, pools):
+def test_more_memory_pools_than_the_planner_has_are_rejected(acos_model_path, tmp_path, pools):
     output = tmp_path / "should-not-exist.tgrs"
 
-    result = CliRunner().invoke(cli, ["compile", str(sin_model_path), *pools, "-o", str(output)])
+    result = CliRunner().invoke(cli, ["compile", str(acos_model_path), *pools, "-o", str(output)])
 
     assert result.exit_code != 0
     assert "3 memory pools given" in result.output

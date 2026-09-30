@@ -113,6 +113,23 @@ OP_TYPE_MAP: dict[str, int] = {
     "Split": 35,
     "ResizeLinear": 36,
     "HardSwish": 37,
+    "Abs": 38,
+    "Rsqrt": 39,
+    "SquaredDifference": 40,
+    "Max": 41,
+    "Min": 42,
+    "Neg": 43,
+    "Exp": 44,
+    "Log": 45,
+    "Sqrt": 46,
+    "Square": 47,
+    "Floor": 48,
+    "Ceil": 49,
+    "Round": 50,
+    "Sin": 51,
+    "Cos": 52,
+    "FloorDiv": 53,
+    "FloorMod": 54,
 }
 OP_TYPE_UNKNOWN = 255
 

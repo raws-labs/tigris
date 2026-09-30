@@ -58,11 +58,12 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _lower_legacy_softmax(ag)
     ag = _fold_constant_ops(ag)
     ag = _fold_static_subgraphs(ag)
+    ag = _fold_elementwise_patterns(ag)
     ag = _fold_qdq(ag)
+    ag = _fold_float_square(ag)
     ag = _fold_gemm_scalars(ag)
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
-    ag = _neg_to_scalar_mul(ag)
     ag = _fold_sub_constant_to_add(ag)
     ag = _fold_div_constant_to_mul(ag)
     ag = _fold_constant_add_into_bias(ag)
@@ -1201,6 +1202,86 @@ def _fold_static_subgraphs(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Recognize elementwise compositions without crossing quantization edges."""
+    producers = {name: op for op in ag.ops for name in op.outputs}
+    removed: set[str] = set()
+
+    def match(name: str, kind: str, arity: int) -> OpNode | None:
+        op = producers.get(name)
+        return op if op is not None and op.op_type == kind and len(op.inputs) == arity else None
+
+    def zero(name: str) -> bool:
+        value = ag.weight_data.get(name)
+        return value is not None and value.size == 1 and float(value.reshape(-1)[0]) == 0.0
+
+    def replace(root: OpNode, kind: str, inputs: list[str], parts: list[OpNode]) -> None:
+        operands = [ag.tensors.get(name) for name in inputs]
+        if (any(t is None or t.is_constant for t in operands)
+                or any(t.shape != operands[0].shape for t in operands[1:])):
+            return
+        names = {name for part in parts for name in part.outputs}
+        group = {id(part) for part in parts} | {id(root)}
+        if names.intersection(ag.model_outputs) or any(
+            id(op) not in group and names.intersection(op.inputs) for op in ag.ops
+        ):
+            return
+        root.op_type, root.inputs, root.attrs = kind, inputs, {}
+        removed.update(names)
+
+    for op in ag.ops:
+        if op.op_type == "Reciprocal" and len(op.inputs) == 1:
+            inner = match(op.inputs[0], "Sqrt", 1)
+            if inner is not None:
+                replace(op, "Rsqrt", inner.inputs.copy(), [inner])
+        elif op.op_type == "Mul" and len(op.inputs) == 2 and op.inputs[0] == op.inputs[1]:
+            inner = match(op.inputs[0], "Sub", 2)
+            if inner is not None:
+                replace(op, "SquaredDifference", inner.inputs.copy(), [inner])
+        elif op.op_type == "Floor" and len(op.inputs) == 1:
+            inner = match(op.inputs[0], "Div", 2)
+            if inner is not None:
+                replace(op, "FloorDiv", inner.inputs.copy(), [inner])
+        elif op.op_type == "Where" and len(op.inputs) == 3:
+            remainder = match(op.inputs[2], "Mod", 2)
+            added = match(op.inputs[1], "Add", 2)
+            condition = match(op.inputs[0], "And", 2)
+            if remainder is None or added is None or condition is None:
+                continue
+            a, b = remainder.inputs
+            r = op.inputs[2]
+            if remainder.attrs.get("fmod", 0) != 1 or added.inputs != [r, b]:
+                continue
+            nonzero = match(condition.inputs[0], "Not", 1)
+            different = match(condition.inputs[1], "Xor", 2)
+            if nonzero is None or different is None:
+                continue
+            equal = match(nonzero.inputs[0], "Equal", 2)
+            negative_b = match(different.inputs[0], "Less", 2)
+            negative_r = match(different.inputs[1], "Less", 2)
+            if equal is None or negative_b is None or negative_r is None:
+                continue
+            if (equal.inputs[0] == r and zero(equal.inputs[1])
+                    and negative_b.inputs[0] == b and zero(negative_b.inputs[1])
+                    and negative_r.inputs[0] == r and zero(negative_r.inputs[1])):
+                replace(op, "FloorMod", [a, b], [remainder, added, condition, nonzero,
+                                               different, equal, negative_b, negative_r])
+    ag.ops = [op for op in ag.ops if not removed.intersection(op.outputs)]
+    for name in removed:
+        ag.tensors.pop(name, None)
+    return ag
+
+
+def _fold_float_square(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Keep quantized multiplication distinct from the float-only square kernel."""
+    for op in ag.ops:
+        if op.op_type == "Mul" and len(op.inputs) == 2 and op.inputs[0] == op.inputs[1]:
+            tensor = ag.tensors.get(op.inputs[0])
+            if tensor is not None and tensor.dtype == 1:
+                op.op_type, op.inputs = "Square", op.inputs[:1]
+    return ag
+
+
 def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Fold QuantizeLinear / DequantizeLinear ops.
 
@@ -1871,31 +1952,6 @@ def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 
-def _neg_to_scalar_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Rewrite Neg as a multiplication by minus one.
-
-    Neg has no opcode, so a graph holding one is rejected outright, yet it is
-    exactly the scalar-constant Mul the kernels already carry. The scalar is a
-    float, so this applies before quantization folding, where a quantized graph
-    still states its operands in float.
-    """
-    for index, op in enumerate(ag.ops):
-        if op.op_type != "Neg" or len(op.inputs) != 1:
-            continue
-        info = ag.tensors.get(op.inputs[0])
-        if info is None or info.dtype != 1:
-            continue
-
-        scalar = f"{op.outputs[0]}_minus_one_{index}"
-        ag.weight_data[scalar] = np.array([-1.0], dtype=np.float32)
-        ag.tensors[scalar] = TensorInfo(
-            name=scalar, shape=(1,), dtype=1, is_constant=True)
-        op.op_type = "Mul"
-        op.inputs = [op.inputs[0], scalar]
-        op.attrs = {}
-    return ag
-
-
 def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Rewrite a constant subtrahend as an added negation.
 
@@ -2014,8 +2070,8 @@ def _fresh_name(ag: AnalyzedGraph, base: str) -> str:
 def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Rewrite a constant divisor as a multiplication by its reciprocal.
 
-    Div has no opcode, yet a constant divisor is exactly the Mul the kernels
-    already carry: a GELU exports as ``Erf(x / sqrt(2))`` and an attention
+    Div requires two dynamic operands; a constant divisor uses the Mul
+    constant path: a GELU exports as ``Erf(x / sqrt(2))`` and an attention
     scale as a division by the head width. A divisor on the left has no such
     equivalent, and a zero in one would turn an infinity the model states into
     a finite number, so both are left for validation to reject.

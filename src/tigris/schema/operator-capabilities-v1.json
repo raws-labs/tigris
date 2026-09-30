@@ -297,12 +297,15 @@
       }
     },
     {
+      "constraints": [
+        "two dynamic operands with identical shapes; float32 only"
+      ],
       "opcode": 19,
       "operator": "Div",
       "routes": {
         "cmsis-nn": "unsupported",
         "esp-nn": "unsupported",
-        "reference": "unsupported",
+        "reference": "native",
         "s8_ref": "unsupported"
       }
     },
@@ -508,6 +511,198 @@
         "esp-nn": "fallback:s8_ref",
         "reference": "native",
         "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "int8 requantization must stay within the 32-bit reference arithmetic domain"
+      ],
+      "opcode": 38,
+      "operator": "Abs",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "int8 requires nonnegative centered inputs and reference shifts in range"
+      ],
+      "opcode": 39,
+      "operator": "Rsqrt",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "two dynamic operands with identical shapes",
+        "int8 requantization must stay within the 32-bit reference arithmetic domain"
+      ],
+      "opcode": 40,
+      "operator": "SquaredDifference",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "two dynamic operands with identical shapes; int8 quantization must match"
+      ],
+      "opcode": 41,
+      "operator": "Max",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "two dynamic operands with identical shapes; int8 quantization must match"
+      ],
+      "opcode": 42,
+      "operator": "Min",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "opcode": 43,
+      "operator": "Neg",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 44,
+      "operator": "Exp",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 45,
+      "operator": "Log",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 46,
+      "operator": "Sqrt",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 47,
+      "operator": "Square",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 48,
+      "operator": "Floor",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 49,
+      "operator": "Ceil",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 50,
+      "operator": "Round",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 51,
+      "operator": "Sin",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "opcode": 52,
+      "operator": "Cos",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "constraints": [
+        "two dynamic operands with identical shapes; zero denominators are rejected"
+      ],
+      "opcode": 53,
+      "operator": "FloorDiv",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "constraints": [
+        "two dynamic operands with identical shapes"
+      ],
+      "opcode": 54,
+      "operator": "FloorMod",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
       }
     }
   ],
