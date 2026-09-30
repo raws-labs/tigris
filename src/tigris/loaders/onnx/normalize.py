@@ -273,10 +273,15 @@ def _flattened_into_a_product(ag: AnalyzedGraph, op: OpNode) -> bool:
     describe has to be converted rather than left to a compensation nobody
     applies.
     """
-    if not op.outputs:
+    if not op.outputs or not op.inputs:
         return False
+    source = ag.tensors.get(op.inputs[0])
     vector = ag.tensors.get(op.outputs[0])
-    if vector is None or len(vector.shape) != 2:
+    if source is None or vector is None or len(vector.shape) != 2:
+        return False
+    # The emitter's column permutation assumes the batch axis stays the row
+    # axis; a reshape that also regroups rows is not a flatten it can absorb.
+    if len(source.shape) not in (3, 4) or vector.shape[0] != source.shape[0]:
         return False
     readers = [
         other for other in ag.ops
@@ -485,7 +490,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
     # Model inputs and outputs keep the convention callers already rely on, so
     # a boundary that ended up linear is converted back. Internal tensors are
     # free to be either; the interface is not.
-    terminal_transpose = {
+    terminal_transpose = set() if ag.channels_last_boundaries else {
         op.outputs[0]
         for op in ag.ops
         if op.op_type == "Transpose" and len(op.outputs) == 1
@@ -2424,7 +2429,11 @@ def _fold_pad_into_conv(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Relabel Conv ops with group == C_in as DepthwiseConv."""
+    """Relabel Conv ops with group == C_in as DepthwiseConv.
+
+    Each group reads one input channel and may write several output channels,
+    the channel multiplier, so the output channel count is a multiple of group.
+    """
     for op in ag.ops:
         if op.op_type != "Conv":
             continue
@@ -2436,8 +2445,8 @@ def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
         if w_name and w_name in ag.weight_data:
             W = ag.weight_data[w_name]
             # Standard Conv weight: [OC, IC/G, KH, KW]
-            # Depthwise: group == OC and IC/G == 1
-            if W.ndim >= 2 and W.shape[1] == 1 and group == W.shape[0]:
+            # Depthwise: IC/G == 1 and OC a multiple of group
+            if W.ndim >= 2 and W.shape[1] == 1 and W.shape[0] % group == 0:
                 op.op_type = "DepthwiseConv"
         elif group > 1:
             # No weight data but group > 1 - check tensor info
@@ -2446,7 +2455,7 @@ def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
                 if (
                     len(w_info.shape) >= 2
                     and w_info.shape[1] == 1
-                    and group == w_info.shape[0]
+                    and w_info.shape[0] % group == 0
                 ):
                     op.op_type = "DepthwiseConv"
 
@@ -2867,6 +2876,14 @@ def _normalize_concat_axis(ag: AnalyzedGraph) -> AnalyzedGraph:
     says which, so this runs once layouts are assigned.
     """
     for op in ag.ops:
+        if op.op_type == "Split" and op.inputs:
+            # A Split names its axis the same way, 0 being the outermost.
+            source = ag.tensors.get(op.inputs[0])
+            if source is not None and source.shape:
+                rank = len(source.shape)
+                axis = int(op.attrs.get("axis", 0)) % rank
+                op.attrs["kernel_shape"] = [serialized_axis_map(rank, source.layout)[axis]]
+            continue
         if op.op_type != "Concat":
             continue
         result = ag.tensors.get(op.outputs[0]) if op.outputs else None
@@ -2878,7 +2895,9 @@ def _normalize_concat_axis(ag: AnalyzedGraph) -> AnalyzedGraph:
             axis += rank
         if not 0 <= axis < rank:
             continue
-        op.attrs["kernel_shape"] = [serialized_axis_map(rank, result.layout)[axis]]
+        stored = serialized_axis_map(rank, result.layout)[axis]
+        op.attrs["kernel_shape"] = [stored]
+        op.attrs["concat_last_axis"] = stored == rank - 1
     return ag
 
 def _validate_transposes(ag: AnalyzedGraph) -> AnalyzedGraph:

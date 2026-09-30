@@ -49,29 +49,57 @@ def test_compile_and_analyze_accept_a_tflite_file(tmp_path):
     assert result.exit_code == 0, result.output
 
 
-def test_plan_reproduces_tflite_micro_outputs(tmp_path):
-    """Recorded TFLite Micro reference outputs, compared bit for bit."""
+def _session():
     import tigris
     if not (Path(tigris.__file__).parent / "native" / "manifest.json").exists():
         if os.environ.get("TIGRIS_REQUIRE_HOST"):
             pytest.fail("Installed wheel has no host library")
         pytest.skip("Host library has not been staged in this source checkout")
     from tigris.runtime import Session
+    return Session
 
-    plan_path = tmp_path / "kws.tgrs"
-    result = CliRunner().invoke(cli, ["compile", str(KWS), "-m", "16K", "-o", str(plan_path)])
+
+def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path):
+    """Runs the compiled plan on TFLite Micro's recorded inputs and compares
+    the int8 outputs bit for bit."""
+    Session = _session()
+    plan_path = tmp_path / "model.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(model), "-m", budget, "-o", str(plan_path)])
     assert result.exit_code == 0, result.output
-    golden = np.load(FIXTURES / "kws_ref_model_tflm.npz")
-    _, graphs = tflite._read(KWS.read_bytes())
+    _, graphs = tflite._read(model.read_bytes())
     _, tensors, inputs, outputs, _ = graphs[0]
-    source, result_tensor = tensors[inputs[0]], tensors[outputs[0]]
     with Session(plan_path) as session:
-        for quantized, expected in zip(golden["inputs"], golden["outputs"]):
-            value = ((quantized.astype(np.float32) - np.float32(source.zero_point[0]))
-                     * source.scale[0]).astype(np.float32)
-            produced = session.run({"input_1": value})["Identity"].reshape(-1)
-            got = np.round(produced / result_tensor.scale[0]).astype(np.int32) + int(result_tensor.zero_point[0])
-            np.testing.assert_array_equal(got, expected.astype(np.int32))
+        assert [tuple(i["shape"]) for i in session.inputs] == [tuple(tensors[i].shape) for i in inputs]
+        for sample in range(len(golden["input_0"])):
+            feed = {}
+            for position, index in enumerate(inputs):
+                tensor, value = tensors[index], golden[f"input_{position}"][sample]
+                if tensor.type == "INT8":
+                    value = (value.astype(np.float32) - np.float32(tensor.zero_point[0])) * tensor.scale[0]
+                feed[tensor.name] = value.astype(np.float32)
+            produced = session.run(feed)
+            for position, index in enumerate(outputs):
+                tensor = tensors[index]
+                got = produced[session.outputs[position]["name"]]
+                assert got.shape == tuple(tensor.shape)
+                expected = golden[f"output_{position}"][sample]
+                if tensor.type == "INT8":
+                    got = np.round(got / tensor.scale[0]).astype(np.int32) + int(tensor.zero_point[0])
+                    expected = expected.astype(np.int32)
+                np.testing.assert_array_equal(got, expected, err_msg=f"sample {sample}, output {position}")
+
+
+def test_plan_reproduces_tflite_micro_outputs(tmp_path):
+    """Recorded TFLite Micro reference outputs, compared bit for bit."""
+    recorded = np.load(FIXTURES / "kws_ref_model_tflm.npz")
+    golden = {"input_0": recorded["inputs"], "output_0": recorded["outputs"].reshape(-1, 1, 12)}
+    _assert_matches_tflite_micro(KWS, golden, "16K", tmp_path)
+
+
+@pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("*.tflite")), ids=lambda p: p.stem)
+def test_single_operator_matches_tflite_micro(model, tmp_path):
+    assert tflite.unsupported(model.read_bytes()) == []
+    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256K", tmp_path)
 
 
 def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
@@ -88,16 +116,16 @@ def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
 
 
 def test_an_unsupported_operator_is_refused_by_name(tmp_path):
-    logistic = tflite._BUILTIN_OPERATORS.index("LOGISTIC")
-    path = tmp_path / "kws_logistic.tflite"
-    path.write_bytes(_with_operator_replaced(KWS.read_bytes(), "FULLY_CONNECTED", logistic))
+    svdf = tflite._BUILTIN_OPERATORS.index("SVDF")
+    path = tmp_path / "kws_svdf.tflite"
+    path.write_bytes(_with_operator_replaced(KWS.read_bytes(), "FULLY_CONNECTED", svdf))
 
     report = inspect_file(path)
     assert report["format"] == "tflite"
-    assert any("LOGISTIC: not supported" in reason for reason in report["unsupported"])
+    assert any("SVDF: not supported" in reason for reason in report["unsupported"])
     result = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-o", str(tmp_path / "x.tgrs")])
     assert result.exit_code != 0
-    assert "LOGISTIC: not supported" in result.output
+    assert "SVDF: not supported" in result.output
     assert not (tmp_path / "x.tgrs").exists()
 
 

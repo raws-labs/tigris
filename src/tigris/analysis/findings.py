@@ -517,7 +517,7 @@ def _budget_sweep(ag: AnalyzedGraph) -> list[BudgetRow]:
     # stage), then find the largest peak among untileable ops. Tileable ops
     # can be brought down by spatial tiling, but untileable ones (Flatten,
     # Reshape, Gemm, etc.) need their full peak - that's the hard floor.
-    from tigris.analysis.partition_spatial import classify_op, TileCategory
+    from tigris.analysis.partition_spatial import op_category, TileCategory
     ag_max = copy.deepcopy(ag)
     for op in ag_max.ops:
         op.stage = -1
@@ -526,7 +526,7 @@ def _budget_sweep(ag: AnalyzedGraph) -> list[BudgetRow]:
     untileable_peaks = []
     for s in ag_max.stages:
         ops = [ag_max.ops[i] for i in s.op_indices]
-        if any(classify_op(op.op_type) == TileCategory.UNTILEABLE for op in ops):
+        if any(op_category(op) == TileCategory.UNTILEABLE for op in ops):
             untileable_peaks.append(s.peak_bytes)
     floor = max(untileable_peaks) if untileable_peaks else 0
 

@@ -131,3 +131,21 @@ def test_every_layout_agnostic_operator_has_operands_that_agree(tmp_path):
         layouts = _operand_layouts(ag, op)
         assert len(set(layouts)) <= 1, (
             f"{op.name} ({op.op_type}) operands disagree: {layouts}")
+
+
+def test_a_reshape_that_regroups_rows_into_a_product_is_held_in_model_order(tmp_path):
+    """Only a flatten that keeps the batch axis can be absorbed by permuting
+    weight columns; (1, 6, 8) -> (6, 8) regroups rows, so its operand must be
+    converted to the model's own order first."""
+    ag, _ = _plan(
+        tmp_path, "row_regroup",
+        [
+            helper.make_node("Reshape", ["x", "shape"], ["rows"], name="rows"),
+            helper.make_node("Gemm", ["rows", "w"], ["y"], transB=1, name="fc"),
+        ],
+        [_vi("x", [1, 6, 8])], [_vi("y", [6, 5])],
+        [numpy_helper.from_array(np.array([6, 8], np.int64), "shape"),
+         numpy_helper.from_array(np.ones((5, 8), np.float32), "w")])
+
+    reshape = next(op for op in ag.ops if op.op_type == "Reshape")
+    assert ag.tensors[reshape.inputs[0]].layout is Layout.LINEAR

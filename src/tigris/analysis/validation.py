@@ -17,7 +17,6 @@ from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
     Stage,
-    serialized_axis_map,
 )
 
 
@@ -342,12 +341,19 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 tensor is None or len(tensor.shape) != rank for tensor in tensors
             ):
                 reasons.append("Concat operands are not runtime tensors")
+            elif rank not in (3, 4):
+                reasons.append("runtime concatenates rank-3 and rank-4 only")
+            elif normalized_axis not in [[axis] for axis in range(1, rank)]:
+                reasons.append("runtime does not concatenate on the batch axis")
+            elif normalized_axis != [rank - 1] and any(
+                name in ag.weight_data for name in op.inputs
+            ):
+                reasons.append(
+                    "a constant Concat part is only expressible along the "
+                    "last stored axis"
+                )
             elif rank == 4:
-                if normalized_axis != [3]:
-                    reasons.append(
-                        "runtime concatenates a rank-4 tensor on its channel "
-                        "axis only"
-                    )
+                pass
             elif any(
                 name in ag.weight_data
                 for name in op.inputs[1:]
@@ -362,17 +368,6 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 reasons.append(
                     "a quantized Concat carries no scale for a constant part"
                 )
-            elif rank == 3:
-                # The runtime walks the positions ahead of the last stored
-                # axis and copies one run per input, so that is the only axis
-                # it can cut.
-                if normalized_axis != [2]:
-                    reasons.append(
-                        "runtime concatenates a rank-3 tensor on its last "
-                        "stored axis only"
-                    )
-            else:
-                reasons.append("runtime concatenates rank-3 and rank-4 only")
 
         if op.op_type == "Split":
             source = ag.tensors.get(op.inputs[0])
@@ -382,16 +377,11 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 reasons.append("Split operands are not runtime tensors")
             else:
                 rank = len(source.shape)
-                stored = serialized_axis_map(rank, source.layout)
-                # Only the outermost stored axis leaves every part a
-                # contiguous run of the input; anything else interleaves.
-                if rank == 0 or stored[axis % rank] != 0:
-                    reasons.append(
-                        "runtime splits only along the outermost stored axis"
-                    )
-                elif any(
+                axis = axis % rank if rank else 0
+                if rank == 0 or any(
                     len(part.shape) != rank
-                    or tuple(part.shape[1:]) != tuple(source.shape[1:])
+                    or any(p != s for i, (p, s) in enumerate(zip(part.shape, source.shape))
+                           if i != axis)
                     for part in parts
                 ):
                     reasons.append(

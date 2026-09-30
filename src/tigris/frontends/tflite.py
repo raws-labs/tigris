@@ -13,6 +13,9 @@ from tigris.frontends.flatbuffer import Table
 from tigris.frontends.qdq import GraphBuilder, same_padding
 
 MAGIC = b"TFL3"
+# Metadata stating that every model input and output of rank 3 or more is held
+# channels-last, as the TFLite tensor is laid out.
+BOUNDARY_LAYOUT_KEY = "tigris.boundary_layout"
 
 # Field slots in the TFLite schema (tensorflow/lite/schema/schema.fbs).
 _MODEL_VERSION, _MODEL_OPCODES, _MODEL_SUBGRAPHS, _MODEL_DESCRIPTION, _MODEL_BUFFERS = 0, 1, 2, 3, 4
@@ -78,8 +81,6 @@ _TENSOR_TYPES = (
 _ACTIVATIONS = {0: "none", 1: "relu", 2: "relu_n1_to_1", 3: "relu6", 4: "tanh", 5: "sign_bit"}
 _NUMPY = {"FLOAT32": np.float32, "INT32": np.int32, "INT8": np.int8, "UINT8": np.uint8,
           "INT16": np.int16, "INT64": np.int64}
-_SUPPORTED = ("ADD", "AVERAGE_POOL_2D", "CONV_2D", "DEPTHWISE_CONV_2D", "FULLY_CONNECTED",
-              "RESHAPE", "SOFTMAX")
 
 
 def is_tflite(data: bytes) -> bool:
@@ -181,8 +182,8 @@ def unsupported(data: bytes) -> list[str]:
         reasons.append(f"{len(graphs)} subgraphs; only single-subgraph models convert")
     for _, tensors, inputs, outputs, operators in graphs[:1]:
         for index in list(inputs) + list(outputs):
-            if tensors[index].type != "INT8":
-                reasons.append(f"model boundary {tensors[index].name!r} is {tensors[index].type}, not INT8")
+            if tensors[index].type not in ("INT8", "FLOAT32"):
+                reasons.append(f"model boundary {tensors[index].name!r} is {tensors[index].type}")
         grouped: dict[str, list[_Operator]] = {}
         for op in operators:
             reason = _operator_reason(op, tensors)
@@ -201,49 +202,83 @@ def _activation(code: int) -> str:
     return _ACTIVATIONS.get(code, f"activation {code}")
 
 
+# Slot of the fused activation in each operator's options table.
+_FUSED_SLOT = {"ADD": 0, "SUB": 0, "MUL": 0, "FULLY_CONNECTED": 0, "CONCATENATION": 1,
+               "CONV_2D": 3, "TRANSPOSE_CONV": 3, "DEPTHWISE_CONV_2D": 4,
+               "AVERAGE_POOL_2D": 5, "MAX_POOL_2D": 5}
+_UNARY = {"LOGISTIC": "Sigmoid", "TANH": "Tanh", "HARD_SWISH": "HardSwish", "RELU": "Relu"}
+_SHAPE_ONLY = ("RESHAPE", "SQUEEZE", "EXPAND_DIMS")
+_SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, "RELU6", "SOFTMAX", "MEAN", "TRANSPOSE",
+              "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
+              "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE")
+# Positions of the data, weights and bias operands of the weighted operators.
+_WEIGHTED = {"CONV_2D": (0, 1, 2), "DEPTHWISE_CONV_2D": (0, 1, 2), "FULLY_CONNECTED": (0, 1, 2),
+             "TRANSPOSE_CONV": (2, 1, 3)}
+_CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V": (1, 2),
+                      "PAD": (1,), "PADV2": (1, 2), "RESHAPE": (1,), "EXPAND_DIMS": (1,),
+                      "RESIZE_NEAREST_NEIGHBOR": (1,), "RESIZE_BILINEAR": (1,),
+                      "TRANSPOSE_CONV": (0,)}
+
+
+def _is_constant(tensor: _Tensor) -> bool:
+    return tensor.buffer > 0 and bool(tensor.data)
+
+
 def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     if op.kind not in _SUPPORTED:
         return "not supported"
-    ins = [tensors[i] for i in op.inputs if i >= 0]
-    out = tensors[op.outputs[0]]
-    if ins[0].type != "INT8" or out.type != "INT8":
-        return "only int8 activations convert"
-    if op.kind in ("CONV_2D", "DEPTHWISE_CONV_2D", "FULLY_CONNECTED"):
-        if ins[1].type != "INT8" or np.any(ins[1].zero_point != 0):
-            return "weights must be symmetric int8"
-        if len(ins) > 2 and ins[2].type != "INT32":
+    ins = [tensors[i] if i >= 0 else None for i in op.inputs]
+    outs = [tensors[i] for i in op.outputs]
+    for position in _CONSTANT_OPERANDS.get(op.kind, ()):
+        if position < len(ins) and ins[position] is not None and not _is_constant(ins[position]):
+            return f"input {position} must be a constant"
+    data = [t for i, t in enumerate(ins) if t is not None and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
+    if op.kind in _WEIGHTED:
+        source, position, bias_position = _WEIGHTED[op.kind]
+        weights = ins[position]
+        if weights.type != "INT8" or np.any(weights.zero_point != 0) or not _is_constant(weights):
+            return "weights must be constant symmetric int8"
+        bias = ins[bias_position] if bias_position < len(ins) else None
+        if bias is not None and bias.type != "INT32":
             return "bias must be int32"
-    if op.kind == "CONV_2D":
-        if op.option(4, "i", 1) != 1 or op.option(5, "i", 1) != 1:
-            return "dilation other than 1"
-        if _activation(op.option(3, "b")) not in ("none", "relu", "relu6"):
-            return f"fused {_activation(op.option(3, 'b'))}"
-    if op.kind == "DEPTHWISE_CONV_2D":
-        if op.option(5, "i", 1) != 1 or op.option(6, "i", 1) != 1:
-            return "dilation other than 1"
-        if ins[0].shape[3] != out.shape[3]:
-            return "depth multiplier other than 1"
-        if _activation(op.option(4, "b")) not in ("none", "relu", "relu6"):
-            return f"fused {_activation(op.option(4, 'b'))}"
-    if op.kind == "AVERAGE_POOL_2D":
-        if (op.option(4, "i"), op.option(3, "i")) != tuple(ins[0].shape[1:3]) or list(out.shape[1:3]) != [1, 1]:
-            return "only a pool over the whole map converts"
-        if _activation(op.option(5, "b")) != "none":
-            return "fused activation"
-    if op.kind == "RESHAPE" and len(out.shape) != 2:
-        return "only a flattening reshape converts"
-    if op.kind == "FULLY_CONNECTED":
-        if op.option(1, "b") != 0 or op.option(2, "?", False) or len(ins[0].shape) != 2:
-            return "only a rank-2 product with default weights format converts"
-        if _activation(op.option(0, "b")) not in ("none", "relu", "relu6"):
-            return f"fused {_activation(op.option(0, 'b'))}"
-    if op.kind == "ADD":
-        if ins[0].shape != ins[1].shape:
-            return "only an add of equal shapes converts"
-        if _activation(op.option(0, "b")) not in ("none", "relu", "relu6"):
-            return f"fused {_activation(op.option(0, 'b'))}"
+        data = [ins[source]]
+    if op.kind == "QUANTIZE":
+        if data[0].type not in ("INT8", "FLOAT32") or outs[0].type != "INT8":
+            return "only float or int8 to int8 converts"
+    elif op.kind == "DEQUANTIZE":
+        if data[0].type != "INT8" or outs[0].type != "FLOAT32":
+            return "only int8 to float converts"
+    elif any(t.type != "INT8" for t in [*data, *outs]):
+        return "only int8 activations convert"
+    if any(len(t.scale) != 1 for t in [*data, *outs] if t.type == "INT8"):
+        return "activations must be quantized per tensor"
+    if op.kind in _FUSED_SLOT:
+        fused = _activation(op.option(_FUSED_SLOT[op.kind], "b"))
+        if fused not in ("none", "relu", "relu6"):
+            return f"fused {fused}"
+    rank = len(outs[0].shape)
+    if op.kind in ("ADD", "SUB", "MUL"):
+        for operand in ins:
+            if not _is_constant(operand) and len(operand.shape) != rank:
+                return "operands of different rank"
+    if op.kind == "CONCATENATION":
+        if any(t.scale[0] != outs[0].scale[0] or t.zero_point[0] != outs[0].zero_point[0] for t in data):
+            return "inputs quantized differently from the output"
     if op.kind == "SOFTMAX" and op.option(0, "f", 1.0) != 1.0:
         return "beta other than 1"
+    if op.kind == "FULLY_CONNECTED" and op.option(1, "b") != 0:
+        return "shuffled weights format"
+    if op.kind == "BATCH_MATMUL" and len(ins[0].shape) != len(ins[1].shape):
+        return "operands of different rank"
+    if op.kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
+        align, half_pixel = ((op.option(2, "?", False), op.option(3, "?", False))
+                             if op.kind == "RESIZE_BILINEAR" else
+                             (op.option(0, "?", False), op.option(1, "?", False)))
+        if align:
+            return "align_corners"
+        if op.kind == "RESIZE_NEAREST_NEIGHBOR" and half_pixel and any(
+                o % i for i, o in zip(ins[0].shape[1:3], outs[0].shape[1:3])):
+            return "half-pixel centers with a non-integer scale"
     return ""
 
 
@@ -279,6 +314,270 @@ def describe(data: bytes) -> dict:
     }
 
 
+# ONNX carries tensors of rank 3 and 4 channels-first; TFLite's are
+# channels-last, which is how the compiler stores such a tensor.
+def _to_first(rank: int) -> list[int]:
+    return [0, rank - 1, *range(1, rank - 1)] if rank >= 3 else list(range(rank))
+
+
+def _to_last(rank: int) -> list[int]:
+    return [0, *range(2, rank), 1] if rank >= 3 else list(range(rank))
+
+
+def _onnx_axis(axis: int, rank: int) -> int:
+    return _to_last(rank)[axis % rank]
+
+
+def _onnx_shape(shape) -> list[int]:
+    return [shape[i] for i in _to_first(len(shape))]
+
+
+def _layout_free(shape) -> bool:
+    """True when both axis orders hold the elements in the same sequence."""
+    return len(shape) < 3 or shape[-1] == 1 or int(np.prod(shape[1:-1])) == 1
+
+
+class _Converter:
+    """Builds the QDQ ONNX graph operator by operator; `values` maps a TFLite
+    tensor index to the ONNX value holding it, rank-4 values in NCHW."""
+
+    def __init__(self, tensors: list[_Tensor]):
+        self.b = GraphBuilder()
+        self.tensors = tensors
+        self.values: dict[int, str] = {}
+
+    def value(self, index: int, rank: int | None = None) -> str:
+        """The ONNX value of a tensor; a constant is broadcast-aligned to `rank`."""
+        if index in self.values and rank is None:
+            return self.values[index]
+        tensor = self.tensors[index]
+        array = tensor.array()
+        rank = rank or array.ndim
+        array = array.reshape((1,) * (rank - array.ndim) + array.shape)
+        axis = _onnx_axis(tensor.quantized_dimension + rank - len(tensor.shape), rank)
+        array = array.transpose(_to_first(rank))
+        if tensor.type == "FLOAT32":
+            return self.b.constant(array, tensor.name)
+        return self.b.dequantized_constant(array, tensor.scale, tensor.zero_point, tensor.name,
+                                           axis=axis)
+
+    def ints(self, index: int) -> list[int]:
+        return [int(v) for v in self.tensors[index].array().reshape(-1)]
+
+    def held(self, source: str, index: int, name: str) -> str:
+        """`source` requantized as tensor `index` is, so a data-movement step
+        between two operators stays in int8."""
+        tensor = self.tensors[index]
+        if tensor.type == "FLOAT32":
+            return source
+        return self.b.requantized(source, float(tensor.scale[0]), int(tensor.zero_point[0]), name)
+
+    def finish(self, source: str, index: int) -> None:
+        tensor = self.tensors[index]
+        if tensor.type == "FLOAT32":
+            self.values[index] = self.b.node("Identity", [source], tensor.name)
+        else:
+            self.values[index] = self.b.requantized(source, float(tensor.scale[0]),
+                                                    int(tensor.zero_point[0]), tensor.name)
+
+    def reshape(self, source: str, source_shape, shape, tag: str, index: int) -> str:
+        """TFLite's row-major reshape of a channels-last tensor, between ONNX
+        layouts; intermediate steps are held as tensor `index` is quantized."""
+        b = self.b
+        if not _layout_free(source_shape):
+            source = self.held(b.node("Transpose", [source], tag + "_last",
+                                      perm=_to_last(len(source_shape))), index, tag + "_last_q")
+        free_out = _layout_free(shape)
+        target = _onnx_shape(shape) if free_out else list(shape)
+        y = b.node("Reshape", [source, b.constant(np.asarray(target, np.int64), tag + "_shape")], tag)
+        if not free_out:
+            y = b.node("Transpose", [self.held(y, index, tag + "_q")], tag + "_first",
+                       perm=_to_first(len(shape)))
+        return y
+
+    def convert(self, op: _Operator) -> None:
+        ins, outs = op.inputs, op.outputs
+        out = self.tensors[outs[0]]
+        tag = out.name + "_float"
+        kind = op.kind
+        fused = _activation(op.option(_FUSED_SLOT[kind], "b")) if kind in _FUSED_SLOT else "none"
+        b = self.b
+        if kind in ("CONV_2D", "DEPTHWISE_CONV_2D"):
+            y = self._conv(op, tag)
+        elif kind == "TRANSPOSE_CONV":
+            y = self._transpose_conv(op, tag)
+        elif kind == "FULLY_CONNECTED":
+            y = self._fully_connected(op, tag)
+        elif kind in ("MAX_POOL_2D", "AVERAGE_POOL_2D"):
+            source = self.tensors[ins[0]]
+            kh, kw = op.option(4, "i", 1), op.option(3, "i", 1)
+            sh, sw = op.option(2, "i", 1), op.option(1, "i", 1)
+            top, bottom = same_padding(source.shape[1], out.shape[1], kh, sh)
+            left, right = same_padding(source.shape[2], out.shape[2], kw, sw)
+            attributes = {"count_include_pad": 0} if kind == "AVERAGE_POOL_2D" else {}
+            y = b.node("MaxPool" if kind == "MAX_POOL_2D" else "AveragePool", [self.value(ins[0])],
+                       tag, kernel_shape=[kh, kw], strides=[sh, sw],
+                       pads=[top, left, bottom, right], **attributes)
+        elif kind in ("ADD", "SUB", "MUL"):
+            rank = len(out.shape)
+            y = b.node({"ADD": "Add", "SUB": "Sub", "MUL": "Mul"}[kind],
+                       [self.value(i, rank if i not in self.values else None) for i in ins], tag)
+        elif kind == "CONCATENATION":
+            y = b.node("Concat", [self.value(i) for i in ins], tag,
+                       axis=_onnx_axis(op.option(0, "i"), len(out.shape)))
+        elif kind in _UNARY:
+            y = b.node(_UNARY[kind], [self.value(ins[0])], tag)
+        elif kind == "RELU6":
+            y = b.fused_activation(self.value(ins[0]), "relu6", tag)
+        elif kind == "SOFTMAX":
+            y = b.node("Softmax", [self.value(ins[0])], tag, axis=_onnx_axis(-1, len(out.shape)))
+        elif kind == "MEAN":
+            source = self.tensors[ins[0]]
+            rank = len(source.shape)
+            axes = sorted(_onnx_axis(a, rank) for a in self.ints(ins[1]))
+            y = b.node("ReduceMean", [self.value(ins[0])], tag, axes=axes, keepdims=1)
+            if len(out.shape) != rank:
+                kept = [1 if i in [a % rank for a in self.ints(ins[1])] else d
+                        for i, d in enumerate(source.shape)]
+                y = self.reshape(self.held(y, outs[0], tag + "_kept"), kept, out.shape,
+                                 tag + "_squeezed", outs[0])
+        elif kind in _SHAPE_ONLY:
+            y = self.reshape(self.value(ins[0]), self.tensors[ins[0]].shape, out.shape, tag, outs[0])
+        elif kind == "TRANSPOSE":
+            rank = len(out.shape)
+            perm = [p % rank for p in self.ints(ins[1])]
+            first, last = _to_first(rank), _to_last(rank)
+            perm = [last[perm[first[i]]] for i in range(rank)]
+            y = b.node("Transpose", [self.value(ins[0])], tag, perm=perm)
+        elif kind in ("SPLIT", "SPLIT_V"):
+            source_index, axis_index = (ins[1], ins[0]) if kind == "SPLIT" else (ins[0], ins[2])
+            rank = len(self.tensors[source_index].shape)
+            axis = self.ints(axis_index)[0] % rank
+            sizes = b.constant(np.asarray([self.tensors[i].shape[axis] for i in outs], np.int64),
+                               out.name + "_sizes")
+            names = [self.tensors[i].name + "_float" for i in outs]
+            parts = b.multi_node("Split", [self.value(source_index), sizes], names,
+                                 axis=_onnx_axis(axis, rank))
+            for index, part in zip(outs, parts):
+                self.finish(part, index)
+            return
+        elif kind in ("PAD", "PADV2"):
+            rank = len(out.shape)
+            pairs = np.asarray(self.ints(ins[1])).reshape(rank, 2)
+            order = _to_first(rank)
+            pads = b.constant(np.asarray([pairs[a, 0] for a in order] + [pairs[a, 1] for a in order],
+                                         np.int64), tag + "_pads")
+            source = self.tensors[ins[0]]
+            fill = (float((int(self.ints(ins[2])[0]) - source.zero_point[0]) * source.scale[0])
+                    if kind == "PADV2" and len(ins) > 2 else 0.0)
+            y = b.node("Pad", [self.value(ins[0]), pads, b.constant(np.float32(fill), tag + "_fill")],
+                       tag, mode="constant")
+        elif kind == "BATCH_MATMUL":
+            # The matrices are the last two TFLite axes, so the product runs
+            # in TFLite's own axis order.
+            rank = len(out.shape)
+            operands = []
+            for i, adjoint in zip(ins, (op.option(0, "?", False), op.option(1, "?", False))):
+                perm = list(range(rank))
+                if adjoint:
+                    perm[-2:] = perm[-1], perm[-2]
+                perm = [_to_last(rank)[p] for p in perm]
+                x = self.value(i)
+                if perm != list(range(rank)):
+                    x = self.held(b.node("Transpose", [x], tag + "_operand", perm=perm), i,
+                                  tag + "_operand_q")
+                operands.append(x)
+            y = b.node("MatMul", operands, tag)
+            if rank >= 3:
+                y = b.node("Transpose", [self.held(y, outs[0], tag + "_q")], tag + "_first",
+                           perm=_to_first(rank))
+        elif kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
+            sizes = b.constant(np.asarray(_onnx_shape(out.shape), np.int64), tag + "_sizes")
+            half_pixel = op.option(3 if kind == "RESIZE_BILINEAR" else 1, "?", False)
+            if kind == "RESIZE_BILINEAR":
+                attributes = {"mode": "linear", "coordinate_transformation_mode":
+                              "half_pixel" if half_pixel else "asymmetric"}
+            else:
+                # With an integer scale, half-pixel centers pick the same source
+                # pixel as the asymmetric floor rule.
+                attributes = {"mode": "nearest", "coordinate_transformation_mode": "asymmetric",
+                              "nearest_mode": "floor"}
+            y = b.node("Resize", [self.value(ins[0]), "", "", sizes], tag, **attributes)
+        elif kind in ("QUANTIZE", "DEQUANTIZE"):
+            y = self.value(ins[0])
+        else:
+            raise ValueError(f"no conversion for {kind}")
+        self.finish(b.fused_activation(y, fused, tag), outs[0])
+
+    def _bias(self, op: _Operator, position: int, name: str) -> str | None:
+        if position >= len(op.inputs) or op.inputs[position] < 0:
+            return None
+        tensor = self.tensors[op.inputs[position]]
+        return self.b.dequantized_constant(tensor.array(), tensor.scale,
+                                           np.zeros_like(tensor.zero_point), tensor.name,
+                                           axis=0, zero_dtype=np.int32)
+
+    def _conv(self, op: _Operator, tag: str) -> str:
+        depthwise = op.kind == "DEPTHWISE_CONV_2D"
+        source, weights_tensor = self.tensors[op.inputs[0]], self.tensors[op.inputs[1]]
+        out = self.tensors[op.outputs[0]]
+        weights = np.transpose(weights_tensor.array(), (3, 0, 1, 2) if depthwise else (0, 3, 1, 2))
+        kh, kw = weights.shape[2], weights.shape[3]
+        sw, sh = op.option(1, "i", 1), op.option(2, "i", 1)
+        dw, dh = (op.option(5, "i", 1), op.option(6, "i", 1)) if depthwise else (
+            op.option(4, "i", 1), op.option(5, "i", 1))
+        top, bottom = same_padding(source.shape[1], out.shape[1], (kh - 1) * dh + 1, sh)
+        left, right = same_padding(source.shape[2], out.shape[2], (kw - 1) * dw + 1, sw)
+        w = self.b.dequantized_constant(weights, weights_tensor.scale,
+                                        np.zeros_like(weights_tensor.zero_point),
+                                        weights_tensor.name, axis=0)
+        operands = [self.value(op.inputs[0]), w]
+        bias = self._bias(op, 2, tag)
+        if bias:
+            operands.append(bias)
+        return self.b.node("Conv", operands, tag, kernel_shape=[kh, kw], strides=[sh, sw],
+                           dilations=[dh, dw], pads=[top, left, bottom, right],
+                           group=source.shape[3] if depthwise else 1)
+
+    def _transpose_conv(self, op: _Operator, tag: str) -> str:
+        source, weights_tensor = self.tensors[op.inputs[2]], self.tensors[op.inputs[1]]
+        out = self.tensors[op.outputs[0]]
+        weights = np.transpose(weights_tensor.array(), (3, 0, 1, 2))
+        kh, kw = weights.shape[2], weights.shape[3]
+        sw, sh = op.option(1, "i", 1), op.option(2, "i", 1)
+        top, bottom = same_padding(out.shape[1], source.shape[1], kh, sh)
+        left, right = same_padding(out.shape[2], source.shape[2], kw, sw)
+        w = self.b.dequantized_constant(weights, weights_tensor.scale,
+                                        np.zeros_like(weights_tensor.zero_point),
+                                        weights_tensor.name, axis=1)
+        operands = [self.value(op.inputs[2]), w]
+        bias = self._bias(op, 3, tag)
+        if bias:
+            operands.append(bias)
+        return self.b.node("ConvTranspose", operands, tag, kernel_shape=[kh, kw],
+                           strides=[sh, sw], pads=[top, left, bottom, right])
+
+    def _fully_connected(self, op: _Operator, tag: str) -> str:
+        source, weights_tensor = self.tensors[op.inputs[0]], self.tensors[op.inputs[1]]
+        out = self.tensors[op.outputs[0]]
+        w = self.b.dequantized_constant(weights_tensor.array(), weights_tensor.scale,
+                                        np.zeros_like(weights_tensor.zero_point),
+                                        weights_tensor.name, axis=0)
+        bias = self._bias(op, 2, tag) or self.b.constant(
+            np.zeros(weights_tensor.shape[0], np.float32), out.name + "_bias")
+        x = self.value(op.inputs[0])
+        rows = int(np.prod(source.shape)) // weights_tensor.shape[1]
+        flat = [rows, weights_tensor.shape[1]]
+        if list(source.shape) != flat:
+            x = self.held(self.reshape(x, source.shape, flat, tag + "_rows", op.inputs[0]),
+                          op.inputs[0], tag + "_rows_q")
+        y = self.b.node("Gemm", [x, w, bias], tag, transB=1)
+        if list(out.shape) != [rows, weights_tensor.shape[0]]:
+            y = self.reshape(self.held(y, op.outputs[0], tag + "_q"), [rows, weights_tensor.shape[0]],
+                             out.shape, tag + "_shape", op.outputs[0])
+        return y
+
+
 def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     """The model as QDQ ONNX with its TFLite tensor names; raises ValueError
     naming every construct that does not convert."""
@@ -287,78 +586,29 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         raise ValueError("TFLite model does not convert: " + "; ".join(reasons))
     _, graphs = _read(data)
     _, tensors, inputs, outputs, operators = graphs[0]
-    b = GraphBuilder()
-    values: dict[int, str] = {}
-
-    def qparams(tensor):
-        return float(tensor.scale[0]), int(tensor.zero_point[0])
+    converter = _Converter(tensors)
+    b = converter.b
 
     onnx_inputs = []
     for index in inputs:
         tensor = tensors[index]
-        n, h, w, c = tensor.shape
         b._names.add(tensor.name)
-        onnx_inputs.append(helper.make_tensor_value_info(tensor.name, TensorProto.FLOAT, [n, c, h, w]))
-        values[index] = b.requantized(tensor.name, *qparams(tensor), tensor.name + "_int8")
-
-    def finish(source, op):
-        out = tensors[op.outputs[0]]
-        values[op.outputs[0]] = b.requantized(source, *qparams(out), out.name)
-
+        onnx_inputs.append(helper.make_tensor_value_info(tensor.name, TensorProto.FLOAT,
+                                                         _onnx_shape(tensor.shape)))
+        if tensor.type == "FLOAT32":
+            converter.values[index] = tensor.name
+        else:
+            converter.values[index] = b.requantized(tensor.name, float(tensor.scale[0]),
+                                                    int(tensor.zero_point[0]),
+                                                    tensor.name + "_int8")
     for op in operators:
-        ins = [tensors[i] for i in op.inputs if i >= 0]
-        out = tensors[op.outputs[0]]
-        tag = out.name + "_float"
-        x = values[op.inputs[0]]
-        if op.kind in ("CONV_2D", "DEPTHWISE_CONV_2D"):
-            depthwise = op.kind == "DEPTHWISE_CONV_2D"
-            weights = ins[1].array()
-            weights = np.transpose(weights, (3, 0, 1, 2) if depthwise else (0, 3, 1, 2))
-            kh, kw = weights.shape[2], weights.shape[3]
-            sw, sh = op.option(1, "i", 1), op.option(2, "i", 1)
-            top, bottom = same_padding(ins[0].shape[1], out.shape[1], kh, sh)
-            left, right = same_padding(ins[0].shape[2], out.shape[2], kw, sw)
-            w = b.dequantized_constant(weights, ins[1].scale, np.zeros_like(ins[1].zero_point),
-                                       ins[1].name, axis=0)
-            operands = [x, w]
-            if len(ins) > 2:
-                operands.append(b.dequantized_constant(
-                    ins[2].array(), ins[2].scale, np.zeros_like(ins[2].zero_point), ins[2].name,
-                    axis=0, zero_dtype=np.int32))
-            y = b.node("Conv", operands, tag, kernel_shape=[kh, kw], strides=[sh, sw],
-                       pads=[top, left, bottom, right], group=weights.shape[0] if depthwise else 1)
-            finish(b.fused_activation(y, _activation(op.option(4 if depthwise else 3, "b")), tag), op)
-        elif op.kind == "AVERAGE_POOL_2D":
-            h, w = ins[0].shape[1:3]
-            y = b.node("AveragePool", [x], tag, kernel_shape=[h, w], strides=[1, 1])
-            finish(y, op)
-        elif op.kind == "ADD":
-            y = b.node("Add", [x, values[op.inputs[1]]], tag)
-            finish(b.fused_activation(y, _activation(op.option(0, "b")), tag), op)
-        elif op.kind == "RESHAPE":
-            finish(b.node("Flatten", [x], tag, axis=1), op)
-        elif op.kind == "FULLY_CONNECTED":
-            w = b.dequantized_constant(ins[1].array(), ins[1].scale,
-                                       np.zeros_like(ins[1].zero_point), ins[1].name, axis=0)
-            if len(ins) > 2:
-                bias = b.dequantized_constant(ins[2].array(), ins[2].scale,
-                                              np.zeros_like(ins[2].zero_point), ins[2].name,
-                                              axis=0, zero_dtype=np.int32)
-            else:
-                bias = b.constant(np.zeros(ins[1].shape[0], np.float32), out.name + "_bias")
-            y = b.node("Gemm", [x, w, bias], tag, transB=1)
-            finish(b.fused_activation(y, _activation(op.option(0, "b")), tag), op)
-        elif op.kind == "SOFTMAX":
-            finish(b.node("Softmax", [x], tag, axis=1), op)
-
-    onnx_outputs = []
-    for index in outputs:
-        tensor = tensors[index]
-        onnx_outputs.append(helper.make_tensor_value_info(values[index], TensorProto.FLOAT,
-                                                          list(tensor.shape)))
+        converter.convert(op)
+    onnx_outputs = [helper.make_tensor_value_info(converter.values[index], TensorProto.FLOAT,
+                                                  _onnx_shape(tensors[index].shape)) for index in outputs]
     model = helper.make_model(helper.make_graph(b.nodes, name, onnx_inputs, onnx_outputs,
                                                 b.initializers),
                               opset_imports=[helper.make_opsetid("", 17)])
     model.ir_version = 8
+    onnx.helper.set_model_props(model, {BOUNDARY_LAYOUT_KEY: "channels_last"})
     onnx.checker.check_model(model)
     return model
