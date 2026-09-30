@@ -1,6 +1,9 @@
 """Fail-closed validation of compiler deployment plans."""
 
 from dataclasses import dataclass
+import math
+
+import numpy as np
 
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
 from tigris.analysis.lifetime import compute_lifetimes, pure_reinterpretations
@@ -415,59 +418,54 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
 
         if op.op_type in {"Resize", "ResizeLinear"}:
             linear = op.op_type == "ResizeLinear"
+            coordinate = op.attrs.get("coordinate_transformation_mode", "half_pixel")
+            nearest = op.attrs.get("nearest_mode", "round_prefer_floor")
             if linear:
-                # Both conventions execute: half-pixel places a sample at
-                # (o + 0.5) / scale - 0.5, asymmetric at o / scale. The
-                # loader has already resolved which one the opset means.
-                if op.attrs.get("coordinate_transformation_mode",
-                                "half_pixel") not in {
-                    "half_pixel", "asymmetric"
-                }:
-                    reasons.append(
-                        "bilinear Resize coordinate_transformation_mode must "
-                        "be 'half_pixel' or 'asymmetric'"
-                    )
-            else:
-                if op.attrs.get("mode", "nearest") != "nearest":
-                    reasons.append("Resize mode must be 'nearest'")
-                if op.attrs.get("coordinate_transformation_mode",
-                                "half_pixel") != "asymmetric":
-                    reasons.append(
-                        "Resize coordinate_transformation_mode must be "
-                        "'asymmetric'"
-                    )
-                if op.attrs.get("nearest_mode", "round_prefer_floor") != "floor":
-                    reasons.append("Resize nearest_mode must be 'floor'")
+                if coordinate not in {"half_pixel", "asymmetric", "align_corners"}:
+                    reasons.append("bilinear Resize requires half_pixel, asymmetric or align_corners coordinates")
+            elif (op.attrs.get("mode", "nearest") != "nearest" or
+                  (coordinate, nearest) not in {
+                      ("asymmetric", "floor"), ("align_corners", "round_prefer_ceil"),
+                      ("tf_half_pixel_for_nn", "floor"), ("half_pixel", "round_prefer_ceil"),
+                  }):
+                reasons.append("Resize nearest_mode and coordinate_transformation_mode must state a TFLite sampling convention")
             if "axes" in op.attrs:
                 reasons.append("Resize axes is not encoded")
-
-            input_tensor = (
-                ag.tensors.get(op.inputs[0]) if len(op.inputs) == 1 else None
-            )
-            output_tensor = (
-                ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
-            )
-            if (
-                input_tensor is None
-                or output_tensor is None
-                or len(input_tensor.shape) != 4
-                or len(output_tensor.shape) != 4
-            ):
+            if op.attrs.get("antialias", 0) or op.attrs.get("exclude_outside", 0):
+                reasons.append("Resize antialias and exclude_outside are not encoded")
+            if op.attrs.get("keep_aspect_ratio_policy", "stretch") != "stretch":
+                reasons.append("Resize requires keep_aspect_ratio_policy=stretch")
+            if op.attrs.get("resize_error"):
+                reasons.append(op.attrs["resize_error"])
+            input_tensor = ag.tensors.get(op.inputs[0]) if len(op.inputs) == 1 else None
+            output_tensor = ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
+            if (input_tensor is None or output_tensor is None or
+                    len(input_tensor.shape) != 4 or len(output_tensor.shape) != 4):
                 reasons.append("runtime supports rank-4 Resize only")
             else:
                 in_n, in_c, in_h, in_w = input_tensor.shape
                 out_n, out_c, out_h, out_w = output_tensor.shape
-                if (
-                    in_h <= 0
-                    or in_w <= 0
-                    or in_n != out_n
-                    or in_c != out_c
-                    or out_h % in_h != 0
-                    or out_w % in_w != 0
-                ):
-                    reasons.append(
-                        "Resize requires unchanged N/C and integer H/W upscaling"
-                    )
+                if (min(in_h, in_w, out_h, out_w) <= 0 or
+                        in_n != out_n or in_c != out_c):
+                    reasons.append("Resize requires unchanged N/C and positive H/W extents")
+                else:
+                    explicit = op.attrs.get("resize_scales")
+                    iq, oq = input_tensor.quant, output_tensor.quant
+                    integer = (linear and input_tensor.dtype == _INT8 and iq is not None and
+                               oq is not None and np.array_equal(iq.scale, oq.scale) and
+                               np.array_equal(iq.zero_point, oq.zero_point))
+                    for axis, (extent, target) in enumerate(((in_h, out_h), (in_w, out_w))):
+                        if explicit and math.floor(float(np.float32(extent) * np.float32(explicit[axis]))) != target:
+                            reasons.append("Resize scales disagree with output H/W extents")
+                        if integer:
+                            ni, no = (extent - 1, target - 1) if coordinate == "align_corners" and target > 1 else (extent, target)
+                            scale_10 = (math.floor(1024.0 / explicit[axis] + 0.5)
+                                        if explicit and coordinate != "align_corners" else (1024 * ni + no // 2) // no)
+                            last = (target - 1) * scale_10 + (scale_10 // 2 if coordinate == "half_pixel" else 0)
+                            pos = last - (512 if coordinate == "half_pixel" else 0)
+                            if (1024 * extent + target // 2 > 2147483647 or last > 2147483647 or
+                                    pos > 2147482624 or max(0, pos // 1024) >= extent):
+                                reasons.append("int8 bilinear Resize exceeds the defined TFLite reference coordinate range")
 
         if op.op_type in {"Add", "Sub", "Mul"}:
             dynamic_inputs = [

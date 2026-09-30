@@ -11,6 +11,8 @@ tensors can stay in fast memory as tiles, avoiding full-size slow allocation.
 import math
 from enum import Enum
 
+import numpy as np
+
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.graph.ir import (
@@ -1342,6 +1344,76 @@ def partition_spatial(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _solve_resize_height(ag: AnalyzedGraph, stage: Stage, ops: list[OpNode], budget: int) -> TilePlan:
+    """Size output bands from the same source-coordinate bounds as the runtime."""
+    resizes = [op for op in ops if op_category(op) is TileCategory.UPSAMPLE]
+    resize = resizes[0]
+    seen_resize = False
+    seen_output = False
+    for op in ops:
+        if op is resize:
+            if seen_output:
+                return TilePlan(tileable=False, warnings=["Resize cannot band an earlier stage output"])
+            seen_resize = True
+        elif (op_category(op) is not TileCategory.POINTWISE or
+              ((op.op_type in _BINARY_OPS or op.op_type == "Concat") and
+               (seen_resize or not _cotileable_skip_operands(ag, stage, op)))):
+            return TilePlan(tileable=False, warnings=["Resize requires one spatial operator per band"])
+        seen_output |= any(name in stage.output_tensors for name in op.outputs)
+    source, result = ag.tensors[resize.inputs[0]], ag.tensors[resize.outputs[0]]
+    ih, oh = int(source.shape[2]), int(result.shape[2])
+    if max(ih, oh) > _MAX_PLAN_EXTENT:
+        return TilePlan(tileable=False, warnings=["Resize height exceeds the tile-plan extent"])
+    coordinate = resize.attrs.get("coordinate_transformation_mode", "half_pixel")
+    explicit = resize.attrs.get("resize_scales")
+    align = coordinate == "align_corners" and oh > 1
+    ni, no = (ih - 1, oh - 1) if align else (ih, oh)
+    scale = (np.float32(1.0) / np.float32(explicit[0])
+             if explicit and coordinate != "align_corners" else np.float32(ni) / np.float32(no))
+    integer = (resize.op_type == "ResizeLinear" and source.quant is not None and
+               result.quant is not None and
+               np.array_equal(source.quant.scale, result.quant.scale) and
+               np.array_equal(source.quant.zero_point, result.quant.zero_point))
+    scale_10 = (math.floor(1024.0 / explicit[0] + 0.5) if explicit and coordinate != "align_corners"
+                else (1024 * ni + no // 2) // no)
+    taps = 2 if resize.op_type == "ResizeLinear" else 1
+    alignment = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+
+    def working_set(rows):
+        span = taps
+        if rows > 1:
+            span += (((rows - 1) * scale_10 + 1023) // 1024 if integer
+                     else math.ceil((rows - 1) * float(scale)) + 1)
+        input_rows = min(ih, span)
+
+        def size(name, extent):
+            info = ag.tensors[name]
+            return _align_up(info.size_bytes // int(info.shape[2]) * extent, alignment)
+
+        total = sum(size(name, input_rows) for name in stage.input_tensors)
+        current = input_rows
+        for op in ops:
+            if op is resize:
+                current = rows
+            total += sum(size(name, current) for name in op.outputs)
+        return total
+
+    minimum = working_set(1)
+    if minimum > budget:
+        return TilePlan(tileable=False, min_tile_bytes=minimum,
+                        warnings=[f"Stage {stage.stage_id} minimum Resize band exceeds budget ({budget:,} bytes)"])
+    low, high, best = 1, oh, 1
+    while low <= high:
+        rows = (low + high) // 2
+        if working_set(rows) <= budget:
+            best, low = rows, rows + 1
+        else:
+            high = rows - 1
+    return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+                    tile_height=best, num_tiles=math.ceil(oh / best), original_height=oh,
+                    receptive_field=taps, halo=taps - 1, tiled_peak_bytes=working_set(best))
+
+
 def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
     """One pass of tile analysis over the current stage list."""
     if not ag.stages or ag.mem_budget <= 0:
@@ -1354,6 +1426,10 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue  # fits, no tiling needed
 
         stage_ops = [ag.ops[i] for i in stage.op_indices]
+
+        if any(op_category(op) is TileCategory.UPSAMPLE for op in stage_ops):
+            stage.tile_plan = _solve_resize_height(ag, stage, stage_ops, budget)
+            continue
 
         # ConvTranspose stays UNTILEABLE in _OP_CATEGORY on purpose (so it is
         # auto-excluded from chains, the 1D height solve, and receptive-field

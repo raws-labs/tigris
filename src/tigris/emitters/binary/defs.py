@@ -58,6 +58,7 @@ POOL_ROUNDING_AVERAGE = 1
 OP_ATTR_CONSTANT_OPERAND = 9  # uint8[4]: the constant operand's position (0 or 1),
                               # a zero byte, and its quant param index (u16 LE,
                               # NO_QUANT_PARAM for float)
+OP_ATTR_RESIZE_SCALES = 10  # float32[2], explicit output/input H/W scales
 
 OP_ATTR_KINDS = (
     OP_ATTR_TRANSPOSE_PERM,
@@ -69,6 +70,7 @@ OP_ATTR_KINDS = (
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_POOL_ROUNDING,
     OP_ATTR_CONSTANT_OPERAND,
+    OP_ATTR_RESIZE_SCALES,
 )
 
 # Compression types

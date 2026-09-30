@@ -85,6 +85,12 @@ CASES = {
 
 
 FLOAT_BOUNDARIES = {"float_boundaries": _unary(lambda x: tf.nn.relu(x) * x, (1, 6, 6, 4))}
+for _kind, _resize in (("nearest", tf.raw_ops.ResizeNearestNeighbor), ("bilinear", tf.raw_ops.ResizeBilinear)):
+    for _coordinate in ("asymmetric", "half_pixel", "align_corners"):
+        CASES[f"resize_{_kind}_{_coordinate}_down"] = _unary(
+            lambda x, fn=_resize, mode=_coordinate: fn(
+                images=x, size=(7, 5), align_corners=mode == "align_corners", half_pixel_centers=mode == "half_pixel"),
+            (1, 17, 9, 4))
 CASES.update(FLOAT_BOUNDARIES)
 
 _MAP = (1, 6, 6, 4)

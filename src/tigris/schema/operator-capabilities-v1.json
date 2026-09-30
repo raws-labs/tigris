@@ -424,7 +424,7 @@
     },
     {
       "constraints": [
-        "rank-4 nearest-neighbor integer H/W upscaling; height tiling as the stage's single spatial op, never in a chain"
+        "rank-4 nearest-neighbor H/W resizing with asymmetric floor, half-pixel centers or align-corners rounding; height tiling as the stage's single spatial op, never in a chain"
       ],
       "opcode": 30,
       "operator": "Resize",
@@ -493,7 +493,7 @@
     },
     {
       "constraints": [
-        "rank-4 bilinear integer H/W upscaling with half-pixel or asymmetric coordinates; height tiling as the stage's single spatial op, never in a chain"
+        "rank-4 bilinear H/W resizing with half-pixel, asymmetric or align-corners coordinates; height tiling as the stage's single spatial op, never in a chain"
       ],
       "opcode": 36,
       "operator": "ResizeLinear",

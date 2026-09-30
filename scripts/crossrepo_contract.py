@@ -508,6 +508,33 @@ def _bilinear_upsample_case(*, tiled: bool = False) -> ContractCase:
     )
 
 
+def _resize_case(mode: str, coordinate: str, geometry: str, quantized: bool) -> ContractCase:
+    nearest = "round_prefer_ceil" if coordinate in {"align_corners", "half_pixel"} else "floor"
+    ih, iw = (17, 9) if geometry == "down" else (7, 9)
+    oh, ow = (7, 5) if geometry == "down" else (11, 4)
+    scales = np.array([1, 1, 2.35, 0.7], np.float32) if geometry == "scales" else None
+    if scales is not None:
+        oh, ow = (int(np.floor(np.float32(n) * s)) for n, s in zip((ih, iw), scales[2:]))
+    shape, target = [1, 4, ih, iw], [1, 4, oh, ow]
+    name = f"{'int8' if quantized else 'float'}_resize_{mode}_{coordinate}_{geometry}"
+    initializers = [numpy_helper.from_array(scales, "scales") if scales is not None else
+                    numpy_helper.from_array(np.array(target, np.int64), "sizes")]
+    nodes = _qdq("input", "q_s", "q_z", "x") if quantized else []
+    nodes.append(helper.make_node("Resize", ["x" if quantized else "input", "", "scales"]
+                                  if scales is not None else ["x" if quantized else "input", "", "", "sizes"],
+                                  ["raw" if quantized else "output"], mode=mode,
+                                  coordinate_transformation_mode=coordinate, nearest_mode=nearest))
+    if quantized:
+        initializers += _scalars(q=(0.125, -17))
+        nodes += _qdq("raw", "q_s", "q_z", "output")
+    model = _model(name, nodes, [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, target)], initializers)
+    data = np.random.default_rng(1709).uniform(-5, 5, shape).astype(np.float32)
+    return ContractCase(name, model, copy.deepcopy(model), {"input": data},
+                        ("ResizeLinear" if mode == "linear" else "Resize",),
+                        mem_budget="256" if quantized else "1K", expect_tiled=True)
+
+
 def _qdq(tensor: str, scale: str, zero: str, out: str) -> list[onnx.NodeProto]:
     """A QuantizeLinear/DequantizeLinear pair, the way a QDQ export marks a tensor int8."""
     return [
@@ -6247,6 +6274,11 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _per_channel_constant_case(),
         _bilinear_upsample_case(),
         _bilinear_upsample_case(tiled=True),
+        *[_resize_case(mode, coordinate, geometry, quantized)
+          for mode, coordinates in (("linear", ("half_pixel", "asymmetric", "align_corners")),
+                                    ("nearest", ("asymmetric", "align_corners", "tf_half_pixel_for_nn", "half_pixel")))
+          for coordinate in coordinates for geometry in ("down", "mixed", "scales")
+          for quantized in (False, True)],
         _split_chain_case(quantized=False),
         _split_chain_case(quantized=True),
         _inferred_kernel_chain_case(quantized=False),

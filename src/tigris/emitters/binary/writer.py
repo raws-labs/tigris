@@ -39,6 +39,7 @@ from .defs import (
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
     OP_ATTR_POOL_ROUNDING,
+    OP_ATTR_RESIZE_SCALES,
     POOL_ROUNDING_AVERAGE,
     OP_ATTR_EPSILON,
     OP_ATTR_TRANSPOSE_PERM,
@@ -862,6 +863,11 @@ def _build_op_attributes(
         constant = _constant_operand_payload(ag, op, quant_idx_map or {})
         if constant is not None:
             records.append((op_index, OP_ATTR_CONSTANT_OPERAND, constant))
+        if op.op_type in {"Resize", "ResizeLinear"}:
+            scales = op.attrs.get("resize_scales")
+            if scales is not None:
+                records.append((op_index, OP_ATTR_RESIZE_SCALES, struct.pack("<2f", *scales)))
+            continue
         if op.op_type == "LayerNormalization":
             records.append((
                 op_index,

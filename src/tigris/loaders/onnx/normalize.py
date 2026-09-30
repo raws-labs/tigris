@@ -2862,76 +2862,54 @@ def _resolve_resize_conventions(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Extract integer scale factors from Resize ops.
-
-    ONNX Resize has inputs: X, roi, scales, [sizes]. This pass reads the
-    constant ``scales`` or ``sizes`` input, computes integer H/W scale
-    factors, and stores them in ``op.attrs["strides"]`` so the binary
-    writer packs them into spatial.stride_h/w.
-    """
+    """Keep explicit Resize scales and encode the sampling convention."""
     for op in ag.ops:
         if op.op_type != "Resize":
             continue
-
-        x_name = op.inputs[0]
-        x_info = ag.tensors.get(x_name)
-        y_name = op.outputs[0]
-        y_info = ag.tensors.get(y_name)
-
-        scale_h, scale_w = 1, 1
-
-        # Try scales input (index 2)
-        if len(op.inputs) >= 3 and op.inputs[2] and op.inputs[2] in ag.weight_data:
-            scales = ag.weight_data[op.inputs[2]].flatten()
-            if len(scales) == 4:
-                # NCHW: [N=1, C=1, H_scale, W_scale]
-                scale_h = max(1, int(round(float(scales[2]))))
-                scale_w = max(1, int(round(float(scales[3]))))
-
-        # Try sizes input (index 3) if scales didn't work
-        if (
-            scale_h == 1
-            and scale_w == 1
-            and len(op.inputs) >= 4
-            and op.inputs[3]
-            and op.inputs[3] in ag.weight_data
-        ):
-            sizes = ag.weight_data[op.inputs[3]].flatten()
-            if len(sizes) == 4 and x_info and len(x_info.shape) == 4:
-                # NCHW input shape
-                scale_h = max(1, int(round(float(sizes[2]) / float(x_info.shape[2]))))
-                scale_w = max(1, int(round(float(sizes[3]) / float(x_info.shape[3]))))
-
-        # Infer from input/output shapes as fallback
-        if scale_h == 1 and scale_w == 1 and x_info and y_info:
-            if len(x_info.shape) == 4 and len(y_info.shape) == 4:
-                in_h, in_w = x_info.shape[2], x_info.shape[3]  # NCHW
-                out_h, out_w = y_info.shape[2], y_info.shape[3]
-                if in_h > 0 and in_w > 0:
-                    scale_h = max(1, out_h // in_h)
-                    scale_w = max(1, out_w // in_w)
-
-        op.attrs["strides"] = [scale_h, scale_w]
-
-        # Bilinear upsampling is its own operator rather than a mode on this
-        # one. A runtime that does not carry it refuses the plan outright,
-        # where a mode flag on Resize would have been read as nearest and
-        # quietly produced a different picture. Which coordinates it samples
-        # on rides in kernel_shape, the way Concat carries its axis.
-        if op.attrs.get("mode", "nearest") == "linear":
+        source = ag.tensors.get(op.inputs[0])
+        result = ag.tensors.get(op.outputs[0])
+        mode = op.attrs.get("mode", "nearest")
+        coordinate = op.attrs.get("coordinate_transformation_mode", "half_pixel")
+        scale_index = 1 if ag.opset and ag.opset < 11 else 2
+        if len(op.inputs) > scale_index and op.inputs[scale_index]:
+            name = op.inputs[scale_index]
+            scales = ag.weight_data.get(name)
+            if scales is None:
+                op.attrs["resize_error"] = "Resize scales must be constant"
+            elif scales.size:
+                values = scales.flatten()
+                if (values.size != 4 or not np.all(np.isfinite(values))
+                        or np.any(values <= 0) or np.any(values[:2] != 1)):
+                    op.attrs["resize_error"] = "Resize scales must preserve N/C and have positive finite H/W"
+                else:
+                    op.attrs["resize_scales"] = [float(v) for v in values[2:]]
+        if len(op.inputs) > 3 and op.inputs[3] and op.inputs[3] not in ag.weight_data:
+            op.attrs["resize_error"] = "Resize sizes must be constant"
+        convention = {"asymmetric": 1, "align_corners": 2}.get(coordinate, 0)
+        if mode == "linear":
             op.op_type = "ResizeLinear"
-            asymmetric = op.attrs.get(
-                "coordinate_transformation_mode") == "asymmetric"
-            op.attrs["kernel_shape"] = [1 if asymmetric else 0]
-
-        # Strip constant inputs (roi, scales, sizes) - keep only X
-        for inp_name in op.inputs[1:]:
-            if inp_name and inp_name in ag.weight_data:
-                del ag.weight_data[inp_name]
-            if inp_name and inp_name in ag.tensors and ag.tensors[inp_name].is_constant:
-                del ag.tensors[inp_name]
+        elif coordinate in {"half_pixel", "tf_half_pixel_for_nn"}:
+            convention = 3
+        op.attrs["kernel_shape"] = [convention]
+        strides = [0, 0]
+        if source and result and len(source.shape) == len(result.shape) == 4:
+            for axis in range(2):
+                i, o = int(source.shape[axis + 2]), int(result.shape[axis + 2])
+                if i > 0 and o % i == 0 and 1 <= o // i <= 255:
+                    strides[axis] = o // i
+            explicit = op.attrs.get("resize_scales")
+            if explicit and all(s == e for s, e in zip(strides, explicit)):
+                del op.attrs["resize_scales"]
+        if convention >= 2 or "resize_scales" in op.attrs:
+            strides = [0, 0]
+        op.attrs["strides"] = strides
+        constants = op.inputs[1:]
         op.inputs = [op.inputs[0]]
-
+        for name in constants:
+            if name and not any(name in other.inputs for other in ag.ops):
+                ag.weight_data.pop(name, None)
+                if name in ag.tensors and ag.tensors[name].is_constant:
+                    del ag.tensors[name]
     return ag
 
 

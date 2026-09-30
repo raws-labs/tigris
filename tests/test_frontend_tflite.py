@@ -97,6 +97,13 @@ def test_single_operator_matches_tflite_micro(model, tmp_path):
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256K", tmp_path)
 
 
+@pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("resize_*_down.tflite")), ids=lambda p: p.stem)
+def test_resize_downscales_in_height_bands(model, tmp_path):
+    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
+    plan = read_binary_plan((tmp_path / "model.tgrs").read_bytes())
+    assert any(tile["num_tiles"] > 1 for tile in plan["tile_plans"])
+
+
 def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
     """A copy whose operator code for `kind` names builtin `code` instead."""
     buffer = bytearray(data)
