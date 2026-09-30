@@ -60,8 +60,8 @@ def _session():
 
 
 def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path):
-    """Runs the compiled plan on TFLite Micro's recorded inputs and compares
-    the int8 outputs bit for bit."""
+    """Runs the compiled plan on TFLite Micro's recorded inputs, in the
+    model's own dtypes, and compares the outputs bit for bit."""
     Session = _session()
     plan_path = tmp_path / "model.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", budget, "-o", str(plan_path)])
@@ -73,20 +73,15 @@ def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_pat
         for sample in range(len(golden["input_0"])):
             feed = {}
             for position, index in enumerate(inputs):
-                tensor, value = tensors[index], golden[f"input_{position}"][sample]
-                if tensor.type == "INT8":
-                    value = (value.astype(np.float32) - np.float32(tensor.zero_point[0])) * tensor.scale[0]
-                feed[tensor.name] = value.astype(np.float32)
+                feed[tensors[index].name] = golden[f"input_{position}"][sample]
             produced = session.run(feed)
             for position, index in enumerate(outputs):
                 tensor = tensors[index]
                 got = produced[session.outputs[position]["name"]]
                 assert got.shape == tuple(tensor.shape)
-                expected = golden[f"output_{position}"][sample]
-                if tensor.type == "INT8":
-                    got = np.round(got / tensor.scale[0]).astype(np.int32) + int(tensor.zero_point[0])
-                    expected = expected.astype(np.int32)
-                np.testing.assert_array_equal(got, expected, err_msg=f"sample {sample}, output {position}")
+                assert got.dtype == golden[f"output_{position}"].dtype
+                np.testing.assert_array_equal(got, golden[f"output_{position}"][sample],
+                                              err_msg=f"sample {sample}, output {position}")
 
 
 def test_plan_reproduces_tflite_micro_outputs(tmp_path):
@@ -133,3 +128,10 @@ def test_a_truncated_file_is_an_error_not_a_misread():
     data = KWS.read_bytes()[:4096]
     with pytest.raises(ValueError):
         tflite.describe(data)
+
+
+def test_an_int8_operator_tflite_micro_runs_in_float_only_is_refused():
+    negate = tflite._BUILTIN_OPERATORS.index("NEG")
+    data = _with_operator_replaced((FIXTURES / "ops" / "abs.tflite").read_bytes(), "ABS", negate)
+    assert any("NEG: TFLite Micro runs it in float32 only" in reason
+               for reason in tflite.unsupported(data))

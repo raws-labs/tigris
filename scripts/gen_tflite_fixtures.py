@@ -87,16 +87,59 @@ CASES = {
 FLOAT_BOUNDARIES = {"float_boundaries": _unary(lambda x: tf.nn.relu(x) * x, (1, 6, 6, 4))}
 CASES.update(FLOAT_BOUNDARIES)
 
+_MAP = (1, 6, 6, 4)
+CASES.update({
+    "abs": _unary(tf.abs, _MAP),
+    "rsqrt": _unary(tf.math.rsqrt, _MAP),
+    "squared_difference": _binary(tf.math.squared_difference, _MAP, _MAP),
+    "maximum": _binary(tf.maximum, _MAP, _MAP),
+    "minimum": _binary(tf.minimum, _MAP, _MAP),
+    "div": _binary(tf.divide, _MAP, _MAP),
+})
+# Converted without quantization: TFLite Micro runs these in float only.
+FLOAT_MODELS = {
+    "float_abs": _unary(tf.abs, _MAP),
+    "float_neg": _unary(tf.negative, _MAP),
+    "float_exp": _unary(tf.exp, _MAP),
+    "float_log": _unary(tf.math.log, _MAP),
+    "float_sqrt": _unary(tf.sqrt, _MAP),
+    "float_rsqrt": _unary(tf.math.rsqrt, _MAP),
+    "float_square": _unary(tf.square, _MAP),
+    "float_squared_difference": _binary(tf.math.squared_difference, _MAP, _MAP),
+    "float_div": _binary(tf.divide, _MAP, _MAP),
+    "float_maximum": _binary(tf.maximum, _MAP, _MAP),
+    "float_minimum": _binary(tf.minimum, _MAP, _MAP),
+    "float_floor": _unary(tf.floor, _MAP),
+    "float_ceil": _unary(tf.math.ceil, _MAP),
+    "float_round": _unary(tf.round, _MAP),
+    "float_sin": _unary(tf.sin, _MAP),
+    "float_cos": _unary(tf.cos, _MAP),
+    "float_floor_div": _binary(tf.math.floordiv, _MAP, _MAP),
+    "float_floor_mod": _binary(tf.math.floormod, _MAP, _MAP),
+}
+CASES.update(FLOAT_MODELS)
+# Input ranges per operand where the default [-3, 3] leaves the domain.
+_POSITIVE, _DIVISOR = (0.05, 4.0), (0.5, 3.0)
+RANGES = {
+    "rsqrt": [_POSITIVE], "float_rsqrt": [_POSITIVE], "float_log": [_POSITIVE],
+    "float_sqrt": [(0.0, 4.0)],
+    "div": [(-3.0, 3.0), _DIVISOR], "float_div": [(-3.0, 3.0), _DIVISOR], "float_floor_div": [(-3.0, 3.0), _DIVISOR],
+    "float_floor_mod": [(-3.0, 3.0), _DIVISOR],
+}
 
-def _convert(fn, shapes, rng, float_io=False):
+
+def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):
     specs = [tf.TensorSpec(shape, tf.float32) for shape in shapes]
     concrete = tf.function(fn).get_concrete_function(*specs)
 
     def representative():
         for _ in range(64):
-            yield [rng.uniform(-3.0, 3.0, shape).astype(np.float32) for shape in shapes]
+            yield [rng.uniform(lo, hi, shape).astype(np.float32)
+                   for shape, (lo, hi) in zip(shapes, ranges)]
 
     converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete], tf.function(fn))
+    if not quantize:
+        return converter.convert()
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
@@ -105,22 +148,42 @@ def _convert(fn, shapes, rng, float_io=False):
     return converter.convert()
 
 
-def _inputs(details, rng):
+def _inputs(details, rng, value_range=None):
+    shape = (SAMPLES, *details["shape"])
     if details["dtype"] == np.float32:
-        return rng.uniform(-3.0, 3.0, (SAMPLES, *details["shape"])).astype(np.float32)
-    return rng.integers(-128, 128, (SAMPLES, *details["shape"]), dtype=np.int8)
+        return rng.uniform(*(value_range or (-3.0, 3.0)), shape).astype(np.float32)
+    if value_range is None:
+        return rng.integers(-128, 128, shape, dtype=np.int8)
+    scale, zero_point = details["quantization"]
+    values = np.round(rng.uniform(*value_range, shape) / scale) + zero_point
+    return np.clip(values, -128, 127).astype(np.int8)
 
 
 def generate(name: str) -> bool:
     """Writes the case; True when TFLite Micro deviates from the reference kernels."""
     shapes, fn = CASES[name]
     rng = np.random.default_rng(sum(name.encode()))
-    model = _convert(fn, shapes, rng, float_io=name in FLOAT_BOUNDARIES)
-    reference = tf.lite.Interpreter(
-        model_content=model,
-        experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
+    ranges = RANGES.get(name)
+    model = _convert(fn, shapes, ranges or [(-3.0, 3.0)] * len(shapes), rng,
+                     float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS)
+    try:
+        reference = tf.lite.Interpreter(
+            model_content=model,
+            experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
+    except ValueError:
+        # The reference resolver lacks some float operators (CEIL).
+        reference = tf.lite.Interpreter(model_content=model)
     reference.allocate_tensors()
-    inputs = [_inputs(details, rng) for details in reference.get_input_details()]
+    inputs = [_inputs(details, rng, ranges[i] if ranges else None)
+              for i, details in enumerate(reference.get_input_details())]
+    if name == "div":
+        # TFLite refuses a divisor whose raw byte is 0; keep its value nonzero too.
+        divisor, zero_point = inputs[1], reference.get_input_details()[1]["quantization"][1]
+        divisor[(divisor == 0) | (divisor == zero_point)] = zero_point + 1 or 1
+        # A numerator of 0 or -1 after its zero point makes TFLite's arithmetic
+        # shift a 32-bit value by 32 or more, which is undefined there.
+        numerator, zero_point = inputs[0], reference.get_input_details()[0]["quantization"][1]
+        numerator[(numerator == zero_point) | (numerator == zero_point - 1)] = zero_point + 1
     output_details = reference.get_output_details()
     micro_interpreter = micro.Interpreter.from_bytes(model, arena_size=1024 * 1024)
     micro_outputs, reference_outputs = [], []

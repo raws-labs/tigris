@@ -203,12 +203,22 @@ def _activation(code: int) -> str:
 
 
 # Slot of the fused activation in each operator's options table.
-_FUSED_SLOT = {"ADD": 0, "SUB": 0, "MUL": 0, "FULLY_CONNECTED": 0, "CONCATENATION": 1,
+_FUSED_SLOT = {"ADD": 0, "SUB": 0, "MUL": 0, "DIV": 0, "FULLY_CONNECTED": 0, "CONCATENATION": 1,
                "CONV_2D": 3, "TRANSPOSE_CONV": 3, "DEPTHWISE_CONV_2D": 4,
                "AVERAGE_POOL_2D": 5, "MAX_POOL_2D": 5}
 _UNARY = {"LOGISTIC": "Sigmoid", "TANH": "Tanh", "HARD_SWISH": "HardSwish", "RELU": "Relu"}
 _SHAPE_ONLY = ("RESHAPE", "SQUEEZE", "EXPAND_DIMS")
-_SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, "RELU6", "SOFTMAX", "MEAN", "TRANSPOSE",
+# Elementwise math: the ONNX operator, or a composition the compiler folds back.
+_ELEMENTWISE_UNARY = {"ABS": "Abs", "NEG": "Neg", "EXP": "Exp", "LOG": "Log", "SQRT": "Sqrt",
+                      "FLOOR": "Floor", "CEIL": "Ceil", "ROUND": "Round", "SIN": "Sin",
+                      "COS": "Cos"}
+_ELEMENTWISE_BINARY = ("DIV", "MAXIMUM", "MINIMUM", "SQUARED_DIFFERENCE", "FLOOR_DIV",
+                       "FLOOR_MOD")
+_ELEMENTWISE = (*_ELEMENTWISE_UNARY, *_ELEMENTWISE_BINARY, "RSQRT", "SQUARE")
+# The ones TFLite Micro also runs in int8; the others are float only there.
+_INT8_ELEMENTWISE = ("ABS", "RSQRT", "SQUARED_DIFFERENCE", "MAXIMUM", "MINIMUM", "DIV")
+_SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, "RELU6", "SOFTMAX", "MEAN",
+              "TRANSPOSE",
               "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
               "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE")
 # Positions of the data, weights and bias operands of the weighted operators.
@@ -248,8 +258,13 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     elif op.kind == "DEQUANTIZE":
         if data[0].type != "INT8" or outs[0].type != "FLOAT32":
             return "only int8 to float converts"
+    elif op.kind in _ELEMENTWISE and all(t.type == "FLOAT32" for t in [*data, *outs]):
+        pass
     elif any(t.type != "INT8" for t in [*data, *outs]):
-        return "only int8 activations convert"
+        return ("activations must be all int8 or all float32" if op.kind in _ELEMENTWISE
+                else "only int8 activations convert")
+    elif op.kind in _ELEMENTWISE and op.kind not in _INT8_ELEMENTWISE:
+        return "TFLite Micro runs it in float32 only"
     if any(len(t.scale) != 1 for t in [*data, *outs] if t.type == "INT8"):
         return "activations must be quantized per tensor"
     if op.kind in _FUSED_SLOT:
@@ -261,6 +276,9 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         for operand in ins:
             if not _is_constant(operand) and len(operand.shape) != rank:
                 return "operands of different rank"
+    if op.kind in _ELEMENTWISE_BINARY and (
+            any(_is_constant(t) for t in ins) or ins[0].shape != ins[1].shape):
+        return "only two non-constant operands of the same shape convert"
     if op.kind == "CONCATENATION":
         if any(t.scale[0] != outs[0].scale[0] or t.zero_point[0] != outs[0].zero_point[0] for t in data):
             return "inputs quantized differently from the output"
@@ -341,10 +359,13 @@ class _Converter:
     """Builds the QDQ ONNX graph operator by operator; `values` maps a TFLite
     tensor index to the ONNX value holding it, rank-4 values in NCHW."""
 
-    def __init__(self, tensors: list[_Tensor]):
+    def __init__(self, tensors: list[_Tensor], outputs=(), consumed=()):
         self.b = GraphBuilder()
         self.tensors = tensors
         self.values: dict[int, str] = {}
+        # int8 model outputs are the QuantizeLinear itself, as TFLite hands them over.
+        self.int8_outputs = {i for i in outputs if tensors[i].type == "INT8"}
+        self.consumed = set(consumed)
 
     def value(self, index: int, rank: int | None = None) -> str:
         """The ONNX value of a tensor; a constant is broadcast-aligned to `rank`."""
@@ -374,7 +395,15 @@ class _Converter:
 
     def finish(self, source: str, index: int) -> None:
         tensor = self.tensors[index]
-        if tensor.type == "FLOAT32":
+        if index in self.int8_outputs:
+            b = self.b
+            scale = b.constant(np.float32(tensor.scale[0]), tensor.name + "_scale")
+            zero = b.constant(np.array(int(tensor.zero_point[0]), np.int8), tensor.name + "_zero_point")
+            quantized = b.node("QuantizeLinear", [source, scale, zero], tensor.name)
+            self.values[index] = (b.node("DequantizeLinear", [quantized, scale, zero],
+                                         tensor.name + "_float")
+                                  if index in self.consumed else quantized)
+        elif tensor.type == "FLOAT32":
             self.values[index] = self.b.node("Identity", [source], tensor.name)
         else:
             self.values[index] = self.b.requantized(source, float(tensor.scale[0]),
@@ -425,6 +454,24 @@ class _Converter:
         elif kind == "CONCATENATION":
             y = b.node("Concat", [self.value(i) for i in ins], tag,
                        axis=_onnx_axis(op.option(0, "i"), len(out.shape)))
+        elif kind in _ELEMENTWISE_UNARY:
+            y = b.node(_ELEMENTWISE_UNARY[kind], [self.value(ins[0])], tag)
+        elif kind == "RSQRT":
+            y = b.node("Reciprocal", [b.node("Sqrt", [self.value(ins[0])], tag + "_sqrt")], tag)
+        elif kind == "SQUARE":
+            x = self.value(ins[0])
+            y = b.node("Mul", [x, x], tag)
+        elif kind in ("DIV", "MAXIMUM", "MINIMUM"):
+            y = b.node({"DIV": "Div", "MAXIMUM": "Max", "MINIMUM": "Min"}[kind],
+                       [self.value(i) for i in ins], tag)
+        elif kind == "SQUARED_DIFFERENCE":
+            difference = b.node("Sub", [self.value(i) for i in ins], tag + "_difference")
+            y = b.node("Mul", [difference, difference], tag)
+        elif kind == "FLOOR_DIV":
+            y = b.node("Floor", [b.node("Div", [self.value(i) for i in ins], tag + "_quotient")],
+                       tag)
+        elif kind == "FLOOR_MOD":
+            y = self._floor_mod(self.value(ins[0]), self.value(ins[1]), tag)
         elif kind in _UNARY:
             y = b.node(_UNARY[kind], [self.value(ins[0])], tag)
         elif kind == "RELU6":
@@ -509,6 +556,21 @@ class _Converter:
             raise ValueError(f"no conversion for {kind}")
         self.finish(b.fused_activation(y, fused, tag), outs[0])
 
+    def _floor_mod(self, a: str, divisor: str, tag: str) -> str:
+        """TFLite's FLOOR_MOD: the truncated remainder, plus the divisor where
+        the remainder is non-zero and its sign differs from the divisor's."""
+        b = self.b
+        zero = b.constant(np.float32(0.0), tag + "_zero")
+        remainder = b.node("Mod", [a, divisor], tag + "_remainder", fmod=1)
+        nonzero = b.node("Not", [b.node("Equal", [remainder, zero], tag + "_is_zero")],
+                         tag + "_nonzero")
+        signs = b.node("Xor", [b.node("Less", [divisor, zero], tag + "_divisor_negative"),
+                               b.node("Less", [remainder, zero], tag + "_remainder_negative")],
+                       tag + "_signs_differ")
+        condition = b.node("And", [nonzero, signs], tag + "_adjust")
+        shifted = b.node("Add", [remainder, divisor], tag + "_shifted")
+        return b.node("Where", [condition, shifted, remainder], tag)
+
     def _bias(self, op: _Operator, position: int, name: str) -> str | None:
         if position >= len(op.inputs) or op.inputs[position] < 0:
             return None
@@ -586,25 +648,33 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         raise ValueError("TFLite model does not convert: " + "; ".join(reasons))
     _, graphs = _read(data)
     _, tensors, inputs, outputs, operators = graphs[0]
-    converter = _Converter(tensors)
+    consumed = {i for op in operators for i in op.inputs}
+    converter = _Converter(tensors, outputs, consumed)
     b = converter.b
+    boundary_type = {"INT8": TensorProto.INT8, "FLOAT32": TensorProto.FLOAT}
 
+    # The interface keeps TFLite's dtypes: an int8 input is dequantized straight
+    # off the graph input.
     onnx_inputs = []
     for index in inputs:
         tensor = tensors[index]
         b._names.add(tensor.name)
-        onnx_inputs.append(helper.make_tensor_value_info(tensor.name, TensorProto.FLOAT,
-                                                         _onnx_shape(tensor.shape)))
+        onnx_inputs.append(helper.make_tensor_value_info(
+            tensor.name, boundary_type[tensor.type], _onnx_shape(tensor.shape)))
         if tensor.type == "FLOAT32":
             converter.values[index] = tensor.name
         else:
-            converter.values[index] = b.requantized(tensor.name, float(tensor.scale[0]),
-                                                    int(tensor.zero_point[0]),
-                                                    tensor.name + "_int8")
+            scale = b.constant(np.float32(tensor.scale[0]), tensor.name + "_scale")
+            zero = b.constant(np.array(int(tensor.zero_point[0]), np.int8),
+                              tensor.name + "_zero_point")
+            converter.values[index] = b.node("DequantizeLinear", [tensor.name, scale, zero],
+                                             tensor.name + "_float")
     for op in operators:
         converter.convert(op)
-    onnx_outputs = [helper.make_tensor_value_info(converter.values[index], TensorProto.FLOAT,
-                                                  _onnx_shape(tensors[index].shape)) for index in outputs]
+    onnx_outputs = [helper.make_tensor_value_info(
+        tensors[index].name if index in converter.int8_outputs else converter.values[index],
+        boundary_type[tensors[index].type], _onnx_shape(tensors[index].shape))
+        for index in outputs]
     model = helper.make_model(helper.make_graph(b.nodes, name, onnx_inputs, onnx_outputs,
                                                 b.initializers),
                               opset_imports=[helper.make_opsetid("", 17)])
