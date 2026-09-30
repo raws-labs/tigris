@@ -211,6 +211,22 @@ CASES.update({
     "expand_dims_op": _unary(lambda x: tf.expand_dims(x, 1), (1, 8, 6)),
 })
 
+CASES["softmax"] = _unary(tf.nn.softmax, (1, 10))
+# The tier-1 cases again, converted without quantization.
+_FLOAT_TIER1 = (
+    "max_pool_valid", "max_pool_same", "avg_pool_valid", "avg_pool_same", "concat_channels",
+    "concat_rows", "add_broadcast", "mul", "sub", "logistic", "tanh", "hard_swish", "relu",
+    "relu6", "mean_spatial", "mean_spatial_flat", "resize_nearest", "resize_bilinear",
+    "resize_bilinear_asymmetric", "transpose", "split", "split_v", "reshape", "conv_dilated",
+    "depthwise_multiplier", "transpose_conv", "batch_matmul", "fully_connected_rank3",
+    "pad_conv", "pad", "padv2", "squeeze_op", "expand_dims_op", "softmax",
+)
+for _name in _FLOAT_TIER1:
+    FLOAT_MODELS[f"float_{_name}"] = CASES[_name]
+    if _name in REWRITES:
+        REWRITES[f"float_{_name}"] = REWRITES[_name]
+CASES.update(FLOAT_MODELS)
+
 
 def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):
     specs = [tf.TensorSpec(shape, tf.float32) for shape in shapes]

@@ -12,8 +12,7 @@ them, so the frontend can be checked bit for bit without TFLite Micro installed.
 Where TFLite Micro disagrees with TFLite's reference kernels, the reference
 kernels' outputs are recorded instead; `relu6` is the one such case, because
 TFLite Micro's int8 RELU6 ignores the output quantization.
-The `float_` models are converted without quantization, for operators TFLite
-Micro runs in float only.
+The `float_` models are converted without quantization.
 `div` keeps its numerators off 0 and -1 after the zero point, where TFLite's
 int8 arithmetic shifts a 32-bit value by 32 or more; the runtime's own tests
 cover that range.
