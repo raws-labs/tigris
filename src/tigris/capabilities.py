@@ -60,14 +60,43 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "LayerNormalization",
     "Erf",
     "HardSwish",
+    "Abs",
+    "Rsqrt",
+    "Neg",
+    "Exp",
+    "Log",
+    "Sqrt",
+    "Square",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Sin",
+    "Cos",
+    "Div",
+    "SquaredDifference",
+    "Max",
+    "Min",
+    "FloorDiv",
+    "FloorMod",
     "ReduceMean",
     "Split",
 })
 
-# Every reference operator has an int8 kernel. What an int8 plan cannot state
-# is a constant operand's scale and zero point, which validation refuses per
-# operator.
-_S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS
+_S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS - frozenset({
+    "Div",
+    "Neg",
+    "Exp",
+    "Log",
+    "Sqrt",
+    "Square",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Sin",
+    "Cos",
+    "FloorDiv",
+    "FloorMod",
+})
 
 
 # Native accelerated adapters sometimes route a supported variant through the
@@ -158,6 +187,17 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "Sigmoid": ("rank-3 pointwise length tiling on serialized axis 1",),
     "Tanh": ("rank-3 pointwise length tiling on serialized axis 1",),
     "HardSwish": ("rank-3 pointwise length tiling on serialized axis 1",),
+    "Abs": ("int8 requantization must stay within the 32-bit reference arithmetic domain",),
+    "Rsqrt": ("int8 requires nonnegative centered inputs and reference shifts in range",),
+    "Div": ("two dynamic operands with identical shapes; float32 only",),
+    "SquaredDifference": (
+        "two dynamic operands with identical shapes",
+        "int8 requantization must stay within the 32-bit reference arithmetic domain",
+    ),
+    "Max": ("two dynamic operands with identical shapes; int8 quantization must match",),
+    "Min": ("two dynamic operands with identical shapes; int8 quantization must match",),
+    "FloorDiv": ("two dynamic operands with identical shapes; zero denominators are rejected",),
+    "FloorMod": ("two dynamic operands with identical shapes",),
     "Transpose": ("a concrete, valid permutation is stored in schema 4+ plans",),
 }
 

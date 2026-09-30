@@ -527,6 +527,63 @@ def _scalars(**values: tuple[float, int]) -> list[onnx.TensorProto]:
     return tensors
 
 
+def _elementwise_case(kind: str, *, quantized: bool = False) -> ContractCase:
+    shape = [1, 4, 16, 16]
+    binary = kind in {"Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod"}
+    rng = np.random.default_rng(917)
+    data = rng.uniform(-3, 3, size=shape).astype(np.float32)
+    if kind in {"Rsqrt", "Sqrt", "Log"}:
+        data = np.abs(data) + np.float32(0.5)
+    other = rng.uniform(0.5, 3, size=shape).astype(np.float32)
+    other.reshape(-1)[::2] *= -1
+    inputs = {"input": data}
+    if binary:
+        inputs["second"] = other
+    nodes = []
+    initializers = []
+    a, b = "input", "second"
+    if quantized:
+        initializers += _scalars(a=(0.03125, -17), b=(0.03125, -17), y=(0.03125, -17))
+        nodes += _qdq(a, "a_s", "a_z", "a_float")
+        a = "a_float"
+        if binary:
+            nodes += _qdq(b, "b_s", "b_z", "b_float")
+            b = "b_float"
+    output = "raw" if quantized else "output"
+    if kind == "Rsqrt":
+        nodes += [helper.make_node("Sqrt", [a], ["root"]),
+                  helper.make_node("Reciprocal", ["root"], [output])]
+    elif kind == "Square":
+        nodes += [helper.make_node("Mul", [a, a], [output])]
+    elif kind == "SquaredDifference":
+        nodes += [helper.make_node("Sub", [a, b], ["difference"]),
+                  helper.make_node("Mul", ["difference", "difference"], [output])]
+    elif kind == "FloorDiv":
+        nodes += [helper.make_node("Div", [a, b], ["quotient"]),
+                  helper.make_node("Floor", ["quotient"], [output])]
+    elif kind == "FloorMod":
+        initializers.append(numpy_helper.from_array(np.array(0, dtype=np.float32), "zero"))
+        nodes += [helper.make_node("Mod", [a, b], ["remainder"], fmod=1),
+                  helper.make_node("Equal", ["remainder", "zero"], ["is_zero"]),
+                  helper.make_node("Not", ["is_zero"], ["nonzero"]),
+                  helper.make_node("Less", [b, "zero"], ["negative_b"]),
+                  helper.make_node("Less", ["remainder", "zero"], ["negative_r"]),
+                  helper.make_node("Xor", ["negative_b", "negative_r"], ["different"]),
+                  helper.make_node("And", ["nonzero", "different"], ["adjust"]),
+                  helper.make_node("Add", ["remainder", b], ["shifted"]),
+                  helper.make_node("Where", ["adjust", "shifted", "remainder"], [output])]
+    else:
+        nodes += [helper.make_node(kind, [a, b] if binary else [a], [output])]
+    if quantized:
+        nodes += _qdq("raw", "y_s", "y_z", "output")
+    label = f"{'int8' if quantized else 'float'}_elementwise_{kind.lower()}"
+    model = _model(label, nodes,
+                   [helper.make_tensor_value_info(name, TensorProto.FLOAT, shape) for name in inputs],
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)], initializers)
+    return ContractCase(label, model, copy.deepcopy(model), inputs, (kind,),
+                        mem_budget="256", expect_tiled=True)
+
+
 def _hardswish_case(*, quantized: bool) -> ContractCase:
     """HardSwish, MobileNetV3's activation, banded behind a convolution.
 
@@ -2210,7 +2267,7 @@ def _clip_as_relu_case() -> ContractCase:
 
 
 def _negate_case() -> ContractCase:
-    """Neg has no opcode; it compiles as a multiplication by minus one."""
+    """Neg preserves the sign reversal after a rectifier."""
     shape = [1, 5]
     model = _model(
         "negate",
@@ -2226,7 +2283,7 @@ def _negate_case() -> ContractCase:
         model,
         model,
         {"input": np.array([[-2.0, -0.5, 0.0, 1.5, 3.0]], dtype=np.float32)},
-        ("Relu", "Mul"),
+        ("Relu", "Neg"),
     )
 
 
@@ -5914,8 +5971,8 @@ def _assert_compile_rejected(work_dir: Path) -> None:
     )
     cases = [
         _model(
-            "unsupported_sin",
-            [helper.make_node("Sin", ["input"], ["output"])],
+            "unsupported_acos",
+            [helper.make_node("Acos", ["input"], ["output"])],
             [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
             [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
         ),
@@ -6051,6 +6108,13 @@ def _assert_runtime_rejects_incompatible_plan(
 
 def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
+        *[_elementwise_case(kind) for kind in (
+            "Abs", "Neg", "Exp", "Log", "Sqrt", "Rsqrt", "Square", "SquaredDifference",
+            "Div", "Max", "Min", "Floor", "Ceil", "Round", "Sin", "Cos", "FloorDiv", "FloorMod",
+        )],
+        *[_elementwise_case(kind, quantized=True) for kind in (
+            "Abs", "Rsqrt", "SquaredDifference", "Max", "Min",
+        )],
         _constant_add_case(),
         _add_relu_fusion_case(),
         _residual_case(),
