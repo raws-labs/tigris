@@ -36,6 +36,7 @@ from .defs import (
     NO_QUANT_PARAM,
     NO_WEIGHT,
     OP_ATTR_AXES,
+    OP_ATTR_ALPHA,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
     OP_ATTR_PADS,
@@ -217,6 +218,7 @@ def _pack_spatial_attrs(
         "ConvTranspose",
         "MaxPool",
         "AveragePool",
+        "L2Pool",
     }
     if not ks and op.op_type in {
         "Conv",
@@ -880,11 +882,15 @@ def _build_op_attributes(
                      for value in (amounts[axis], amounts[rank + axis])]
             records.append((op_index, OP_ATTR_PADS, struct.pack(f"<{2 * rank}i", *pairs)))
             continue
-        if op.op_type == "LayerNormalization":
+        if op.op_type == "LeakyRelu":
+            records.append((op_index, OP_ATTR_ALPHA,
+                            struct.pack("<f", float(op.attrs.get("alpha", 0.01)))))
+            continue
+        if op.op_type in {"LayerNormalization", "L2Normalization"}:
             records.append((
                 op_index,
                 OP_ATTR_EPSILON,
-                struct.pack("<f", float(op.attrs.get("epsilon", 1e-5))),
+                struct.pack("<f", float(op.attrs.get("epsilon", 1e-6 if op.op_type == "L2Normalization" else 1e-5))),
             ))
             continue
         if op.op_type in ("Add", "Sub"):

@@ -41,7 +41,7 @@ SECTION_TYPES = (
 # without a schema version. Payloads are little-endian, and their length is the
 # record's data_len.
 OP_ATTR_TRANSPOSE_PERM = 1   # uint8[rank], the serialized axis permutation
-OP_ATTR_EPSILON = 2          # float32, a normalization's variance floor
+OP_ATTR_EPSILON = 2          # float32, a normalization's floor
 OP_ATTR_ALPHA = 3            # float32, a leaky activation's negative slope
 OP_ATTR_CLIP_BOUNDS = 4      # float32[2], a clip's lower then upper bound
 OP_ATTR_PADS = 5             # int32[2 * rank], leading then trailing per axis
@@ -136,6 +136,11 @@ OP_TYPE_MAP: dict[str, int] = {
     "Cos": 52,
     "FloorDiv": 53,
     "FloorMod": 54,
+    "PRelu": 55,
+    "Elu": 56,
+    "LogSoftmax": 57,
+    "L2Normalization": 58,
+    "L2Pool": 59,
 }
 OP_TYPE_UNKNOWN = 255
 

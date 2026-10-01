@@ -75,7 +75,7 @@ def _cmsis_weight_decompression_overhead(plan: dict) -> int:
 
 # The operators the executor reserves per-op tiling state for in a chain
 # (is_height_spatial_op in the runtime executor).
-_HEIGHT_SPATIAL_OPS = frozenset({"Conv", "DepthwiseConv", "MaxPool", "AveragePool"})
+_HEIGHT_SPATIAL_OPS = frozenset({"Conv", "DepthwiseConv", "MaxPool", "AveragePool", "L2Pool"})
 
 
 def _executor_workspace_limits(plan: dict) -> tuple[int, int, int, int, int]:

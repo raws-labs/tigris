@@ -337,10 +337,10 @@
       "opcode": 21,
       "operator": "LeakyRelu",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
-        "reference": "unsupported",
-        "s8_ref": "unsupported"
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
       }
     },
     {
@@ -715,6 +715,71 @@
       ],
       "opcode": 54,
       "operator": "FloorMod",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
+    },
+    {
+      "constraints": [
+        "constant broadcast alpha, rank at most 4; each operand has the output's shape or broadcasts to it, a tensor operand at the output's rank; tiled only when every operand is dense, a repeating constant, or one value per channel as the second operand"
+      ],
+      "opcode": 55,
+      "operator": "PRelu",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "alpha=1"
+      ],
+      "opcode": 56,
+      "operator": "Elu",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "final stored axis; int8 output scale 1/16 and zero point 127"
+      ],
+      "opcode": 57,
+      "operator": "LogSoftmax",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "final stored axis; int8 output scale 1/128 and zero point 0"
+      ],
+      "opcode": 58,
+      "operator": "L2Normalization",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "float32 square root of the mean of valid squared samples"
+      ],
+      "opcode": 59,
+      "operator": "L2Pool",
       "routes": {
         "cmsis-nn": "unsupported",
         "esp-nn": "unsupported",

@@ -52,6 +52,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     "DepthwiseConv": TileCategory.CONV,
     "MaxPool": TileCategory.POOL,
     "AveragePool": TileCategory.POOL,
+    "L2Pool": TileCategory.POOL,
     # Audited, shape-preserving runtime kernels.
     "Relu": TileCategory.POINTWISE,
     "Relu6": TileCategory.POINTWISE,
@@ -68,6 +69,11 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     # neighbours. Shape-preserving and halo-free, which is what POINTWISE means
     # here, even though the operator itself is a reduction.
     "Softmax": TileCategory.POINTWISE,
+    "LeakyRelu": TileCategory.POINTWISE,
+    "PRelu": TileCategory.POINTWISE,
+    "Elu": TileCategory.POINTWISE,
+    "LogSoftmax": TileCategory.POINTWISE,
+    "L2Normalization": TileCategory.POINTWISE,
     # Erf is elementwise. LayerNormalization reduces along the final stored
     # dimension, which both tile axes are ahead of, so a tile holds whole
     # normalization rows and needs nothing from its neighbours: the same
@@ -111,7 +117,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 # no spatial op. Shared between the rank-3 and rank-4 eligibility checks
 # below since the hazard is the same in both.
 _BINARY_OPS = frozenset({
-    "Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod",
+    "Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod", "PRelu",
 })
 
 # Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
@@ -125,6 +131,10 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Sigmoid",
     "Tanh",
     "Softmax",
+    "LeakyRelu",
+    "Elu",
+    "LogSoftmax",
+    "L2Normalization",
     "Erf",
     "HardSwish",
     "Abs",
@@ -601,12 +611,17 @@ _ROW_TILING_OPS = frozenset({
     "Sin",
     "Cos",
     "Softmax",
+    "LeakyRelu",
+    "Elu",
+    "LogSoftmax",
+    "L2Normalization",
     "LayerNormalization",
     "Reshape",
     "Flatten",
     "Add",
     "Sub",
     "Mul",
+    "PRelu",
 })
 
 # The operators that may read an operand the band does not cut. A matrix
