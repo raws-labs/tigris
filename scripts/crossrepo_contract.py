@@ -616,6 +616,49 @@ def _elementwise_case(kind: str, *, quantized: bool = False) -> ContractCase:
                         mem_budget="256", expect_tiled=True)
 
 
+def _activation_case(kind: str, *, quantized: bool = False) -> ContractCase:
+    shape = [2, 4, 16, 16]
+    output_shape = shape
+    data = np.random.default_rng(193).uniform(-2, 2, size=shape).astype(np.float32)
+    nodes, initializers = [], []
+    source = "input"
+    if quantized:
+        output_quant = {"LogSoftmax": (1 / 16, 127),
+                        "L2Normalization": (1 / 128, 0)}.get(kind, (0.03125, -17))
+        initializers += _scalars(a=(0.03125, -17), b=(0.0625, 3), y=output_quant)
+        nodes += _qdq(source, "a_s", "a_z", "x")
+        source = "x"
+    target = "raw" if quantized else "output"
+    if kind == "PRelu":
+        initializers.append(numpy_helper.from_array(
+            np.array([-0.5, 0.0, 0.25, 1.5], np.float32).reshape(4, 1, 1), "alpha"))
+        alpha = "alpha"
+        if quantized:
+            nodes += _qdq(alpha, "b_s", "b_z", "slope")
+            alpha = "slope"
+        nodes += [helper.make_node(kind, [source, alpha], [target])]
+    elif kind == "L2Pool":
+        output_shape = [2, 4, 8, 8]
+        nodes += [helper.make_node("Mul", [source, source], ["square"]),
+                  helper.make_node("AveragePool", ["square"], ["mean"],
+                                   kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 0, 0]),
+                  helper.make_node("Sqrt", ["mean"], [target])]
+    elif kind == "L2Normalization":
+        nodes += [helper.make_node("LpNormalization", [source], [target], p=2, axis=1)]
+    else:
+        attrs = {"axis": 1} if kind == "LogSoftmax" else {"alpha": -0.5} if kind == "LeakyRelu" else {}
+        nodes += [helper.make_node(kind, [source], [target], **attrs)]
+    if quantized:
+        nodes += _qdq(target, "y_s", "y_z", "output")
+    label = f"{'int8' if quantized else 'float'}_activation_{kind.lower()}"
+    model = _model(label, nodes,
+                   [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)], initializers)
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data}, (kind,),
+                        mem_budget="2K" if kind == "L2Pool" else "512", expect_tiled=True,
+                        reference_unoptimized=True)
+
+
 def _hardswish_case(*, quantized: bool) -> ContractCase:
     """HardSwish, MobileNetV3's activation, banded behind a convolution.
 
@@ -6292,6 +6335,9 @@ def _assert_runtime_rejects_incompatible_plan(
 
 def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
+        *[_activation_case(kind, quantized=quantized)
+          for kind in ("LeakyRelu", "PRelu", "Elu", "LogSoftmax", "L2Normalization", "L2Pool")
+          for quantized in (False, True) if not (kind == "L2Pool" and quantized)],
         *[_elementwise_case(kind) for kind in (
             "Abs", "Neg", "Exp", "Log", "Sqrt", "Rsqrt", "Square", "SquaredDifference",
             "Div", "Max", "Min", "Floor", "Ceil", "Round", "Sin", "Cos", "FloorDiv", "FloorMod",

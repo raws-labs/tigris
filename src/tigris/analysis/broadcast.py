@@ -9,7 +9,7 @@ coordinate, for any other broadcast. The last is never tiled.
 from tigris.graph.ir import AnalyzedGraph, OpNode, serialized_shape
 
 BINARY_OPS = frozenset({"Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min",
-                        "FloorDiv", "FloorMod"})
+                        "FloorDiv", "FloorMod", "PRelu"})
 
 DENSE, PERIODIC, GENERAL = "dense", "periodic", "general"
 

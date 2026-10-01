@@ -227,8 +227,9 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         elementwise_unary = {
             "Abs", "Rsqrt", "Neg", "Exp", "Log", "Sqrt", "Square",
             "Floor", "Ceil", "Round", "Sin", "Cos",
+            "LeakyRelu", "Elu", "LogSoftmax", "L2Normalization",
         }
-        elementwise_binary = {"Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod"}
+        elementwise_binary = {"Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod", "PRelu"}
         constant_operand = (
             op.op_type in elementwise_binary
             and len(op.inputs) == 2
@@ -256,6 +257,31 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     for t in tensors[1:]
                 ):
                     reasons.append("Max/Min requires identical input and output quantization")
+        if op.op_type == "PRelu":
+            if (len(op.inputs) != 2 or not constant_operand
+                    or _is_constant_operand(ag, op.inputs[0])):
+                reasons.append("PRelu requires a tensor followed by a constant alpha")
+            elif (len(op.outputs) != 1 or op.outputs[0] not in ag.tensors
+                  or len(ag.tensors[op.inputs[0]].shape) not in range(1, 5)
+                  or ag.tensors[op.inputs[0]].shape != ag.tensors[op.outputs[0]].shape):
+                reasons.append("PRelu requires equal input/output shapes of rank 1 to 4")
+        if op.op_type == "Elu" and float(op.attrs.get("alpha", 1.0)) != 1.0:
+            reasons.append("Elu requires alpha=1")
+        if op.op_type == "LeakyRelu" and not math.isfinite(float(op.attrs.get("alpha", 0.01))):
+            reasons.append("LeakyRelu requires a finite alpha")
+        if op.op_type == "L2Normalization":
+            epsilon = float(op.attrs.get("epsilon", 1e-6))
+            if not math.isfinite(epsilon) or epsilon < 0:
+                reasons.append("L2Normalization requires a finite nonnegative epsilon")
+            if op.inputs and len(ag.tensors[op.inputs[0]].shape) > 4:
+                reasons.append("L2Normalization requires rank at most 4")
+        if ag.is_quantized and op.op_type in {"LogSoftmax", "L2Normalization"}:
+            output = ag.tensors.get(op.outputs[0]) if op.outputs else None
+            scale, zero = ((1 / 16, 127) if op.op_type == "LogSoftmax" else (1 / 128, 0))
+            if (output is None or output.quant is None or output.quant.scale.size != 1
+                    or float(output.quant.scale[0]) != scale
+                    or output.quant.zero_point.size != 1 or int(output.quant.zero_point[0]) != zero):
+                reasons.append(f"{op.op_type} requires output scale {scale} and zero point {zero}")
         auto_pad = op.attrs.get("auto_pad", "NOTSET")
         if op.op_type in {
             "Conv",
@@ -264,6 +290,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             "ConvTranspose",
             "MaxPool",
             "AveragePool",
+            "L2Pool",
         } and auto_pad not in ("", "NOTSET"):
             reasons.append(f"auto_pad={auto_pad!r} requires explicit pads")
 
@@ -284,7 +311,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if any(value != 1 for value in dilations):
                 reasons.append("ConvTranspose dilation is not implemented")
 
-        if op.op_type in {"MaxPool", "AveragePool"}:
+        if op.op_type in {"MaxPool", "AveragePool", "L2Pool"}:
             if int(op.attrs.get("ceil_mode", 0)) != 0:
                 reasons.append("ceil_mode=1 is not encoded")
             dilations = [int(value) for value in op.attrs.get("dilations", [1, 1])]
@@ -294,7 +321,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         # Without padding every window lies inside the input, so counting the
         # padded positions changes nothing: PyTorch states the flag by default.
         if (
-            op.op_type == "AveragePool"
+            op.op_type in {"AveragePool", "L2Pool"}
             and int(op.attrs.get("count_include_pad", 0)) != 0
             and any(int(pad) != 0 for pad in op.attrs.get("pads", []))
         ):
@@ -306,7 +333,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if len(op.outputs) != 1:
                 reasons.append("MaxPool indices output is not implemented")
 
-        if op.op_type in ("Softmax", "LayerNormalization"):
+        if op.op_type in ("Softmax", "LogSoftmax", "L2Normalization", "LayerNormalization"):
             input_tensor = (
                 ag.tensors.get(op.inputs[0]) if op.inputs else None
             )

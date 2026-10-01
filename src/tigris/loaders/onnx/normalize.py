@@ -109,7 +109,7 @@ def _lower_legacy_softmax(ag: AnalyzedGraph) -> AnalyzedGraph:
         return ag
     rewritten: list[OpNode] = []
     for op in ag.ops:
-        if op.op_type != "Softmax":
+        if op.op_type not in {"Softmax", "LogSoftmax"}:
             rewritten.append(op)
             continue
         info = ag.tensors.get(op.inputs[0])
@@ -139,7 +139,7 @@ def _lower_legacy_softmax(ag: AnalyzedGraph) -> AnalyzedGraph:
             name=f"{op.name}_rows", op_type="Reshape",
             inputs=[op.inputs[0]], outputs=[flat_in]))
         rewritten.append(OpNode(
-            name=op.name, op_type="Softmax",
+            name=op.name, op_type=op.op_type,
             inputs=[flat_in], outputs=[flat_out], attrs={"axis": -1}))
         rewritten.append(OpNode(
             name=f"{op.name}_shape", op_type="Reshape",
@@ -263,6 +263,7 @@ _SPATIAL_LAYOUT_OPS = frozenset({
     "ConvTranspose",
     "MaxPool",
     "AveragePool",
+    "L2Pool",
     "GlobalAveragePool",
     "Resize",
 })
@@ -407,7 +408,7 @@ def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
         if _reshape_keeps_its_order(ag, op) or _flattened_into_a_product(ag, op):
             return None
         return Layout.LINEAR
-    if op.op_type in ("Softmax", "LayerNormalization"):
+    if op.op_type in ("Softmax", "LogSoftmax", "L2Normalization", "LayerNormalization"):
         # Both reduce along one axis and the kernel takes the final stored
         # one, so the layout is what says which ONNX axis that is.
         return _trailing_axis_required_layout(ag, op)
@@ -1280,7 +1281,17 @@ def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
         removed.update(names)
 
     for op in ag.ops:
-        if op.op_type == "Reciprocal" and len(op.inputs) == 1:
+        if op.op_type == "LpNormalization" and int(op.attrs.get("p", 2)) == 2:
+            op.op_type = "L2Normalization"
+            op.attrs = {"axis": int(op.attrs.get("axis", -1)), "epsilon": 0.0}
+        if op.op_type == "Sqrt" and len(op.inputs) == 1:
+            pool = match(op.inputs[0], "AveragePool", 1)
+            square = match(pool.inputs[0], "Mul", 2) if pool is not None else None
+            if square is not None and square.inputs[0] == square.inputs[1]:
+                replace(op, "L2Pool", square.inputs[:1], [square, pool])
+                if op.op_type == "L2Pool":
+                    op.attrs = pool.attrs.copy()
+        elif op.op_type == "Reciprocal" and len(op.inputs) == 1:
             inner = match(op.inputs[0], "Sqrt", 1)
             if inner is not None:
                 replace(op, "Rsqrt", inner.inputs.copy(), [inner])

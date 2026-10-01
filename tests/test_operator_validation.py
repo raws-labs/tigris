@@ -826,3 +826,134 @@ def test_more_memory_pools_than_the_planner_has_are_rejected(acos_model_path, tm
     assert result.exit_code != 0
     assert "3 memory pools given" in result.output
     assert not output.exists()
+
+@pytest.mark.parametrize("alpha", [0.0, 0.5, 2.0, float("nan")])
+def test_elu_rejects_alpha_other_than_one(alpha):
+    graph = AnalyzedGraph(
+        ops=[OpNode("elu", "Elu", ["x"], ["y"], attrs={"alpha": alpha})],
+        tensors={name: TensorInfo(name, (1, 4), 1) for name in ("x", "y")},
+    )
+    assert "Elu requires alpha=1" in validate_operator_support(graph).describe()
+    graph.ops[0].attrs["alpha"] = 1.0
+    assert validate_operator_support(graph).supported
+
+
+@pytest.mark.parametrize("kind,scale,zero", [
+    ("LogSoftmax", 1 / 16, 127), ("L2Normalization", 1 / 128, 0),
+])
+@pytest.mark.parametrize("invalid", ["scale", "zero_point", "missing", "per_channel"])
+def test_quantized_normalization_requires_fixed_output_encoding(kind, scale, zero, invalid):
+    output_quant = QuantParam(np.array([scale], np.float32), np.array([zero], np.int8))
+    graph = AnalyzedGraph(
+        ops=[OpNode("normalize", kind, ["x"], ["y"])],
+        tensors={
+            "x": TensorInfo("x", (1, 4), 3, quant=QuantParam(
+                np.array([0.125], np.float32), np.array([-17], np.int8))),
+            "y": TensorInfo("y", (1, 4), 3, quant=output_quant),
+        }, is_quantized=True,
+    )
+    assert validate_operator_support(graph).supported
+    if invalid == "scale":
+        output_quant.scale[0] *= 2
+    elif invalid == "zero_point":
+        output_quant.zero_point[0] = zero - 1
+    elif invalid == "missing":
+        graph.tensors["y"].quant = None
+    else:
+        output_quant.scale = np.array([scale, scale], np.float32)
+        output_quant.zero_point = np.array([zero, zero], np.int8)
+    assert f"{kind} requires output scale" in validate_operator_support(graph).describe()
+
+
+@pytest.mark.parametrize("invalid", ["dynamic", "reversed", "rank"])
+def test_prelu_requires_constant_alpha_after_rank_one_to_four_input(invalid):
+    shape = (1, 4) if invalid != "rank" else (1, 1, 1, 1, 4)
+    graph = AnalyzedGraph(
+        ops=[OpNode("prelu", "PRelu", ["x", "alpha"], ["y"])],
+        tensors={
+            "x": TensorInfo("x", shape, 1), "y": TensorInfo("y", shape, 1),
+            "alpha": TensorInfo("alpha", (4,), 1, is_constant=True),
+        }, weight_data={"alpha": np.ones(4, np.float32)},
+    )
+    if invalid == "dynamic":
+        graph.tensors["alpha"].is_constant = False
+        graph.tensors["alpha"].shape = shape
+        graph.weight_data.clear()
+    elif invalid == "reversed":
+        graph.ops[0].inputs.reverse()
+    reason = "rank 1 to 4" if invalid == "rank" else "tensor followed by a constant alpha"
+    assert reason in validate_operator_support(graph).describe()
+
+
+@pytest.mark.parametrize("count_include_pad,other_operand", [(0, False), (1, False), (0, True)])
+def test_l2pool_fold_preserves_pool_semantics(tmp_path, count_include_pad, other_operand):
+    inputs = [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2, 6, 6])]
+    if other_operand:
+        inputs.append(helper.make_tensor_value_info("other", TensorProto.FLOAT, [1, 2, 6, 6]))
+    attrs = {"kernel_shape": [3, 3], "strides": [2, 2], "pads": [1, 0, 0, 1],
+             "count_include_pad": count_include_pad}
+    path = _save(tmp_path, "l2_pool", [
+        helper.make_node("Mul", ["x", "other" if other_operand else "x"], ["squared"]),
+        helper.make_node("AveragePool", ["squared"], ["pooled"], **attrs),
+        helper.make_node("Sqrt", ["pooled"], ["y"]),
+    ], inputs, [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 2, 3, 3])])
+    graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
+    folded = [op for op in graph.ops if op.op_type == "L2Pool"]
+    if other_operand:
+        assert not folded
+        assert {"Mul", "AveragePool", "Sqrt"} <= {op.op_type for op in graph.ops}
+        return
+    assert len(folded) == 1
+    assert folded[0].inputs == ["x"]
+    assert all(folded[0].attrs[key] == value for key, value in attrs.items())
+    if count_include_pad:
+        with pytest.raises(ValueError, match="count_include_pad=1 with padding"):
+            emit_binary_bytes(graph)
+    else:
+        assert validate_operator_support(graph).supported
+        assert emit_binary_bytes(graph)
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_lpnormalization_only_lowers_l2_without_epsilon_floor(tmp_path, order):
+    path = _save(tmp_path, "lp_normalization", [
+        helper.make_node("LpNormalization", ["x"], ["y"], p=order, axis=1),
+    ], [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 4])],
+       [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 4])])
+    graph, _ = _run_pipeline(str(path), ("4K",), report_bindings=False)
+    if order == 2:
+        op = next(op for op in graph.ops if op.op_type == "L2Normalization")
+        assert op.attrs == {"axis": 1, "epsilon": 0.0}
+        assert validate_operator_support(graph).supported
+        assert emit_binary_bytes(graph)
+    else:
+        assert graph.ops[0].op_type == "LpNormalization"
+        assert not validate_operator_support(graph).supported
+        with pytest.raises(ValueError, match="unsupported operators"):
+            emit_binary_bytes(graph)
+
+
+@pytest.mark.parametrize("axis,flat_shape", [
+    (None, (2, 60)), (0, (1, 120)), (1, (2, 60)), (2, (6, 20)),
+    (-2, (6, 20)), (-1, (2, 3, 4, 5)),
+])
+def test_legacy_logsoftmax_normalizes_the_flattened_suffix(tmp_path, axis, flat_shape):
+    attrs = {} if axis is None else {"axis": axis}
+    shape = [2, 3, 4, 5]
+    path = _save(tmp_path, "legacy_logsoftmax", [
+        helper.make_node("LogSoftmax", ["x"], ["y"], name="normalize", **attrs),
+    ], [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+       [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)], opset=12)
+    graph, _ = _run_pipeline(str(path), ("4K",), report_bindings=False)
+    op = next(op for op in graph.ops if op.op_type == "LogSoftmax")
+    assert op.attrs["axis"] == -1
+    assert graph.tensors[op.inputs[0]].shape == flat_shape
+    assert graph.tensors[op.outputs[0]].shape == flat_shape
+    assert graph.tensors[graph.model_outputs[0]].shape == tuple(shape)
+    if axis != -1:
+        assert [node.op_type for node in graph.ops] == [
+            "Transpose", "Reshape", "LogSoftmax", "Reshape", "Transpose",
+        ]
+        assert graph.ops[0].attrs["perm"] == graph.ops[-1].attrs["perm"] == [0, 1, 2, 3]
+    assert validate_operator_support(graph).supported
+    assert emit_binary_bytes(graph)

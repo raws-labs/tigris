@@ -57,6 +57,12 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Resize",
     "ResizeLinear",
     "Softmax",
+    "LeakyRelu",
+    "PRelu",
+    "Elu",
+    "LogSoftmax",
+    "L2Normalization",
+    "L2Pool",
     "Transpose",
     "LayerNormalization",
     "Erf",
@@ -84,6 +90,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
 })
 
 _S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS - frozenset({
+    "L2Pool",
     "Neg",
     "Exp",
     "Log",
@@ -219,6 +226,11 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "coordinates; height tiling as the stage's single spatial op, never "
         "in a chain",
     ),
+    "PRelu": ("constant broadcast alpha, rank at most 4; " + _BROADCAST,),
+    "Elu": ("alpha=1",),
+    "L2Pool": ("float32 square root of the mean of valid squared samples",),
+    "L2Normalization": ("final stored axis; int8 output scale 1/128 and zero point 0",),
+    "LogSoftmax": ("final stored axis; int8 output scale 1/16 and zero point 127",),
     "Softmax": (
         "final axis only; tiling on serialized axis 1, each tile holding whole "
         "rows",
