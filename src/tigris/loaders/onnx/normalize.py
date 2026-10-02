@@ -74,6 +74,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _relabel_depthwise(ag)
     ag = _relabel_conv1d(ag)
     ag = _clip_to_relu6(ag)
+    ag = _normalize_reduction_axes(ag)
     ag = _reduce_mean_to_gap(ag)
     ag = _whole_map_average_pool_to_gap(ag)
     ag = _fold_shape_ops(ag)
@@ -186,6 +187,10 @@ def _restore_output_names(ag: AnalyzedGraph, declared: list[str]) -> AnalyzedGra
 _METADATA_INPUTS: dict[str, int] = {
     "Clip": 1,
     "ReduceMean": 1,
+    "ReduceMax": 1,
+    "ReduceMin": 1,
+    "ReduceSum": 1,
+    "CumSum": 1,
     "Reshape": 1,
     "Resize": 1,
     "Squeeze": 1,
@@ -265,6 +270,7 @@ _SPATIAL_LAYOUT_OPS = frozenset({
     "AveragePool",
     "L2Pool",
     "GlobalAveragePool",
+    "GlobalMaxPool",
     "Resize",
 })
 
@@ -396,6 +402,8 @@ def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     """The layout an operator needs, or None when it works in either."""
     if op.op_type in _SPATIAL_LAYOUT_OPS:
         return Layout.SPATIAL
+    if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum"}:
+        return Layout.LINEAR
     if op.op_type in _LINEAR_LAYOUT_OPS:
         return Layout.LINEAR
     if op.op_type in ("Reshape", "Flatten", "Squeeze", "Unsqueeze"):
@@ -2648,6 +2656,28 @@ def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _normalize_reduction_axes(ag: AnalyzedGraph) -> AnalyzedGraph:
+    for op in ag.ops:
+        if op.op_type not in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum"}:
+            continue
+        source = ag.tensors.get(op.inputs[0]) if op.inputs else None
+        rank = len(source.shape) if source is not None else 0
+        axes = op.attrs.get("axes")
+        if len(op.inputs) >= 2 and op.inputs[1] in ag.weight_data:
+            axes = ag.weight_data[op.inputs[1]].reshape(-1).tolist()
+        if axes is None or not axes or rank == 0 or any(int(a) < -rank or int(a) >= rank for a in axes):
+            raise ValueError(f"{op.op_type} requires explicit constant axes within the input rank")
+        op.attrs["axes"] = sorted({int(a) % rank for a in axes})
+        if op.op_type == "ReduceMax" and ag.is_quantized and op.outputs:
+            output = ag.tensors.get(op.outputs[0])
+            if (source.quant is None or output is None or output.quant is None
+                    or source.quant.scale.size != 1 or source.quant.zero_point.size != 1
+                    or not np.array_equal(source.quant.scale, output.quant.scale)
+                    or not np.array_equal(source.quant.zero_point, output.quant.zero_point)):
+                raise ValueError("ReduceMax requires identical input and output quantization")
+    return ag
+
+
 def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Replace a spatial ReduceMean or ReduceMax with its global pool.
 
@@ -2693,6 +2723,8 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
         if rank != 4 or axes_norm not in ({2, 3}, {1, 2}):
             continue
 
+        if op.op_type == "ReduceMax" and (axes_norm != {2, 3} or int(op.attrs.get("keepdims", 1)) != 1):
+            continue
         op.op_type = reductions[op.op_type]
         op.attrs = {}
 

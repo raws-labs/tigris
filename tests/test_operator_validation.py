@@ -957,3 +957,87 @@ def test_legacy_logsoftmax_normalizes_the_flattened_suffix(tmp_path, axis, flat_
         assert graph.ops[0].attrs["perm"] == graph.ops[-1].attrs["perm"] == [0, 1, 2, 3]
     assert validate_operator_support(graph).supported
     assert emit_binary_bytes(graph)
+
+
+def _reduction_graph(kind, *, axes=(1,), shape=(2, 5, 3), keep=True, quantized=False):
+    result = list(shape)
+    if kind != "CumSum":
+        if keep:
+            result[1] = 1
+        else:
+            result.pop(1)
+    quant = QuantParam(scale=np.array([0.125], np.float32), zero_point=np.array([0], np.int8))
+    graph = AnalyzedGraph(
+        ops=[OpNode(name="reduce", op_type=kind, inputs=["x"], outputs=["y"],
+                    attrs={"axes": list(axes), "keepdims": int(keep)})],
+        tensors={"x": TensorInfo(name="x", shape=shape, dtype=3 if quantized else 1,
+                                 quant=quant if quantized else None),
+                 "y": TensorInfo(name="y", shape=tuple(result), dtype=3 if quantized else 1,
+                                 quant=quant if quantized else None)},
+        model_inputs=["x"], model_outputs=["y"])
+    graph.is_quantized = quantized
+    return graph
+
+
+@pytest.mark.parametrize("kind", ["ReduceMax", "ReduceMin", "ReduceSum", "CumSum"])
+@pytest.mark.parametrize("axes,shape", [([], (2, 5, 3)), ([0, 1], (2, 5, 3)),
+                                       ([3], (2, 5, 3)), ([1], (2, 5, 3, 4))])
+def test_reductions_reject_axes_and_ranks_outside_native_contract(kind, axes, shape):
+    graph = _reduction_graph(kind, axes=axes, shape=shape)
+    assert "rank-3" in validate_operator_support(graph).describe()
+
+
+@pytest.mark.parametrize("kind", ["ReduceMax", "ReduceMin", "ReduceSum", "CumSum"])
+def test_reductions_reject_wrong_shapes_and_per_channel_quantization(kind):
+    graph = _reduction_graph(kind, quantized=True)
+    assert validate_operator_support(graph).supported
+    graph.tensors["y"].shape = (2, 2, 3)
+    assert "output shape" in validate_operator_support(graph).describe()
+    graph = _reduction_graph(kind, quantized=True)
+    graph.tensors["y"].quant = QuantParam(
+        scale=np.array([0.125, 0.125], np.float32), zero_point=np.array([0, 0], np.int8))
+    assert "per-tensor" in validate_operator_support(graph).describe()
+
+
+@pytest.mark.parametrize("kind", ["ReduceMax", "ReduceMin"])
+def test_extrema_require_matching_int8_quantization(kind):
+    graph = _reduction_graph(kind, quantized=True)
+    graph.tensors["y"].quant = QuantParam(
+        scale=np.array([0.25], np.float32), zero_point=np.array([0], np.int8))
+    assert "identical" in validate_operator_support(graph).describe()
+
+
+def test_cumsum_refuses_nonzero_input_zero_point_and_invalid_options():
+    graph = _reduction_graph("CumSum", quantized=True)
+    graph.tensors["x"].quant = QuantParam(
+        scale=np.array([0.125], np.float32), zero_point=np.array([-17], np.int8))
+    assert "input zero point 0" in validate_operator_support(graph).describe()
+    graph = _reduction_graph("CumSum", quantized=True)
+    graph.tensors["y"].quant = QuantParam(
+        scale=np.array([2**-22], np.float32), zero_point=np.array([0], np.int8))
+    assert "smaller than one" in validate_operator_support(graph).describe()
+    graph.ops[0].attrs["exclusive"] = 2
+    assert "exclusive and reverse" in validate_operator_support(graph).describe()
+
+
+@pytest.mark.parametrize("kind", ["ArgMax", "ArgMin"])
+@pytest.mark.parametrize("input_dtype", [1, 3])
+@pytest.mark.parametrize("output_dtype", [6, 7])
+def test_index_outputs_do_not_bypass_dispatcher_dtype_contract(kind, input_dtype, output_dtype):
+    graph = _reduction_graph(kind)
+    graph.tensors["x"].dtype = input_dtype
+    graph.tensors["y"].dtype = output_dtype
+    assert not validate_execution_dtype(graph).supported
+    assert "unsupported activation tensor dtype" in validate_execution_dtype(graph).describe()
+    assert not validate_operator_support(graph).supported
+
+
+def test_reducemax_does_not_rewrite_nonspatial_axes_to_global_pool(tmp_path):
+    path = _save(tmp_path, "max_nonspatial", [
+        helper.make_node("ReduceMax", ["x"], ["y"], axes=[1, 2], keepdims=1),
+    ], [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3, 4, 5])],
+       [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 1, 1, 5])])
+    graph, _ = _run_pipeline(str(path), ("4K",), report_bindings=False)
+    assert any(op.op_type == "ReduceMax" for op in graph.ops)
+    assert all(op.op_type != "GlobalMaxPool" for op in graph.ops)
+    assert not validate_operator_support(graph).supported

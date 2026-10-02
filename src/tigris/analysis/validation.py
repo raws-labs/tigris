@@ -282,6 +282,40 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     or float(output.quant.scale[0]) != scale
                     or output.quant.zero_point.size != 1 or int(output.quant.zero_point[0]) != zero):
                 reasons.append(f"{op.op_type} requires output scale {scale} and zero point {zero}")
+        if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum"}:
+            source = ag.tensors.get(op.inputs[0]) if op.inputs else None
+            output = ag.tensors.get(op.outputs[0]) if op.outputs else None
+            axes = op.attrs.get("axes", [])
+            if (len(op.inputs) != 1 or len(op.outputs) != 1 or source is None or output is None
+                    or source.is_constant or output.is_constant or len(source.shape) != 3
+                    or len(axes) != 1 or int(axes[0]) not in range(3)):
+                reasons.append("runtime requires one rank-3 tensor and one constant reduction axis")
+            else:
+                axis = int(axes[0])
+                shape = list(source.shape)
+                if op.op_type != "CumSum":
+                    if int(op.attrs.get("keepdims", 1)):
+                        shape[axis] = 1
+                    else:
+                        shape.pop(axis)
+                if tuple(shape) != output.shape:
+                    reasons.append("output shape does not match the reduction axis")
+                if ag.is_quantized:
+                    quants = [source.quant, output.quant]
+                    if any(q is None or q.scale.size != 1 or q.zero_point.size != 1 for q in quants):
+                        reasons.append("int8 reductions require per-tensor quantization")
+                    elif op.op_type in {"ReduceMax", "ReduceMin"} and (
+                            quants[0].scale[0] != quants[1].scale[0]
+                            or quants[0].zero_point[0] != quants[1].zero_point[0]):
+                        reasons.append("ReduceMax/ReduceMin requires identical input and output quantization")
+                    elif op.op_type == "CumSum":
+                        if int(quants[0].zero_point[0]) != 0:
+                            reasons.append("int8 CumSum requires input zero point 0 to preserve ONNX prefix sums")
+                        if float(quants[0].scale[0]) / float(quants[1].scale[0]) >= 2**19:
+                            reasons.append("int8 CumSum output multiplier must be smaller than one")
+            if op.op_type == "CumSum" and any(int(op.attrs.get(key, 0)) not in {0, 1}
+                                             for key in ("exclusive", "reverse")):
+                reasons.append("CumSum exclusive and reverse must be 0 or 1")
         auto_pad = op.attrs.get("auto_pad", "NOTSET")
         if op.op_type in {
             "Conv",
