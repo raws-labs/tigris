@@ -36,6 +36,7 @@ from .defs import (
     NO_QUANT_PARAM,
     NO_WEIGHT,
     OP_ATTR_AXES,
+    OP_ATTR_CUMSUM_OPTIONS,
     OP_ATTR_ALPHA,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
@@ -903,10 +904,13 @@ def _build_op_attributes(
                 records.append((
                     op_index, OP_ATTR_POOL_ROUNDING, bytes([POOL_ROUNDING_AVERAGE])))
             continue
-        if op.op_type == "ReduceMean":
+        if op.op_type == "CumSum":
+            records.append((op_index, OP_ATTR_CUMSUM_OPTIONS, bytes([
+                int(op.attrs.get("exclusive", 0)), int(op.attrs.get("reverse", 0))])))
+        if op.op_type in {"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum"}:
             axes = op.attrs.get("axes")
             if not axes:
-                raise ValueError(f"ReduceMean '{op.name}' must state its axes")
+                raise ValueError(f"{op.op_type} '{op.name}' must state its axes")
             info = ag.tensors[op.inputs[0]]
             axis_map = serialized_axis_map(len(info.shape), info.layout)
             serialized = sorted(

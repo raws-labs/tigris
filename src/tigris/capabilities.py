@@ -86,6 +86,10 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "FloorDiv",
     "FloorMod",
     "ReduceMean",
+    "ReduceMax",
+    "ReduceMin",
+    "ReduceSum",
+    "CumSum",
     "Split",
 })
 
@@ -212,6 +216,10 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "Split": (
         "parts along any stored axis; untiled execution",
     ),
+    "ReduceMax": ("one axis of a rank-3 tensor, untiled; rank-4 spatial max with keepdims uses GlobalMaxPool; int8 quantization must match",),
+    "ReduceMin": ("one axis of a rank-3 tensor, untiled; int8 quantization must match",),
+    "ReduceSum": ("one axis of a rank-3 tensor, untiled; int8 rejects reference arithmetic overflow",),
+    "CumSum": ("one axis of a rank-3 tensor, untiled; exclusive and reverse; int8 input zero point 0",),
     "ReduceMean": (
         "rank-3 mean over serialized axis 1; untiled execution. A rank-4 mean "
         "over both spatial axes is rewritten to GlobalAveragePool instead",

@@ -616,6 +616,70 @@ def _elementwise_case(kind: str, *, quantized: bool = False) -> ContractCase:
                         mem_budget="256", expect_tiled=True)
 
 
+def _linear_spatial_max_case(*, quantized: bool) -> ContractCase:
+    shape = [1, 3, 2, 4]
+    source, target = "input", "output"
+    nodes, initializers = [], []
+    if quantized:
+        initializers = _scalars(x=(0.03125, -17), y=(1 / 16, 127))
+        nodes += _qdq(source, "x_s", "x_z", "x")
+        source, target = "x", "raw"
+    nodes += [helper.make_node("LogSoftmax", [source], ["normalized"], axis=-1)]
+    normalized = "normalized"
+    if quantized:
+        nodes += _qdq(normalized, "y_s", "y_z", "normalized_qdq")
+        normalized = "normalized_qdq"
+    nodes += [helper.make_node("ReduceMax", [normalized], [target], axes=[2, 3], keepdims=1)]
+    if quantized:
+        nodes += _qdq(target, "y_s", "y_z", "output")
+    label = f"{'int8' if quantized else 'float'}_linear_spatial_max"
+    model = _model(label, nodes,
+                   [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 1, 1])], initializers)
+    data = np.random.default_rng(416).uniform(-2, 2, size=shape).astype(np.float32)
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data},
+                        ("Transpose", "LogSoftmax", "Transpose", "GlobalMaxPool"),
+                        reference_unoptimized=True)
+
+
+def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
+                    exclusive: bool = False, reverse: bool = False) -> ContractCase:
+    shape = [2, 7, 4]
+    output_shape = shape.copy()
+    if kind != "CumSum":
+        if keep:
+            output_shape[axis] = 1
+        else:
+            output_shape.pop(axis)
+    data = np.random.default_rng(411).uniform(-1, 1, size=shape).astype(np.float32)
+    nodes, initializers = [], []
+    source = "input"
+    if quantized:
+        iq = (0.03125, 0 if kind == "CumSum" else -17)
+        oq = iq if kind in {"ReduceMax", "ReduceMin"} else (0.0625, 31)
+        initializers += _scalars(x=iq, y=oq)
+        nodes += _qdq(source, "x_s", "x_z", "x")
+        source = "x"
+    target = "raw" if quantized else "output"
+    if kind in {"CumSum", "ReduceSum"}:
+        initializers.append(numpy_helper.from_array(
+            np.array(axis - 3 if kind == "CumSum" else [axis - 3], np.int64), "axis"))
+        attrs = {"exclusive": int(exclusive), "reverse": int(reverse)} if kind == "CumSum" else {"keepdims": int(keep)}
+        nodes += [helper.make_node(kind, [source, "axis"], [target], **attrs)]
+    else:
+        nodes += [helper.make_node(kind, [source], [target], axes=[axis - 3], keepdims=int(keep))]
+    if quantized:
+        nodes += _qdq(target, "y_s", "y_z", "output")
+    label = (f"{'int8' if quantized else 'float'}_{kind.lower()}_axis{axis}"
+             f"_keep{int(keep)}_exclusive{int(exclusive)}_reverse{int(reverse)}")
+    model = _model(label, nodes,
+                   [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)], initializers)
+    operators = ("Transpose", kind, "Transpose") if keep or kind == "CumSum" else ("Transpose", kind)
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data}, operators,
+                        mem_budget="4K", reference_unoptimized=True)
+
+
 def _activation_case(kind: str, *, quantized: bool = False) -> ContractCase:
     shape = [2, 4, 16, 16]
     output_shape = shape
@@ -6335,6 +6399,14 @@ def _assert_runtime_rejects_incompatible_plan(
 
 def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
+        _linear_spatial_max_case(quantized=False),
+        _linear_spatial_max_case(quantized=True),
+        *[_reduction_case(kind, axis, quantized=q, keep=keep)
+          for kind in ("ReduceMax", "ReduceMin", "ReduceSum") for axis in range(3)
+          for q in (False, True) for keep in (False, True)],
+        *[_reduction_case("CumSum", axis, quantized=q, exclusive=ex, reverse=rev)
+          for axis in range(3) for q in (False, True)
+          for ex in (False, True) for rev in (False, True)],
         *[_activation_case(kind, quantized=quantized)
           for kind in ("LeakyRelu", "PRelu", "Elu", "LogSoftmax", "L2Normalization", "L2Pool")
           for quantized in (False, True) if not (kind == "L2Pool" and quantized)],
