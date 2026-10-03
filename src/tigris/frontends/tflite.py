@@ -205,8 +205,9 @@ def _activation(code: int) -> str:
 # Slot of the fused activation in each operator's options table.
 _FUSED_SLOT = {"ADD": 0, "SUB": 0, "MUL": 0, "DIV": 0, "FULLY_CONNECTED": 0, "CONCATENATION": 1,
                "CONV_2D": 3, "TRANSPOSE_CONV": 3, "DEPTHWISE_CONV_2D": 4,
-               "AVERAGE_POOL_2D": 5, "MAX_POOL_2D": 5}
-_UNARY = {"LOGISTIC": "Sigmoid", "TANH": "Tanh", "HARD_SWISH": "HardSwish", "RELU": "Relu"}
+               "AVERAGE_POOL_2D": 5, "MAX_POOL_2D": 5, "L2_POOL_2D": 5}
+_UNARY = {"LOGISTIC": "Sigmoid", "TANH": "Tanh", "HARD_SWISH": "HardSwish", "RELU": "Relu",
+          "ELU": "Elu"}
 _SHAPE_ONLY = ("RESHAPE", "SQUEEZE", "EXPAND_DIMS")
 # Elementwise math: the ONNX operator, or a composition the compiler folds back.
 _ELEMENTWISE_UNARY = {"ABS": "Abs", "NEG": "Neg", "EXP": "Exp", "LOG": "Log", "SQRT": "Sqrt",
@@ -220,8 +221,11 @@ _INT8_ELEMENTWISE = ("ABS", "RSQRT", "SQUARED_DIFFERENCE", "MAXIMUM", "MINIMUM",
 # Data movement built from Split, Concat, Reshape and Transpose.
 _DATA_MOVEMENT = ("SLICE", "STRIDED_SLICE", "GATHER", "PACK", "UNPACK", "SPACE_TO_DEPTH",
                   "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND", "BROADCAST_TO")
-_SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, "RELU6",
-              "SOFTMAX", "MEAN",
+# Reductions over one run of adjacent axes, and the prefix sum over one axis.
+_REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum"}
+_SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
+              "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
+              "CUMSUM", "MEAN",
               "TRANSPOSE",
               "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
               "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE")
@@ -233,7 +237,8 @@ _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V":
                       "RESIZE_NEAREST_NEIGHBOR": (1,), "RESIZE_BILINEAR": (1,),
                       "TRANSPOSE_CONV": (0,), "SLICE": (1, 2), "STRIDED_SLICE": (1, 2, 3),
                       "GATHER": (1,), "SPACE_TO_BATCH_ND": (1, 2), "BATCH_TO_SPACE_ND": (1, 2),
-                      "BROADCAST_TO": (1,)}
+                      "BROADCAST_TO": (1,), "PRELU": (1,), "REDUCE_MAX": (1,),
+                      "REDUCE_MIN": (1,), "SUM": (1,), "CUMSUM": (1,)}
 
 
 def _is_constant(tensor: _Tensor) -> bool:
@@ -274,7 +279,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         pass
     elif any(t.type != "INT8" for t in [*data, *outs]):
         return "activations must be all int8 or all float32"
-    elif op.kind in _ELEMENTWISE and op.kind not in _INT8_ELEMENTWISE:
+    elif (op.kind in _ELEMENTWISE and op.kind not in _INT8_ELEMENTWISE) or op.kind == "L2_POOL_2D":
         return "TFLite Micro runs it in float32 only"
     if any(len(t.scale) != 1 for t in [*data, *outs] if t.type == "INT8"):
         return "activations must be quantized per tensor"
@@ -298,6 +303,16 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         reason = _data_movement_reason(op, ins, outs)
         if reason:
             return reason
+    if op.kind == "L2_NORMALIZATION" and op.option(0, "b") != 0:
+        return f"fused {_activation(op.option(0, 'b'))}"
+    if op.kind in _REDUCTIONS:
+        axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
+        if not axes or axes != list(range(axes[0], axes[-1] + 1)):
+            return "axes that are not adjacent"
+    if op.kind == "CUMSUM" and outs[0].type == "INT8" and ins[0].zero_point[0] != 0:
+        # TFLite Micro seeds the int8 sum with the input zero point, which
+        # ONNX's CumSum over dequantized values cannot express.
+        return "int8 input zero point other than 0"
     if op.kind == "SOFTMAX" and op.option(0, "f", 1.0) != 1.0:
         return "beta other than 1"
     if op.kind == "FULLY_CONNECTED" and op.option(1, "b") != 0:
@@ -573,8 +588,28 @@ class _Converter:
             y = b.node(_UNARY[kind], [self.value(ins[0])], tag)
         elif kind == "RELU6":
             y = b.fused_activation(self.value(ins[0]), "relu6", tag)
-        elif kind == "SOFTMAX":
-            y = b.node("Softmax", [self.value(ins[0])], tag, axis=_onnx_axis(-1, len(out.shape)))
+        elif kind in ("SOFTMAX", "LOG_SOFTMAX"):
+            y = b.node("Softmax" if kind == "SOFTMAX" else "LogSoftmax", [self.value(ins[0])], tag,
+                       axis=_onnx_axis(-1, len(out.shape)))
+        elif kind == "LEAKY_RELU":
+            y = b.node("LeakyRelu", [self.value(ins[0])], tag, alpha=op.option(0, "f", 0.0))
+        elif kind == "PRELU":
+            y = b.node("PRelu", self.operands(op), tag)
+        elif kind == "L2_NORMALIZATION":
+            y = self._l2_normalization(op, tag)
+        elif kind == "L2_POOL_2D":
+            source = self.tensors[ins[0]]
+            kh, kw = op.option(4, "i", 1), op.option(3, "i", 1)
+            sh, sw = op.option(2, "i", 1), op.option(1, "i", 1)
+            top, bottom = same_padding(source.shape[1], out.shape[1], kh, sh)
+            left, right = same_padding(source.shape[2], out.shape[2], kw, sw)
+            x = self.value(ins[0])
+            pooled = b.node("AveragePool", [b.node("Mul", [x, x], tag + "_square")], tag + "_mean",
+                            kernel_shape=[kh, kw], strides=[sh, sw],
+                            pads=[top, left, bottom, right], count_include_pad=0)
+            y = b.node("Sqrt", [pooled], tag)
+        elif kind in _REDUCTIONS or kind == "CUMSUM":
+            y = self._reduction(op, tag)
         elif kind == "MEAN":
             source = self.tensors[ins[0]]
             rank = len(source.shape)
@@ -744,6 +779,52 @@ class _Converter:
         else:
             raise ValueError(f"no conversion for {kind}")
         self.finish(b.fused_activation(y, fused, tag), outs[0])
+
+    def _l2_normalization(self, op: _Operator, tag: str) -> str:
+        """x / max(sqrt(sum(x * x)), 1e-6) over the last TFLite axis, as TFLite
+        Micro computes it; the compiler folds it back into one operator."""
+        b = self.b
+        rank = len(self.tensors[op.inputs[0]].shape)
+        x = self.value(op.inputs[0])
+        axes = b.constant(np.asarray([_onnx_axis(-1, rank)], np.int64), tag + "_axes")
+        total = b.node("ReduceSum", [b.node("Mul", [x, x], tag + "_square"), axes], tag + "_sum",
+                       keepdims=1)
+        norm = b.node("Max", [b.node("Sqrt", [total], tag + "_norm"),
+                              b.constant(np.float32(1e-6), tag + "_epsilon")], tag + "_floor")
+        return b.node("Div", [x, norm], tag)
+
+    def _reduction(self, op: _Operator, tag: str) -> str:
+        """A reduction or prefix sum over adjacent axes, run on the three axes
+        [before, reduced, after] of the TFLite shape and reshaped back."""
+        b = self.b
+        ins, source = op.inputs, self.tensors[op.inputs[0]]
+        out = self.tensors[op.outputs[0]]
+        shape = list(source.shape)
+        axes = sorted({a % len(shape) for a in self.ints(ins[1])})
+        first, last = axes[0], axes[-1] + 1
+        rows = [int(np.prod(shape[:first])), int(np.prod(shape[first:last])),
+                int(np.prod(shape[last:]))]
+        x = self.value(ins[0])
+        if rows != shape:
+            x = self.held(self.reshape(x, shape, rows, tag + "_rows", ins[0]), ins[0],
+                          tag + "_rows_q")
+        axis = _onnx_axis(1, 3)
+        if op.kind == "CUMSUM":
+            y = b.node("CumSum", [x, b.constant(np.asarray(axis, np.int64), tag + "_axis")],
+                       tag + "_scan", exclusive=int(op.option(0, "?", False)),
+                       reverse=int(op.option(1, "?", False)))
+            kept = rows
+        elif op.kind == "SUM":
+            y = b.node("ReduceSum", [x, b.constant(np.asarray([axis], np.int64), tag + "_axes")],
+                       tag + "_reduced", keepdims=1)
+            kept = [rows[0], 1, rows[2]]
+        else:
+            y = b.node(_REDUCTIONS[op.kind], [x], tag + "_reduced", axes=[axis], keepdims=1)
+            kept = [rows[0], 1, rows[2]]
+        if kept == list(out.shape):
+            return b.node("Identity", [y], tag)
+        return self.reshape(self.held(y, op.outputs[0], tag + "_kept"), kept, out.shape, tag,
+                            op.outputs[0])
 
     def _six(self, x: str, split, perm, joined, tag: str, index: int) -> str:
         """Reshape to six axes, permute, reshape back, in TFLite's axis order,
