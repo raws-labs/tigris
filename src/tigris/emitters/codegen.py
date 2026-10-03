@@ -18,7 +18,7 @@ from tigris.capabilities import (
     effective_operators,
     resolve_kernel_backend,
 )
-from tigris.graph.dtypes import check_dtype_signatures
+from tigris.dtypes import check_dtype_signatures
 from tigris.emitters.binary.defs import FLAG_XIP
 from tigris.emitters.binary.reader import read_binary_plan
 

@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from tigris.capabilities import KERNEL_CAPABILITIES
-from tigris.graph.dtypes import OP_DTYPE_SIGNATURES
+from tigris.dtypes import OP_DTYPE_SIGNATURES
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 
 

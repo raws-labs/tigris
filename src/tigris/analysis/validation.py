@@ -17,7 +17,7 @@ from tigris.analysis.partition_spatial import (
 from tigris.analysis.broadcast import DENSE, PERIODIC, stored_operands
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
-from tigris.graph.dtypes import check_dtype_signatures
+from tigris.dtypes import check_dtype_signatures
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,

@@ -1078,7 +1078,7 @@ def test_non_arg_integer_model_output_is_not_exempt(kind):
 
 
 def test_auxiliary_dtype_placement_and_operator_slots(monkeypatch):
-    from tigris.graph.dtypes import DATA, DTypeSignature, OP_DTYPE_SIGNATURES, check_dtype_signatures
+    from tigris.dtypes import DATA, DTypeSignature, OP_DTYPE_SIGNATURES, check_dtype_signatures
 
     monkeypatch.setitem(OP_DTYPE_SIGNATURES, "predicate", DTypeSignature(outputs=(9,)))
     monkeypatch.setitem(OP_DTYPE_SIGNATURES, "choose", DTypeSignature(inputs=(9, DATA, DATA)))
