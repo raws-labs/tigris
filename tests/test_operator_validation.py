@@ -3,6 +3,7 @@
 import numpy as np
 import onnx
 import pytest
+from click import ClickException
 from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
 
@@ -1088,3 +1089,40 @@ def test_auxiliary_dtype_placement_and_operator_slots(monkeypatch):
     assert check_dtype_signatures(tensors, [("Relu", ["p"], ["y"])], ["p"], ["y"])[1]
     assert check_dtype_signatures(tensors, [("choose", ["x", "p", "x"], ["y"])], ["x"], ["y"])[1]
     assert check_dtype_signatures([("p", 9, False, True)], [], ["p"], ["p"])[1]
+
+
+@pytest.mark.parametrize("kind", ["Gather", "GatherND", "StridedSlice", "MirrorPad", "ReverseV2",
+                                  "EmbeddingLookup", "DynamicUpdateSlice"])
+def test_movement_refuses_runtime_indices(tmp_path, kind):
+    from scripts.crossrepo_contract import _movement_case
+    case = _movement_case(kind, False)
+    model = case.compile_model
+    index_name = {"StridedSlice": "starts", "MirrorPad": "pads", "ReverseV2": "axes",
+                  "DynamicUpdateSlice": "starts"}.get(kind, "indices")
+    initializer = next(item for item in model.graph.initializer if item.name == index_name)
+    model.graph.input.append(helper.make_tensor_value_info(index_name, initializer.data_type, initializer.dims))
+    model.graph.initializer.remove(initializer)
+    path = tmp_path / "dynamic_indices.onnx"
+    onnx.save(model, path)
+    with pytest.raises(ClickException, match="constant indices or bounds"):
+        _run_pipeline(str(path), ("8K",))
+
+
+@pytest.mark.parametrize("kind,changes,message", [
+    ("Gather", {"indices": [3, 0, 1]}, "outside its dimension"),
+    ("GatherND", {"indices": [[0, 3], [0, 0], [1, 0]]}, "outside its dimension"),
+    ("StridedSlice", {"steps": [1, 0, 2]}, "step is invalid"),
+    ("MirrorPad", {"pads": [2, 0, 0, 0, 0, 0]}, "reflection domain"),
+    ("ReverseV2", {"axes": [0, 2]}, "contiguous"),
+    ("ReverseV2", {"axes": []}, "nonempty"),
+])
+def test_movement_refuses_invalid_constants(tmp_path, kind, changes, message):
+    from scripts.crossrepo_contract import _movement_case
+    case = _movement_case(kind, False)
+    for name, value in changes.items():
+        initializer = next(item for item in case.compile_model.graph.initializer if item.name == name)
+        initializer.CopyFrom(numpy_helper.from_array(np.array(value, np.int64), name))
+    path = tmp_path / "invalid_indices.onnx"
+    onnx.save(case.compile_model, path)
+    with pytest.raises(ClickException, match=message):
+        _run_pipeline(str(path), ("8K",))

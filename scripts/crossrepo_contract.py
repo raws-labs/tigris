@@ -682,6 +682,127 @@ def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
                         mem_budget="4K", reference_unoptimized=True)
 
 
+def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase:
+    shape = [2, 3, 4]
+    data = ((np.arange(24).reshape(shape) * 7) % 31 - 15).astype(np.float32) * 0.125
+    nodes, initializers, reference_nodes = [], [], []
+    inputs = {"input": data}
+    model_inputs = [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)]
+    source = "input"
+    if quantized:
+        initializers += _scalars(x=(0.125, -17), y=(0.125, -17))
+        nodes += _qdq(source, "x_s", "x_z", "x")
+        source = "x"
+    reference_nodes.extend(nodes)
+    target = "raw" if quantized else "output"
+
+    def integer(name, value):
+        initializers.append(numpy_helper.from_array(np.array(value, np.int64), name))
+        return name
+
+    if kind == "Gather":
+        axis = variant % 3
+        indices = [shape[axis] - 1, 0, shape[axis] - 1]
+        node = helper.make_node(kind, [source, integer("indices", indices)], [target], axis=axis)
+        nodes.append(node)
+        reference_nodes.append(copy.deepcopy(node))
+        expected = np.take(data, indices, axis=axis)
+    elif kind == "GatherND":
+        indices = [[1, 2], [0, 0], [1, 0]]
+        node = helper.make_node(kind, [source, integer("indices", indices)], [target])
+        nodes.append(node)
+        reference_nodes.append(copy.deepcopy(node))
+        expected = data[tuple(np.array(indices).T)]
+    elif kind == "StridedSlice":
+        if variant == 2:
+            args = [source, integer("starts", [0, -1, 3]), integer("ends", [2, 0, 0]), integer("steps", [1, 1, -2])]
+            nodes.append(helper.make_node(kind, args, [target], domain="tigris", end_mask=4, shrink_axis_mask=2))
+            reference_nodes += [helper.make_node("Slice", [source, integer("ref_starts", [0, 2, 3]),
+                                integer("ref_ends", [2, 3, -2**63]), integer("axes", [0, 1, 2]), "steps"], ["sliced"]),
+                                helper.make_node("Squeeze", ["sliced", integer("squeeze_axis", [1])], [target])]
+            expected = data[:, -1, ::-2]
+        else:
+            starts, ends, steps = ([1, 2, 3], [-2**63] * 3, [-1, -2, -2]) if variant else ([0, 0, 0], shape, [1, 2, 2])
+            args = [source, integer("starts", starts), integer("ends", ends), integer("axes", [0, 1, 2]), integer("steps", steps)]
+            node = helper.make_node("Slice", args, [target])
+            nodes.append(node)
+            reference_nodes.append(copy.deepcopy(node))
+            expected = data[tuple(slice(s, e, t) for s, e, t in zip(starts, ends, steps))]
+    elif kind == "MirrorPad":
+        mode = "symmetric" if variant else "reflect"
+        pads = [[1, 1], [2, 1], [0, 2]]
+        integer("pads", np.array(pads).T.reshape(-1))
+        if variant:
+            nodes.append(helper.make_node(kind, [source, "pads"], [target], mode=mode, domain="tigris"))
+        else:
+            nodes.append(helper.make_node("Pad", [source, "pads"], [target], mode=mode))
+        previous = source
+        for axis, (dim, pad) in enumerate(zip(shape, pads)):
+            indices = np.pad(np.arange(dim), pad, mode=mode)
+            name = target if axis == 2 else f"pad_axis{axis}"
+            reference_nodes.append(helper.make_node("Gather", [previous, integer(f"mirror{axis}", indices)], [name], axis=axis))
+            previous = name
+        expected = np.pad(data, pads, mode=mode)
+    elif kind == "ReverseV2":
+        nodes.append(helper.make_node(kind, [source, integer("axes", [0, 1])], [target], domain="tigris"))
+        reference_nodes += [helper.make_node("Gather", [source, integer("first", [1, 0])], ["rev"], axis=0),
+                            helper.make_node("Gather", ["rev", integer("last", [2, 1, 0])], [target], axis=1)]
+        expected = data[::-1, ::-1, :]
+    elif kind == "EmbeddingLookup":
+        indices = [1, 0, 1]
+        name = integer("indices", indices)
+        nodes.append(helper.make_node(kind, [source, name], [target], domain="tigris"))
+        reference_nodes.append(helper.make_node("Gather", [source, name], [target], axis=0))
+        expected = data[indices]
+    else:
+        update = np.full((1, 2, 2), 3.5, np.float32)
+        starts = [99, -4, 1]
+        if variant:
+            initializers.append(numpy_helper.from_array(update, "update"))
+        else:
+            inputs["update"] = update
+            model_inputs.append(helper.make_tensor_value_info("update", TensorProto.FLOAT, update.shape))
+        update_name = "update"
+        if quantized:
+            prefix = _qdq("update", "x_s", "x_z", "u")
+            nodes.extend(prefix)
+            reference_nodes.extend(copy.deepcopy(prefix))
+            update_name = "u"
+        nodes.append(helper.make_node(kind, [source, update_name, integer("starts", starts)], [target], domain="tigris"))
+        clamped = np.clip(starts, 0, np.array(shape) - update.shape)
+        coordinates = np.array(list(np.ndindex(update.shape))) + clamped
+        reference_nodes += [helper.make_node("Reshape", [update_name, integer("flat", [-1])], ["updates_flat"]),
+                            helper.make_node("ScatterND", [source, integer("positions", coordinates), "updates_flat"], [target])]
+        expected = data.copy()
+        expected[tuple(slice(int(s), int(s) + d) for s, d in zip(clamped, update.shape))] = update
+    if quantized:
+        nodes.extend(_qdq(target, "y_s", "y_z", "output"))
+        reference_nodes.extend(_qdq(target, "y_s", "y_z", "output"))
+    label = f"{'int8' if quantized else 'float'}_{kind.lower()}_{variant}"
+    output = helper.make_tensor_value_info("output", TensorProto.FLOAT, expected.shape)
+
+    def build(body):
+        value_info = ([helper.make_tensor_value_info(target, TensorProto.FLOAT, expected.shape),
+                       helper.make_tensor_value_info("output_q", TensorProto.INT8, expected.shape)]
+                      if quantized else [])
+        model = helper.make_model(helper.make_graph(body, label, model_inputs, [output], initializers,
+                                                    value_info=value_info),
+                                  opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("tigris", 1)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        return model
+
+    operators = ["Transpose"]
+    if kind == "DynamicUpdateSlice" and not variant:
+        operators.append("Transpose")
+    operators.append(kind)
+    if expected.ndim >= 3:
+        operators.append("Transpose")
+    return ContractCase(label, build(nodes), build(reference_nodes), inputs, tuple(operators),
+                        mem_budget="8K", reference_unoptimized=True,
+                        compression="lz4" if kind == "Gather" and variant == 0 else None)
+
+
 def _arg_case(kind: str, axis: int, quantized: bool, keep: bool) -> ContractCase:
     shape = [2, 7, 4]
     target = shape.copy()
@@ -6426,6 +6547,11 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
         _linear_spatial_max_case(quantized=False),
         _linear_spatial_max_case(quantized=True),
+        *[_movement_case(kind, q, variant)
+          for kind, variants in (("Gather", 3), ("GatherND", 1), ("StridedSlice", 3),
+                                 ("MirrorPad", 2), ("ReverseV2", 1), ("EmbeddingLookup", 1),
+                                 ("DynamicUpdateSlice", 2))
+          for variant in range(variants) for q in (False, True)],
         *[_arg_case(kind, axis, q, keep) for kind in ("ArgMax", "ArgMin")
           for axis in range(3) for q in (False, True) for keep in (False, True)],
         *[_reduction_case(kind, axis, quantized=q, keep=keep)

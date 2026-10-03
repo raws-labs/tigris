@@ -81,6 +81,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_shape_ops(ag)
     ag = _resolve_resize_conventions(ag)
     ag = _extract_resize_scales(ag)
+    ag = _normalize_movement(ag)
     ag = _lift_pad_operands(ag)
     ag = _strip_metadata_inputs(ag)
     ag = _validate_transposes(ag)
@@ -401,6 +402,8 @@ def _reshape_keeps_its_order(ag: AnalyzedGraph, op: OpNode) -> bool:
 
 def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     """The layout an operator needs, or None when it works in either."""
+    if op.op_type in _MOVEMENT_OPS:
+        return Layout.LINEAR
     if op.op_type in _SPATIAL_LAYOUT_OPS:
         return Layout.SPATIAL
     if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin"}:
@@ -2676,6 +2679,178 @@ def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
         op.inputs = [op.inputs[0]]
         op.attrs = {}
 
+    return ag
+
+
+_MOVEMENT_OPS = frozenset({
+    "Gather", "GatherND", "StridedSlice", "MirrorPad", "ReverseV2",
+    "EmbeddingLookup", "DynamicUpdateSlice",
+})
+
+
+def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
+    def constant(op, position):
+        if len(op.inputs) <= position or op.inputs[position] not in ag.weight_data:
+            raise ValueError(f"{op.op_type} requires constant indices or bounds")
+        value = ag.weight_data[op.inputs[position]]
+        if value.dtype not in (np.dtype("int32"), np.dtype("int64")):
+            raise ValueError(f"{op.op_type} indices or bounds must be int32 or int64")
+        return value
+
+    for op in ag.ops:
+        if op.op_type in {f"tigris::{kind}" for kind in _MOVEMENT_OPS}:
+            op.op_type = op.op_type.split("::", 1)[1]
+        mode = op.attrs.get("mode", "constant")
+        if isinstance(mode, bytes):
+            mode = mode.decode("ascii")
+        if op.op_type == "Pad" and mode in {"reflect", "symmetric"}:
+            op.op_type = "MirrorPad"
+        onnx_slice = op.op_type == "Slice"
+        if onnx_slice:
+            op.op_type = "StridedSlice"
+        if op.op_type not in _MOVEMENT_OPS:
+            continue
+        if not op.inputs or len(op.outputs) != 1:
+            raise ValueError(f"{op.op_type} requires data and one output")
+        source = ag.tensors[op.inputs[0]]
+        shape = source.shape
+        rank = len(shape)
+        if source.is_constant or not 1 <= rank <= 6 or any(d <= 0 for d in shape):
+            raise ValueError(f"{op.op_type} requires a nonempty data tensor of rank 1 through 6")
+        output = ag.tensors[op.outputs[0]]
+        if source.dtype != output.dtype or source.dtype not in {1, 3}:
+            raise ValueError(f"{op.op_type} requires matching float32 or int8 data")
+        if source.dtype == 3 and (source.quant is None or output.quant is None
+                or source.quant.scale.size != 1 or source.quant.zero_point.size != 1
+                or not np.array_equal(source.quant.scale, output.quant.scale)
+                or not np.array_equal(source.quant.zero_point, output.quant.zero_point)):
+            raise ValueError(f"{op.op_type} requires identical per-tensor quantization")
+        kind = op.op_type
+        if kind in {"Gather", "GatherND", "EmbeddingLookup"}:
+            indices = constant(op, 1).copy()
+            if indices.ndim > 6 or indices.size == 0:
+                raise ValueError(f"{kind} requires nonempty indices of rank at most 6")
+            if kind == "GatherND":
+                if int(op.attrs.get("batch_dims", 0)) != 0 or indices.ndim == 0:
+                    raise ValueError("GatherND requires batch_dims=0 and nonscalar indices")
+                width = indices.shape[-1]
+                if not 1 <= width <= min(rank, 5):
+                    raise ValueError("GatherND index depth must fit the input rank and be at most 5")
+                for a in range(width):
+                    component = indices[..., a]
+                    if np.any(component < -shape[a]) or np.any(component >= shape[a]):
+                        raise ValueError("GatherND index is outside its dimension")
+                    indices[..., a] = np.where(component < 0, component + shape[a], component)
+                target = (*indices.shape[:-1], *shape[width:])
+                metadata = [indices.ndim, *indices.shape]
+            else:
+                axis = 0 if kind == "EmbeddingLookup" else int(op.attrs.get("axis", 0))
+                batch = int(op.attrs.get("batch_dims", 0))
+                if batch < 0:
+                    batch += indices.ndim
+                if axis not in range(-rank, rank) or not 0 <= batch <= min(axis % rank, indices.ndim):
+                    raise ValueError(f"{kind} axis or batch_dims is invalid")
+                axis %= rank
+                if kind == "EmbeddingLookup" and (rank < 2 or indices.ndim != 1 or batch != 0):
+                    raise ValueError("EmbeddingLookup requires a rank-2-or-higher value and vector indices")
+                if tuple(indices.shape[:batch]) != shape[:batch]:
+                    raise ValueError("Gather batch dimensions must match")
+                if np.any(indices < -shape[axis]) or np.any(indices >= shape[axis]):
+                    raise ValueError(f"{kind} index is outside its dimension")
+                indices = np.where(indices < 0, indices + shape[axis], indices)
+                target = (*shape[:axis], *indices.shape[batch:], *shape[axis + 1:])
+                metadata = [axis, batch, indices.ndim, *indices.shape]
+                op.attrs["axis"] = axis
+            name = _fresh_name(ag, f"{op.name}_indices_i32")
+            ag.weight_data[name] = np.asarray(indices, dtype=np.int32)
+            ag.tensors[name] = TensorInfo(name=name, shape=indices.shape, dtype=6, is_constant=True,
+                                          layout=Layout.LINEAR)
+            op.inputs = [op.inputs[0], name]
+        elif kind == "StridedSlice":
+            if rank > 4:
+                raise ValueError("StridedSlice supports rank at most 4")
+            starts = constant(op, 1).reshape(-1).tolist()
+            ends = constant(op, 2).reshape(-1).tolist()
+            shrink = 0
+            begin_mask = end_mask = 0
+            if onnx_slice:
+                axes = constant(op, 3).reshape(-1).tolist() if len(op.inputs) > 3 and op.inputs[3] else list(range(len(starts)))
+                steps = constant(op, 4).reshape(-1).tolist() if len(op.inputs) > 4 and op.inputs[4] else [1] * len(starts)
+            else:
+                axes = list(range(rank))
+                steps = constant(op, 3).reshape(-1).tolist()
+                begin_mask = int(op.attrs.get("begin_mask", 0))
+                end_mask = int(op.attrs.get("end_mask", 0))
+                shrink = int(op.attrs.get("shrink_axis_mask", 0))
+                if (any(mask < 0 or mask >= 1 << rank for mask in (begin_mask, end_mask, shrink))
+                        or int(op.attrs.get("ellipsis_mask", 0)) or int(op.attrs.get("new_axis_mask", 0))):
+                    raise ValueError("StridedSlice masks must fit the input rank; new axes and ellipses are unsupported")
+            if not len(starts) == len(ends) == len(axes) == len(steps) or len(set(a % rank for a in axes)) != len(axes):
+                raise ValueError("StridedSlice bounds must have equal lengths and unique axes")
+            slices = [slice(None)] * rank
+            for start, end, axis, step in zip(starts, ends, axes, steps):
+                if axis not in range(-rank, rank) or step == 0:
+                    raise ValueError("StridedSlice axis or step is invalid")
+                a = axis % rank
+                slices[a] = slice(None if begin_mask & (1 << a) else start,
+                                  None if end_mask & (1 << a) else end, step)
+            normalized = [part.indices(dim) for part, dim in zip(slices, shape)]
+            for a, (start, end, step) in enumerate(normalized):
+                if shrink & (1 << a):
+                    if step <= 0 or not 0 <= start < shape[a]:
+                        raise ValueError("StridedSlice shrinking requires a valid start and positive stride")
+                    normalized[a] = (start, start + 1, 1)
+            target = tuple(len(range(*part)) for a, part in enumerate(normalized) if not shrink & (1 << a))
+            metadata = [value for part in normalized for value in part]
+            if shrink:
+                metadata.append(shrink)
+            op.inputs = op.inputs[:1]
+        elif kind == "MirrorPad":
+            pads = constant(op, 1)
+            if pads.shape == (rank, 2):
+                pairs = pads.tolist()
+            elif pads.shape == (2 * rank,):
+                pairs = list(zip(pads[:rank].tolist(), pads[rank:].tolist()))
+            else:
+                raise ValueError("MirrorPad requires two padding widths per input dimension")
+            symmetric = mode == "symmetric"
+            if mode not in {"reflect", "symmetric"}:
+                raise ValueError("MirrorPad mode must be reflect or symmetric")
+            for dim, pair in zip(shape, pairs):
+                if any(p < 0 or p > dim - (0 if symmetric else 1) for p in pair):
+                    raise ValueError("MirrorPad width exceeds the reflection domain")
+            target = tuple(d + sum(pair) for d, pair in zip(shape, pairs))
+            metadata = [int(symmetric), *(p for pair in pairs for p in pair)]
+            op.inputs = op.inputs[:1]
+        elif kind == "ReverseV2":
+            axes = constant(op, 1).reshape(-1).tolist()
+            if any(a not in range(-rank, rank) for a in axes) or len(set(a % rank for a in axes)) != len(axes):
+                raise ValueError("ReverseV2 requires unique axes within the input rank")
+            normalized_axes = sorted(a % rank for a in axes)
+            if not normalized_axes or normalized_axes != list(range(normalized_axes[0], normalized_axes[-1] + 1)):
+                raise ValueError("ReverseV2 requires a nonempty contiguous set of axes")
+            metadata = [sum(1 << a for a in normalized_axes)]
+            target = shape
+            op.inputs = op.inputs[:1]
+        else:
+            starts = constant(op, 2).reshape(-1).tolist()
+            update = ag.tensors[op.inputs[1]]
+            if len(starts) != rank or len(update.shape) != rank:
+                raise ValueError("DynamicUpdateSlice requires a data update and one start per input dimension")
+            if update.dtype != source.dtype or any(u > d or u <= 0 for u, d in zip(update.shape, shape)):
+                raise ValueError("DynamicUpdateSlice update must fit the input shape and dtype")
+            if source.dtype == 3 and (update.quant is None
+                    or not np.array_equal(source.quant.scale, update.quant.scale)
+                    or not np.array_equal(source.quant.zero_point, update.quant.zero_point)):
+                raise ValueError("DynamicUpdateSlice requires identical update quantization")
+            metadata = [min(max(s, 0), d - u) for s, d, u in zip(starts, shape, update.shape)] + list(update.shape)
+            target = shape
+            op.inputs = op.inputs[:2]
+        if tuple(target) != output.shape or len(target) > 6 or any(d <= 0 for d in target):
+            raise ValueError(f"{kind} output shape does not match its constant indices or bounds")
+        if any(not -(2**31) <= value < 2**31 for value in metadata):
+            raise ValueError(f"{kind} metadata exceeds int32")
+        op.attrs["movement"] = metadata
     return ag
 
 

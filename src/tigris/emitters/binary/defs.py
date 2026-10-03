@@ -59,6 +59,7 @@ OP_ATTR_CONSTANT_OPERAND = 9  # uint8[4]: the constant operand's position (0 or 
                               # a zero byte, and its quant param index (u16 LE,
                               # NO_QUANT_PARAM for float)
 OP_ATTR_RESIZE_SCALES = 10  # float32[2], explicit output/input H/W scales
+OP_ATTR_MOVEMENT = 12  # int32 metadata, interpreted by the data movement opcode
 OP_ATTR_CUMSUM_OPTIONS = 11  # uint8[2], exclusive then reverse (each 0 or 1)
 
 OP_ATTR_KINDS = (
@@ -73,6 +74,7 @@ OP_ATTR_KINDS = (
     OP_ATTR_CONSTANT_OPERAND,
     OP_ATTR_RESIZE_SCALES,
     OP_ATTR_CUMSUM_OPTIONS,
+    OP_ATTR_MOVEMENT,
 )
 
 # Compression types
@@ -149,6 +151,13 @@ OP_TYPE_MAP: dict[str, int] = {
     "CumSum": 63,
     "ArgMax": 64,
     "ArgMin": 65,
+    "Gather": 66,
+    "GatherND": 67,
+    "StridedSlice": 68,
+    "MirrorPad": 69,
+    "ReverseV2": 70,
+    "EmbeddingLookup": 71,
+    "DynamicUpdateSlice": 72,
 }
 OP_TYPE_UNKNOWN = 255
 
