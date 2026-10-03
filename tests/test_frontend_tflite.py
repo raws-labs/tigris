@@ -179,3 +179,30 @@ def test_a_strided_slice_with_a_stride_is_refused():
     offset = model.index(strides.data)
     data[offset + 4:offset + 8] = np.array([2], np.int32).tobytes()
     assert any("only stride-1 slices" in reason for reason in tflite.unsupported(bytes(data)))
+
+
+def test_an_int8_l2_pool_is_refused():
+    l2_pool = tflite._BUILTIN_OPERATORS.index("L2_POOL_2D")
+    data = _with_operator_replaced((FIXTURES / "ops" / "avg_pool_same.tflite").read_bytes(),
+                                   "AVERAGE_POOL_2D", l2_pool)
+    assert any("L2_POOL_2D: TFLite Micro runs it in float32 only" in reason
+               for reason in tflite.unsupported(data))
+
+
+def test_a_reduction_over_axes_that_are_not_adjacent_is_refused():
+    model = (FIXTURES / "ops" / "sum_spatial.tflite").read_bytes()
+    _, graphs = tflite._read(model)
+    _, tensors, _, _, operators = graphs[0]
+    axes = tensors[operators[0].inputs[1]]
+    data = bytearray(model)
+    offset = model.index(axes.data)
+    data[offset:offset + 8] = np.array([1, 3], np.int32).tobytes()
+    assert any("axes that are not adjacent" in reason for reason in tflite.unsupported(bytes(data)))
+
+
+def test_an_int8_cumsum_off_a_zero_input_zero_point_is_refused():
+    _, graphs = tflite._read((FIXTURES / "ops" / "cumsum.tflite").read_bytes())
+    _, tensors, _, _, operators = graphs[0]
+    assert tflite._operator_reason(operators[0], tensors) == ""
+    tensors[operators[0].inputs[0]].zero_point = np.array([3])
+    assert tflite._operator_reason(operators[0], tensors) == "int8 input zero point other than 0"

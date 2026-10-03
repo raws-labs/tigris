@@ -228,6 +228,70 @@ CASES.update({
         lambda x: tf.batch_to_space(x, [2, 2], [[0, 1], [1, 0]]), (4, 3, 3, 3)),
     "broadcast_to": _unary(lambda x: tf.broadcast_to(x, (1, 6, 6, 4)), (1, 1, 6, 4)),
 })
+_PRELU = tf.keras.layers.PReLU(alpha_initializer=tf.constant_initializer([0.1, -0.3, 0.6, 1.4]),
+                               shared_axes=[1, 2])
+_PRELU.build((None, 6, 6, 4))
+ACTIVATIONS = {
+    "leaky_relu": _unary(lambda x: tf.nn.leaky_relu(x, 0.2), _MAP),
+    "prelu": _unary(_PRELU, _MAP),
+    "elu": _unary(tf.nn.elu, _MAP),
+    "log_softmax": _unary(tf.nn.log_softmax, (1, 10)),
+    "log_softmax_channels": _unary(tf.nn.log_softmax, _MAP),
+    "l2_normalization": _unary(lambda x: tf.math.l2_normalize(x, -1), _MAP),
+    "reduce_max_channels": _unary(lambda x: tf.reduce_max(x, -1, keepdims=True), _MAP),
+    "reduce_max_spatial": _unary(lambda x: tf.reduce_max(x, [1, 2]), _MAP),
+    "reduce_min_rows": _unary(lambda x: tf.reduce_min(x, 1), _MAP),
+    "sum_channels": _unary(lambda x: tf.reduce_sum(x, -1), _MAP),
+    "sum_spatial": _unary(lambda x: tf.reduce_sum(x, [1, 2], keepdims=True), _MAP),
+    "cumsum": _unary(lambda x: tf.math.cumsum(x, 2), _MAP),
+    "cumsum_exclusive_reverse": _unary(
+        lambda x: tf.math.cumsum(x, -1, exclusive=True, reverse=True), _MAP),
+}
+CASES.update(ACTIVATIONS)
+# TFLite Micro runs L2_POOL_2D in float only; the converter emits it for no
+# TensorFlow operation, so an AVERAGE_POOL_2D is recoded with its options kept.
+CASES["float_l2_pool"] = CASES["avg_pool_same"]
+
+
+# TFLite's reference int8 SUM does not requantize its result in this release
+# (a spatial sum comes out -1 everywhere); TFLite Micro matches the exact sum.
+BROKEN_REFERENCE = {"sum_channels", "sum_spatial"}
+
+
+def _recode(kind: str):
+    def rewrite(model: bytes) -> bytes:
+        tree = schema.ModelT.InitFromPackedBuf(model, 0)
+        code = tree.operatorCodes[tree.subgraphs[0].operators[0].opcodeIndex]
+        code.builtinCode = getattr(schema.BuiltinOperator, kind)
+        code.deprecatedBuiltinCode = min(code.builtinCode, 127)
+        code.version = 1
+        builder = flatbuffers.Builder(4096)
+        builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
+        return bytes(builder.Output())
+    return rewrite
+
+
+REWRITES["float_l2_pool"] = _recode("L2_POOL_2D")
+
+
+def _int8_island(centered: bool = False):
+    """The converter keeps ELU and CUMSUM in float between a DEQUANTIZE and a
+    QUANTIZE; this runs the operator itself on the int8 tensors, as TFLite
+    Micro registers it. `centered` moves the input zero point to 0."""
+    def rewrite(model: bytes) -> bytes:
+        tree = schema.ModelT.InitFromPackedBuf(model, 0)
+        graph = tree.subgraphs[0]
+        dequantize, op, quantize = graph.operators
+        op.inputs = np.array([dequantize.inputs[0], *op.inputs[1:]], np.int32)
+        op.outputs = np.array(quantize.outputs, np.int32)
+        graph.operators = [op]
+        if centered:
+            graph.tensors[dequantize.inputs[0]].quantization.zeroPoint = np.zeros(1, np.int64)
+        builder = flatbuffers.Builder(4096)
+        builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
+        return bytes(builder.Output())
+    return rewrite
+
 # The tier-1 cases again, converted without quantization.
 _FLOAT_TIER1 = (
     "max_pool_valid", "max_pool_same", "avg_pool_valid", "avg_pool_same", "concat_channels",
@@ -238,12 +302,17 @@ _FLOAT_TIER1 = (
     "pad_conv", "pad", "padv2", "squeeze_op", "expand_dims_op", "softmax", "pack", "unpack",
     "slice", "strided_slice", "strided_slice_shrink", "gather", "gather_scalar",
     "space_to_depth", "depth_to_space", "space_to_batch", "batch_to_space", "broadcast_to",
+    *ACTIVATIONS,
 )
+FLOAT_MODELS["float_l2_pool"] = CASES["float_l2_pool"]
 for _name in _FLOAT_TIER1:
     FLOAT_MODELS[f"float_{_name}"] = CASES[_name]
     if _name in REWRITES:
         REWRITES[f"float_{_name}"] = REWRITES[_name]
 CASES.update(FLOAT_MODELS)
+# The float islands exist only in the int8 conversions.
+REWRITES.update({"elu": _int8_island(), "cumsum": _int8_island(True),
+                 "cumsum_exclusive_reverse": _int8_island(True)})
 
 
 def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):
@@ -286,42 +355,56 @@ def generate(name: str) -> bool:
                      float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS)
     if name in REWRITES:
         model = REWRITES[name](model)
+    micro_interpreter = micro.Interpreter.from_bytes(model, arena_size=1024 * 1024)
+    graph = schema.Model.GetRootAs(model, 0).Subgraphs(0)
+    details = []
+    for index in range(graph.InputsLength()):
+        found = micro_interpreter.get_input_details(index)
+        quantization = found["quantization_parameters"]
+        details.append({"shape": found["shape"], "dtype": found["dtype"],
+                        "quantization": (float(quantization["scales"][0]),
+                                         int(quantization["zero_points"][0]))
+                        if len(quantization["scales"]) else (0.0, 0)})
     try:
         reference = tf.lite.Interpreter(
             model_content=model,
             experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
-    except ValueError:
-        # The reference resolver lacks some float operators (CEIL).
-        reference = tf.lite.Interpreter(model_content=model)
-    reference.allocate_tensors()
-    inputs = [_inputs(details, rng, ranges[i] if ranges else None)
-              for i, details in enumerate(reference.get_input_details())]
+        reference.allocate_tensors()
+    except (ValueError, RuntimeError):
+        # TFLite's reference resolver lacks some operators (CEIL, ELU, int8
+        # CUMSUM); TFLite Micro's outputs are recorded unchecked for those.
+        reference = None
+    inputs = [_inputs(found, rng, ranges[i] if ranges else None)
+              for i, found in enumerate(details)]
     if name == "div":
         # TFLite refuses a divisor whose raw byte is 0; keep its value nonzero too.
-        divisor, zero_point = inputs[1], reference.get_input_details()[1]["quantization"][1]
+        divisor, zero_point = inputs[1], details[1]["quantization"][1]
         divisor[(divisor == 0) | (divisor == zero_point)] = zero_point + 1 or 1
         # A numerator of 0 or -1 after its zero point makes TFLite's arithmetic
         # shift a 32-bit value by 32 or more, which is undefined there.
-        numerator, zero_point = inputs[0], reference.get_input_details()[0]["quantization"][1]
+        numerator, zero_point = inputs[0], details[0]["quantization"][1]
         numerator[(numerator == zero_point) | (numerator == zero_point - 1)] = zero_point + 1
-    output_details = reference.get_output_details()
-    micro_interpreter = micro.Interpreter.from_bytes(model, arena_size=1024 * 1024)
+    outputs_count = graph.OutputsLength()
     micro_outputs, reference_outputs = [], []
     for sample in range(SAMPLES):
         for index, values in enumerate(inputs):
             micro_interpreter.set_input(values[sample], index)
-            reference.set_tensor(reference.get_input_details()[index]["index"], values[sample])
         micro_interpreter.invoke()
-        reference.invoke()
-        micro_outputs.append([micro_interpreter.get_output(i).copy() for i in range(len(output_details))])
-        reference_outputs.append([reference.get_tensor(d["index"]).copy() for d in output_details])
-    deviates = any(not np.array_equal(m, r) for ms, rs in zip(micro_outputs, reference_outputs)
-                   for m, r in zip(ms, rs))
+        micro_outputs.append([micro_interpreter.get_output(i).copy() for i in range(outputs_count)])
+        if reference is not None:
+            for index, values in enumerate(inputs):
+                reference.set_tensor(reference.get_input_details()[index]["index"], values[sample])
+            reference.invoke()
+            reference_outputs.append([reference.get_tensor(d["index"]).copy()
+                                      for d in reference.get_output_details()])
+    has_reference = reference is not None and name not in BROKEN_REFERENCE
+    deviates = has_reference and any(not np.array_equal(m, r) for ms, rs in
+                                     zip(micro_outputs, reference_outputs) for m, r in zip(ms, rs))
     outputs = reference_outputs if deviates else micro_outputs
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"{name}.tflite").write_bytes(model)
     arrays = {f"input_{i}": values for i, values in enumerate(inputs)}
-    for index in range(len(output_details)):
+    for index in range(outputs_count):
         arrays[f"output_{index}"] = np.stack([sample[index] for sample in outputs])
     np.savez_compressed(OUT / f"{name}.npz", **arrays)
     print(f"{name}: {len(model)} bytes" + (", TFLite Micro deviates" if deviates else ""))

@@ -1299,6 +1299,24 @@ def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
                 replace(op, "L2Pool", square.inputs[:1], [square, pool])
                 if op.op_type == "L2Pool":
                     op.attrs = pool.attrs.copy()
+        elif op.op_type == "Div" and len(op.inputs) == 2:
+            # x / max(sqrt(sum(x * x)), epsilon) over one axis: TFLite's L2
+            # normalization with its norm floor.
+            x = op.inputs[0]
+            floor = match(op.inputs[1], "Max", 2)
+            norm = match(floor.inputs[0], "Sqrt", 1) if floor is not None else None
+            total = match(norm.inputs[0], "ReduceSum", 2) if norm is not None else None
+            square = match(total.inputs[0], "Mul", 2) if total is not None else None
+            epsilon = ag.weight_data.get(floor.inputs[1]) if floor is not None else None
+            axes = ag.weight_data.get(total.inputs[1]) if total is not None else None
+            if (square is None or square.inputs != [x, x] or epsilon is None or epsilon.size != 1
+                    or axes is None or axes.size != 1
+                    or int(total.attrs.get("keepdims", 1)) != 1):
+                continue
+            replace(op, "L2Normalization", [x], [square, total, norm, floor])
+            if op.op_type == "L2Normalization":
+                op.attrs = {"axis": int(axes.reshape(-1)[0]),
+                            "epsilon": float(epsilon.reshape(-1)[0])}
         elif op.op_type == "Reciprocal" and len(op.inputs) == 1:
             inner = match(op.inputs[0], "Sqrt", 1)
             if inner is not None:
