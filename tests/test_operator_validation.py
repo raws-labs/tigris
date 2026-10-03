@@ -1126,3 +1126,85 @@ def test_movement_refuses_invalid_constants(tmp_path, kind, changes, message):
     onnx.save(case.compile_model, path)
     with pytest.raises(ClickException, match=message):
         _run_pipeline(str(path), ("8K",))
+
+
+def _bool_graph(kind, quantized=False, count=None):
+    comparisons = {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"}
+    count = count or (3 if kind in {"Where", "Sum"} else 2 if kind in comparisons | {"And", "Or"} else 1)
+    inputs = [f"x{i}" for i in range(count)]
+    tensors = {}
+    for i, name in enumerate(inputs + ["y"]):
+        boolean = (kind in comparisons | {"And", "Or", "Not"} if name == "y" else
+                   kind in {"And", "Or", "Not", "Cast"} or kind == "Where" and i == 0)
+        dtype = 9 if boolean else 3 if quantized else 1
+        quant = QuantParam(scale=np.array([1.0 if kind == "Cast" else 0.125], np.float32),
+                           zero_point=np.array([0], np.int8)) if dtype == 3 else None
+        tensors[name] = TensorInfo(name=name, shape=(1, 2, 3, 4), dtype=dtype, quant=quant)
+    graph = AnalyzedGraph(ops=[OpNode(name="op", op_type=kind, inputs=inputs, outputs=["y"])],
+                          tensors=tensors, model_inputs=inputs, model_outputs=["y"])
+    graph.is_quantized = quantized
+    return graph
+
+
+@pytest.mark.parametrize("kind", ["Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
+                                  "And", "Or", "Not", "Where", "Cast", "Sum"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_bool_signatures_and_quantization(kind, quantized):
+    graph = _bool_graph(kind, quantized)
+    assert validate_execution_dtype(graph).supported
+    assert validate_operator_support(graph).supported
+    boolean = next((t for t in graph.tensors.values() if t.dtype == 9), None)
+    if boolean:
+        boolean.quant = QuantParam(scale=np.array([1.0], np.float32), zero_point=np.array([0], np.int8))
+        assert not validate_execution_dtype(graph).supported
+        assert not validate_operator_support(graph).supported
+
+
+@pytest.mark.parametrize("zero,count,valid", [(-128, 15, True), (-128, 16, False),
+                                             (0, 32, True), (0, 33, False),
+                                             (127, 15, True), (127, 16, False)])
+def test_sum_proves_reference_accumulator_bounds(zero, count, valid):
+    graph = _bool_graph("Sum", True, count)
+    for name in graph.model_inputs:
+        graph.tensors[name].quant.zero_point[0] = zero
+    report = validate_operator_support(graph)
+    assert report.supported == valid
+    if not valid:
+        assert "int32 reference accumulator" in report.describe()
+
+
+@pytest.mark.parametrize("kind", ["Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"])
+@pytest.mark.parametrize("scale", [0, -0.1, 1, 2, float("nan"), float("inf")])
+def test_comparison_rejects_scales_outside_prepare_domain(kind, scale):
+    graph = _bool_graph(kind, True)
+    graph.tensors["x1"].quant.scale[0] = scale
+    assert not validate_operator_support(graph).supported
+
+
+@pytest.mark.parametrize("kind,slot", [("Where", "x1"), ("Where", "x2"), ("Where", "y"), ("Sum", "x1")])
+def test_select_and_sum_require_matching_quantization(kind, slot):
+    graph = _bool_graph(kind, True)
+    graph.tensors[slot].quant.scale[0] = 0.25
+    assert "identical quantization" in validate_operator_support(graph).describe()
+
+
+@pytest.mark.parametrize("scale,zero", [(0.5, 0), (1, -1), (2, 3)])
+def test_cast_requires_raw_bool_encoding(scale, zero):
+    graph = _bool_graph("Cast", True)
+    graph.tensors["y"].quant.scale[0] = scale
+    graph.tensors["y"].quant.zero_point[0] = zero
+    assert "scale 1 and zero point 0" in validate_operator_support(graph).describe()
+
+
+@pytest.mark.parametrize("source,target", [(1, 9), (3, 9), (1, 3), (3, 1), (6, 9), (9, 6)])
+def test_cast_refuses_unapproved_directions(source, target):
+    graph = _bool_graph("Cast")
+    graph.tensors["x0"].dtype = source
+    graph.tensors["y"].dtype = target
+    assert not validate_operator_support(graph).supported
+
+
+def test_sum_rejects_output_multiplier_outside_reference_domain():
+    graph = _bool_graph("Sum", True)
+    graph.tensors["y"].quant.scale[0] = 2**-23
+    assert "output multiplier" in validate_operator_support(graph).describe()

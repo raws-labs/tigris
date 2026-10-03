@@ -955,6 +955,149 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "constraints": [
+        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+      ],
+      "opcode": 73,
+      "operator": "Equal",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+      ],
+      "opcode": 74,
+      "operator": "Less",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+      ],
+      "opcode": 75,
+      "operator": "LessOrEqual",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+      ],
+      "opcode": 76,
+      "operator": "Greater",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+      ],
+      "opcode": 77,
+      "operator": "GreaterOrEqual",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "bool inputs and output; broadcasting and one constant operand"
+      ],
+      "opcode": 78,
+      "operator": "And",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "bool inputs and output; broadcasting and one constant operand"
+      ],
+      "opcode": 79,
+      "operator": "Or",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "one dynamic bool input and bool output"
+      ],
+      "opcode": 80,
+      "operator": "Not",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "bool condition and data branches; three-operand broadcasting through rank 5; at most one constant; int8 branches and output share quantization"
+      ],
+      "opcode": 81,
+      "operator": "Where",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "dynamic bool to float32, or int8 with output scale 1 and zero point 0"
+      ],
+      "opcode": 82,
+      "operator": "Cast",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "equal-shaped dynamic data inputs; int8 input quantization must match, with all partial sums proven within int32"
+      ],
+      "opcode": 83,
+      "operator": "Sum",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
   "schema_version": 9,

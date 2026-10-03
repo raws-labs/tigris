@@ -101,7 +101,7 @@ def validate_execution_dtype(ag: AnalyzedGraph) -> ExecutionDTypeValidation:
         return ExecutionDTypeValidation(dtype=None, issues=signature_issues)
 
     if not by_dtype:
-        return ExecutionDTypeValidation(dtype=None, issues=())
+        return ExecutionDTypeValidation(dtype="float32", issues=())
 
     labels = {_FLOAT32: "float32", _INT8: "int8"}
     unsupported = sorted(dtype for dtype in by_dtype if dtype not in labels)
@@ -225,6 +225,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             continue
 
         reasons: list[str] = []
+        reasons.extend(_bool_and_sum_reasons(ag, op))
         backend = "s8_ref" if ag.is_quantized else "reference"
         if op.op_type not in effective_operators(backend):
             reasons.append(f"{op.op_type} has no {backend} runtime kernel")
@@ -1088,3 +1089,70 @@ class BudgetValidation:
 
 def validate_budget(ag: AnalyzedGraph) -> BudgetValidation:
     return BudgetValidation(fast=validate_memory_plan(ag), slow=slow_pool_usage(ag))
+
+
+_COMPARISONS = {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"}
+_LOGICAL_BINARY = {"And", "Or"}
+
+
+def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
+    if op.op_type not in _COMPARISONS | _LOGICAL_BINARY | {"Not", "Where", "Cast", "Sum"}:
+        return []
+    kind = op.op_type
+    count = 3 if kind == "Where" else 2 if kind in _COMPARISONS | _LOGICAL_BINARY else 1
+    if len(op.outputs) != 1 or (len(op.inputs) != count if kind != "Sum" else not op.inputs):
+        return ["invalid operand count"]
+    tensors = [ag.tensors.get(n) for n in op.inputs + op.outputs]
+    if any(t is None for t in tensors):
+        return ["missing operand metadata"]
+    inputs, output = tensors[:-1], tensors[-1]
+    expected = ([9, 3 if ag.is_quantized else 1, 3 if ag.is_quantized else 1] if kind == "Where"
+                else [9] * len(inputs) if kind in _LOGICAL_BINARY | {"Not", "Cast"}
+                else [3 if ag.is_quantized else 1] * len(inputs))
+    out_type = 9 if kind in _COMPARISONS | _LOGICAL_BINARY | {"Not"} else 3 if ag.is_quantized else 1
+    if [t.dtype for t in inputs] != expected or output.dtype != out_type:
+        return ["operand dtypes do not match the operator signature"]
+    if kind == "Cast" and int(op.attrs.get("to", output.dtype)) not in {1, 3}:
+        return ["Cast only supports bool to float32 or int8"]
+    constants = [t for t in inputs if t.is_constant]
+    if kind in {"Sum", "Cast", "Not"}:
+        if constants or any(t.shape != output.shape for t in inputs):
+            return ["runtime requires equal-shaped dynamic inputs and output"]
+    else:
+        operands = stored_operands(ag, op)
+        if len(output.shape) > 8:
+            return ["broadcast operands require rank at most 8"]
+        if len(constants) > 1:
+            return ["runtime supports at most one constant operand"]
+        if operands is None or any(how is None for *_, how in operands):
+            return ["each operand must broadcast to the output"]
+        if any(how == "general" for *_, how in operands) and len(output.shape) > (5 if kind == "Where" else 4):
+            return ["broadcast rank exceeds the reference kernel limit"]
+    for t in tensors:
+        if t.dtype == 9 and t.quant is not None:
+            return ["bool tensors cannot carry quantization"]
+        if t.dtype == 3 and (t.quant is None or t.quant.scale.size != 1 or t.quant.zero_point.size != 1
+                            or not 0 < float(t.quant.scale[0]) < float("inf")
+                            or not -128 <= int(t.quant.zero_point[0]) <= 127):
+            return ["int8 operands require valid per-tensor quantization"]
+    if not ag.is_quantized:
+        return []
+    if kind in _COMPARISONS and any(not 0 < float(t.quant.scale[0]) < 1 for t in inputs):
+        return ["int8 comparison input scales must be strictly between 0 and 1"]
+    if kind == "Cast" and (float(output.quant.scale[0]) != 1 or int(output.quant.zero_point[0]) != 0):
+        return ["bool to int8 Cast requires output scale 1 and zero point 0"]
+    data = inputs[1:] + [output] if kind == "Where" else inputs if kind == "Sum" else []
+    if data and any(float(t.quant.scale[0]) != float(data[0].quant.scale[0])
+                    or int(t.quant.zero_point[0]) != int(data[0].quant.zero_point[0]) for t in data):
+        return [f"{kind} requires identical quantization"]
+    if kind == "Sum":
+        zero = int(inputs[0].quant.zero_point[0])
+        # Left shift 20 and the exact input multiplier 0.5 give 2^19 per code.
+        lower = (-zero + len(inputs) * (-128 - zero)) * (1 << 19)
+        upper = (-zero + len(inputs) * (127 - zero)) * (1 << 19)
+        if lower < -(1 << 31) or upper > (1 << 31) - 1:
+            return ["int8 Sum partial sums can overflow the int32 reference accumulator"]
+        multiplier = 2 * float(inputs[0].quant.scale[0]) / ((1 << 20) * float(output.quant.scale[0]))
+        if not 0 < multiplier < 1:
+            return ["int8 Sum output multiplier must be strictly between 0 and 1"]
+    return []

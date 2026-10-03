@@ -78,3 +78,35 @@ def test_movement_output_is_exact(tmp_path, kind, variant, quantized):
     assert actual.dtype == expected.dtype
     assert actual.shape == expected.shape
     assert actual.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("kind", ["Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
+                                  "And", "Or", "Not", "Where", "Cast", "Sum"])
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("tiled", [False, True])
+def test_bool_model_boundaries_and_codegen(tmp_path, kind, quantized, tiled):
+    import onnx
+    import onnxruntime as ort
+    from scripts.crossrepo_contract import _bool_case, _to_runtime_layout
+    from tigris.emitters.codegen import generate_c
+
+    case = _bool_case(kind, quantized, tiled)
+    model_path = tmp_path / "bool.onnx"
+    onnx.save(case.compile_model, model_path)
+    budgets = (case.mem_budget, case.slow_budget) if tiled else (case.mem_budget,)
+    graph, _ = _run_pipeline(str(model_path), budgets)
+    data = emit_binary_bytes(graph)
+    for backend in ("reference", "cmsis-nn", "esp-nn"):
+        for fmt in ("app", "core"):
+            assert generate_c(data, backend, fmt)
+    path = tmp_path / "bool.tgrs"
+    path.write_bytes(data)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    reference = ort.InferenceSession(case.reference_model.SerializeToString(), options, providers=["CPUExecutionProvider"])
+    expected = _to_runtime_layout(reference.run(None, case.inputs)[0])
+    with Session(path) as session:
+        actual = session.run({name: _to_runtime_layout(value) for name, value in case.inputs.items()})["output"]
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape
+    assert actual.tobytes() == expected.tobytes()

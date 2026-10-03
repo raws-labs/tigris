@@ -9,7 +9,9 @@ coordinate, for any other broadcast. The last is never tiled.
 from tigris.graph.ir import AnalyzedGraph, OpNode, serialized_shape
 
 BINARY_OPS = frozenset({"Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min",
-                        "FloorDiv", "FloorMod", "PRelu"})
+                        "FloorDiv", "FloorMod", "PRelu",
+                        "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
+                        "And", "Or", "Where"})
 
 DENSE, PERIODIC, GENERAL = "dense", "periodic", "general"
 
@@ -51,10 +53,10 @@ def stored_operands(ag: AnalyzedGraph, op: OpNode):
     or None when an operand's shape or the output is unknown. A constant is
     aligned to the output's rank and held in the output's layout; a tensor
     operand is taken as stored."""
-    if op.op_type not in BINARY_OPS or len(op.inputs) != 2 or len(op.outputs) != 1:
+    if op.op_type not in BINARY_OPS or len(op.inputs) != (3 if op.op_type == "Where" else 2) or len(op.outputs) != 1:
         return None
     output = ag.tensors.get(op.outputs[0])
-    if output is None or not output.shape:
+    if output is None:
         return None
     stored_output = serialized_shape(output.shape, output.layout)
     result = []
@@ -68,8 +70,13 @@ def stored_operands(ag: AnalyzedGraph, op: OpNode):
                 return None
             stored = serialized_shape(padded(shape, len(output.shape)), output.layout)
         else:
-            if info is None or len(info.shape) != len(output.shape):
+            if info is None or len(info.shape) > len(output.shape):
                 return None
-            stored = serialized_shape(info.shape, info.layout)
+            if len(info.shape) != len(output.shape) and op.op_type not in {
+                    "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Where"}:
+                return None
+            if len(info.shape) != len(output.shape) and ((len(info.shape) >= 3 and info.layout.value != "linear") or (len(output.shape) >= 3 and output.layout.value != "linear")):
+                return None
+            stored = padded(serialized_shape(info.shape, info.layout), len(output.shape))
         result.append((name, constant, stored, access(stored, stored_output)))
     return result

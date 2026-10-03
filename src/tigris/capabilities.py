@@ -99,6 +99,17 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "ReverseV2",
     "EmbeddingLookup",
     "DynamicUpdateSlice",
+    "Equal",
+    "Less",
+    "LessOrEqual",
+    "Greater",
+    "GreaterOrEqual",
+    "And",
+    "Or",
+    "Not",
+    "Where",
+    "Cast",
+    "Sum",
     "Split",
 })
 
@@ -186,6 +197,14 @@ _CONSTANT_OPERAND = (
 )
 
 OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
+    **{kind: ("data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1",)
+       for kind in ("Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual")},
+    "And": ("bool inputs and output; broadcasting and one constant operand",),
+    "Or": ("bool inputs and output; broadcasting and one constant operand",),
+    "Not": ("one dynamic bool input and bool output",),
+    "Where": ("bool condition and data branches; three-operand broadcasting through rank 5; at most one constant; int8 branches and output share quantization",),
+    "Cast": ("dynamic bool to float32, or int8 with output scale 1 and zero point 0",),
+    "Sum": ("equal-shaped dynamic data inputs; int8 input quantization must match, with all partial sums proven within int32",),
     "Pad": (
         "constant mode with non-negative pads and a constant fill; int8 keeps its "
         "quantization; untiled execution",
