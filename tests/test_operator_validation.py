@@ -1188,12 +1188,12 @@ def test_select_and_sum_require_matching_quantization(kind, slot):
     assert "identical quantization" in validate_operator_support(graph).describe()
 
 
-@pytest.mark.parametrize("scale,zero", [(0.5, 0), (1, -1), (2, 3)])
-def test_cast_requires_raw_bool_encoding(scale, zero):
+@pytest.mark.parametrize("scale,zero", [(0.5, 0), (1, -1), (2, 3), (1 / 256, -128)])
+def test_cast_quantizes_bool_into_any_int8_encoding(scale, zero):
     graph = _bool_graph("Cast", True)
     graph.tensors["y"].quant.scale[0] = scale
     graph.tensors["y"].quant.zero_point[0] = zero
-    assert "scale 1 and zero point 0" in validate_operator_support(graph).describe()
+    assert validate_operator_support(graph).supported
 
 
 @pytest.mark.parametrize("source,target", [(1, 9), (3, 9), (1, 3), (3, 1), (6, 9), (9, 6)])

@@ -1075,7 +1075,7 @@
     },
     {
       "constraints": [
-        "dynamic bool to float32, or int8 with output scale 1 and zero point 0"
+        "dynamic bool to float32, or to int8 quantizing 0 and 1 into the output encoding"
       ],
       "opcode": 82,
       "operator": "Cast",
