@@ -2855,6 +2855,21 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _normalize_arg_outputs(ag: AnalyzedGraph) -> AnalyzedGraph:
+    # An index cast to int32 as the model output is the index itself, stored
+    # as the runtime writes it.
+    for cast in list(ag.ops):
+        if (cast.op_type != "Cast" or int(cast.attrs.get("to", 0)) != 6 or len(cast.inputs) != 1
+                or len(cast.outputs) != 1 or cast.outputs[0] not in ag.model_outputs):
+            continue
+        index = cast.inputs[0]
+        producer = next((op for op in ag.ops if index in op.outputs), None)
+        if (producer is None or producer.op_type not in {"ArgMax", "ArgMin"} or index in ag.model_outputs
+                or any(index in op.inputs for op in ag.ops if op is not cast)):
+            continue
+        producer.outputs = [cast.outputs[0]]
+        ag.tensors[cast.outputs[0]].shape = ag.tensors[index].shape
+        ag.tensors.pop(index, None)
+        ag.ops.remove(cast)
     for op in ag.ops:
         if op.op_type not in {"ArgMax", "ArgMin"}:
             continue

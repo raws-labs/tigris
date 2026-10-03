@@ -841,7 +841,7 @@
     },
     {
       "constraints": [
-        "one axis of a rank-3 tensor, untiled; terminal int32 indices; first index wins ties"
+        "one axis of a tensor of rank 1 to 6, untiled; terminal int32 indices; first index wins ties"
       ],
       "opcode": 64,
       "operator": "ArgMax",
@@ -854,7 +854,7 @@
     },
     {
       "constraints": [
-        "one axis of a rank-3 tensor, untiled; terminal int32 indices; first index wins ties"
+        "one axis of a tensor of rank 1 to 6, untiled; terminal int32 indices; first index wins ties"
       ],
       "opcode": 65,
       "operator": "ArgMin",

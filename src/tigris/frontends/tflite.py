@@ -181,9 +181,14 @@ def unsupported(data: bytes) -> list[str]:
     if len(graphs) != 1:
         reasons.append(f"{len(graphs)} subgraphs; only single-subgraph models convert")
     for _, tensors, inputs, outputs, operators in graphs[:1]:
+        indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
+        consumed = {i for op in operators for i in op.inputs}
         for index in list(inputs) + list(outputs):
-            if tensors[index].type not in ("INT8", "FLOAT32"):
+            if tensors[index].type not in ("INT8", "FLOAT32") and index not in indices:
                 reasons.append(f"model boundary {tensors[index].name!r} is {tensors[index].type}")
+        for index in sorted(indices):
+            if index not in outputs or index in consumed:
+                reasons.append(f"index {tensors[index].name!r} is not only a model output")
         grouped: dict[str, list[_Operator]] = {}
         for op in operators:
             reason = _operator_reason(op, tensors)
@@ -220,10 +225,15 @@ _ELEMENTWISE = (*_ELEMENTWISE_UNARY, *_ELEMENTWISE_BINARY, "RSQRT", "SQUARE")
 _INT8_ELEMENTWISE = ("ABS", "RSQRT", "SQUARED_DIFFERENCE", "MAXIMUM", "MINIMUM", "DIV")
 # Data movement built from Split, Concat, Reshape and Transpose.
 _DATA_MOVEMENT = ("SLICE", "STRIDED_SLICE", "GATHER", "PACK", "UNPACK", "SPACE_TO_DEPTH",
-                  "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND", "BROADCAST_TO")
+                  "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND", "BROADCAST_TO",
+                  "GATHER_ND", "MIRROR_PAD", "REVERSE_V2", "EMBEDDING_LOOKUP",
+                  "DYNAMIC_UPDATE_SLICE")
+# Index outputs: int32 positions, only as model outputs.
+_INDEX = {"ARG_MAX": "ArgMax", "ARG_MIN": "ArgMin"}
 # Reductions over one run of adjacent axes, and the prefix sum over one axis.
 _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum"}
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
+              *_INDEX,
               "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
               "CUMSUM", "MEAN",
               "TRANSPOSE",
@@ -238,7 +248,9 @@ _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V":
                       "TRANSPOSE_CONV": (0,), "SLICE": (1, 2), "STRIDED_SLICE": (1, 2, 3),
                       "GATHER": (1,), "SPACE_TO_BATCH_ND": (1, 2), "BATCH_TO_SPACE_ND": (1, 2),
                       "BROADCAST_TO": (1,), "PRELU": (1,), "REDUCE_MAX": (1,),
-                      "REDUCE_MIN": (1,), "SUM": (1,), "CUMSUM": (1,)}
+                      "REDUCE_MIN": (1,), "SUM": (1,), "CUMSUM": (1,), "GATHER_ND": (1,),
+                      "MIRROR_PAD": (1,), "REVERSE_V2": (1,), "EMBEDDING_LOOKUP": (0,),
+                      "DYNAMIC_UPDATE_SLICE": (2,), "ARG_MAX": (1,), "ARG_MIN": (1,)}
 
 
 def _is_constant(tensor: _Tensor) -> bool:
@@ -249,7 +261,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     if op.kind not in _SUPPORTED:
         return "not supported"
     ins = [tensors[i] if i >= 0 else None for i in op.inputs]
-    outs = [tensors[i] for i in op.outputs]
+    outs = op_outputs = [tensors[i] for i in op.outputs]
     for position in _CONSTANT_OPERANDS.get(op.kind, ()):
         if position < len(ins) and ins[position] is not None and not _is_constant(ins[position]):
             return f"input {position} must be a constant"
@@ -269,6 +281,10 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                 return "weights must be constant symmetric int8"
             if bias is not None and bias.type != "INT32":
                 return "bias must be int32"
+    if op.kind in _INDEX:
+        if outs[0].type != "INT32":
+            return f"{outs[0].type} indices; TFLite Micro writes int32"
+        outs = []
     if op.kind == "QUANTIZE":
         if data[0].type not in ("INT8", "FLOAT32") or outs[0].type != "INT8":
             return "only float or int8 to int8 converts"
@@ -287,7 +303,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         fused = _activation(op.option(_FUSED_SLOT[op.kind], "b"))
         if fused not in ("none", "relu", "relu6"):
             return f"fused {fused}"
-    rank = len(outs[0].shape)
+    rank = len(op_outputs[0].shape)
     if op.kind in ("ADD", "SUB", "MUL"):
         for operand in ins:
             if not _is_constant(operand) and len(operand.shape) != rank:
@@ -375,10 +391,23 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
     data = [t for t in ins if not _is_constant(t)]
     if not _same_quantization([*data, *outs]):
         return "inputs and outputs quantized differently"
-    if op.kind == "STRIDED_SLICE" and _strided_slice_bounds(op, ins) is None:
-        return "only stride-1 slices without ellipsis or new axes convert"
-    if op.kind == "GATHER" and _gather_run(op, ins) is None:
-        return "only a contiguous run of constant indices converts"
+    if op.kind == "STRIDED_SLICE":
+        if op.option(2, "i") or op.option(3, "i") or op.option(5, "?", False):
+            return "ellipsis, new axes or offset slices"
+        if len(ins[0].shape) > 4:
+            return "slices of rank above 4"
+        steps = [int(v) for v in ins[3].array().reshape(-1)]
+        if any(step == 0 for step in steps):
+            return "a zero stride"
+        if any(op.option(4, "i") >> axis & 1 and step < 0 for axis, step in enumerate(steps)):
+            # TFLite Micro leaves such an output unwritten.
+            return "a dropped axis with a negative stride"
+    if op.kind == "GATHER" and op.option(1, "i"):
+        return "batch dimensions"
+    if op.kind == "REVERSE_V2":
+        axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
+        if not axes or axes != list(range(axes[0], axes[-1] + 1)):
+            return "axes that are not adjacent"
     if op.kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND",
                    "BATCH_TO_SPACE_ND") and len(ins[0].shape) != 4:
         return "only rank-4 inputs convert"
@@ -419,12 +448,14 @@ def describe(data: bytes) -> dict:
 
 # ONNX carries tensors of rank 3 and 4 channels-first; TFLite's are
 # channels-last, which is how the compiler stores such a tensor.
+# Ranks 3 and 4 are channels-first in ONNX, as the runtime stores them
+# channels-last; other ranks keep TFLite's order.
 def _to_first(rank: int) -> list[int]:
-    return [0, rank - 1, *range(1, rank - 1)] if rank >= 3 else list(range(rank))
+    return [0, rank - 1, *range(1, rank - 1)] if rank in (3, 4) else list(range(rank))
 
 
 def _to_last(rank: int) -> list[int]:
-    return [0, *range(2, rank), 1] if rank >= 3 else list(range(rank))
+    return [0, *range(2, rank), 1] if rank in (3, 4) else list(range(rank))
 
 
 def _onnx_axis(axis: int, rank: int) -> int:
@@ -437,7 +468,8 @@ def _onnx_shape(shape) -> list[int]:
 
 def _layout_free(shape) -> bool:
     """True when both axis orders hold the elements in the same sequence."""
-    return len(shape) < 3 or shape[-1] == 1 or int(np.prod(shape[1:-1])) == 1
+    return (len(shape) not in (3, 4) or shape[-1] == 1
+            or int(np.prod(shape[1:-1])) == 1)
 
 
 class _Converter:
@@ -451,6 +483,8 @@ class _Converter:
         # int8 model outputs are the QuantizeLinear itself, as TFLite hands them over.
         self.int8_outputs = {i for i in outputs if tensors[i].type == "INT8"}
         self.consumed = set(consumed)
+        # Output shapes of the operators ONNX has no standard form for.
+        self.value_info = []
 
     def value(self, index: int, rank: int | None = None) -> str:
         """The ONNX value of a tensor; a constant is broadcast-aligned to `rank`."""
@@ -492,7 +526,7 @@ class _Converter:
 
     def last_to_last(self, x: str, rank: int, tag: str, index: int, to_tflite: bool) -> str:
         """`x` moved between the ONNX and the TFLite axis order, held."""
-        if rank < 3:
+        if rank not in (3, 4):
             return x
         perm = _to_last(rank) if to_tflite else _to_first(rank)
         return self.held(self.b.node("Transpose", [x], tag, perm=perm), index, tag + "_q")
@@ -546,6 +580,14 @@ class _Converter:
         kind = op.kind
         fused = _activation(op.option(_FUSED_SLOT[kind], "b")) if kind in _FUSED_SLOT else "none"
         b = self.b
+        if kind in _INDEX:
+            # The index in TFLite's axis order, cast to the int32 TFLite writes.
+            rank = len(self.tensors[ins[0]].shape)
+            x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
+            y = b.node(_INDEX[kind], [x], tag, axis=self.ints(ins[1])[0] % rank, keepdims=0,
+                       select_last_index=0)
+            self.values[outs[0]] = b.node("Cast", [y], out.name, to=TensorProto.INT32)
+            return
         if kind in ("CONV_2D", "DEPTHWISE_CONV_2D"):
             y = self._conv(op, tag)
         elif kind == "TRANSPOSE_CONV":
@@ -655,6 +697,39 @@ class _Converter:
                 fill = float((int(self.ints(ins[2])[0]) - source.zero_point[0]) * source.scale[0])
             y = b.node("Pad", [self.value(ins[0]), pads, b.constant(np.float32(fill), tag + "_fill")],
                        tag, mode="constant")
+        elif kind == "GATHER" and _gather_run(op, [self.tensors[i] for i in ins]) is None:
+            y = self._gather("Gather", ins[0], ins[1], op.option(0, "i"), op, tag)
+        elif kind == "EMBEDDING_LOOKUP":
+            y = self._gather("Gather", ins[1], ins[0], 0, op, tag)
+        elif kind == "GATHER_ND":
+            y = self._gather("GatherND", ins[0], ins[1], None, op, tag)
+        elif (kind == "STRIDED_SLICE"
+              and _strided_slice_bounds(op, [self.tensors[i] for i in ins]) is None):
+            y = self._strided_slice(op, tag)
+        elif kind == "MIRROR_PAD":
+            rank = len(out.shape)
+            pairs = np.asarray(self.ints(ins[1])).reshape(rank, 2)
+            order = _to_first(rank)
+            pads = b.constant(np.asarray([pairs[a, 0] for a in order] + [pairs[a, 1] for a in order],
+                                         np.int64), tag + "_pads")
+            if op.option(0, "b") == 0:
+                y = b.node("Pad", [self.value(ins[0]), pads], tag, mode="reflect")
+            else:
+                y = self.custom("MirrorPad", [self.value(ins[0]), pads], tag,
+                                _onnx_shape(out.shape), mode="symmetric")
+        elif kind == "REVERSE_V2":
+            rank = len(out.shape)
+            x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
+            axes = b.constant(np.asarray(self.ints(ins[1]), np.int64), tag + "_axes")
+            y = self.tflite_order_out(self.custom("ReverseV2", [x, axes], tag + "_reversed",
+                                                  out.shape), outs[0], tag)
+        elif kind == "DYNAMIC_UPDATE_SLICE":
+            rank = len(out.shape)
+            starts = [self.ints(ins[2])[a] for a in _to_first(rank)]
+            y = self.custom("DynamicUpdateSlice",
+                            [self.value(ins[0]), self.value(ins[1]),
+                             b.constant(np.asarray(starts, np.int64), tag + "_starts")],
+                            tag, _onnx_shape(out.shape))
         elif kind in ("SLICE", "STRIDED_SLICE", "GATHER"):
             source = self.tensors[ins[0]]
             if kind == "SLICE":
@@ -759,7 +834,7 @@ class _Converter:
                                   tag + "_operand_q")
                 operands.append(x)
             y = b.node("MatMul", operands, tag)
-            if rank >= 3:
+            if rank in (3, 4):
                 y = b.node("Transpose", [self.held(y, outs[0], tag + "_q")], tag + "_first",
                            perm=_to_first(rank))
         elif kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
@@ -825,6 +900,66 @@ class _Converter:
             return b.node("Identity", [y], tag)
         return self.reshape(self.held(y, op.outputs[0], tag + "_kept"), kept, out.shape, tag,
                             op.outputs[0])
+
+    def custom(self, kind: str, inputs: list[str], tag: str, shape, **attributes) -> str:
+        """A node of the compiler's own domain, with the output shape stated."""
+        y = self.b.unique(tag)
+        self.b.nodes.append(helper.make_node(kind, inputs, [y], domain="tigris", **attributes))
+        self.value_info.append(helper.make_tensor_value_info(y, TensorProto.FLOAT, list(shape)))
+        return y
+
+    def tflite_order_out(self, y: str, index: int, tag: str) -> str:
+        """`y`, held in TFLite's axis order as tensor `index`, moved to ONNX's."""
+        rank = len(self.tensors[index].shape)
+        if rank not in (3, 4):
+            return y
+        return self.b.node("Transpose", [self.held(y, index, tag + "_q")], tag,
+                           perm=_to_first(rank))
+
+    def _gather(self, kind: str, data: int, ids: int, axis, op: _Operator, tag: str) -> str:
+        """GATHER, GATHER_ND or EMBEDDING_LOOKUP with constant indices, run in
+        TFLite's axis order, where its axis and index tuples are stated."""
+        rank = len(self.tensors[data].shape)
+        x = self.last_to_last(self.value(data), rank, tag + "_last", data, True)
+        indices = self.b.constant(np.asarray(self.tensors[ids].array(), np.int64), tag + "_indices")
+        attributes = {} if axis is None else {"axis": axis % rank}
+        y = self.b.node(kind, [x, indices], tag + "_gathered", **attributes)
+        return self.tflite_order_out(y, op.outputs[0], tag)
+
+    def _strided_slice(self, op: _Operator, tag: str) -> str:
+        """A STRIDED_SLICE with any strides, as an ONNX Slice in TFLite's axis
+        order; a dropped axis is a slice of one, reshaped away."""
+        b = self.b
+        ins, source = op.inputs, self.tensors[op.inputs[0]]
+        shape, rank = list(source.shape), len(source.shape)
+        begins, ends, steps = (self.ints(i) for i in ins[1:4])
+        begin_mask, end_mask, shrink = op.option(0, "i"), op.option(1, "i"), op.option(4, "i")
+        starts, stops, sliced = [], [], []
+        for axis, extent in enumerate(shape):
+            if shrink >> axis & 1:
+                start = begins[axis] + extent if begins[axis] < 0 else begins[axis]
+                stop, step = start + 1, 1
+                steps[axis] = 1
+            else:
+                start, stop, step = slice(None if begin_mask >> axis & 1 else begins[axis],
+                                          None if end_mask >> axis & 1 else ends[axis],
+                                          steps[axis]).indices(extent)
+            sliced.append(len(range(start, stop, step)))
+            starts.append(start)
+            # Below zero, a reverse slice runs past the first element.
+            stops.append(stop if stop >= 0 else -(2**63))
+        x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
+        y = b.node("Slice", [x, b.constant(np.asarray(starts, np.int64), tag + "_starts"),
+                             b.constant(np.asarray(stops, np.int64), tag + "_ends"),
+                             b.constant(np.arange(rank, dtype=np.int64), tag + "_axes"),
+                             b.constant(np.asarray(steps, np.int64), tag + "_steps")],
+                   tag + "_sliced")
+        out = self.tensors[op.outputs[0]]
+        if list(out.shape) != sliced:
+            y = b.node("Reshape", [self.held(y, op.outputs[0], tag + "_sliced_q"),
+                                   b.constant(np.asarray(out.shape, np.int64), tag + "_shape")],
+                       tag + "_dropped")
+        return self.tflite_order_out(y, op.outputs[0], tag)
 
     def _six(self, x: str, split, perm, joined, tag: str, index: int) -> str:
         """Reshape to six axes, permute, reshape back, in TFLite's axis order,
@@ -973,7 +1108,9 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     consumed = {i for op in operators for i in op.inputs}
     converter = _Converter(tensors, outputs, consumed)
     b = converter.b
-    boundary_type = {"INT8": TensorProto.INT8, "FLOAT32": TensorProto.FLOAT}
+    boundary_type = {"INT8": TensorProto.INT8, "FLOAT32": TensorProto.FLOAT,
+                     "INT32": TensorProto.INT32}
+    indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
 
     # The interface keeps TFLite's dtypes: an int8 input is dequantized straight
     # off the graph input.
@@ -993,13 +1130,18 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
                                              tensor.name + "_float")
     for op in operators:
         converter.convert(op)
+    # An index is stored as the operator writes it, in TFLite's axis order.
     onnx_outputs = [helper.make_tensor_value_info(
         tensors[index].name if index in converter.int8_outputs else converter.values[index],
-        boundary_type[tensors[index].type], _onnx_shape(tensors[index].shape))
+        boundary_type[tensors[index].type],
+        list(tensors[index].shape) if index in indices else _onnx_shape(tensors[index].shape))
         for index in outputs]
+    opsets = [helper.make_opsetid("", 17)]
+    if converter.value_info:
+        opsets.append(helper.make_opsetid("tigris", 1))
     model = helper.make_model(helper.make_graph(b.nodes, name, onnx_inputs, onnx_outputs,
-                                                b.initializers),
-                              opset_imports=[helper.make_opsetid("", 17)])
+                                                b.initializers, value_info=converter.value_info),
+                              opset_imports=opsets)
     model.ir_version = 8
     onnx.helper.set_model_props(model, {BOUNDARY_LAYOUT_KEY: "channels_last"})
     onnx.checker.check_model(model)
