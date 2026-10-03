@@ -274,24 +274,78 @@ def _recode(kind: str):
 REWRITES["float_l2_pool"] = _recode("L2_POOL_2D")
 
 
-def _int8_island(centered: bool = False):
-    """The converter keeps ELU and CUMSUM in float between a DEQUANTIZE and a
-    QUANTIZE; this runs the operator itself on the int8 tensors, as TFLite
-    Micro registers it. `centered` moves the input zero point to 0."""
+def _int8_island(centered: bool = False, shared: bool = False):
+    """The converter keeps ELU, CUMSUM and DYNAMIC_UPDATE_SLICE in float
+    between DEQUANTIZEs and a QUANTIZE; this runs the operator itself on the
+    int8 tensors, as TFLite Micro registers it. `centered` moves the input
+    zero point to 0; `shared` gives every data tensor the first input's
+    quantization, as a kernel that copies raw bytes requires."""
     def rewrite(model: bytes) -> bytes:
         tree = schema.ModelT.InitFromPackedBuf(model, 0)
         graph = tree.subgraphs[0]
-        dequantize, op, quantize = graph.operators
-        op.inputs = np.array([dequantize.inputs[0], *op.inputs[1:]], np.int32)
+        *dequantizes, op, quantize = graph.operators
+        sources = {d.outputs[0]: d.inputs[0] for d in dequantizes}
+        op.inputs = np.array([sources.get(i, i) for i in op.inputs], np.int32)
         op.outputs = np.array(quantize.outputs, np.int32)
         graph.operators = [op]
+        first = graph.tensors[op.inputs[0]].quantization
         if centered:
-            graph.tensors[dequantize.inputs[0]].quantization.zeroPoint = np.zeros(1, np.int64)
+            first.zeroPoint = np.zeros(1, np.int64)
+        if shared:
+            for index in [*sources.values(), *op.outputs]:
+                graph.tensors[index].quantization.scale = np.array(first.scale)
+                graph.tensors[index].quantization.zeroPoint = np.array(first.zeroPoint)
         builder = flatbuffers.Builder(4096)
         builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
         return bytes(builder.Output())
     return rewrite
 
+
+try:
+    from tensorflow.compiler.tf2xla.python import xla as _xla
+except ImportError:
+    _xla = None
+INDEXING = {
+    "arg_max": _unary(lambda x: tf.argmax(x, -1, output_type=tf.int32), (1, 10)),
+    "arg_min_rows": _unary(lambda x: tf.argmin(x, 1, output_type=tf.int32), (1, 6, 4)),
+    "arg_max_channels": _unary(lambda x: tf.argmax(x, -1, output_type=tf.int32), _MAP),
+    "gather_indices": _unary(lambda x: tf.gather(x, [4, 0, 4, 2], axis=2), _MAP),
+    "gather_matrix": _unary(lambda x: tf.gather(x, [[0, 2], [5, 5]], axis=1), _MAP),
+    "gather_nd": _unary(lambda x: tf.gather_nd(x, [[0, 1], [0, 4], [0, 1]]), _MAP),
+    "strided_slice_steps": _unary(lambda x: x[:, ::2, 5:0:-2, :], _MAP),
+    "mirror_pad_reflect": _unary(
+        lambda x: tf.pad(x, [[0, 0], [1, 2], [2, 1], [0, 0]], "REFLECT"), _MAP),
+    "mirror_pad_symmetric": _unary(
+        lambda x: tf.pad(x, [[0, 0], [2, 0], [1, 3], [0, 0]], "SYMMETRIC"), _MAP),
+    "reverse_spatial": _unary(lambda x: tf.reverse(x, [1, 2]), _MAP),
+    "reverse_channels": _unary(lambda x: tf.reverse(x, [3]), _MAP),
+    "embedding_lookup": _unary(lambda x: tf.gather(x, [3, 0, 3, 5]), (6, 4)),
+}
+if _xla is not None:
+    INDEXING["dynamic_update_slice"] = _binary(
+        lambda x, u: _xla.dynamic_update_slice(x, u, tf.constant([0, 3, 1, 0])), _MAP, (1, 2, 3, 4))
+CASES.update(INDEXING)
+
+
+def _embedding_lookup(model: bytes) -> bytes:
+    """GATHER on axis 0 recoded as EMBEDDING_LOOKUP, which takes the ids first
+    and the table second; the converter emits it for no TensorFlow operation."""
+    tree = schema.ModelT.InitFromPackedBuf(model, 0)
+    graph = tree.subgraphs[0]
+    op = graph.operators[0]
+    code = tree.operatorCodes[op.opcodeIndex]
+    code.builtinCode = schema.BuiltinOperator.EMBEDDING_LOOKUP
+    code.deprecatedBuiltinCode = code.builtinCode
+    code.version = 1
+    op.inputs = np.array([op.inputs[1], op.inputs[0]], np.int32)
+    op.builtinOptionsType = schema.BuiltinOptions.NONE
+    op.builtinOptions = None
+    builder = flatbuffers.Builder(4096)
+    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
+    return bytes(builder.Output())
+
+
+REWRITES["embedding_lookup"] = _embedding_lookup
 # The tier-1 cases again, converted without quantization.
 _FLOAT_TIER1 = (
     "max_pool_valid", "max_pool_same", "avg_pool_valid", "avg_pool_same", "concat_channels",
@@ -302,7 +356,7 @@ _FLOAT_TIER1 = (
     "pad_conv", "pad", "padv2", "squeeze_op", "expand_dims_op", "softmax", "pack", "unpack",
     "slice", "strided_slice", "strided_slice_shrink", "gather", "gather_scalar",
     "space_to_depth", "depth_to_space", "space_to_batch", "batch_to_space", "broadcast_to",
-    *ACTIVATIONS,
+    *ACTIVATIONS, *INDEXING,
 )
 FLOAT_MODELS["float_l2_pool"] = CASES["float_l2_pool"]
 for _name in _FLOAT_TIER1:
@@ -312,7 +366,8 @@ for _name in _FLOAT_TIER1:
 CASES.update(FLOAT_MODELS)
 # The float islands exist only in the int8 conversions.
 REWRITES.update({"elu": _int8_island(), "cumsum": _int8_island(True),
-                 "cumsum_exclusive_reverse": _int8_island(True)})
+                 "cumsum_exclusive_reverse": _int8_island(True),
+                 "dynamic_update_slice": _int8_island(shared=True)})
 
 
 def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):

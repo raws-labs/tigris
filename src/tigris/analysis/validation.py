@@ -290,10 +290,15 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             source = ag.tensors.get(op.inputs[0]) if op.inputs else None
             output = ag.tensors.get(op.outputs[0]) if op.outputs else None
             axes = op.attrs.get("axes", [])
+            # An index reads its axis at any rank; the reductions run on rank 3.
+            ranks = range(1, 7) if op.op_type in {"ArgMax", "ArgMin"} else range(3, 4)
+            rank = len(source.shape) if source is not None else 0
             if (len(op.inputs) != 1 or len(op.outputs) != 1 or source is None or output is None
-                    or source.is_constant or output.is_constant or len(source.shape) != 3
-                    or len(axes) != 1 or int(axes[0]) not in range(3)):
-                reasons.append("runtime requires one rank-3 tensor and one constant reduction axis")
+                    or source.is_constant or output.is_constant or rank not in ranks
+                    or len(axes) != 1 or int(axes[0]) not in range(rank)):
+                reasons.append("runtime requires one tensor of rank 1 to 6 and one constant axis"
+                               if op.op_type in {"ArgMax", "ArgMin"} else
+                               "runtime requires one rank-3 tensor and one constant reduction axis")
             else:
                 axis = int(axes[0])
                 shape = list(source.shape)

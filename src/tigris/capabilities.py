@@ -235,8 +235,8 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "ReverseV2": ("constant indices or bounds; untiled; identical int8 quantization",),
     "EmbeddingLookup": ("constant indices or bounds; untiled; identical int8 quantization",),
     "DynamicUpdateSlice": ("constant indices or bounds; untiled; identical int8 quantization",),
-    "ArgMax": ("one axis of a rank-3 tensor, untiled; terminal int32 indices; first index wins ties",),
-    "ArgMin": ("one axis of a rank-3 tensor, untiled; terminal int32 indices; first index wins ties",),
+    "ArgMax": ("one axis of a tensor of rank 1 to 6, untiled; terminal int32 indices; first index wins ties",),
+    "ArgMin": ("one axis of a tensor of rank 1 to 6, untiled; terminal int32 indices; first index wins ties",),
     "CumSum": ("one axis of a rank-3 tensor, untiled; exclusive and reverse; int8 input zero point 0",),
     "ReduceMean": (
         "rank-3 mean over serialized axis 1; untiled execution. A rank-4 mean "

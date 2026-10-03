@@ -17,9 +17,9 @@ _DTYPE_NAMES = {1: "float32", 2: "uint8", 3: "int8", 6: "int32", 7: "int64"}
 
 def source_shape(ag, shape) -> tuple[int, ...]:
     """A shape in the axis order of the model file: channels-last for a
-    tensor of rank 3 or more from a file that states it so, as TFLite does."""
+    tensor of rank 3 or 4 from a file that states it so, as TFLite does."""
     shape = tuple(shape)
-    if getattr(ag, "channels_last_source", False) and len(shape) >= 3:
+    if getattr(ag, "channels_last_source", False) and len(shape) in (3, 4):
         return (shape[0], *shape[2:], shape[1])
     return shape
 
