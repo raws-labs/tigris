@@ -275,18 +275,23 @@ REWRITES["float_l2_pool"] = _recode("L2_POOL_2D")
 
 
 def _int8_island(centered: bool = False, shared: bool = False):
-    """The converter keeps ELU, CUMSUM and DYNAMIC_UPDATE_SLICE in float
-    between DEQUANTIZEs and a QUANTIZE; this runs the operator itself on the
-    int8 tensors, as TFLite Micro registers it. `centered` moves the input
+    """The converter keeps ELU, CUMSUM, DYNAMIC_UPDATE_SLICE, NOT_EQUAL and
+    ADD_N in float after DEQUANTIZEs, and before a QUANTIZE where the result
+    is not bool; this runs the operator itself on the int8 tensors, as
+    TFLite Micro registers it. `centered` moves the input
     zero point to 0; `shared` gives every data tensor the first input's
     quantization, as a kernel that copies raw bytes requires."""
     def rewrite(model: bytes) -> bytes:
         tree = schema.ModelT.InitFromPackedBuf(model, 0)
         graph = tree.subgraphs[0]
-        *dequantizes, op, quantize = graph.operators
+        operators = list(graph.operators)
+        quantize = operators.pop() if tree.operatorCodes[operators[-1].opcodeIndex].builtinCode \
+            == schema.BuiltinOperator.QUANTIZE else None
+        *dequantizes, op = operators
         sources = {d.outputs[0]: d.inputs[0] for d in dequantizes}
         op.inputs = np.array([sources.get(i, i) for i in op.inputs], np.int32)
-        op.outputs = np.array(quantize.outputs, np.int32)
+        if quantize is not None:
+            op.outputs = np.array(quantize.outputs, np.int32)
         graph.operators = [op]
         first = graph.tensors[op.inputs[0]].quantization
         if centered:
@@ -326,6 +331,44 @@ if _xla is not None:
         lambda x, u: _xla.dynamic_update_slice(x, u, tf.constant([0, 3, 1, 0])), _MAP, (1, 2, 3, 4))
 CASES.update(INDEXING)
 
+# Comparisons end in bool outputs; the logical, select and cast operators take
+# bool operands, so a comparison produces them inside the model.
+_TRIPLE = ([_MAP, _MAP, _MAP], lambda x, y, z: tf.add_n([x, y, z]))
+BOOLEAN = {
+    "equal": _binary(tf.equal, _MAP, _MAP),
+    "not_equal": _binary(tf.not_equal, _MAP, _MAP),
+    "less": _binary(tf.less, _MAP, (1, 1, 1, 4)),
+    "less_equal": _binary(tf.less_equal, _MAP, _MAP),
+    "greater_constant": _unary(lambda x: tf.greater(x, _CHANNELS), _MAP),
+    "greater_equal": _binary(tf.greater_equal, _MAP, _MAP),
+    "logical_and": _binary(lambda x, y: tf.logical_and(x > 0.5, y > -0.5), _MAP, _MAP),
+    "logical_or": _binary(lambda x, y: tf.logical_or(x > 0.5, y < -0.5), _MAP, _MAP),
+    "logical_not": _binary(lambda x, y: tf.logical_not(tf.logical_or(x > 0.5, y < -0.5)),
+                           _MAP, _MAP),
+    "select_v2": _binary(lambda x, y: tf.where(x > y, x, y), _MAP, _MAP),
+    "select_v2_broadcast": _binary(lambda x, y: tf.where(x > 0.5, x, y), _MAP, (1, 1, 1, 4)),
+    "cast_bool": _binary(lambda x, y: tf.cast(x > y, tf.float32), _MAP, _MAP),
+    "add_n": _TRIPLE,
+}
+CASES.update(BOOLEAN)
+
+
+def _select_v2(model: bytes) -> bytes:
+    """The converter's SELECT for operands of one shape, recoded as the
+    SELECT_V2 TFLite Micro registers; the two agree without broadcasting."""
+    tree = schema.ModelT.InitFromPackedBuf(model, 0)
+    for code in tree.operatorCodes:
+        if code.builtinCode == schema.BuiltinOperator.SELECT:
+            code.builtinCode = schema.BuiltinOperator.SELECT_V2
+            code.deprecatedBuiltinCode = min(code.builtinCode, 127)
+            code.version = 1
+    builder = flatbuffers.Builder(4096)
+    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
+    return bytes(builder.Output())
+
+
+REWRITES["select_v2"] = _select_v2
+
 
 def _embedding_lookup(model: bytes) -> bytes:
     """GATHER on axis 0 recoded as EMBEDDING_LOOKUP, which takes the ids first
@@ -356,7 +399,7 @@ _FLOAT_TIER1 = (
     "pad_conv", "pad", "padv2", "squeeze_op", "expand_dims_op", "softmax", "pack", "unpack",
     "slice", "strided_slice", "strided_slice_shrink", "gather", "gather_scalar",
     "space_to_depth", "depth_to_space", "space_to_batch", "batch_to_space", "broadcast_to",
-    *ACTIVATIONS, *INDEXING,
+    *ACTIVATIONS, *INDEXING, *BOOLEAN,
 )
 FLOAT_MODELS["float_l2_pool"] = CASES["float_l2_pool"]
 for _name in _FLOAT_TIER1:
@@ -367,7 +410,8 @@ CASES.update(FLOAT_MODELS)
 # The float islands exist only in the int8 conversions.
 REWRITES.update({"elu": _int8_island(), "cumsum": _int8_island(True),
                  "cumsum_exclusive_reverse": _int8_island(True),
-                 "dynamic_update_slice": _int8_island(shared=True)})
+                 "dynamic_update_slice": _int8_island(shared=True),
+                 "not_equal": _int8_island(), "add_n": _int8_island()})
 
 
 def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):
@@ -449,7 +493,12 @@ def generate(name: str) -> bool:
         if reference is not None:
             for index, values in enumerate(inputs):
                 reference.set_tensor(reference.get_input_details()[index]["index"], values[sample])
-            reference.invoke()
+            try:
+                reference.invoke()
+            except RuntimeError:
+                # Allocated but not run there (int8 ADD_N); recorded unchecked.
+                reference = None
+                continue
             reference_outputs.append([reference.get_tensor(d["index"]).copy()
                                       for d in reference.get_output_details()])
     has_reference = reference is not None and name not in BROKEN_REFERENCE

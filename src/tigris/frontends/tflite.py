@@ -80,7 +80,7 @@ _TENSOR_TYPES = (
 
 _ACTIVATIONS = {0: "none", 1: "relu", 2: "relu_n1_to_1", 3: "relu6", 4: "tanh", 5: "sign_bit"}
 _NUMPY = {"FLOAT32": np.float32, "INT32": np.int32, "INT8": np.int8, "UINT8": np.uint8,
-          "INT16": np.int16, "INT64": np.int64}
+          "INT16": np.int16, "INT64": np.int64, "BOOL": np.bool_}
 
 
 def is_tflite(data: bytes) -> bool:
@@ -184,7 +184,7 @@ def unsupported(data: bytes) -> list[str]:
         indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
         consumed = {i for op in operators for i in op.inputs}
         for index in list(inputs) + list(outputs):
-            if tensors[index].type not in ("INT8", "FLOAT32") and index not in indices:
+            if tensors[index].type not in ("INT8", "FLOAT32", "BOOL") and index not in indices:
                 reasons.append(f"model boundary {tensors[index].name!r} is {tensors[index].type}")
         for index in sorted(indices):
             if index not in outputs or index in consumed:
@@ -228,12 +228,20 @@ _DATA_MOVEMENT = ("SLICE", "STRIDED_SLICE", "GATHER", "PACK", "UNPACK", "SPACE_T
                   "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND", "BROADCAST_TO",
                   "GATHER_ND", "MIRROR_PAD", "REVERSE_V2", "EMBEDDING_LOOKUP",
                   "DYNAMIC_UPDATE_SLICE")
+# Comparisons write bool; the logical operators read and write it.
+_COMPARISONS = {"EQUAL": "Equal", "NOT_EQUAL": "Equal", "LESS": "Less", "LESS_EQUAL": "LessOrEqual",
+                "GREATER": "Greater", "GREATER_EQUAL": "GreaterOrEqual"}
+_LOGICAL = {"LOGICAL_AND": "And", "LOGICAL_OR": "Or", "LOGICAL_NOT": "Not"}
+# Input positions that hold bool, and whether the output does.
+_BOOL_SLOTS = {**{kind: ((), True) for kind in _COMPARISONS},
+               "LOGICAL_AND": ((0, 1), True), "LOGICAL_OR": ((0, 1), True),
+               "LOGICAL_NOT": ((0,), True), "SELECT_V2": ((0,), False), "CAST": ((0,), False)}
 # Index outputs: int32 positions, only as model outputs.
 _INDEX = {"ARG_MAX": "ArgMax", "ARG_MIN": "ArgMin"}
 # Reductions over one run of adjacent axes, and the prefix sum over one axis.
 _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum"}
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
-              *_INDEX,
+              *_INDEX, *_BOOL_SLOTS, "ADD_N",
               "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
               "CUMSUM", "MEAN",
               "TRANSPOSE",
@@ -281,6 +289,22 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                 return "weights must be constant symmetric int8"
             if bias is not None and bias.type != "INT32":
                 return "bias must be int32"
+    if op.kind in _BOOL_SLOTS:
+        positions, bool_output = _BOOL_SLOTS[op.kind]
+        if any((t.type == "BOOL") != (i in positions) for i, t in enumerate(ins) if t is not None):
+            return "operands of the wrong dtype"
+        if (outs[0].type == "BOOL") != bool_output:
+            return "an output of the wrong dtype"
+        if op.kind == "CAST" and outs[0].type == "INT8" and (
+                outs[0].scale.size != 1 or outs[0].scale[0] != 1 or outs[0].zero_point[0] != 0):
+            # TFLite copies the raw 0 or 1 into the int8 output.
+            return "int8 output encoding other than scale 1 and zero point 0"
+        data = [t for i, t in enumerate(ins) if t is not None and i not in positions]
+        if bool_output:
+            outs = []
+        dynamic = [t for t in ins if t is not None and not _is_constant(t)]
+        if any(len(t.shape) != len(op_outputs[0].shape) for t in dynamic):
+            return "operands of different rank"
     if op.kind in _INDEX:
         if outs[0].type != "INT32":
             return f"{outs[0].type} indices; TFLite Micro writes int32"
@@ -496,7 +520,7 @@ class _Converter:
         array = array.reshape((1,) * (rank - array.ndim) + array.shape)
         axis = _onnx_axis(tensor.quantized_dimension + rank - len(tensor.shape), rank)
         array = array.transpose(_to_first(rank))
-        if tensor.type == "FLOAT32":
+        if tensor.type in ("FLOAT32", "BOOL"):
             return self.b.constant(array, tensor.name)
         return self.b.dequantized_constant(array, tensor.scale, tensor.zero_point, tensor.name,
                                            axis=axis)
@@ -538,7 +562,7 @@ class _Converter:
         """`source` requantized as tensor `index` is, so a data-movement step
         between two operators stays in int8."""
         tensor = self.tensors[index]
-        if tensor.type == "FLOAT32":
+        if tensor.type in ("FLOAT32", "BOOL"):
             return source
         return self.b.requantized(source, float(tensor.scale[0]), int(tensor.zero_point[0]), name)
 
@@ -552,7 +576,7 @@ class _Converter:
             self.values[index] = (b.node("DequantizeLinear", [quantized, scale, zero],
                                          tensor.name + "_float")
                                   if index in self.consumed else quantized)
-        elif tensor.type == "FLOAT32":
+        elif tensor.type in ("FLOAT32", "BOOL"):
             self.values[index] = self.b.node("Identity", [source], tensor.name)
         else:
             self.values[index] = self.b.requantized(source, float(tensor.scale[0]),
@@ -628,6 +652,19 @@ class _Converter:
             y = self._floor_mod(*self.operands(op), tag)
         elif kind in _UNARY:
             y = b.node(_UNARY[kind], [self.value(ins[0])], tag)
+        elif kind in _COMPARISONS:
+            y = b.node(_COMPARISONS[kind], self.operands(op), tag + "_equal" if kind == "NOT_EQUAL" else tag)
+            if kind == "NOT_EQUAL":
+                y = b.node("Not", [y], tag)
+        elif kind in _LOGICAL:
+            y = b.node(_LOGICAL[kind], self.operands(op), tag)
+        elif kind == "SELECT_V2":
+            y = b.node("Where", self.operands(op), tag)
+        elif kind == "CAST":
+            # A bool cast to int8 is the float 0.0 or 1.0 quantized into the output.
+            y = b.node("Cast", [self.value(ins[0])], tag, to=TensorProto.FLOAT)
+        elif kind == "ADD_N":
+            y = b.node("Sum", [self.value(i) for i in ins], tag)
         elif kind == "RELU6":
             y = b.fused_activation(self.value(ins[0]), "relu6", tag)
         elif kind in ("SOFTMAX", "LOG_SOFTMAX"):
@@ -1109,7 +1146,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     converter = _Converter(tensors, outputs, consumed)
     b = converter.b
     boundary_type = {"INT8": TensorProto.INT8, "FLOAT32": TensorProto.FLOAT,
-                     "INT32": TensorProto.INT32}
+                     "INT32": TensorProto.INT32, "BOOL": TensorProto.BOOL}
     indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
 
     # The interface keeps TFLite's dtypes: an int8 input is dequantized straight
@@ -1120,7 +1157,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         b._names.add(tensor.name)
         onnx_inputs.append(helper.make_tensor_value_info(
             tensor.name, boundary_type[tensor.type], _onnx_shape(tensor.shape)))
-        if tensor.type == "FLOAT32":
+        if tensor.type in ("FLOAT32", "BOOL"):
             converter.values[index] = tensor.name
         else:
             scale = b.constant(np.float32(tensor.scale[0]), tensor.name + "_scale")

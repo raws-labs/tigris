@@ -203,7 +203,7 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "Or": ("bool inputs and output; broadcasting and one constant operand",),
     "Not": ("one dynamic bool input and bool output",),
     "Where": ("bool condition and data branches; three-operand broadcasting through rank 5; at most one constant; int8 branches and output share quantization",),
-    "Cast": ("dynamic bool to float32, or int8 with output scale 1 and zero point 0",),
+    "Cast": ("dynamic bool to float32, or to int8 quantizing 0 and 1 into the output encoding",),
     "Sum": ("equal-shaped dynamic data inputs; int8 input quantization must match, with all partial sums proven within int32",),
     "Pad": (
         "constant mode with non-negative pads and a constant fill; int8 keeps its "

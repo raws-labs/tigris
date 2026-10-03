@@ -1139,8 +1139,6 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
         return []
     if kind in _COMPARISONS and any(not 0 < float(t.quant.scale[0]) < 1 for t in inputs):
         return ["int8 comparison input scales must be strictly between 0 and 1"]
-    if kind == "Cast" and (float(output.quant.scale[0]) != 1 or int(output.quant.zero_point[0]) != 0):
-        return ["bool to int8 Cast requires output scale 1 and zero point 0"]
     data = inputs[1:] + [output] if kind == "Where" else inputs if kind == "Sum" else []
     if data and any(float(t.quant.scale[0]) != float(data[0].quant.scale[0])
                     or int(t.quant.zero_point[0]) != int(data[0].quant.zero_point[0]) for t in data):
