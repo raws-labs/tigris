@@ -653,6 +653,10 @@ int main(int argc, char **argv)
             for (uint32_t j = 0; j < show; j++)
                 printf("  [%u] % d\\n", j, (int)out[j]);
             if (n > show) printf("  ... (%u more)\\n", n - show);
+        }} else if (t->iface_dtype == 2u || t->dtype == 9u) {{
+            const uint8_t *out = (const uint8_t *)staging;
+            for (uint32_t j = 0; j < iface_bytes && j < 10u; j++)
+                printf("  [%u] %u\\n", j, (unsigned)out[j]);
         }} else {{
             const float *out = (const float *)staging;
             uint32_t n = iface_bytes / (uint32_t)sizeof(float);
@@ -846,6 +850,12 @@ void app_main(void)
         if (!ptr) continue;
 
         printf("Output '%s': %u bytes\\n", tigris_tensor_name(&plan, t), t->size_bytes);
+        if (t->dtype == 9u) {{
+            const uint8_t *values = (const uint8_t *)ptr;
+            for (uint32_t j = 0; j < t->size_bytes && j < 10u; j++)
+                printf("  [%u] %u\\n", j, (unsigned)values[j]);
+            continue;
+        }}
         if (t->dtype == 6u) {{
             const int32_t *indices = (const int32_t *)ptr;
             uint32_t count = t->size_bytes / (uint32_t)sizeof(int32_t);
