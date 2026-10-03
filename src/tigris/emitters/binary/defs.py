@@ -147,6 +147,8 @@ OP_TYPE_MAP: dict[str, int] = {
     "ReduceMin": 61,
     "ReduceSum": 62,
     "CumSum": 63,
+    "ArgMax": 64,
+    "ArgMin": 65,
 }
 OP_TYPE_UNKNOWN = 255
 

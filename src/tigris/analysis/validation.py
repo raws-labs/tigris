@@ -91,8 +91,18 @@ def validate_execution_dtype(ag: AnalyzedGraph) -> ExecutionDTypeValidation:
     both float32 and int8 activations cannot safely be routed through either
     dispatcher, even if every individual opcode is otherwise supported.
     """
+    index_outputs = {
+        op.outputs[0] for op in ag.ops
+        if op.op_type in {"ArgMax", "ArgMin"} and len(op.outputs) == 1
+        and op.outputs[0] in ag.model_outputs
+        and op.outputs[0] not in ag.model_inputs
+        and not any(op.outputs[0] in other.inputs for other in ag.ops)
+        and sum(op.outputs[0] in other.outputs for other in ag.ops) == 1
+    }
     by_dtype: dict[int, list[str]] = {}
     for name, tensor in ag.tensors.items():
+        if name in index_outputs and tensor.dtype == 6 and tensor.quant is None:
+            continue
         if not tensor.is_constant:
             by_dtype.setdefault(tensor.dtype, []).append(name)
 
@@ -282,7 +292,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     or float(output.quant.scale[0]) != scale
                     or output.quant.zero_point.size != 1 or int(output.quant.zero_point[0]) != zero):
                 reasons.append(f"{op.op_type} requires output scale {scale} and zero point {zero}")
-        if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum"}:
+        if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin"}:
             source = ag.tensors.get(op.inputs[0]) if op.inputs else None
             output = ag.tensors.get(op.outputs[0]) if op.outputs else None
             axes = op.attrs.get("axes", [])
@@ -300,7 +310,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         shape.pop(axis)
                 if tuple(shape) != output.shape:
                     reasons.append("output shape does not match the reduction axis")
-                if ag.is_quantized:
+                if ag.is_quantized and op.op_type not in {"ArgMax", "ArgMin"}:
                     quants = [source.quant, output.quant]
                     if any(q is None or q.scale.size != 1 or q.zero_point.size != 1 for q in quants):
                         reasons.append("int8 reductions require per-tensor quantization")
@@ -316,6 +326,17 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if op.op_type == "CumSum" and any(int(op.attrs.get(key, 0)) not in {0, 1}
                                              for key in ("exclusive", "reverse")):
                 reasons.append("CumSum exclusive and reverse must be 0 or 1")
+        if op.op_type in {"ArgMax", "ArgMin"}:
+            if (len(op.outputs) != 1 or op.outputs[0] not in ag.model_outputs
+                    or any(name in other.inputs for name in op.outputs for other in ag.ops)
+                    or output is None or output.dtype != 6 or output.quant is not None):
+                reasons.append("index tensor must be an unquantized int32 terminal model output")
+            if int(op.attrs.get("select_last_index", 0)) != 0:
+                reasons.append("select_last_index=1 is unsupported")
+            if int(op.attrs.get("keepdims", 1)) not in {0, 1}:
+                reasons.append("keepdims must be 0 or 1")
+            if source is not None and any(not 0 < d <= 2**31 - 1 for d in source.shape):
+                reasons.append("axis extent cannot be indexed by int32")
         auto_pad = op.attrs.get("auto_pad", "NOTSET")
         if op.op_type in {
             "Conv",

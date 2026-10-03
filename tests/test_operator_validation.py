@@ -1027,8 +1027,15 @@ def test_index_outputs_do_not_bypass_dispatcher_dtype_contract(kind, input_dtype
     graph = _reduction_graph(kind)
     graph.tensors["x"].dtype = input_dtype
     graph.tensors["y"].dtype = output_dtype
+    graph.is_quantized = input_dtype == 3
+    if output_dtype == 6:
+        assert validate_execution_dtype(graph).supported
+        assert validate_operator_support(graph).supported
+    else:
+        assert not validate_execution_dtype(graph).supported
+        assert not validate_operator_support(graph).supported
+    graph.ops.append(OpNode(name="consumer", op_type="Relu", inputs=["y"], outputs=["z"]))
     assert not validate_execution_dtype(graph).supported
-    assert "unsupported activation tensor dtype" in validate_execution_dtype(graph).describe()
     assert not validate_operator_support(graph).supported
 
 
@@ -1041,3 +1048,29 @@ def test_reducemax_does_not_rewrite_nonspatial_axes_to_global_pool(tmp_path):
     assert any(op.op_type == "ReduceMax" for op in graph.ops)
     assert all(op.op_type != "GlobalMaxPool" for op in graph.ops)
     assert not validate_operator_support(graph).supported
+
+
+@pytest.mark.parametrize("kind", ["ArgMax", "ArgMin"])
+def test_arg_normalization_refuses_consumers_and_last_index(tmp_path, kind):
+    from tigris.loaders.onnx.normalize import _normalize_arg_outputs
+
+    graph = _reduction_graph(kind)
+    graph.tensors["y"].dtype = 7
+    graph.ops[0].attrs = {"axis": -2, "keepdims": 1, "select_last_index": 1}
+    with pytest.raises(ValueError, match="select_last_index"):
+        _normalize_arg_outputs(graph)
+    graph.ops[0].attrs["select_last_index"] = 0
+    graph.ops.append(OpNode(name="consumer", op_type="Identity", inputs=["y"], outputs=["z"]))
+    with pytest.raises(ValueError, match="terminal model output"):
+        _normalize_arg_outputs(graph)
+    graph.ops.pop()
+    graph.tensors["x"].shape = (2, 2**31, 3)
+    with pytest.raises(ValueError, match="int32"):
+        _normalize_arg_outputs(graph)
+
+
+@pytest.mark.parametrize("kind", ["Relu", "ReduceMax"])
+def test_non_arg_integer_model_output_is_not_exempt(kind):
+    graph = _reduction_graph(kind)
+    graph.tensors["y"].dtype = 6
+    assert not validate_execution_dtype(graph).supported

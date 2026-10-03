@@ -26,6 +26,8 @@
   "op_types": {
     "Abs": 38,
     "Add": 7,
+    "ArgMax": 64,
+    "ArgMin": 65,
     "AveragePool": 6,
     "BatchNormalization": 22,
     "Ceil": 49,
