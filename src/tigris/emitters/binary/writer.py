@@ -37,6 +37,7 @@ from .defs import (
     NO_WEIGHT,
     OP_ATTR_AXES,
     OP_ATTR_CUMSUM_OPTIONS,
+    OP_ATTR_MOVEMENT,
     OP_ATTR_ALPHA,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
@@ -903,6 +904,13 @@ def _build_op_attributes(
             if op.attrs.get("pool_rounding") == "average":
                 records.append((
                     op_index, OP_ATTR_POOL_ROUNDING, bytes([POOL_ROUNDING_AVERAGE])))
+            continue
+        if op.op_type in {"Gather", "GatherND", "StridedSlice", "MirrorPad", "ReverseV2",
+                          "EmbeddingLookup", "DynamicUpdateSlice"}:
+            values = op.attrs.get("movement")
+            if values is None:
+                raise ValueError(f"{op.op_type} requires normalized constant metadata")
+            records.append((op_index, OP_ATTR_MOVEMENT, struct.pack(f"<{len(values)}i", *values)))
             continue
         if op.op_type == "CumSum":
             records.append((op_index, OP_ATTR_CUMSUM_OPTIONS, bytes([

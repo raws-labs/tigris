@@ -302,3 +302,31 @@ def test_bool_passthrough_boundary_selects_data_dispatcher(tmp_path):
         assert result["flag"].dtype == np.dtype("bool")
         np.testing.assert_array_equal(result["flag"], flags)
         np.testing.assert_array_equal(result["output"], [0, 2, 0, 4])
+
+
+@pytest.mark.parametrize("kind,variant", [("Gather", 0), ("Gather", 1), ("Gather", 2),
+                                         ("GatherND", 0), ("StridedSlice", 0), ("StridedSlice", 1), ("StridedSlice", 2),
+                                         ("MirrorPad", 0), ("MirrorPad", 1), ("ReverseV2", 0),
+                                         ("EmbeddingLookup", 0), ("DynamicUpdateSlice", 0), ("DynamicUpdateSlice", 1)])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_movement_output_is_exact(tmp_path, kind, variant, quantized):
+    import onnx
+    import onnxruntime as ort
+    from scripts.crossrepo_contract import _movement_case, _to_runtime_layout
+
+    case = _movement_case(kind, quantized, variant)
+    model_path = tmp_path / "movement.onnx"
+    onnx.save(case.compile_model, model_path)
+    graph, _ = _run_pipeline(str(model_path), ("8K",))
+    path = tmp_path / "movement.tgrs"
+    path.write_bytes(emit_binary_bytes(graph))
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    reference = ort.InferenceSession(case.reference_model.SerializeToString(), options, providers=["CPUExecutionProvider"])
+    expected = _to_runtime_layout(reference.run(None, case.inputs)[0])
+    with Session(path) as session:
+        actual = session.run({name: _to_runtime_layout(value) for name, value in case.inputs.items()})["output"]
+    assert actual.dtype == expected.dtype
+    assert actual.shape == expected.shape
+    assert actual.tobytes() == expected.tobytes()

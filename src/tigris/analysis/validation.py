@@ -320,6 +320,10 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if op.op_type == "CumSum" and any(int(op.attrs.get(key, 0)) not in {0, 1}
                                              for key in ("exclusive", "reverse")):
                 reasons.append("CumSum exclusive and reverse must be 0 or 1")
+        if op.op_type in {"Gather", "GatherND", "StridedSlice", "MirrorPad", "ReverseV2",
+                          "EmbeddingLookup", "DynamicUpdateSlice"}:
+            if "movement" not in op.attrs:
+                reasons.append("requires normalized constant indices or bounds")
         if op.op_type in {"ArgMax", "ArgMin"}:
             if (len(op.outputs) != 1 or op.outputs[0] not in ag.model_outputs
                     or any(name in other.inputs for name in op.outputs for other in ag.ops)

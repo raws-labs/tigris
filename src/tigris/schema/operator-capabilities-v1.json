@@ -864,6 +864,97 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "constraints": [
+        "constant indices or bounds; untiled; identical int8 quantization"
+      ],
+      "opcode": 66,
+      "operator": "Gather",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "constant indices or bounds; untiled; identical int8 quantization"
+      ],
+      "opcode": 67,
+      "operator": "GatherND",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "constant indices or bounds; untiled; identical int8 quantization"
+      ],
+      "opcode": 68,
+      "operator": "StridedSlice",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "constant indices or bounds; untiled; identical int8 quantization"
+      ],
+      "opcode": 69,
+      "operator": "MirrorPad",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "constant indices or bounds; untiled; identical int8 quantization"
+      ],
+      "opcode": 70,
+      "operator": "ReverseV2",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "constant indices or bounds; untiled; identical int8 quantization"
+      ],
+      "opcode": 71,
+      "operator": "EmbeddingLookup",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "constant indices or bounds; untiled; identical int8 quantization"
+      ],
+      "opcode": 72,
+      "operator": "DynamicUpdateSlice",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
   "schema_version": 9,
