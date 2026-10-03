@@ -275,3 +275,30 @@ def test_arg_output_interface(tmp_path, kind, axis, quantized, keep):
         actual = session.run({"input": np.ascontiguousarray(source.transpose(0, 2, 1))})["output"]
         assert actual.dtype == np.dtype("int64")
         np.testing.assert_array_equal(actual, expected)
+
+
+def test_bool_passthrough_boundary_selects_data_dispatcher(tmp_path):
+    import onnx
+    from onnx import TensorProto, helper
+    from tigris.emitters.codegen import generate_c
+
+    flag = helper.make_tensor_value_info("flag", TensorProto.BOOL, [4])
+    data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [4])
+    output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [4])
+    model = helper.make_model(helper.make_graph([helper.make_node("Relu", ["data"], ["output"])],
+                                                "boundary", [flag, data], [flag, output]),
+                              opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    model_path = tmp_path / "boundary.onnx"
+    onnx.save(model, model_path)
+    graph, _ = _run_pipeline(str(model_path), ("4K",))
+    plan = emit_binary_bytes(graph)
+    assert "t->dtype == 9u" in generate_c(plan, "reference")
+    path = tmp_path / "boundary.tgrs"
+    path.write_bytes(plan)
+    flags = np.array([True, False, True, False], np.bool_)
+    with Session(path) as session:
+        result = session.run({"flag": flags, "data": np.array([-1, 2, -3, 4], np.float32)})
+        assert result["flag"].dtype == np.dtype("bool")
+        np.testing.assert_array_equal(result["flag"], flags)
+        np.testing.assert_array_equal(result["output"], [0, 2, 0, 4])
