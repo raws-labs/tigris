@@ -54,6 +54,8 @@ _DTYPE_BY_ONNX_CODE = {
     TensorProto.FLOAT: np.dtype("<f4"),
     TensorProto.UINT8: np.dtype("u1"),
     TensorProto.INT8: np.dtype("i1"),
+    TensorProto.INT32: np.dtype("<i4"),
+    TensorProto.INT64: np.dtype("<i8"),
 }
 _INT8_LSB_TOLERANCE = 1
 
@@ -677,6 +679,29 @@ def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
                    [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)], initializers)
     operators = ("Transpose", kind, "Transpose") if keep or kind == "CumSum" else ("Transpose", kind)
     return ContractCase(label, model, copy.deepcopy(model), {"input": data}, operators,
+                        mem_budget="4K", reference_unoptimized=True)
+
+
+def _arg_case(kind: str, axis: int, quantized: bool, keep: bool) -> ContractCase:
+    shape = [2, 7, 4]
+    target = shape.copy()
+    if keep:
+        target[axis] = 1
+    else:
+        target.pop(axis)
+    data = (np.arange(np.prod(shape)).reshape(shape) % 5).astype(np.float32)
+    nodes, initializers = [], []
+    source = "input"
+    if quantized:
+        initializers = _scalars(x=(0.125, -17))
+        nodes = _qdq(source, "x_s", "x_z", "x")
+        source = "x"
+    nodes.append(helper.make_node(kind, [source], ["output"], axis=axis - 3, keepdims=int(keep)))
+    label = f"{kind.lower()}_axis{axis}_int8{int(quantized)}_keep{int(keep)}"
+    model = _model(label, nodes,
+                   [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                   [helper.make_tensor_value_info("output", TensorProto.INT64, target)], initializers)
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data}, ("Transpose", kind),
                         mem_budget="4K", reference_unoptimized=True)
 
 
@@ -6143,7 +6168,7 @@ def _output_scales(plan: dict) -> list[float]:
     scales: list[float] = []
     for tensor_index in plan["model_outputs"]:
         tensor = plan["tensors"][tensor_index]
-        if _declared_dtype(tensor) == tensor["dtype"]:
+        if _declared_dtype(tensor) == tensor["dtype"] or tensor["dtype"] == 6:
             scales.append(0.0)
             continue
         quant = plan["quant_params"][tensor["quant_param_idx"]]
@@ -6401,6 +6426,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
         _linear_spatial_max_case(quantized=False),
         _linear_spatial_max_case(quantized=True),
+        *[_arg_case(kind, axis, q, keep) for kind in ("ArgMax", "ArgMin")
+          for axis in range(3) for q in (False, True) for keep in (False, True)],
         *[_reduction_case(kind, axis, quantized=q, keep=keep)
           for kind in ("ReduceMax", "ReduceMin", "ReduceSum") for axis in range(3)
           for q in (False, True) for keep in (False, True)],

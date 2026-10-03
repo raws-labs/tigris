@@ -838,6 +838,32 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "constraints": [
+        "one axis of a rank-3 tensor, untiled; terminal int32 indices; first index wins ties"
+      ],
+      "opcode": 64,
+      "operator": "ArgMax",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "one axis of a rank-3 tensor, untiled; terminal int32 indices; first index wins ties"
+      ],
+      "opcode": 65,
+      "operator": "ArgMin",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
   "schema_version": 9,

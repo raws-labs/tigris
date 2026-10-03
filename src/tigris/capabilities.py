@@ -90,6 +90,8 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "ReduceMin",
     "ReduceSum",
     "CumSum",
+    "ArgMax",
+    "ArgMin",
     "Split",
 })
 
@@ -219,6 +221,8 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "ReduceMax": ("one axis of a rank-3 tensor, untiled; rank-4 spatial max with keepdims uses GlobalMaxPool; int8 quantization must match",),
     "ReduceMin": ("one axis of a rank-3 tensor, untiled; int8 quantization must match",),
     "ReduceSum": ("one axis of a rank-3 tensor, untiled; int8 rejects reference arithmetic overflow",),
+    "ArgMax": ("one axis of a rank-3 tensor, untiled; terminal int32 indices; first index wins ties",),
+    "ArgMin": ("one axis of a rank-3 tensor, untiled; terminal int32 indices; first index wins ties",),
     "CumSum": ("one axis of a rank-3 tensor, untiled; exclusive and reverse; int8 input zero point 0",),
     "ReduceMean": (
         "rank-3 mean over serialized axis 1; untiled execution. A rank-4 mean "

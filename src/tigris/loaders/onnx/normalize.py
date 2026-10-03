@@ -55,6 +55,7 @@ from tigris.graph.ir import (
 def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
     declared_outputs = list(ag.model_outputs)
+    ag = _normalize_arg_outputs(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
     ag = _fold_constant_ops(ag)
@@ -402,7 +403,7 @@ def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     """The layout an operator needs, or None when it works in either."""
     if op.op_type in _SPATIAL_LAYOUT_OPS:
         return Layout.SPATIAL
-    if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum"}:
+    if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin"}:
         return Layout.LINEAR
     if op.op_type in _LINEAR_LAYOUT_OPS:
         return Layout.LINEAR
@@ -542,9 +543,13 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
     terminal_transpose = set() if ag.channels_last_source else {
         op.outputs[0]
         for op in ag.ops
-        if op.op_type == "Transpose" and len(op.outputs) == 1
+        if op.op_type in {"Transpose", "ArgMax", "ArgMin"} and len(op.outputs) == 1
         and op.outputs[0] in ag.model_outputs
     }
+    terminal_transpose.update(
+        op.outputs[0] for op in ag.ops
+        if op.op_type in {"ArgMax", "ArgMin"} and len(op.outputs) == 1
+        and op.outputs[0] in ag.model_outputs)
     for name in list(ag.model_outputs):
         info = ag.tensors.get(name)
         if info is None or name in terminal_transpose:
@@ -2671,6 +2676,34 @@ def _clip_to_relu6(ag: AnalyzedGraph) -> AnalyzedGraph:
         op.inputs = [op.inputs[0]]
         op.attrs = {}
 
+    return ag
+
+
+def _normalize_arg_outputs(ag: AnalyzedGraph) -> AnalyzedGraph:
+    for op in ag.ops:
+        if op.op_type not in {"ArgMax", "ArgMin"}:
+            continue
+        if len(op.inputs) != 1 or len(op.outputs) != 1:
+            raise ValueError(f"{op.op_type} requires one input and one output")
+        name = op.outputs[0]
+        if name not in ag.model_outputs or any(name in other.inputs for other in ag.ops):
+            raise ValueError(f"{op.op_type} index tensor must be a terminal model output")
+        source, output = ag.tensors[op.inputs[0]], ag.tensors[name]
+        rank = len(source.shape)
+        axis = int(op.attrs.get("axis", 0))
+        if rank == 0 or axis not in range(-rank, rank):
+            raise ValueError(f"{op.op_type} axis is outside the input rank")
+        axis %= rank
+        if not 0 < source.shape[axis] <= 2**31 - 1:
+            raise ValueError(f"{op.op_type} axis extent cannot be indexed by int32")
+        if int(op.attrs.get("select_last_index", 0)) != 0:
+            raise ValueError(f"{op.op_type} select_last_index=1 is unsupported")
+        if int(op.attrs.get("keepdims", 1)) not in {0, 1}:
+            raise ValueError(f"{op.op_type} keepdims must be 0 or 1")
+        if output.dtype not in {6, 7} or output.quant is not None:
+            raise ValueError(f"{op.op_type} requires an unquantized integer output")
+        output.dtype = 6
+        op.attrs["axes"] = [axis]
     return ag
 
 

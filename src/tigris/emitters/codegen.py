@@ -154,7 +154,17 @@ def _build_limit_assertions(plan: dict) -> str:
 
 def _plan_dtype(plan: dict) -> DTypeMode:
     """Resolve the graph-wide runtime dtype from serialized tensors."""
-    tensor_dtypes = {tensor["dtype"] for tensor in plan.get("tensors", [])}
+    operators = plan.get("ops", [])
+    index_outputs = {
+        op["outputs"][0] for op in operators
+        if op["op_type"] in {64, 65} and len(op["outputs"]) == 1
+        and op["outputs"][0] in plan.get("model_outputs", [])
+        and op["outputs"][0] not in plan.get("model_inputs", [])
+        and not any(op["outputs"][0] in other["inputs"] for other in operators)
+        and sum(op["outputs"][0] in other["outputs"] for other in operators) == 1
+    }
+    tensor_dtypes = {tensor["dtype"] for index, tensor in enumerate(plan.get("tensors", []))
+                     if not (index in index_outputs and tensor["dtype"] == 6)}
     num_quant_params = plan.get("num_quant_params", 0)
 
     if tensor_dtypes == {1} and num_quant_params == 0:
@@ -628,7 +638,15 @@ int main(int argc, char **argv)
             continue;
         }}
         printf("Output '%s': %u bytes\\n", tigris_tensor_name(&plan, t), iface_bytes);
-        if (t->iface_dtype == 0u && t->dtype == 3u) {{
+        if (t->dtype == 6u) {{
+            uint32_t n = t->size_bytes / (uint32_t)sizeof(int32_t);
+            for (uint32_t j = 0; j < n && j < 10u; j++) {{
+                long long value = t->iface_dtype == 7u
+                    ? (long long)((const int64_t *)staging)[j]
+                    : (long long)((const int32_t *)staging)[j];
+                printf("  [%u] %lld\\n", j, value);
+            }}
+        }} else if (t->iface_dtype == 0u && t->dtype == 3u) {{
             const int8_t *out = (const int8_t *)staging;
             uint32_t n = iface_bytes;
             uint32_t show = n < 10 ? n : 10;
@@ -828,6 +846,13 @@ void app_main(void)
         if (!ptr) continue;
 
         printf("Output '%s': %u bytes\\n", tigris_tensor_name(&plan, t), t->size_bytes);
+        if (t->dtype == 6u) {{
+            const int32_t *indices = (const int32_t *)ptr;
+            uint32_t count = t->size_bytes / (uint32_t)sizeof(int32_t);
+            for (uint32_t j = 0; j < count && j < 10u; j++)
+                printf("  [%u] %ld\\n", j, (long)indices[j]);
+            continue;
+        }}
         {"int8_t" if is_quantized else "float"} *out = ({"int8_t" if is_quantized else "float"} *)ptr;
         uint32_t n = t->size_bytes / {"1" if is_quantized else "sizeof(float)"};
         uint32_t show = n < 10 ? n : 10;
