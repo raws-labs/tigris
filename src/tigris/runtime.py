@@ -149,7 +149,7 @@ class Session:
             args = (self._handle, output, index)
             code = self._lib.tigris_host_tensor_dtype(*args)
             dtype = {1: np.dtype("float32"), 2: np.dtype("uint8"), 3: np.dtype("int8"),
-                     6: np.dtype("int32"), 7: np.dtype("int64")}.get(code)
+                     6: np.dtype("int32"), 7: np.dtype("int64"), 9: np.dtype("bool")}.get(code)
             if dtype is None:
                 raise RuntimeError(f"Unsupported interface dtype {code}")
             shape = tuple(self._lib.tigris_host_tensor_dim(*args, axis)

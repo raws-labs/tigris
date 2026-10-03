@@ -17,6 +17,7 @@ from tigris.analysis.partition_spatial import (
 from tigris.analysis.broadcast import DENSE, PERIODIC, stored_operands
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
+from tigris.graph.dtypes import check_dtype_signatures
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
@@ -85,26 +86,19 @@ class ExecutionDTypeValidation:
 
 
 def validate_execution_dtype(ag: AnalyzedGraph) -> ExecutionDTypeValidation:
-    """Require one supported dtype across all non-constant tensors.
+    """Validate operator slots and one homogeneous data dtype.
 
     Runtime dispatch is selected once for the whole plan.  A plan containing
     both float32 and int8 activations cannot safely be routed through either
     dispatcher, even if every individual opcode is otherwise supported.
     """
-    index_outputs = {
-        op.outputs[0] for op in ag.ops
-        if op.op_type in {"ArgMax", "ArgMin"} and len(op.outputs) == 1
-        and op.outputs[0] in ag.model_outputs
-        and op.outputs[0] not in ag.model_inputs
-        and not any(op.outputs[0] in other.inputs for other in ag.ops)
-        and sum(op.outputs[0] in other.outputs for other in ag.ops) == 1
-    }
-    by_dtype: dict[int, list[str]] = {}
-    for name, tensor in ag.tensors.items():
-        if name in index_outputs and tensor.dtype == 6 and tensor.quant is None:
-            continue
-        if not tensor.is_constant:
-            by_dtype.setdefault(tensor.dtype, []).append(name)
+    by_dtype, signature_issues = check_dtype_signatures(
+        [(name, tensor.dtype, tensor.is_constant, tensor.quant is not None)
+         for name, tensor in ag.tensors.items()],
+        [(op.op_type, op.inputs, op.outputs) for op in ag.ops],
+        ag.model_inputs, ag.model_outputs)
+    if signature_issues:
+        return ExecutionDTypeValidation(dtype=None, issues=signature_issues)
 
     if not by_dtype:
         return ExecutionDTypeValidation(dtype=None, issues=())
