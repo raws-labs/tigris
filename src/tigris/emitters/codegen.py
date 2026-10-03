@@ -18,6 +18,7 @@ from tigris.capabilities import (
     effective_operators,
     resolve_kernel_backend,
 )
+from tigris.graph.dtypes import check_dtype_signatures
 from tigris.emitters.binary.defs import FLAG_XIP
 from tigris.emitters.binary.reader import read_binary_plan
 
@@ -154,17 +155,16 @@ def _build_limit_assertions(plan: dict) -> str:
 
 def _plan_dtype(plan: dict) -> DTypeMode:
     """Resolve the graph-wide runtime dtype from serialized tensors."""
-    operators = plan.get("ops", [])
-    index_outputs = {
-        op["outputs"][0] for op in operators
-        if op["op_type"] in {64, 65} and len(op["outputs"]) == 1
-        and op["outputs"][0] in plan.get("model_outputs", [])
-        and op["outputs"][0] not in plan.get("model_inputs", [])
-        and not any(op["outputs"][0] in other["inputs"] for other in operators)
-        and sum(op["outputs"][0] in other["outputs"] for other in operators) == 1
-    }
-    tensor_dtypes = {tensor["dtype"] for index, tensor in enumerate(plan.get("tensors", []))
-                     if not (index in index_outputs and tensor["dtype"] == 6)}
+    by_dtype, issues = check_dtype_signatures(
+        [(index, tensor["dtype"], bool(tensor.get("flags", 0) & 1),
+          tensor.get("quant_param_idx", 65535) != 65535)
+         for index, tensor in enumerate(plan.get("tensors", []))],
+        [(OP_TYPE_BY_CODE.get(op["op_type"], ""), op["inputs"], op["outputs"])
+         for op in plan.get("ops", [])],
+        plan.get("model_inputs", []), plan.get("model_outputs", []))
+    if issues:
+        raise ValueError("Plan dtype signature mismatch: " + "; ".join(issues))
+    tensor_dtypes = set(by_dtype)
     num_quant_params = plan.get("num_quant_params", 0)
 
     if tensor_dtypes == {1} and num_quant_params == 0:

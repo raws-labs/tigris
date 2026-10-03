@@ -1074,3 +1074,17 @@ def test_non_arg_integer_model_output_is_not_exempt(kind):
     graph = _reduction_graph(kind)
     graph.tensors["y"].dtype = 6
     assert not validate_execution_dtype(graph).supported
+
+
+def test_auxiliary_dtype_placement_and_operator_slots(monkeypatch):
+    from tigris.graph.dtypes import DATA, DTypeSignature, OP_DTYPE_SIGNATURES, check_dtype_signatures
+
+    monkeypatch.setitem(OP_DTYPE_SIGNATURES, "predicate", DTypeSignature(outputs=(9,)))
+    monkeypatch.setitem(OP_DTYPE_SIGNATURES, "choose", DTypeSignature(inputs=(9, DATA, DATA)))
+    tensors = [("x", 1, False, False), ("p", 9, False, False), ("y", 1, False, False)]
+    ops = [("predicate", ["x"], ["p"]), ("choose", ["p", "x", "x"], ["y"])]
+    data, issues = check_dtype_signatures(tensors, ops, ["x"], ["y"])
+    assert data == {1: ["x", "y"]} and not issues
+    assert check_dtype_signatures(tensors, [("Relu", ["p"], ["y"])], ["p"], ["y"])[1]
+    assert check_dtype_signatures(tensors, [("choose", ["x", "p", "x"], ["y"])], ["x"], ["y"])[1]
+    assert check_dtype_signatures([("p", 9, False, True)], [], ["p"], ["p"])[1]

@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from tigris.capabilities import KERNEL_CAPABILITIES
+from tigris.graph.dtypes import OP_DTYPE_SIGNATURES
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 
 
@@ -64,6 +65,15 @@ def validate(runtime: Path) -> list[str]:
             f"runtime-only={sorted(runtime_schema_codes - expected_schema_codes)}, "
             f"compiler-only={sorted(expected_schema_codes - runtime_schema_codes)}"
         )
+
+    loader = (runtime / "src/tigris_loader.c").read_text()
+    rows = re.findall(r"\[(TIGRIS_OP_[A-Z0-9_]+)\] = \{\{(\d+), (\d+), (\d+)\}, (\d+)\}", loader)
+    actual_signatures = {enum_values[name]: (tuple(map(int, (a, b, c))), (int(out),))
+                         for name, a, b, c, out in rows}
+    expected_signatures = {OP_TYPE_MAP[name]: (signature.inputs, signature.outputs)
+                           for name, signature in OP_DTYPE_SIGNATURES.items()}
+    if actual_signatures != expected_signatures:
+        errors.append("runtime/compiler operator dtype signatures differ")
 
     functions = {
         "reference": "tigris_dispatch_kernel",
