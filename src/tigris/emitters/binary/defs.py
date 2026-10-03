@@ -55,14 +55,17 @@ OP_ATTR_BINARY_REQUANT = 7   # int32[6], three Q0.31 (multiplier, shift) pairs:
 OP_ATTR_POOL_ROUNDING = 8    # uint8[1], POOL_ROUNDING_AVERAGE on an int8 global
                              # average pool that rounds like AVERAGE_POOL_2D
 POOL_ROUNDING_AVERAGE = 1
-OP_ATTR_CONSTANT_OPERAND = 9  # uint8[4]: the constant operand's position (0 or 1),
+OP_ATTR_CONSTANT_OPERAND = 9  # uint8[4]: the constant operand's position (0 to 2),
                               # a zero byte, and its quant param index (u16 LE,
-                              # NO_QUANT_PARAM for float)
+                              # NO_QUANT_PARAM for float or bool)
 OP_ATTR_RESIZE_SCALES = 10  # float32[2], explicit output/input H/W scales
 OP_ATTR_MOVEMENT = 12  # int32 metadata, interpreted by the data movement opcode
 OP_ATTR_CUMSUM_OPTIONS = 11  # uint8[2], exclusive then reverse (each 0 or 1)
 
+OP_ATTR_COMPARISON_REQUANT = 13  # int32[5]: left shift, then two multiplier/shift pairs
+
 OP_ATTR_KINDS = (
+    OP_ATTR_COMPARISON_REQUANT,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ATTR_EPSILON,
     OP_ATTR_ALPHA,
@@ -158,6 +161,17 @@ OP_TYPE_MAP: dict[str, int] = {
     "ReverseV2": 70,
     "EmbeddingLookup": 71,
     "DynamicUpdateSlice": 72,
+    "Equal": 73,
+    "Less": 74,
+    "LessOrEqual": 75,
+    "Greater": 76,
+    "GreaterOrEqual": 77,
+    "And": 78,
+    "Or": 79,
+    "Not": 80,
+    "Where": 81,
+    "Cast": 82,
+    "Sum": 83,
 }
 OP_TYPE_UNKNOWN = 255
 

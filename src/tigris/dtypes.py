@@ -6,6 +6,7 @@ from tigris.emitters.binary.defs import OP_TYPE_MAP
 
 
 DATA = 0
+DATA_OR_BOOL = 255
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,18 @@ OP_DTYPE_SIGNATURES = {kind: DTypeSignature() for kind in OP_TYPE_MAP}
 OP_DTYPE_SIGNATURES.update({
     "ArgMax": DTypeSignature(outputs=(6,)),
     "ArgMin": DTypeSignature(outputs=(6,)),
+    "Equal": DTypeSignature(outputs=(9,)),
+    "Less": DTypeSignature(outputs=(9,)),
+    "LessOrEqual": DTypeSignature(outputs=(9,)),
+    "Greater": DTypeSignature(outputs=(9,)),
+    "GreaterOrEqual": DTypeSignature(outputs=(9,)),
+    "And": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
+    "Or": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
+    "Not": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
+    "Where": DTypeSignature(inputs=(9, DATA, DATA)),
+    "Cast": DTypeSignature(inputs=(9, 9, 9)),
+    **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
+       for kind in ("Transpose", "Reshape", "Flatten")},
 })
 
 
@@ -59,6 +72,10 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs):
                     continue
                 dtype = tensor[0]
                 expected = slots[min(position, len(slots) - 1)]
+                if expected == DATA_OR_BOOL:
+                    if dtype not in {1, 3, 9} or dtype != by_name[inputs[0]][0]:
+                        issues.append(f"{kind} must preserve its data or bool dtype")
+                    continue
                 if (expected == DATA and dtype not in {1, 3}) or (expected != DATA and dtype != expected):
                     label = "data (float32 or int8)" if expected == DATA else f"ONNX dtype {expected}"
                     issues.append(f"{kind} {direction} {position} ({name}) requires {label}, got ONNX dtype {dtype}")

@@ -99,6 +99,17 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     "FloorDiv": TileCategory.POINTWISE,
     "FloorMod": TileCategory.POINTWISE,
     "LayerNormalization": TileCategory.POINTWISE,
+    "Equal": TileCategory.POINTWISE,
+    "Less": TileCategory.POINTWISE,
+    "LessOrEqual": TileCategory.POINTWISE,
+    "Greater": TileCategory.POINTWISE,
+    "GreaterOrEqual": TileCategory.POINTWISE,
+    "And": TileCategory.POINTWISE,
+    "Or": TileCategory.POINTWISE,
+    "Not": TileCategory.POINTWISE,
+    "Where": TileCategory.POINTWISE,
+    "Cast": TileCategory.POINTWISE,
+    "Sum": TileCategory.POINTWISE,
     # Resampling along the height: the runtime cuts the output into bands and
     # reads the source band each one needs. Only the height axis, and only on
     # its own stage, because the chain executor does not compose a fractional
@@ -118,6 +129,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 # below since the hazard is the same in both.
 _BINARY_OPS = frozenset({
     "Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod", "PRelu",
+    "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Where", "Sum",
 })
 
 # Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
@@ -149,7 +161,7 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Round",
     "Sin",
     "Cos",
-    "LayerNormalization",
+    "LayerNormalization", "Not", "Cast",
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
@@ -185,14 +197,11 @@ def _has_unequal_binary_operands(ag: AnalyzedGraph, op: OpNode) -> bool:
     is one row high, so a rank-4 height stripe loads it whole for every band;
     the 2D, chain and row-band executors have no such rule and keep it out.
     """
-    if op.op_type not in _BINARY_OPS or len(op.inputs) != 2:
+    if op.op_type not in _BINARY_OPS or len(op.inputs) < 2:
         return False
-    first, second = (ag.tensors.get(name) for name in op.inputs)
-    if first is None or second is None:
-        return False
-    if first.is_constant or second.is_constant:
-        return False
-    return tuple(first.shape) != tuple(second.shape)
+    tensors = [ag.tensors[name] for name in op.inputs if name in ag.tensors
+               and not ag.tensors[name].is_constant]
+    return len({tuple(t.shape) for t in tensors}) > 1
 
 
 def classify_op(op_type: str) -> TileCategory:
@@ -590,6 +599,8 @@ def _transpose_band_extents(
 # operators beside it preserve rows outright. Mirrors is_row_tiling_op in the
 # loader and the executor.
 _ROW_TILING_OPS = frozenset({
+    "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
+    "And", "Or", "Not", "Where", "Cast", "Sum",
     "Gemm",
     "MatMul",
     "Relu",

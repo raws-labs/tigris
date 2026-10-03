@@ -199,3 +199,26 @@ def test_named_generated_cores_link_together(qdq_conv_path, tmp_path):
         text=True, capture_output=True, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("kind", ["Equal", "Not", "Where", "Cast", "Sum"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_bool_harness_and_core_are_valid_c99(tmp_path, kind, quantized):
+    import onnx
+    from scripts.crossrepo_contract import _bool_case
+    from tigris.cli import _run_pipeline
+
+    case = _bool_case(kind, quantized)
+    path = tmp_path / "bool.onnx"
+    onnx.save(case.compile_model, path)
+    graph, _ = _run_pipeline(str(path), ("4K",))
+    data = emit_binary_bytes(graph)
+    header = tmp_path / "generated_core.h"
+    header.write_text(generate_core_header(data))
+    for fmt in ("app", "core"):
+        source = tmp_path / f"bool_{fmt}.c"
+        source.write_text(generate_c(data, "reference", output_format=fmt, core_header=header.name))
+        result = subprocess.run([_CC, "-std=c99", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
+                                 f"-I{_RUNTIME_INCLUDE}", f"-I{tmp_path}", str(source)],
+                                text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stdout + result.stderr

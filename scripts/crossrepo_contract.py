@@ -56,6 +56,7 @@ _DTYPE_BY_ONNX_CODE = {
     TensorProto.INT8: np.dtype("i1"),
     TensorProto.INT32: np.dtype("<i4"),
     TensorProto.INT64: np.dtype("<i8"),
+    TensorProto.BOOL: np.dtype("bool"),
 }
 _INT8_LSB_TOLERANCE = 1
 
@@ -801,6 +802,72 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase
     return ContractCase(label, build(nodes), build(reference_nodes), inputs, tuple(operators),
                         mem_budget="8K", reference_unoptimized=True,
                         compression="lz4" if kind == "Gather" and variant == 0 else None)
+
+
+def _bool_case(kind: str, quantized: bool = False, tiled: bool = False, variant: int = 0) -> ContractCase:
+    shape = [] if variant == 4 else [99, 7] if variant == 5 else [1, 3, 231] if variant == 6 else [1, 3, 33, 7] if tiled else [1, 2, 3, 4]
+    comparisons = {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"}
+    arity = 3 if kind in {"Where", "Sum"} else 2 if kind in comparisons | {"And", "Or"} else 1
+    shapes = [shape] * arity
+    if variant == 1:
+        if kind == "Where":
+            shape = [2, 2, 3, 4, 2]
+            shapes = [[2, 1, 3, 1, 2], [1, 2, 1, 4, 1], [1, 1, 1, 1, 2]]
+        else:
+            shapes = [[1, 2, 1, 4], [1, 1, 3, 1]]
+    elif variant == 2:
+        shapes[-1] = [4]
+    elif variant >= 10:
+        shapes[variant - 10] = []
+    nodes, initializers, infos, values, operands = [], [], [], {}, []
+    for i in range(arity):
+        name = f"input{i}"
+        boolean = kind in {"And", "Or", "Not", "Cast"} or kind == "Where" and i == 0
+        dtype = TensorProto.BOOL if boolean else TensorProto.INT8 if quantized else TensorProto.FLOAT
+        data = (np.arange(np.prod(shapes[i], dtype=int)).reshape(shapes[i]) * (i + 1) + i) % 7 - 3
+        values[name] = np.asarray((data > 0) if boolean else data.astype(np.int8 if quantized else np.float32))
+        if variant == i + 10:
+            initializers.append(numpy_helper.from_array(values.pop(name), name))
+        else:
+            infos.append(helper.make_tensor_value_info(name, dtype, shapes[i]))
+        source = name
+        if quantized and not boolean:
+            initializers += _scalars(**{f"q{i}": (0.125, 0)})
+            source = f"dequant{i}"
+            nodes.append(helper.make_node("DequantizeLinear", [name, f"q{i}_s", f"q{i}_z"], [source]))
+        operands.append(source)
+    boolean_output = kind in comparisons | {"And", "Or", "Not"}
+    raw = "output" if boolean_output or not quantized else "raw"
+    attrs = {"to": TensorProto.FLOAT} if kind == "Cast" else {}
+    nodes.append(helper.make_node(kind, operands, [raw], **attrs))
+    if quantized and not boolean_output:
+        initializers += _scalars(y=(1.0 if kind == "Cast" else 0.125, 0))
+        nodes.append(helper.make_node("QuantizeLinear", [raw, "y_s", "y_z"], ["output"]))
+    dtype = TensorProto.BOOL if boolean_output else TensorProto.INT8 if quantized else TensorProto.FLOAT
+    label = f"bool_{kind.lower()}_s8{int(quantized)}_tiled{int(tiled)}_v{variant}"
+    model = _model(label, nodes, infos, [helper.make_tensor_value_info("output", dtype, shape)], initializers, opset=17)
+    return ContractCase(label, model, copy.deepcopy(model), values,
+                        (("Transpose",) * (3 if kind == "Where" else 2) + (kind,)) if variant == 2 else (kind,),
+                        mem_budget="512" if tiled else "4K", slow_budget="32K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True)
+
+
+def _bool_composition_case(quantized: bool, tiled: bool) -> ContractCase:
+    case = _bool_case("Where", quantized, tiled)
+    model = case.compile_model
+    where = next(node for node in model.graph.node if node.op_type == "Where")
+    operands = list(where.input[1:])
+    del model.graph.input[0]
+    values = {key: value for key, value in case.inputs.items() if key != "input0"}
+    nodes = list(model.graph.node)
+    position = nodes.index(where)
+    nodes[position:position] = [helper.make_node("Equal", operands, ["equal"]),
+                                helper.make_node("Not", ["equal"], ["input0"])]
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+    return ContractCase(case.name + "_composed", model, copy.deepcopy(model), values,
+                        ("Equal", "Not", "Where"), mem_budget=case.mem_budget,
+                        slow_budget=case.slow_budget, expect_tiled=tiled, expect_chain=tiled, reference_unoptimized=True)
 
 
 def _arg_case(kind: str, axis: int, quantized: bool, keep: bool) -> ContractCase:
@@ -5930,7 +5997,9 @@ def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
         if declared == TensorProto.FLOAT:
             encoded = source.astype(np.float32, copy=False)
         elif declared == TensorProto.INT8:
-            encoded = _quantize_input(source, plan, tensor)
+            encoded = source if source.dtype == np.int8 else _quantize_input(source, plan, tensor)
+        elif declared == TensorProto.BOOL:
+            encoded = source.astype(np.bool_, copy=False)
         elif declared == TensorProto.UINT8:
             # A camera hands over bytes; the runtime moves them onto the int8
             # tensor itself, so the harness passes them through untouched.
@@ -6560,6 +6629,19 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         *[_reduction_case("CumSum", axis, quantized=q, exclusive=ex, reverse=rev)
           for axis in range(3) for q in (False, True)
           for ex in (False, True) for rev in (False, True)],
+        *[_bool_case(kind, quantized=q, tiled=tiled)
+          for kind in ("Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Not", "Where", "Cast", "Sum")
+          for q in (False, True) if not (q and kind in {"And", "Or", "Not"})
+          for tiled in (False, True)],
+        *[_bool_case(kind, quantized=q, variant=v)
+          for kind in ("Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Where")
+          for q in (False, True) if not (q and kind in {"And", "Or"})
+          for v in (1, 2, 10, 11, *([12] if kind == "Where" else []))],
+        *[_bool_case(kind, quantized=q, tiled=v != 4, variant=v)
+          for kind in ("Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Not", "Where", "Cast", "Sum")
+          for q in (False, True) if not (q and kind in {"And", "Or", "Not"})
+          for v in (4, 5, 6)],
+        *[_bool_composition_case(q, tiled) for q in (False, True) for tiled in (False, True)],
         *[_activation_case(kind, quantized=quantized)
           for kind in ("LeakyRelu", "PRelu", "Elu", "LogSoftmax", "L2Normalization", "L2Pool")
           for quantized in (False, True) if not (kind == "L2Pool" and quantized)],

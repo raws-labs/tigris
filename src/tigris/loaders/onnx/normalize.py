@@ -402,6 +402,11 @@ def _reshape_keeps_its_order(ag: AnalyzedGraph, op: OpNode) -> bool:
 
 def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     """The layout an operator needs, or None when it works in either."""
+    if op.op_type in {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Where"}:
+        ranks = {len(ag.tensors[n].shape) for n in op.inputs + op.outputs
+                 if n in ag.tensors and not ag.tensors[n].is_constant}
+        if len(ranks) > 1:
+            return Layout.LINEAR
     if op.op_type in _MOVEMENT_OPS:
         return Layout.LINEAR
     if op.op_type in _SPATIAL_LAYOUT_OPS:

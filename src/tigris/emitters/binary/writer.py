@@ -38,6 +38,7 @@ from .defs import (
     OP_ATTR_AXES,
     OP_ATTR_CUMSUM_OPTIONS,
     OP_ATTR_MOVEMENT,
+    OP_ATTR_COMPARISON_REQUANT,
     OP_ATTR_ALPHA,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
@@ -302,7 +303,7 @@ def _binary_constant_layouts(ag: AnalyzedGraph) -> dict[str, tuple]:
     """
     layouts = {}
     for op in ag.ops:
-        if op.op_type not in BINARY_OPS or len(op.inputs) != 2 or len(op.outputs) != 1:
+        if op.op_type not in BINARY_OPS or len(op.inputs) != (3 if op.op_type == "Where" else 2) or len(op.outputs) != 1:
             continue
         constants = [name for name in op.inputs if name in ag.weight_data]
         output = ag.tensors.get(op.outputs[0])
@@ -481,7 +482,7 @@ def _build_weights(
         if name in fc_layout_shapes:
             arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
         # Preserve int8/int32 dtype for quantized weights
-        if arr.dtype in (np.int8, np.int32):
+        if arr.dtype in (np.int8, np.int32, np.bool_):
             raw = arr.tobytes()
         else:
             raw = arr.astype(np.float32).tobytes()
@@ -570,7 +571,7 @@ def _build_weights_compressed(
             arr = _transpose_weight_nhwc(arr, op_type)
         if name in fc_layout_shapes:
             arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
-        if arr.dtype in (np.int8, np.int32):
+        if arr.dtype in (np.int8, np.int32, np.bool_):
             raw = arr.tobytes()
         else:
             raw = arr.astype(np.float32).tobytes()
@@ -824,7 +825,7 @@ def _constant_operand_payload(
     A float Add or Mul with its constant second is left without one: every
     runtime reads that form, older ones included.
     """
-    if op.op_type not in BINARY_OPS or len(op.inputs) != 2:
+    if op.op_type not in BINARY_OPS or len(op.inputs) != (3 if op.op_type == "Where" else 2):
         return None
     positions = [i for i, name in enumerate(op.inputs) if name in ag.weight_data]
     output = ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
@@ -839,7 +840,7 @@ def _constant_operand_payload(
                               output.layout)
     by_length = (all(dim == 1 for dim in stored) or stored == stored_output or (
         all(dim == 1 for dim in stored[:-1]) and stored[-1] == stored_output[-1]))
-    if ag.is_quantized:
+    if ag.tensors[name].dtype == 3:
         if name not in quant_idx_map:
             raise ValueError(f"constant operand {name!r} of {op.name!r} has no quantization")
         index = quant_idx_map[name]
@@ -895,6 +896,11 @@ def _build_op_attributes(
                 struct.pack("<f", float(op.attrs.get("epsilon", 1e-6 if op.op_type == "L2Normalization" else 1e-5))),
             ))
             continue
+        if op.op_type in {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"} and ag.is_quantized:
+            pairs = [_compute_multiplier_shift(float(ag.tensors[n].quant.scale[0])) for n in op.inputs]
+            pairs = [(0, 0) if shift < -31 else (value, shift) for value, shift in pairs]
+            records.append((op_index, OP_ATTR_COMPARISON_REQUANT,
+                            struct.pack("<5i", 8, *(v for pair in pairs for v in pair))))
         if op.op_type in ("Add", "Sub"):
             payload = _binary_requant_payload(ag, op)
             if payload is not None:

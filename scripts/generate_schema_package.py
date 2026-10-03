@@ -32,6 +32,7 @@ def schema_package() -> dict[str, object]:
             "constant_operand": defs.OP_ATTR_CONSTANT_OPERAND,
             "cumsum_options": defs.OP_ATTR_CUMSUM_OPTIONS,
             "movement": defs.OP_ATTR_MOVEMENT,
+            "comparison_requant": defs.OP_ATTR_COMPARISON_REQUANT,
             "epsilon": defs.OP_ATTR_EPSILON,
             "pads": defs.OP_ATTR_PADS,
             "pool_rounding": defs.OP_ATTR_POOL_ROUNDING,

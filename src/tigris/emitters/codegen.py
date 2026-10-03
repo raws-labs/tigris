@@ -155,19 +155,26 @@ def _build_limit_assertions(plan: dict) -> str:
 
 def _plan_dtype(plan: dict) -> DTypeMode:
     """Resolve the graph-wide runtime dtype from serialized tensors."""
+    constants = {a["op_index"]: a["data"][0] for a in plan.get("op_attributes", [])
+                 if a["type"] == 9 and a["data"]}
+    operators = []
+    for index, op in enumerate(plan.get("ops", [])):
+        inputs = list(op["inputs"])
+        if index in constants:
+            inputs.insert(constants[index], None)
+        operators.append((OP_TYPE_BY_CODE.get(op["op_type"], ""), inputs, op["outputs"]))
     by_dtype, issues = check_dtype_signatures(
         [(index, tensor["dtype"], bool(tensor.get("flags", 0) & 1),
           tensor.get("quant_param_idx", 65535) != 65535)
          for index, tensor in enumerate(plan.get("tensors", []))],
-        [(OP_TYPE_BY_CODE.get(op["op_type"], ""), op["inputs"], op["outputs"])
-         for op in plan.get("ops", [])],
+        operators,
         plan.get("model_inputs", []), plan.get("model_outputs", []))
     if issues:
         raise ValueError("Plan dtype signature mismatch: " + "; ".join(issues))
     tensor_dtypes = set(by_dtype)
     num_quant_params = plan.get("num_quant_params", 0)
 
-    if tensor_dtypes == {1} and num_quant_params == 0:
+    if tensor_dtypes <= {1} and num_quant_params == 0:
         return "float32"
     if tensor_dtypes == {3} and num_quant_params > 0:
         return "int8"
