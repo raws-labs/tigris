@@ -348,6 +348,22 @@ INDEXING = {
 if _xla is not None:
     INDEXING["dynamic_update_slice"] = _binary(
         lambda x, u: _xla.dynamic_update_slice(x, u, tf.constant([0, 3, 1, 0])), _MAP, (1, 2, 3, 4))
+# Indices supplied at run time: int32 inputs drawn from [low, high), keyed by
+# case and input position. Dynamic update starts reach past both ends, where
+# TFLite clamps them.
+INDEX_INPUTS = {"gather_runtime": {1: (0, 6)}, "gather_nd_runtime": {1: (0, 6)},
+                "embedding_lookup_runtime": {1: (0, 6)},
+                "dynamic_update_slice_runtime": {2: (-2, 7)}}
+INDEXING.update({
+    "gather_runtime": ([_MAP, (3,)], lambda x, i: tf.gather(x, i, axis=2)),
+    "gather_nd_runtime": ([(6, 6, 4), (3, 2)], lambda x, i: tf.gather_nd(x, i)),
+    "embedding_lookup_runtime": ([(6, 4), (4,)], lambda x, i: tf.gather(x, i)),
+    "arg_max_gather": _unary(lambda x: tf.gather(x, tf.argmax(x, 0, output_type=tf.int32)),
+                             (6, 4)),
+})
+if _xla is not None:
+    INDEXING["dynamic_update_slice_runtime"] = (
+        [_MAP, (1, 2, 3, 4), (4,)], lambda x, u, s: _xla.dynamic_update_slice(x, u, s))
 # A Keras LSTM unrolled over its time steps, which the converter writes as
 # plain operators; seeded weights keep the case reproducible.
 _LSTM = tf.keras.layers.LSTM(4, return_sequences=True, unroll=True,
@@ -452,6 +468,7 @@ def _embedding_lookup(model: bytes) -> bytes:
 
 
 REWRITES["embedding_lookup"] = _embedding_lookup
+REWRITES["embedding_lookup_runtime"] = _embedding_lookup
 # The tier-1 cases again, converted without quantization.
 _FLOAT_TIER1 = (
     "max_pool_valid", "max_pool_same", "avg_pool_valid", "avg_pool_same", "concat_channels",
@@ -477,19 +494,24 @@ CASES.update(FLOAT_MODELS)
 REWRITES.update({"elu": _int8_island(), "cumsum": _int8_island(True),
                  "cumsum_exclusive_reverse": _int8_island(True),
                  "dynamic_update_slice": _int8_island(shared=True),
+                 "dynamic_update_slice_runtime": _int8_island(shared=True),
                  "not_equal": _int8_island(), "add_n": _int8_island(),
                  "cumsum_offset": _int8_island(),
                  "cumsum_offset_exclusive_reverse": _int8_island()})
 
 
-def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True, trackable=None):
-    specs = [tf.TensorSpec(shape, tf.float32) for shape in shapes]
+def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True, trackable=None,
+             index_inputs=None):
+    index_inputs = index_inputs or {}
+    specs = [tf.TensorSpec(shape, tf.int32 if i in index_inputs else tf.float32)
+             for i, shape in enumerate(shapes)]
     concrete = tf.function(fn).get_concrete_function(*specs)
 
     def representative():
         for _ in range(64):
-            yield [rng.uniform(lo, hi, shape).astype(np.float32)
-                   for shape, (lo, hi) in zip(shapes, ranges)]
+            yield [rng.integers(*index_inputs[i], shape, dtype=np.int32) if i in index_inputs
+                   else rng.uniform(lo, hi, shape).astype(np.float32)
+                   for i, (shape, (lo, hi)) in enumerate(zip(shapes, ranges))]
 
     converter = tf.lite.TFLiteConverter.from_concrete_functions(
         [concrete], trackable if trackable is not None else tf.function(fn))
@@ -503,8 +525,10 @@ def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True, trackable=N
     return converter.convert()
 
 
-def _inputs(details, rng, value_range=None):
+def _inputs(details, rng, value_range=None, index_range=None):
     shape = (SAMPLES, *details["shape"])
+    if index_range is not None:
+        return rng.integers(*index_range, shape, dtype=np.int32)
     if details["dtype"] == np.float32:
         return rng.uniform(*(value_range or (-3.0, 3.0)), shape).astype(np.float32)
     if value_range is None:
@@ -521,7 +545,8 @@ def generate(name: str) -> bool:
     ranges = RANGES.get(name)
     model = _convert(fn, shapes, ranges or [(-3.0, 3.0)] * len(shapes), rng,
                      float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS,
-                     trackable=TRACKABLES.get(name.removeprefix("float_")))
+                     trackable=TRACKABLES.get(name.removeprefix("float_")),
+                     index_inputs=INDEX_INPUTS.get(name.removeprefix("float_")))
     if name in REWRITES:
         model = REWRITES[name](model)
     micro_interpreter = micro.Interpreter.from_bytes(model, arena_size=1024 * 1024)
@@ -543,7 +568,8 @@ def generate(name: str) -> bool:
         # TFLite's reference resolver lacks some operators (CEIL, ELU, int8
         # CUMSUM); TFLite Micro's outputs are recorded unchecked for those.
         reference = None
-    inputs = [_inputs(found, rng, ranges[i] if ranges else None)
+    index_inputs = INDEX_INPUTS.get(name.removeprefix("float_"), {})
+    inputs = [_inputs(found, rng, ranges[i] if ranges else None, index_inputs.get(i))
               for i, found in enumerate(details)]
     if name == "div":
         # TFLite refuses a divisor whose raw byte is 0; keep its value nonzero too.
