@@ -272,7 +272,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     if op.kind not in _SUPPORTED:
         return "not supported"
     ins = [tensors[i] if i >= 0 else None for i in op.inputs]
-    outs = op_outputs = [tensors[i] for i in op.outputs]
+    outs = [tensors[i] for i in op.outputs]
     for position in _CONSTANT_OPERANDS.get(op.kind, ()):
         if position < len(ins) and ins[position] is not None and not _is_constant(ins[position]):
             return f"input {position} must be a constant"
@@ -306,9 +306,6 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                 and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
         if bool_output:
             outs = []
-        dynamic = [t for t in ins if t is not None and not _is_constant(t)]
-        if op.kind != "REDUCE_ALL" and any(len(t.shape) != len(op_outputs[0].shape) for t in dynamic):
-            return "operands of different rank"
     if op.kind in _INDEX:
         if outs[0].type != "INT32":
             return f"{outs[0].type} indices; TFLite Micro writes int32"
@@ -331,15 +328,8 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         fused = _activation(op.option(_FUSED_SLOT[op.kind], "b"))
         if fused not in ("none", "relu", "relu6"):
             return f"fused {fused}"
-    rank = len(op_outputs[0].shape)
-    if op.kind in ("ADD", "SUB", "MUL"):
-        for operand in ins:
-            if not _is_constant(operand) and len(operand.shape) != rank:
-                return "operands of different rank"
-    if op.kind in _ELEMENTWISE_BINARY:
-        dynamic = [t for t in ins if not _is_constant(t)]
-        if not dynamic or any(len(t.shape) != rank for t in dynamic):
-            return "operands of different rank"
+    if op.kind in _ELEMENTWISE_BINARY and all(_is_constant(t) for t in ins):
+        return "only constant operands"
     if op.kind == "CONCATENATION" and outs[0].type == "INT8":
         if any(t.scale[0] != outs[0].scale[0] or t.zero_point[0] != outs[0].zero_point[0] for t in data):
             return "inputs quantized differently from the output"
@@ -430,8 +420,6 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
         if any(op.option(4, "i") >> axis & 1 and step < 0 for axis, step in enumerate(steps)):
             # TFLite Micro leaves such an output unwritten.
             return "a dropped axis with a negative stride"
-    if op.kind == "GATHER" and op.option(1, "i"):
-        return "batch dimensions"
     if op.kind == "REVERSE_V2":
         axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
         if not axes or axes != list(range(axes[0], axes[-1] + 1)):
@@ -530,9 +518,23 @@ class _Converter:
                                            axis=axis)
 
     def operands(self, op: _Operator) -> list[str]:
-        """A binary operator's operands, a constant aligned to the output's rank."""
+        """A broadcasting operator's operands at the output's rank: a constant
+        aligned when it is built, a lower-rank tensor reshaped with leading
+        ones in TFLite's axis order, as TFLite broadcasts from the right."""
         rank = len(self.tensors[op.outputs[0]].shape)
-        return [self.value(i, rank if i not in self.values else None) for i in op.inputs]
+        result = []
+        for i in op.inputs:
+            if i not in self.values:
+                result.append(self.value(i, rank))
+                continue
+            shape = list(self.tensors[i].shape)
+            if len(shape) == rank:
+                result.append(self.values[i])
+                continue
+            tag = f"{self.tensors[i].name}_rank{rank}"
+            full = [1] * (rank - len(shape)) + shape
+            result.append(self.held(self.reshape(self.values[i], shape, full, tag, i), i, tag + "_q"))
+        return result
 
     def slice_axis(self, x: str, shape, axis: int, begin: int, size: int, tag: str,
                    index: int, hold: bool) -> str:
@@ -971,7 +973,13 @@ class _Converter:
         x = self.last_to_last(self.value(data), rank, tag + "_last", data, True)
         indices = self.b.constant(np.asarray(self.tensors[ids].array(), np.int64), tag + "_indices")
         attributes = {} if axis is None else {"axis": axis % rank}
-        y = self.b.node(kind, [x, indices], tag + "_gathered", **attributes)
+        batch = op.option(1, "i") if op.kind == "GATHER" else 0
+        if batch:
+            # ONNX Gather has no batch dimensions; the compiler's own form does.
+            y = self.custom("Gather", [x, indices], tag + "_gathered",
+                            self.tensors[op.outputs[0]].shape, batch_dims=batch, **attributes)
+        else:
+            y = self.b.node(kind, [x, indices], tag + "_gathered", **attributes)
         return self.tflite_order_out(y, op.outputs[0], tag)
 
     def _strided_slice(self, op: _Operator, tag: str) -> str:

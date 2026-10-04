@@ -120,6 +120,11 @@ CASES.update({
 _ROWS = np.linspace(-1.0, 1.5, 6).reshape(1, 6, 1, 1).astype(np.float32)
 CASES.update({
     "add_broadcast_rows": _binary(tf.add, _MAP, (1, 6, 1, 4)),
+    "add_rank": _binary(tf.add, _MAP, (6, 4)),
+    "mul_rank_vector": _binary(tf.multiply, _MAP, (4,)),
+    "maximum_rank": _binary(tf.maximum, (6, 1, 4), _MAP),
+    "less_rank": _binary(tf.less, _MAP, (6, 1, 4)),
+    "select_v2_rank": _binary(lambda x, y: tf.where(x > 0.5, x, y), _MAP, (4,)),
     "mul_broadcast_both": _binary(tf.multiply, (1, 6, 1, 4), (1, 1, 6, 4)),
     "sub_broadcast_first": _binary(tf.subtract, (1, 1, 6, 4), _MAP),
     "add_constant_rows": _unary(lambda x: x + _ROWS, _MAP),
@@ -317,6 +322,11 @@ INDEXING = {
     "gather_indices": _unary(lambda x: tf.gather(x, [4, 0, 4, 2], axis=2), _MAP),
     "gather_matrix": _unary(lambda x: tf.gather(x, [[0, 2], [5, 5]], axis=1), _MAP),
     "gather_nd": _unary(lambda x: tf.gather_nd(x, [[0, 1], [0, 4], [0, 1]]), _MAP),
+    "gather_batch": _unary(lambda x: tf.gather(x, [[4, 0, 4], [1, 2, 3]], axis=1, batch_dims=1),
+                           (2, 5, 4)),
+    "gather_batch_matrix": _unary(
+        lambda x: tf.gather(x, [[[1, 0], [2, 2]], [[0, 3], [3, 1]]], axis=2, batch_dims=1),
+        (2, 3, 4, 2)),
     "strided_slice_steps": _unary(lambda x: x[:, ::2, 5:0:-2, :], _MAP),
     "mirror_pad_reflect": _unary(
         lambda x: tf.pad(x, [[0, 0], [1, 2], [2, 1], [0, 0]], "REFLECT"), _MAP),
@@ -401,6 +411,7 @@ _FLOAT_TIER1 = (
     "pad_conv", "pad", "padv2", "squeeze_op", "expand_dims_op", "softmax", "pack", "unpack",
     "slice", "strided_slice", "strided_slice_shrink", "gather", "gather_scalar",
     "space_to_depth", "depth_to_space", "space_to_batch", "batch_to_space", "broadcast_to",
+    "add_rank", "mul_rank_vector", "maximum_rank", "less_rank", "select_v2_rank",
     *ACTIVATIONS, *INDEXING, *BOOLEAN,
 )
 FLOAT_MODELS["float_l2_pool"] = CASES["float_l2_pool"]
