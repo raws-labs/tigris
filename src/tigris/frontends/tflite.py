@@ -633,8 +633,8 @@ class _Converter:
         elif kind in ("ADD", "SUB", "MUL"):
             y = b.node({"ADD": "Add", "SUB": "Sub", "MUL": "Mul"}[kind], self.operands(op), tag)
         elif kind == "CONCATENATION":
-            y = b.node("Concat", [self.value(i) for i in ins], tag,
-                       axis=_onnx_axis(op.option(0, "i"), len(out.shape)))
+            y = self._concat([(self.value(i), list(self.tensors[i].shape), i) for i in ins],
+                             op.option(0, "i") % len(out.shape), outs[0], tag)
         elif kind in _ELEMENTWISE_UNARY:
             y = b.node(_ELEMENTWISE_UNARY[kind], [self.value(ins[0])], tag)
         elif kind == "RSQRT":
@@ -801,10 +801,10 @@ class _Converter:
             for step, i in enumerate(ins):
                 shape = list(self.tensors[i].shape)
                 expanded = shape[:axis] + [1] + shape[axis:]
-                parts.append(self.held(self.reshape(self.value(i), shape, expanded,
-                                                    f"{tag}_part{step}", i), i,
-                                       f"{tag}_part{step}_q"))
-            y = b.node("Concat", parts, tag, axis=_onnx_axis(axis, len(out.shape)))
+                parts.append((self.held(self.reshape(self.value(i), shape, expanded,
+                                                     f"{tag}_part{step}", i), i,
+                                        f"{tag}_part{step}_q"), expanded, i))
+            y = self._concat(parts, axis, outs[0], tag)
         elif kind == "UNPACK":
             source = self.tensors[ins[0]]
             axis = op.option(1, "i") % len(source.shape)
@@ -893,6 +893,29 @@ class _Converter:
         else:
             raise ValueError(f"no conversion for {kind}")
         self.finish(b.fused_activation(y, fused, tag), outs[0])
+
+    def _concat(self, parts, axis: int, index: int, tag: str) -> str:
+        """Concatenation along TFLite axis `axis` of (value, TFLite shape,
+        tensor index) parts. The runtime concatenates ranks 3 and 4 along any
+        axis but the first; elsewhere every part becomes [1, outer, run], the
+        outer axes before `axis` and the run from it, joined along the run
+        and reshaped back, which places the elements alike."""
+        b = self.b
+        shape = list(self.tensors[index].shape)
+        rank = len(shape)
+        if rank in (3, 4) and axis > 0:
+            return b.node("Concat", [value for value, _, _ in parts], tag,
+                          axis=_onnx_axis(axis, rank))
+        outer = int(np.prod(shape[:axis]))
+        flat = []
+        for step, (value, part_shape, part) in enumerate(parts):
+            run = [1, outer, int(np.prod(part_shape[axis:]))]
+            flat.append(self.held(self.reshape(value, part_shape, run, f"{tag}_run{step}", part),
+                                  part, f"{tag}_run{step}_q"))
+        joined = self.held(b.node("Concat", flat, tag + "_runs", axis=_onnx_axis(2, 3)), index,
+                           tag + "_runs_q")
+        total = [1, outer, int(np.prod(shape[axis:]))]
+        return self.reshape(joined, total, shape, tag, index)
 
     def _l2_normalization(self, op: _Operator, tag: str) -> str:
         """x / max(sqrt(sum(x * x)), 1e-6) over the last TFLite axis, as TFLite
