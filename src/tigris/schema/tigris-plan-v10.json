@@ -17,12 +17,14 @@
     "clip_bounds": 4,
     "comparison_requant": 13,
     "constant_operand": 9,
+    "constants": 14,
     "cumsum_options": 11,
     "epsilon": 2,
     "movement": 12,
     "pads": 5,
     "pool_rounding": 8,
     "resize_scales": 10,
+    "svdf": 15,
     "transpose_perm": 1
   },
   "op_types": {
@@ -106,6 +108,7 @@
     "StridedSlice": 68,
     "Sub": 18,
     "Sum": 83,
+    "Svdf": 85,
     "Tanh": 20,
     "Transpose": 29,
     "Unsqueeze": 28,
@@ -158,6 +161,7 @@
     "capability_growth_requires_schema_bump": false,
     "scope": "wire_format",
     "stage_assignment_v5": "stage table authoritative; operator byte is canonical low-byte hint",
+    "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
     "state_v10": "only a plan with a state section is written at schema 10"
   }
 }

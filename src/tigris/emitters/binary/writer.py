@@ -21,6 +21,7 @@ from tigris.graph.ir import (
     serialized_axis_map,
     serialized_shape,
     serialized_transpose_perm,
+    state_tensor_names,
 )
 
 from .defs import (
@@ -40,6 +41,8 @@ from .defs import (
     OP_ATTR_CUMSUM_OPTIONS,
     OP_ATTR_MOVEMENT,
     OP_ATTR_COMPARISON_REQUANT,
+    OP_ATTR_CONSTANTS,
+    OP_ATTR_SVDF,
     OP_ATTR_ALPHA,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
@@ -486,8 +489,8 @@ def _build_weights(
         # Preserve ONNX flatten/reshape order across the internal layout change.
         if name in fc_layout_shapes:
             arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
-        # Preserve int8/int32 dtype for quantized weights
-        if arr.dtype in (np.int8, np.int32, np.bool_):
+        # Preserve the integer dtypes of quantized weights
+        if arr.dtype in (np.int8, np.int16, np.int32, np.bool_):
             raw = arr.tobytes()
         else:
             raw = arr.astype(np.float32).tobytes()
@@ -576,7 +579,7 @@ def _build_weights_compressed(
             arr = _transpose_weight_nhwc(arr, op_type)
         if name in fc_layout_shapes:
             arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
-        if arr.dtype in (np.int8, np.int32, np.bool_):
+        if arr.dtype in (np.int8, np.int16, np.int32, np.bool_):
             raw = arr.tobytes()
         else:
             raw = arr.astype(np.float32).tobytes()
@@ -699,13 +702,10 @@ def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
 
 
 def _state_names(ag: AnalyzedGraph) -> set[str]:
-    """The model inputs and outputs that carry variables, not the interface."""
-    names = set()
-    for port in ag.state_ports:
-        names.add(ag.model_inputs[port.input])
-        if port.output is not None:
-            names.add(ag.model_outputs[port.output])
-    return names
+    return state_tensor_names(ag)
+
+
+_STATE_DTYPES = {1: np.float32, 3: np.int8, 5: np.int16}
 
 
 def _build_state(ag: AnalyzedGraph, tensor_idx: dict[str, int]) -> bytes:
@@ -729,7 +729,7 @@ def _build_state(ag: AnalyzedGraph, tensor_idx: dict[str, int]) -> bytes:
         axis_map = serialized_axis_map(len(info.shape), info.layout)
         perm = sorted(range(len(axis_map)), key=lambda axis: axis_map[axis])
         value = np.ascontiguousarray(
-            np.asarray(port.initial, np.float32).reshape(info.shape).transpose(perm))
+            np.asarray(port.initial, _STATE_DTYPES[info.dtype]).reshape(info.shape).transpose(perm))
         data = value.tobytes()
         entries.append(struct.pack("<HHIII", tensor_idx[name],
                                    tensor_idx[out] if out is not None else 0xFFFF,
@@ -904,9 +904,25 @@ def _constant_operand_payload(
     return payload
 
 
+def _svdf_payload(ag: AnalyzedGraph, op: OpNode) -> bytes:
+    """The rank; for int8 also the state zero point and the two requantizations,
+    each scale formed in float32 as TFLite Micro forms it."""
+    rank = int(op.attrs["rank"])
+    if not ag.is_quantized:
+        return struct.pack("<i", rank)
+    f32 = np.float32
+    x_scale = f32(ag.tensors[op.inputs[0]].quant.scale[0])
+    y_scale = f32(ag.tensors[op.outputs[0]].quant.scale[0])
+    feature, time, state = (f32(op.attrs[key]) for key in ("feature_scale", "time_scale", "state_scale"))
+    first = _compute_multiplier_shift(float(x_scale * feature / state))
+    second = _compute_multiplier_shift(float(state * time / y_scale))
+    return struct.pack("<6i", rank, int(op.attrs["state_zero_point"]), *first, *second)
+
+
 def _build_op_attributes(
     ag: AnalyzedGraph, tensor_idx: dict[str, int],
     quant_idx_map: dict[str, int] | None = None,
+    weight_idx: dict[str, int] | None = None,
 ) -> bytes:
     """Build optional, typed per-operator attributes.
 
@@ -919,6 +935,13 @@ def _build_op_attributes(
         constant = _constant_operand_payload(ag, op, quant_idx_map or {})
         if constant is not None:
             records.append((op_index, OP_ATTR_CONSTANT_OPERAND, constant))
+        if op.op_type in _MANY_CONSTANTS:
+            indices = [(weight_idx or {}).get(name, NO_WEIGHT) for name in op.inputs
+                       if name not in tensor_idx]
+            records.append((op_index, OP_ATTR_CONSTANTS, struct.pack(f"<{len(indices)}H", *indices)))
+        if op.op_type == "Svdf":
+            records.append((op_index, OP_ATTR_SVDF, _svdf_payload(ag, op)))
+            continue
         if op.op_type in {"Resize", "ResizeLinear"}:
             scales = op.attrs.get("resize_scales")
             if scales is not None:
@@ -1027,6 +1050,10 @@ def _build_op_attributes(
     )
 
 
+# Operators whose constants are listed by OP_ATTR_CONSTANTS, not weight and bias.
+_MANY_CONSTANTS = {"Svdf"}
+
+
 def _resolve_weight_bias(op: OpNode, weight_idx: dict[str, int]) -> tuple[int, int]:
     """Map an op's constant inputs to weight/bias indices.
 
@@ -1123,7 +1150,8 @@ def _build_ops(
         spatial = _pack_spatial_attrs(op, ag.weight_data)
 
         # Resolve weight/bias indices from op's constant inputs
-        w_idx, b_idx = _resolve_weight_bias(op, weight_idx)
+        w_idx, b_idx = ((NO_WEIGHT, NO_WEIGHT) if op.op_type in _MANY_CONSTANTS
+                        else _resolve_weight_bias(op, weight_idx))
 
         # Determine fused activation
         fused_act_str = op.attrs.get("fused_activation")
@@ -1639,7 +1667,7 @@ def emit_binary_bytes(
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
     op_attributes_data = _build_op_attributes(
-        ag, tensor_idx, quant_idx_map
+        ag, tensor_idx, quant_idx_map, weight_idx
     )
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
     tile_data, stage_to_tile = _build_tile_plans(ag)

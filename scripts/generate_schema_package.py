@@ -33,6 +33,8 @@ def schema_package() -> dict[str, object]:
             "cumsum_options": defs.OP_ATTR_CUMSUM_OPTIONS,
             "movement": defs.OP_ATTR_MOVEMENT,
             "comparison_requant": defs.OP_ATTR_COMPARISON_REQUANT,
+            "constants": defs.OP_ATTR_CONSTANTS,
+            "svdf": defs.OP_ATTR_SVDF,
             "epsilon": defs.OP_ATTR_EPSILON,
             "pads": defs.OP_ATTR_PADS,
             "pool_rounding": defs.OP_ATTR_POOL_ROUNDING,
@@ -66,6 +68,7 @@ def schema_package() -> dict[str, object]:
                 "stage table authoritative; operator byte is canonical low-byte hint"
             ),
             "state_v10": "only a plan with a state section is written at schema 10",
+            "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
         },
         "section_alignment": defs.PLAN_SECTION_ALIGNMENT,
         "tensor_flags": {

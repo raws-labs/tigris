@@ -70,9 +70,15 @@ OP_ATTR_MOVEMENT = 12  # int32 metadata, interpreted by the data movement opcode
 OP_ATTR_CUMSUM_OPTIONS = 11  # uint8[2], exclusive then reverse (each 0 or 1)
 
 OP_ATTR_COMPARISON_REQUANT = 13  # int32[5]: left shift, then two multiplier/shift pairs
+OP_ATTR_CONSTANTS = 14  # uint16 weight index per constant operand, in operand order;
+                        # NO_WEIGHT for an absent optional one
+OP_ATTR_SVDF = 15  # int32: rank; for int8 also the state zero point and the
+                   # input-to-state and state-to-output multiplier/shift pairs
 
 OP_ATTR_KINDS = (
     OP_ATTR_COMPARISON_REQUANT,
+    OP_ATTR_CONSTANTS,
+    OP_ATTR_SVDF,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ATTR_EPSILON,
     OP_ATTR_ALPHA,
@@ -180,6 +186,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "Cast": 82,
     "Sum": 83,
     "ReduceAll": 84,
+    "Svdf": 85,
 }
 OP_TYPE_UNKNOWN = 255
 

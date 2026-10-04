@@ -19,7 +19,7 @@ from tigris.capabilities import (
     resolve_kernel_backend,
 )
 from tigris.dtypes import check_dtype_signatures
-from tigris.emitters.binary.defs import FLAG_XIP
+from tigris.emitters.binary.defs import FLAG_XIP, TENSOR_FLAG_STATE
 from tigris.emitters.binary.reader import read_binary_plan
 
 
@@ -170,7 +170,9 @@ def _plan_dtype(plan: dict) -> DTypeMode:
           tensor.get("quant_param_idx", 65535) != 65535)
          for index, tensor in enumerate(plan.get("tensors", []))],
         operators,
-        plan.get("model_inputs", []), plan.get("model_outputs", []))
+        plan.get("model_inputs", []), plan.get("model_outputs", []),
+        [index for index, tensor in enumerate(plan.get("tensors", []))
+         if tensor.get("flags", 0) & TENSOR_FLAG_STATE])
     if issues:
         raise ValueError("Plan dtype signature mismatch: " + "; ".join(issues))
     tensor_dtypes = set(by_dtype)

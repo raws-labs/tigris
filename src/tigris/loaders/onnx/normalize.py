@@ -56,6 +56,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
     declared_outputs = list(ag.model_outputs)
     ag = _adopt_tflite_cumsum(ag)
+    ag = _adopt_svdf(ag)
     ag = _normalize_arg_outputs(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
@@ -2909,6 +2910,40 @@ def _adopt_tflite_cumsum(ag: AnalyzedGraph) -> AnalyzedGraph:
         if op.op_type == "tigris::CumSum":
             op.op_type = "CumSum"
             op.attrs["tflite_seeded"] = 1
+    return ag
+
+
+def _adopt_svdf(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """The compiler's own SVDF: input [batch, features], constant feature
+    [filters, features], time [filters, memory] and bias [units] weights, and a
+    state [batch, filters * memory] passed in and written back."""
+    for op in ag.ops:
+        if op.op_type != "tigris::Svdf":
+            continue
+        op.op_type = "Svdf"
+        if len(op.inputs) != 5 or len(op.outputs) != 2:
+            raise ValueError("Svdf requires five inputs and two outputs")
+        x, y = ag.tensors[op.inputs[0]], ag.tensors[op.outputs[0]]
+        feature, time, bias = (ag.weight_data.get(name) for name in op.inputs[1:4])
+        state, kept = ag.tensors[op.inputs[4]], ag.tensors[op.outputs[1]]
+        rank = int(op.attrs.get("rank", 0))
+        if feature is None or time is None or bias is None:
+            raise ValueError("Svdf requires constant feature, time and bias weights")
+        if len(x.shape) != 2 or feature.ndim != 2 or time.ndim != 2 or bias.ndim != 1:
+            raise ValueError("Svdf requires a rank-2 input and rank-2 weights")
+        batch, features = x.shape
+        filters, memory = time.shape
+        if (rank <= 0 or filters % rank or feature.shape != (filters, features)
+                or bias.shape != (filters // rank,) or tuple(y.shape) != (batch, filters // rank)
+                or tuple(state.shape) != (batch, filters * memory) or kept.shape != state.shape):
+            raise ValueError("Svdf shapes do not agree with its rank")
+        activation = op.attrs.pop("activation", "none")
+        if isinstance(activation, bytes):
+            activation = activation.decode()
+        if activation not in ("none", "relu", "relu6"):
+            raise ValueError(f"Svdf activation {activation!r} is not supported")
+        if activation != "none":
+            op.attrs["fused_activation"] = {"relu": "Relu", "relu6": "Relu6"}[activation]
     return ag
 
 

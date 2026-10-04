@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import re
 import subprocess
@@ -41,6 +42,7 @@ from tigris.emitters.binary.defs import (
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
 from tigris.fixtures import build_tcn
+from tigris.frontends.tflite import STATE_KEY
 from tigris.graph.ir import Stage
 
 # The byte-level line-buffer flag decoder already exists in the compiler's
@@ -842,6 +844,55 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = F
                         expect_tiled=tiled, reference_unoptimized=True,
                         compression="lz4" if kind == "Gather" and variant == 0 and not tiled else None)
 
+
+
+def _svdf_case() -> ContractCase:
+    """A float SVDF with a fused Relu, run once from its zero initial state, so
+    each filter's time projection sees only the newest slot of its memory."""
+    rng = np.random.default_rng(85)
+    batch, features, units, rank, memory = 2, 6, 3, 2, 4
+    filters = units * rank
+    feature = rng.normal(0.0, 0.5, (filters, features)).astype(np.float32)
+    time = rng.normal(0.0, 0.5, (filters, memory)).astype(np.float32)
+    bias = rng.normal(0.0, 0.3, (units,)).astype(np.float32)
+    x = rng.uniform(-2.0, 2.0, (batch, features)).astype(np.float32)
+    shape_x, shape_y, shape_s = [batch, features], [batch, units], [batch, filters * memory]
+    weights = [numpy_helper.from_array(feature, "feature"), numpy_helper.from_array(time, "time"),
+               numpy_helper.from_array(bias, "bias"),
+               numpy_helper.from_array(np.zeros(shape_s, np.float32), "state_initial")]
+    compile_graph = helper.make_graph(
+        [helper.make_node("Svdf", ["x", "feature", "time", "bias", "state_in"], ["y", "state_out"],
+                          domain="tigris", rank=rank, activation="relu")],
+        "svdf",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape_x),
+         helper.make_tensor_value_info("state_in", TensorProto.FLOAT, shape_s)],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape_y),
+         helper.make_tensor_value_info("state_out", TensorProto.FLOAT, shape_s)],
+        weights,
+        value_info=[helper.make_tensor_value_info("y", TensorProto.FLOAT, shape_y),
+                    helper.make_tensor_value_info("state_out", TensorProto.FLOAT, shape_s)])
+    compile_model = helper.make_model(compile_graph, opset_imports=[
+        helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    compile_model.ir_version = 9
+    helper.set_model_props(compile_model, {STATE_KEY: json.dumps(
+        [{"input": "state_in", "output": "state_out", "initial": "state_initial"}])})
+    reference = _model(
+        "svdf_reference",
+        [helper.make_node("MatMul", ["x", "feature_t"], ["projection"]),
+         helper.make_node("Mul", ["projection", "newest"], ["weighted"]),
+         helper.make_node("Reshape", ["weighted", "grouped_shape"], ["grouped"]),
+         helper.make_node("ReduceSum", ["grouped", "rank_axis"], ["summed"], keepdims=0),
+         helper.make_node("Add", ["summed", "bias"], ["biased"]),
+         helper.make_node("Relu", ["biased"], ["y"])],
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape_x)],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape_y)],
+        [numpy_helper.from_array(np.ascontiguousarray(feature.T), "feature_t"),
+         numpy_helper.from_array(np.ascontiguousarray(time[:, -1]), "newest"),
+         numpy_helper.from_array(np.asarray([batch, units, rank], np.int64), "grouped_shape"),
+         numpy_helper.from_array(np.asarray([2], np.int64), "rank_axis"),
+         numpy_helper.from_array(bias, "bias")])
+    return ContractCase(name="svdf_relu", compile_model=compile_model, reference_model=reference,
+                        inputs={"x": x}, expected_operators=("Svdf",))
 
 
 def _runtime_index_case(kind: str, quantized: bool, variant: int = 0, arg: str | None = None,
@@ -6918,6 +6969,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _convtranspose_2d_tiled_case(),
         _qdq_convtranspose_2d_tiled_case(),
         _convtranspose_2d_partial_edge_case(),
+        _svdf_case(),
     ]
     covered_operators = {
         operator for case in cases for operator in case.expected_operators

@@ -112,6 +112,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Sum",
     "ReduceAll",
     "Split",
+    "Svdf",
 })
 
 _S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS - frozenset({
@@ -248,6 +249,7 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "ReduceMax": ("one axis of a rank-3 tensor; independent height or row bands; rank-4 spatial max with keepdims uses GlobalMaxPool; int8 quantization must match",),
     "ReduceMin": ("one axis of a rank-3 tensor; independent height or row bands; int8 quantization must match",),
     "ReduceAll": ("one axis of a rank-3 bool tensor; independent height or row bands",),
+    "Svdf": ("state kept between runs; int8 with int16 state and time weights; untiled",),
     "ReduceSum": ("one axis of a rank-3 tensor; independent height or row bands; int8 rejects reference arithmetic overflow",),
     "Gather": ("constant or runtime int32 indices; independent bands with constant indices; identical int8 quantization",),
     "GatherND": ("constant or runtime int32 indices; independent bands with constant indices; identical int8 quantization",),

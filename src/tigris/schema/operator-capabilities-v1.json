@@ -1111,6 +1111,19 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "constraints": [
+        "state kept between runs; int8 with int16 state and time weights; untiled"
+      ],
+      "opcode": 85,
+      "operator": "Svdf",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
   "schema_version": 10,
