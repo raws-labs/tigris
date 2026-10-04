@@ -10,7 +10,7 @@ import struct
 import numpy as np
 import onnx
 import pytest
-from onnx import TensorProto, helper
+from onnx import TensorProto, helper, numpy_helper
 
 from tigris import TILE_AXIS_HW
 from tigris.analysis.validation import validate_memory_plan
@@ -33,10 +33,7 @@ def _build_high_res_conv(h: int, w: int, c: int) -> onnx.ModelProto:
     """
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, c, h, w])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, c, h, w])
-    w0 = helper.make_tensor(
-        "w0", TensorProto.FLOAT, [c, c, 3, 3],
-        np.zeros((c, c, 3, 3), dtype=np.float32).flatten().tolist(),
-    )
+    w0 = numpy_helper.from_array(np.zeros((c, c, 3, 3), dtype=np.float32), "w0")
     b0 = helper.make_tensor("b0", TensorProto.FLOAT, [c], np.zeros(c, dtype=np.float32).tolist())
     conv0 = helper.make_node(
         "Conv", ["input", "w0", "b0"], ["output"], name="conv0",

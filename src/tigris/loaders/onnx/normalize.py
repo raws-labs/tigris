@@ -2717,6 +2717,20 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
             raise ValueError(f"{op.op_type} indices or bounds must be int32 or int64")
         return value
 
+    def index_tensor(op, position):
+        if len(op.inputs) <= position or op.inputs[position] not in ag.tensors:
+            raise ValueError(f"{op.op_type} requires an index tensor")
+        name = op.inputs[position]
+        info = ag.tensors[name]
+        if info.dtype not in {6, 7} or info.quant is not None:
+            raise ValueError(f"{op.op_type} indices must be unquantized int32 or int64")
+        if not info.is_constant:
+            if info.dtype == 7 and name not in ag.model_inputs:
+                raise ValueError(f"{op.op_type} computed indices must be int32")
+            info.dtype = 6
+            info.layout = Layout.LINEAR
+        return info
+
     for op in ag.ops:
         if op.op_type in {f"tigris::{kind}" for kind in _MOVEMENT_OPS}:
             op.op_type = op.op_type.split("::", 1)[1]
@@ -2747,45 +2761,53 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
             raise ValueError(f"{op.op_type} requires identical per-tensor quantization")
         kind = op.op_type
         if kind in {"Gather", "GatherND", "EmbeddingLookup"}:
-            indices = constant(op, 1).copy()
-            if indices.ndim > 6 or indices.size == 0:
+            if len(op.inputs) != 2:
+                raise ValueError(f"{kind} requires data and indices")
+            info = index_tensor(op, 1)
+            indices = constant(op, 1).copy() if info.is_constant else None
+            index_shape = info.shape
+            index_rank = len(index_shape)
+            if index_rank > 6 or any(d <= 0 for d in index_shape):
                 raise ValueError(f"{kind} requires nonempty indices of rank at most 6")
             if kind == "GatherND":
-                if int(op.attrs.get("batch_dims", 0)) != 0 or indices.ndim == 0:
+                if int(op.attrs.get("batch_dims", 0)) != 0 or index_rank == 0:
                     raise ValueError("GatherND requires batch_dims=0 and nonscalar indices")
-                width = indices.shape[-1]
+                width = index_shape[-1]
                 if not 1 <= width <= min(rank, 5):
                     raise ValueError("GatherND index depth must fit the input rank and be at most 5")
-                for a in range(width):
-                    component = indices[..., a]
-                    if np.any(component < -shape[a]) or np.any(component >= shape[a]):
-                        raise ValueError("GatherND index is outside its dimension")
-                    indices[..., a] = np.where(component < 0, component + shape[a], component)
-                target = (*indices.shape[:-1], *shape[width:])
-                metadata = [indices.ndim, *indices.shape]
+                if indices is not None:
+                    for a in range(width):
+                        component = indices[..., a]
+                        if np.any(component < -shape[a]) or np.any(component >= shape[a]):
+                            raise ValueError("GatherND index is outside its dimension")
+                        indices[..., a] = np.where(component < 0, component + shape[a], component)
+                target = (*index_shape[:-1], *shape[width:])
+                metadata = [index_rank, *index_shape]
             else:
                 axis = 0 if kind == "EmbeddingLookup" else int(op.attrs.get("axis", 0))
                 batch = int(op.attrs.get("batch_dims", 0))
                 if batch < 0:
-                    batch += indices.ndim
-                if axis not in range(-rank, rank) or not 0 <= batch <= min(axis % rank, indices.ndim):
+                    batch += index_rank
+                if axis not in range(-rank, rank) or not 0 <= batch <= min(axis % rank, index_rank):
                     raise ValueError(f"{kind} axis or batch_dims is invalid")
                 axis %= rank
-                if kind == "EmbeddingLookup" and (rank < 2 or indices.ndim != 1 or batch != 0):
+                if kind == "EmbeddingLookup" and (rank < 2 or index_rank != 1 or batch != 0):
                     raise ValueError("EmbeddingLookup requires a rank-2-or-higher value and vector indices")
-                if tuple(indices.shape[:batch]) != shape[:batch]:
+                if tuple(index_shape[:batch]) != shape[:batch]:
                     raise ValueError("Gather batch dimensions must match")
-                if np.any(indices < -shape[axis]) or np.any(indices >= shape[axis]):
-                    raise ValueError(f"{kind} index is outside its dimension")
-                indices = np.where(indices < 0, indices + shape[axis], indices)
-                target = (*shape[:axis], *indices.shape[batch:], *shape[axis + 1:])
-                metadata = [axis, batch, indices.ndim, *indices.shape]
+                if indices is not None:
+                    if np.any(indices < -shape[axis]) or np.any(indices >= shape[axis]):
+                        raise ValueError(f"{kind} index is outside its dimension")
+                    indices = np.where(indices < 0, indices + shape[axis], indices)
+                target = (*shape[:axis], *index_shape[batch:], *shape[axis + 1:])
+                metadata = [axis, batch, index_rank, *index_shape]
                 op.attrs["axis"] = axis
-            name = _fresh_name(ag, f"{op.name}_indices_i32")
-            ag.weight_data[name] = np.asarray(indices, dtype=np.int32)
-            ag.tensors[name] = TensorInfo(name=name, shape=indices.shape, dtype=6, is_constant=True,
-                                          layout=Layout.LINEAR)
-            op.inputs = [op.inputs[0], name]
+            if indices is not None:
+                name = _fresh_name(ag, f"{op.name}_indices_i32")
+                ag.weight_data[name] = np.asarray(indices, dtype=np.int32)
+                ag.tensors[name] = TensorInfo(name=name, shape=index_shape, dtype=6, is_constant=True,
+                                              layout=Layout.LINEAR)
+                op.inputs = [op.inputs[0], name]
         elif kind == "StridedSlice":
             if rank > 4:
                 raise ValueError("StridedSlice supports rank at most 4")
@@ -2853,9 +2875,12 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
             target = shape
             op.inputs = op.inputs[:1]
         else:
-            starts = constant(op, 2).reshape(-1).tolist()
+            if len(op.inputs) != 3:
+                raise ValueError("DynamicUpdateSlice requires data, update and starts")
+            info = index_tensor(op, 2)
+            starts = constant(op, 2).reshape(-1).tolist() if info.is_constant else None
             update = ag.tensors[op.inputs[1]]
-            if len(starts) != rank or len(update.shape) != rank:
+            if info.shape != (rank,) or len(update.shape) != rank:
                 raise ValueError("DynamicUpdateSlice requires a data update and one start per input dimension")
             if update.dtype != source.dtype or any(u > d or u <= 0 for u, d in zip(update.shape, shape)):
                 raise ValueError("DynamicUpdateSlice update must fit the input shape and dtype")
@@ -2863,11 +2888,13 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
                     or not np.array_equal(source.quant.scale, update.quant.scale)
                     or not np.array_equal(source.quant.zero_point, update.quant.zero_point)):
                 raise ValueError("DynamicUpdateSlice requires identical update quantization")
-            metadata = [min(max(s, 0), d - u) for s, d, u in zip(starts, shape, update.shape)] + list(update.shape)
+            metadata = list(update.shape)
+            if starts is not None:
+                metadata = [min(max(s, 0), d - u) for s, d, u in zip(starts, shape, update.shape)] + metadata
+                op.inputs = op.inputs[:2]
             target = shape
-            op.inputs = op.inputs[:2]
         if tuple(target) != output.shape or len(target) > 6 or any(d <= 0 for d in target):
-            raise ValueError(f"{kind} output shape does not match its constant indices or bounds")
+            raise ValueError(f"{kind} output shape does not match its indices or bounds")
         if any(not -(2**31) <= value < 2**31 for value in metadata):
             raise ValueError(f"{kind} metadata exceeds int32")
         op.attrs["movement"] = metadata
@@ -2886,11 +2913,10 @@ def _adopt_tflite_cumsum(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _normalize_arg_outputs(ag: AnalyzedGraph) -> AnalyzedGraph:
-    # An index cast to int32 as the model output is the index itself, stored
-    # as the runtime writes it.
+    # An index cast to int32 is already stored as the runtime writes it.
     for cast in list(ag.ops):
         if (cast.op_type != "Cast" or int(cast.attrs.get("to", 0)) != 6 or len(cast.inputs) != 1
-                or len(cast.outputs) != 1 or cast.outputs[0] not in ag.model_outputs):
+                or len(cast.outputs) != 1):
             continue
         index = cast.inputs[0]
         producer = next((op for op in ag.ops if index in op.outputs), None)
@@ -2907,8 +2933,6 @@ def _normalize_arg_outputs(ag: AnalyzedGraph) -> AnalyzedGraph:
         if len(op.inputs) != 1 or len(op.outputs) != 1:
             raise ValueError(f"{op.op_type} requires one input and one output")
         name = op.outputs[0]
-        if name not in ag.model_outputs or any(name in other.inputs for other in ag.ops):
-            raise ValueError(f"{op.op_type} index tensor must be a terminal model output")
         source, output = ag.tensors[op.inputs[0]], ag.tensors[name]
         rank = len(source.shape)
         axis = int(op.attrs.get("axis", 0))

@@ -841,7 +841,7 @@
     },
     {
       "constraints": [
-        "one axis of a tensor of rank 1 to 6, untiled; terminal int32 indices; first index wins ties"
+        "one axis of a tensor of rank 1 to 6, untiled; int32 indices in model outputs or index operands; first index wins ties"
       ],
       "opcode": 64,
       "operator": "ArgMax",
@@ -854,7 +854,7 @@
     },
     {
       "constraints": [
-        "one axis of a tensor of rank 1 to 6, untiled; terminal int32 indices; first index wins ties"
+        "one axis of a tensor of rank 1 to 6, untiled; int32 indices in model outputs or index operands; first index wins ties"
       ],
       "opcode": 65,
       "operator": "ArgMin",
@@ -867,7 +867,7 @@
     },
     {
       "constraints": [
-        "constant indices or bounds; untiled; identical int8 quantization"
+        "constant or runtime int32 indices; untiled; identical int8 quantization"
       ],
       "opcode": 66,
       "operator": "Gather",
@@ -880,7 +880,7 @@
     },
     {
       "constraints": [
-        "constant indices or bounds; untiled; identical int8 quantization"
+        "constant or runtime int32 indices; untiled; identical int8 quantization"
       ],
       "opcode": 67,
       "operator": "GatherND",
@@ -932,7 +932,7 @@
     },
     {
       "constraints": [
-        "constant indices or bounds; untiled; identical int8 quantization"
+        "constant or runtime int32 indices; untiled; identical int8 quantization"
       ],
       "opcode": 71,
       "operator": "EmbeddingLookup",
@@ -945,7 +945,7 @@
     },
     {
       "constraints": [
-        "constant indices or bounds; untiled; identical int8 quantization"
+        "constant or runtime int32 starts, clamped to the update domain; untiled; identical int8 quantization"
       ],
       "opcode": 72,
       "operator": "DynamicUpdateSlice",

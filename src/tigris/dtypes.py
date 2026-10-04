@@ -19,11 +19,15 @@ class DTypeSignature:
 @dataclass(frozen=True)
 class AuxiliaryDType:
     terminal_only: bool
+    requires_source: bool = False
 
 
-AUXILIARY_DTYPES = {6: AuxiliaryDType(True), 9: AuxiliaryDType(False)}
+AUXILIARY_DTYPES = {6: AuxiliaryDType(False, requires_source=True), 9: AuxiliaryDType(False)}
 OP_DTYPE_SIGNATURES = {kind: DTypeSignature() for kind in OP_TYPE_MAP}
 OP_DTYPE_SIGNATURES.update({
+    **{kind: DTypeSignature(inputs=(DATA, 6, 6))
+       for kind in ("Gather", "GatherND", "EmbeddingLookup")},
+    "DynamicUpdateSlice": DTypeSignature(inputs=(DATA, DATA, 6)),
     "ArgMax": DTypeSignature(outputs=(6,)),
     "ArgMin": DTypeSignature(outputs=(6,)),
     "Equal": DTypeSignature(outputs=(9,)),
@@ -56,6 +60,8 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs):
             continue
         if quantized:
             issues.append(f"auxiliary tensor {name} cannot carry quantization")
+        if policy.requires_source and sum(name in outputs for _, _, outputs in operators) != (0 if name in model_inputs else 1):
+            issues.append(f"auxiliary tensor {name} requires one producer or a model input declaration")
         if policy.terminal_only and (
                 name not in model_outputs or name in model_inputs
                 or any(name in inputs for _, inputs, _ in operators)

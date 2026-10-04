@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +36,7 @@ from tigris.emitters.binary.defs import (
     COMPRESS_LZ4,
     FLAG_XIP,
     STAGE_FLAG_LINE_BUFFERED,
+    TENSOR_FLAG_LINEAR,
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
@@ -824,6 +825,55 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase
                         mem_budget="8K", reference_unoptimized=True,
                         compression="lz4" if kind == "Gather" and variant == 0 else None)
 
+
+
+def _runtime_index_case(kind: str, quantized: bool, variant: int = 0, arg: str | None = None,
+                        cast: bool = False) -> ContractCase:
+    case = _movement_case(kind, quantized, variant)
+    name = "starts" if kind == "DynamicUpdateSlice" else "indices"
+    original = next(t for t in case.compile_model.graph.initializer if t.name == name)
+    values = numpy_helper.to_array(original).copy()
+    inputs = dict(case.inputs)
+    for model in (case.compile_model, case.reference_model):
+        graph = model.graph
+        initializer = next(t for t in graph.initializer if t.name == name)
+        graph.initializer.remove(initializer)
+        if arg:
+            # The source has unique extrema at exactly the requested indices.
+            shape = [*values.shape, 4]
+            scores = np.zeros(shape, np.float32)
+            np.put_along_axis(scores, values[..., None], -1.0 if arg == "ArgMin" else 1.0, axis=-1)
+            inputs["scores"] = scores
+            graph.input.append(helper.make_tensor_value_info("scores", TensorProto.FLOAT, shape))
+            prefix = []
+            source = "scores"
+            if quantized:
+                prefix = _qdq(source, "x_s", "x_z", "scores_dq")
+                source = "scores_dq"
+            prefix.append(helper.make_node(arg, [source], [name + "_wide" if cast else name], axis=-1, keepdims=0))
+            if cast:
+                prefix.append(helper.make_node("Cast", [name + "_wide"], [name], to=TensorProto.INT32))
+            for node in reversed(prefix):
+                graph.node.insert(0, node)
+        else:
+            # Keep the reference's int64 interface to exercise narrowing as well.
+            graph.input.append(helper.make_tensor_value_info(name, TensorProto.INT64, values.shape))
+            inputs[name] = values
+        if kind == "DynamicUpdateSlice" and model is case.reference_model:
+            # ScatterND positions are computed from the same run-time starts.
+            positions = next(t for t in graph.initializer if t.name == "positions")
+            graph.initializer.remove(positions)
+            for key, value in (("start_min", [0, 0, 0]), ("start_max", [1, 1, 2]),
+                               ("update_coords", list(np.ndindex((1, 2, 2))))):
+                graph.initializer.append(numpy_helper.from_array(np.array(value, np.int64), key))
+            prefix = [helper.make_node("Max", [name, "start_min"], ["positive_starts"]),
+                      helper.make_node("Min", ["positive_starts", "start_max"], ["clamped_starts"]),
+                      helper.make_node("Add", ["update_coords", "clamped_starts"], ["positions"])]
+            for node in reversed(prefix):
+                graph.node.insert(0, node)
+    operators = ((arg,) if arg else ()) + case.expected_operators
+    return replace(case, name=case.name + "_runtime_" + (arg or "input") + ("_cast" if cast else ""), inputs=inputs,
+                   expected_operators=operators, compression=None)
 
 def _bool_case(kind: str, quantized: bool = False, tiled: bool = False, variant: int = 0) -> ContractCase:
     shape = [] if variant == 4 else [99, 7] if variant == 5 else [1, 3, 231] if variant == 6 else [1, 3, 33, 7] if tiled else [1, 2, 3, 4]
@@ -6021,6 +6071,8 @@ def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
             encoded = source if source.dtype == np.int8 else _quantize_input(source, plan, tensor)
         elif declared == TensorProto.BOOL:
             encoded = source.astype(np.bool_, copy=False)
+        elif declared in (TensorProto.INT32, TensorProto.INT64):
+            encoded = source.astype(_DTYPE_BY_ONNX_CODE[declared], copy=False)
         elif declared == TensorProto.UINT8:
             # A camera hands over bytes; the runtime moves them onto the int8
             # tensor itself, so the harness passes them through untouched.
@@ -6029,7 +6081,8 @@ def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
             raise AssertionError(
                 f"unsupported contract input dtype {declared}"
             )
-        encoded = _to_runtime_layout(encoded)
+        if not tensor["flags"] & TENSOR_FLAG_LINEAR:
+            encoded = _to_runtime_layout(encoded)
         expected = tensor["size_bytes"]
         if declared != tensor["dtype"]:
             expected = (
@@ -6642,6 +6695,12 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
                                  ("MirrorPad", 2), ("ReverseV2", 1), ("EmbeddingLookup", 1),
                                  ("DynamicUpdateSlice", 2))
           for variant in range(variants) for q in (False, True)],
+        *[_runtime_index_case(kind, q, variant)
+          for kind, variants in (("Gather", 3), ("GatherND", 1), ("EmbeddingLookup", 1),
+                                 ("DynamicUpdateSlice", 2))
+          for variant in range(variants) for q in (False, True)],
+        *[_runtime_index_case("Gather", q, 1, arg, cast)
+          for arg in ("ArgMax", "ArgMin") for q in (False, True) for cast in (False, True)],
         *[_arg_case(kind, axis, q, keep) for kind in ("ArgMax", "ArgMin")
           for axis in range(3) for q in (False, True) for keep in (False, True)],
         *[_reduction_case(kind, axis, quantized=q, keep=keep)

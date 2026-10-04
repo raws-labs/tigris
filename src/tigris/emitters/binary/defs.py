@@ -64,6 +64,8 @@ OP_ATTR_CONSTANT_OPERAND = 9  # uint8[4]: the constant operand's position (0 to 
                               # a zero byte, and its quant param index (u16 LE,
                               # NO_QUANT_PARAM for float or bool)
 OP_ATTR_RESIZE_SCALES = 10  # float32[2], explicit output/input H/W scales
+# DynamicUpdateSlice stores [starts..., shape...] for constant starts and
+# [shape...] for an int32 start tensor in the final input slot.
 OP_ATTR_MOVEMENT = 12  # int32 metadata, interpreted by the data movement opcode
 OP_ATTR_CUMSUM_OPTIONS = 11  # uint8[2], exclusive then reverse (each 0 or 1)
 
