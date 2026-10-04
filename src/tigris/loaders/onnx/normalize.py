@@ -55,6 +55,7 @@ from tigris.graph.ir import (
 def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
     declared_outputs = list(ag.model_outputs)
+    ag = _adopt_tflite_cumsum(ag)
     ag = _normalize_arg_outputs(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
@@ -2870,6 +2871,17 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
         if any(not -(2**31) <= value < 2**31 for value in metadata):
             raise ValueError(f"{kind} metadata exceeds int32")
         op.attrs["movement"] = metadata
+    return ag
+
+
+def _adopt_tflite_cumsum(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """The compiler's own CumSum states TFLite's int8 semantics, which seed the
+    sum with the scaled input zero point; ONNX's CumSum sums dequantized
+    values, which differs whenever that zero point is not 0."""
+    for op in ag.ops:
+        if op.op_type == "tigris::CumSum":
+            op.op_type = "CumSum"
+            op.attrs["tflite_seeded"] = 1
     return ag
 
 

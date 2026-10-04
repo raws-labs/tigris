@@ -343,10 +343,6 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
         if not axes or axes != list(range(axes[0], axes[-1] + 1)):
             return "axes that are not adjacent"
-    if op.kind == "CUMSUM" and outs[0].type == "INT8" and ins[0].zero_point[0] != 0:
-        # TFLite Micro seeds the int8 sum with the input zero point, which
-        # ONNX's CumSum over dequantized values cannot express.
-        return "int8 input zero point other than 0"
     if op.kind == "SOFTMAX" and op.option(0, "f", 1.0) != 1.0:
         return "beta other than 1"
     if op.kind == "FULLY_CONNECTED" and op.option(1, "b") != 0:
@@ -928,9 +924,16 @@ class _Converter:
                           tag + "_rows_q")
         axis = _onnx_axis(1, 3)
         if op.kind == "CUMSUM":
-            y = b.node("CumSum", [x, b.constant(np.asarray(axis, np.int64), tag + "_axis")],
-                       tag + "_scan", exclusive=int(op.option(0, "?", False)),
-                       reverse=int(op.option(1, "?", False)))
+            operands = [x, b.constant(np.asarray(axis, np.int64), tag + "_axis")]
+            options = {"exclusive": int(op.option(0, "?", False)),
+                       "reverse": int(op.option(1, "?", False))}
+            if source.type == "INT8":
+                # TFLite seeds the int8 sum with the input zero point, which
+                # ONNX's CumSum over dequantized values does not; the
+                # compiler's own CumSum states it.
+                y = self.custom("CumSum", operands, tag + "_scan", _onnx_shape(rows), **options)
+            else:
+                y = b.node("CumSum", operands, tag + "_scan", **options)
             kept = rows
         elif op.kind == "SUM":
             y = b.node("ReduceSum", [x, b.constant(np.asarray([axis], np.int64), tag + "_axes")],
