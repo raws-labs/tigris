@@ -94,6 +94,18 @@ def test_plan_reproduces_tflite_micro_outputs(tmp_path):
     _assert_matches_tflite_micro(KWS, golden, "16K", tmp_path)
 
 
+@pytest.mark.parametrize("name", ["vww_96_int8", "pretrainedResnet_quant"])
+@pytest.mark.parametrize("budget,tiled", [("256K", False), ("16K", True)])
+def test_reference_model_matches_tflite_micro(name, budget, tiled, tmp_path):
+    """Whole MLPerf Tiny models, in one stage and at a budget that tiles
+    most of them."""
+    model = FIXTURES / f"{name}.tflite"
+    _assert_matches_tflite_micro(model, np.load(FIXTURES / f"{name}_tflm.npz"), budget, tmp_path)
+    stages = read_binary_plan((tmp_path / "model.tgrs").read_bytes())["stages"]
+    tiled_stages = [s for s in stages if s["tile_plan_idx"] != 0xFFFF or s["chain_id"] != 0xFFFF]
+    assert bool(tiled_stages) == tiled
+
+
 @pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("*.tflite")), ids=lambda p: p.stem)
 def test_single_operator_matches_tflite_micro(model, tmp_path):
     assert tflite.unsupported(model.read_bytes()) == []
