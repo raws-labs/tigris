@@ -38,6 +38,7 @@ from tigris.emitters.binary.defs import (
     FLAG_XIP,
     STAGE_FLAG_LINE_BUFFERED,
     TENSOR_FLAG_LINEAR,
+    OP_TYPE_MAP,
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
@@ -87,6 +88,7 @@ class ContractCase:
     # optimizer can replace a quantized graph with a fused integer kernel
     # whose result depends on the host CPU.
     reference_unoptimized: bool = False
+    exact_untiled: bool = False
 
 
 def _model(
@@ -714,6 +716,26 @@ def _reduce_all_case(axis: int, keep: bool, tiled: bool = False) -> ContractCase
     return ContractCase(label, model, copy.deepcopy(model), {"input": data}, operators,
                         mem_budget="256" if tiled else "4K", slow_budget="16K" if tiled else None,
                         expect_tiled=tiled, reference_unoptimized=True)
+
+
+def _reshape_band_case(quantized: bool, merge: bool) -> ContractCase:
+    source, target = ([2, 33, 4], [2, 11, 12]) if merge else ([2, 11, 12], [2, 33, 4])
+    data = ((np.arange(np.prod(source)).reshape(source) % 101) - 50).astype(np.float32) * 0.125
+    initializers = [numpy_helper.from_array(np.array(target, np.int64), "shape")]
+    nodes = []
+    if quantized:
+        initializers += _scalars(x=(0.125, -17), y=(0.125, -17))
+        nodes += _qdq("input", "x_s", "x_z", "x")
+    nodes.append(helper.make_node("Reshape", ["x" if quantized else "input", "shape"],
+                                  ["raw" if quantized else "output"]))
+    if quantized:
+        nodes += _qdq("raw", "y_s", "y_z", "output")
+    model = _model("reshape_band", nodes,
+                   [helper.make_tensor_value_info("input", TensorProto.FLOAT, source)],
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, target)], initializers)
+    return ContractCase(f"{'int8' if quantized else 'float'}_reshape_{'merge' if merge else 'split'}",
+                        model, model, {"input": data}, ("Transpose", "Reshape", "Transpose"),
+                        mem_budget="256", slow_budget="16K", expect_tiled=True, exact_untiled=True)
 
 
 def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = False) -> ContractCase:
@@ -6543,6 +6565,19 @@ def _run_case(
     _assert_output_parity(
         actual_outputs, reference_outputs, _output_scales(plan)
     )
+    if case.exact_untiled:
+        reshape_stages = [stage for stage in plan["stages"] if any(
+            plan["ops"][i]["op_type"] == OP_TYPE_MAP["Reshape"] for i in stage["ops"])]
+        assert reshape_stages and all(stage["tile_plan_idx"] != 65535 and
+            plan["tile_plans"][stage["tile_plan_idx"]]["num_tiles"] > 1 for stage in reshape_stages)
+        untiled_path = case_dir / "untiled.tgrs"
+        untiled = _compile_plan(compile_path, untiled_path, mem_budget="64K", slow_budget="16K",
+                                compression=None, xip=False)
+        assert not any(tile["tileable"] for tile in untiled["tile_plans"])
+        untiled_outputs = case_dir / "untiled.bin"
+        _run([str(runner), str(untiled_path), str(inputs_path), str(untiled_outputs),
+              str(untiled["_compiler_scheduled_peak"])], f"{case.name} untiled execution")
+        assert outputs_path.read_bytes() == untiled_outputs.read_bytes()
     print(f"PASS {case.name} memory-contract")
     return plan_path
 
@@ -7027,6 +7062,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _svdf_case(),
         _lstm_case(),
     ]
+    cases.extend(_reshape_band_case(quantized, merge)
+                 for quantized in (False, True) for merge in (False, True))
     covered_operators = {
         operator for case in cases for operator in case.expected_operators
     }

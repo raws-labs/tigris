@@ -13,6 +13,7 @@ from enum import Enum
 
 import numpy as np
 
+from tigris.analysis.lifetime import _same_stored_bytes
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.graph.ir import (
@@ -701,6 +702,50 @@ def _height_view(info) -> tuple[int, int, int] | None:
     if len(shape) not in (3, 4):
         return None
     return shape[0], shape[1], math.prod(shape[2:])
+
+
+def _reshape_band(ag: AnalyzedGraph, stage: Stage):
+    """Stored (blocks, input rows, input width, output rows, output width)."""
+    if (len(stage.op_indices) != 1 or stage.chain_len or
+            len(stage.input_tensors) != 1 or len(stage.output_tensors) != 1):
+        return None
+    op = ag.ops[stage.op_indices[0]]
+    if op.op_type not in {"Reshape", "Flatten"} or len(op.inputs) != 1 or len(op.outputs) != 1:
+        return None
+    if stage.input_tensors != op.inputs or stage.output_tensors != op.outputs:
+        return None
+    source, target = ag.tensors[op.inputs[0]], ag.tensors[op.outputs[0]]
+    if source.dtype not in (1, 3) or source.dtype != target.dtype or not _same_stored_bytes(source, target):
+        return None
+    a, b = serialized_shape(source.shape, source.layout), serialized_shape(target.shape, target.layout)
+    if not 2 <= len(a) <= 6 or not 2 <= len(b) <= 6:
+        return None
+    own = all(len(t.shape) == 2 or t.layout is Layout.LINEAR for t in (source, target))
+    candidates = [(len(a) - 2, len(b) - 2)] if own else []
+    candidates.append((1, 1))
+    for ia, ib in candidates:
+        blocks, other = math.prod(a[:ia]), math.prod(b[:ib])
+        ri, ci, ro, co = a[ia], math.prod(a[ia + 1:]), b[ib], math.prod(b[ib + 1:])
+        if min(blocks, other, ri, ci, ro, co) <= 0 or max(blocks, other, ci, co) > 0x7FFFFFFF:
+            return None
+        if blocks == other and ri * ci == ro * co and ri > 1:
+            return blocks, ri, ci, ro, co
+    return None
+
+
+def _reshape_tile_for_bytes(mapping, budget: int, alignment: int, element: int) -> TilePlan:
+    blocks, rows, width, _, output_width = mapping
+    step = output_width // math.gcd(width, output_width)
+    # One buffer holds both views of exactly the same interval of bytes.
+    alignment = max(alignment, _CONSERVATIVE_TENSOR_ALIGN)
+    minimum = _align_up(blocks * step * width * element, alignment)
+    band = min(rows, (budget // alignment * alignment) // (blocks * width * element))
+    band = band // step * step
+    if band == 0 or not _plan_extents_fit(band, math.ceil(rows / max(1, band)), rows):
+        return TilePlan(tileable=False, min_tile_bytes=minimum)
+    return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+                    tile_height=band, num_tiles=math.ceil(rows / band), original_height=rows,
+                    tiled_peak_bytes=_align_up(blocks * band * width * element, alignment))
 
 
 def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True) -> bool:
@@ -1508,6 +1553,12 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue  # fits, no tiling needed
 
         stage_ops = [ag.ops[i] for i in stage.op_indices]
+
+        reshape = _reshape_band(ag, stage)
+        if reshape is not None:
+            stage.tile_plan = _reshape_tile_for_bytes(
+                reshape, budget, ag.tensor_alignment, ag.tensors[stage.input_tensors[0]].elem_size)
+            continue
 
         if any(op_category(op) is TileCategory.UPSAMPLE for op in stage_ops):
             stage.tile_plan = _solve_resize_height(ag, stage, stage_ops, budget)
