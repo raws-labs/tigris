@@ -9,6 +9,7 @@ outputs go to tests/fixtures/tflite/ops/ so the frontend tests need neither
 package. Needs tensorflow and tflite-micro, which are not project dependencies:
 
     python scripts/gen_tflite_fixtures.py [case ...]
+    python scripts/gen_tflite_fixtures.py --models
 """
 
 from __future__ import annotations
@@ -528,7 +529,32 @@ def generate(name: str) -> bool:
     return deviates
 
 
+# Whole reference models next to the one-operator cases, recorded the same way.
+MODELS = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "tflite"
+REFERENCE_MODELS = ("vww_96_int8", "pretrainedResnet_quant")
+
+
+def generate_model(name: str) -> None:
+    """Records TFLite Micro's outputs for seeded int8 inputs to a whole model."""
+    model = (MODELS / f"{name}.tflite").read_bytes()
+    interpreter = micro.Interpreter.from_bytes(model, arena_size=4 * 1024 * 1024)
+    details = interpreter.get_input_details(0)
+    rng = np.random.default_rng(sum(name.encode()))
+    inputs = rng.integers(-128, 128, (2, *details["shape"]), dtype=np.int8)
+    outputs = []
+    for sample in inputs:
+        interpreter.set_input(sample, 0)
+        interpreter.invoke()
+        outputs.append(interpreter.get_output(0).copy())
+    np.savez_compressed(MODELS / f"{name}_tflm.npz", input_0=inputs, output_0=np.stack(outputs))
+    print(f"{name}: {len(model)} bytes")
+
+
 def main(names: list[str]) -> None:
+    if names == ["--models"]:
+        for name in REFERENCE_MODELS:
+            generate_model(name)
+        return
     deviations = [name for name in names or sorted(CASES) if generate(name)]
     if deviations:
         print("recorded from the reference kernels: " + ", ".join(deviations))

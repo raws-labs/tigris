@@ -6,6 +6,13 @@ benchmark/training/keyword_spotting/trained_models), Apache License 2.0.
 zero point and the int8 outputs TFLite Micro's reference kernels produce for
 them, so the frontend can be checked bit for bit without TFLite Micro installed.
 
+`vww_96_int8.tflite` (visual wake words, benchmark/training/visual_wake_words)
+and `pretrainedResnet_quant.tflite` (image classification,
+benchmark/training/image_classification) are MLPerf Tiny reference models from
+the same commit, Apache License 2.0. Their `_tflm.npz` files hold two seeded
+int8 inputs and TFLite Micro's outputs, written by
+`scripts/gen_tflite_fixtures.py --models`.
+
 `ops/` holds one-operator models and their reference outputs, written by
 `scripts/gen_tflite_fixtures.py` (needs tensorflow and tflite-micro). Each
 `.npz` holds seeded inputs and the outputs TFLite Micro produces for them.
