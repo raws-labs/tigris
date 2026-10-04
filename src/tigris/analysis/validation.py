@@ -338,12 +338,10 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         if op.op_type in {"Gather", "GatherND", "StridedSlice", "MirrorPad", "ReverseV2",
                           "EmbeddingLookup", "DynamicUpdateSlice"}:
             if "movement" not in op.attrs:
-                reasons.append("requires normalized constant indices or bounds")
+                reasons.append("requires normalized indices or bounds")
         if op.op_type in {"ArgMax", "ArgMin"}:
-            if (len(op.outputs) != 1 or op.outputs[0] not in ag.model_outputs
-                    or any(name in other.inputs for name in op.outputs for other in ag.ops)
-                    or output is None or output.dtype != 6 or output.quant is not None):
-                reasons.append("index tensor must be an unquantized int32 terminal model output")
+            if (len(op.outputs) != 1 or output is None or output.dtype != 6 or output.quant is not None):
+                reasons.append("index tensor must be unquantized int32")
             if int(op.attrs.get("select_last_index", 0)) != 0:
                 reasons.append("select_last_index=1 is unsupported")
             if int(op.attrs.get("keepdims", 1)) not in {0, 1}:

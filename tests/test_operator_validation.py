@@ -1055,7 +1055,6 @@ def test_index_outputs_do_not_bypass_dispatcher_dtype_contract(kind, input_dtype
         assert not validate_operator_support(graph).supported
     graph.ops.append(OpNode(name="consumer", op_type="Relu", inputs=["y"], outputs=["z"]))
     assert not validate_execution_dtype(graph).supported
-    assert not validate_operator_support(graph).supported
 
 
 def test_reducemax_does_not_rewrite_nonspatial_axes_to_global_pool(tmp_path):
@@ -1070,7 +1069,7 @@ def test_reducemax_does_not_rewrite_nonspatial_axes_to_global_pool(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["ArgMax", "ArgMin"])
-def test_arg_normalization_refuses_consumers_and_last_index(tmp_path, kind):
+def test_arg_normalization_preserves_indices_and_refuses_last_index(tmp_path, kind):
     from tigris.loaders.onnx.normalize import _normalize_arg_outputs
 
     graph = _reduction_graph(kind)
@@ -1079,9 +1078,10 @@ def test_arg_normalization_refuses_consumers_and_last_index(tmp_path, kind):
     with pytest.raises(ValueError, match="select_last_index"):
         _normalize_arg_outputs(graph)
     graph.ops[0].attrs["select_last_index"] = 0
-    graph.ops.append(OpNode(name="consumer", op_type="Identity", inputs=["y"], outputs=["z"]))
-    with pytest.raises(ValueError, match="terminal model output"):
-        _normalize_arg_outputs(graph)
+    graph.ops.append(OpNode(name="consumer", op_type="Relu", inputs=["y"], outputs=["z"]))
+    _normalize_arg_outputs(graph)
+    assert graph.tensors["y"].dtype == 6
+    assert not validate_execution_dtype(graph).supported
     graph.ops.pop()
     graph.tensors["x"].shape = (2, 2**31, 3)
     with pytest.raises(ValueError, match="int32"):
@@ -1109,9 +1109,8 @@ def test_auxiliary_dtype_placement_and_operator_slots(monkeypatch):
     assert check_dtype_signatures([("p", 9, False, True)], [], ["p"], ["p"])[1]
 
 
-@pytest.mark.parametrize("kind", ["Gather", "GatherND", "StridedSlice", "MirrorPad", "ReverseV2",
-                                  "EmbeddingLookup", "DynamicUpdateSlice"])
-def test_movement_refuses_runtime_indices(tmp_path, kind):
+@pytest.mark.parametrize("kind", ["StridedSlice", "MirrorPad", "ReverseV2"])
+def test_movement_refuses_runtime_bounds(tmp_path, kind):
     from scripts.crossrepo_contract import _movement_case
     case = _movement_case(kind, False)
     model = case.compile_model
@@ -1226,3 +1225,31 @@ def test_sum_rejects_output_multiplier_outside_reference_domain():
     graph = _bool_graph("Sum", True)
     graph.tensors["y"].quant.scale[0] = 2**-23
     assert "output multiplier" in validate_operator_support(graph).describe()
+
+
+@pytest.mark.parametrize("kind", ["Gather", "GatherND", "EmbeddingLookup", "DynamicUpdateSlice"])
+@pytest.mark.parametrize("dtype", [6, 7])
+def test_runtime_index_inputs_narrow_and_keep_their_slot(tmp_path, kind, dtype):
+    from scripts.crossrepo_contract import _runtime_index_case
+    from tigris.emitters.binary.reader import read_binary_plan
+    from tigris.emitters.binary.writer import emit_binary_bytes
+
+    case = _runtime_index_case(kind, False)
+    name = "starts" if kind == "DynamicUpdateSlice" else "indices"
+    info = next(i for i in case.compile_model.graph.input if i.name == name)
+    info.type.tensor_type.elem_type = dtype
+    path = tmp_path / "indices.onnx"
+    onnx.save(case.compile_model, path)
+    graph, _ = _run_pipeline(str(path), ("8K",))
+    assert graph.tensors[name].dtype == 6
+    assert validate_execution_dtype(graph).supported
+    plan = read_binary_plan(emit_binary_bytes(graph))
+    tensor = next(t for t in plan["tensors"] if t["name"] == name)
+    assert tensor["dtype"] == 6 and tensor["iface_dtype"] == (7 if dtype == 7 else 0)
+    graph.ops.append(OpNode(name="wrong_slot", op_type="Relu", inputs=[name], outputs=["bad"]))
+    assert not validate_execution_dtype(graph).supported
+    graph.ops.pop()
+    info.type.tensor_type.elem_type = 1
+    onnx.save(case.compile_model, path)
+    with pytest.raises(ClickException, match="indices must be unquantized int32 or int64"):
+        _run_pipeline(str(path), ("8K",))

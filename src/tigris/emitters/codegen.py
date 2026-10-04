@@ -162,6 +162,8 @@ def _plan_dtype(plan: dict) -> DTypeMode:
         inputs = list(op["inputs"])
         if index in constants:
             inputs.insert(constants[index], None)
+        elif OP_TYPE_BY_CODE.get(op["op_type"]) == "DynamicUpdateSlice" and op["weight_idx"] != 65535:
+            inputs.insert(1, None)
         operators.append((OP_TYPE_BY_CODE.get(op["op_type"], ""), inputs, op["outputs"]))
     by_dtype, issues = check_dtype_signatures(
         [(index, tensor["dtype"], bool(tensor.get("flags", 0) & 1),

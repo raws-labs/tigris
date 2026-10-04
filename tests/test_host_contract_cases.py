@@ -8,7 +8,7 @@ import pytest
 
 from tigris.cli import _run_pipeline
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.runtime import Session
+from tigris.runtime import RuntimeError, Session
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +78,50 @@ def test_movement_output_is_exact(tmp_path, kind, variant, quantized):
     assert actual.dtype == expected.dtype
     assert actual.shape == expected.shape
     assert actual.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("kind,variant", [("Gather", 0), ("Gather", 1), ("Gather", 2),
+                                         ("GatherND", 0), ("EmbeddingLookup", 0),
+                                         ("DynamicUpdateSlice", 0), ("DynamicUpdateSlice", 1)])
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("arg", [None, "ArgMax", "ArgMin"])
+def test_runtime_indices(tmp_path, kind, variant, quantized, arg):
+    if arg and kind != "Gather":
+        pytest.skip("Arg contract uses Gather")
+    import onnx
+    import onnxruntime as ort
+    from scripts.crossrepo_contract import _runtime_index_case, _to_runtime_layout
+    from tigris.emitters.codegen import generate_c
+
+    case = _runtime_index_case(kind, quantized, variant, arg)
+    model = tmp_path / "indices.onnx"
+    onnx.save(case.compile_model, model)
+    graph, _ = _run_pipeline(str(model), ("8K",))
+    binary = emit_binary_bytes(graph)
+    assert generate_c(binary, "reference", "core")
+    plan = tmp_path / "indices.tgrs"
+    plan.write_bytes(binary)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    reference = ort.InferenceSession(case.reference_model.SerializeToString(), options, providers=["CPUExecutionProvider"])
+    inputs = {name: _to_runtime_layout(value) if value.dtype.kind == "f" else value
+              for name, value in case.inputs.items()}
+    with Session(plan) as session:
+        expected = _to_runtime_layout(reference.run(None, case.inputs)[0])
+        assert session.run(inputs)["output"].tobytes() == expected.tobytes()
+        if not arg:
+            name = "starts" if kind == "DynamicUpdateSlice" else "indices"
+            changed = {key: value.copy() for key, value in case.inputs.items()}
+            changed[name].fill(0)
+            inputs[name] = changed[name]
+            expected = _to_runtime_layout(reference.run(None, changed)[0])
+            assert session.run(inputs)["output"].tobytes() == expected.tobytes()
+            if kind != "DynamicUpdateSlice":
+                for invalid in (-1, 2**31 - 1):
+                    inputs[name].fill(invalid)
+                    with pytest.raises(RuntimeError):
+                        session.run(inputs)
 
 
 @pytest.mark.parametrize("kind", ["Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
