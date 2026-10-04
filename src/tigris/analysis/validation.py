@@ -319,7 +319,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                             or quants[0].zero_point[0] != quants[1].zero_point[0]):
                         reasons.append("ReduceMax/ReduceMin requires identical input and output quantization")
                     elif op.op_type == "CumSum":
-                        if int(quants[0].zero_point[0]) != 0:
+                        if int(quants[0].zero_point[0]) != 0 and not op.attrs.get("tflite_seeded"):
                             reasons.append("int8 CumSum requires input zero point 0 to preserve ONNX prefix sums")
                         if float(quants[0].scale[0]) / float(quants[1].scale[0]) >= 2**19:
                             reasons.append("int8 CumSum output multiplier must be smaller than one")

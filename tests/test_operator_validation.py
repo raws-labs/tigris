@@ -980,6 +980,17 @@ def _reduction_graph(kind, *, axes=(1,), shape=(2, 5, 3), keep=True, quantized=F
     return graph
 
 
+def test_int8_cumsum_off_a_zero_input_zero_point_needs_tflite_semantics():
+    """ONNX's CumSum sums dequantized values; only the TFLite form, which seeds
+    the sum with the scaled input zero point, runs off a zero point of 0."""
+    graph = _reduction_graph("CumSum", quantized=True)
+    graph.tensors["x"].quant = QuantParam(scale=np.array([0.125], np.float32),
+                                          zero_point=np.array([-128], np.int8))
+    assert "zero point 0" in validate_operator_support(graph).describe()
+    graph.ops[0].attrs["tflite_seeded"] = 1
+    assert validate_operator_support(graph).supported
+
+
 @pytest.mark.parametrize("kind", ["ReduceMax", "ReduceMin", "ReduceSum", "CumSum"])
 @pytest.mark.parametrize("axes,shape", [([], (2, 5, 3)), ([0, 1], (2, 5, 3)),
                                        ([3], (2, 5, 3)), ([1], (2, 5, 3, 4))])

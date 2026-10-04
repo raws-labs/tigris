@@ -212,9 +212,7 @@ def test_a_reduction_over_axes_that_are_not_adjacent_is_refused():
     assert any("axes that are not adjacent" in reason for reason in tflite.unsupported(bytes(data)))
 
 
-def test_an_int8_cumsum_off_a_zero_input_zero_point_is_refused():
-    _, graphs = tflite._read((FIXTURES / "ops" / "cumsum.tflite").read_bytes())
-    _, tensors, _, _, operators = graphs[0]
-    assert tflite._operator_reason(operators[0], tensors) == ""
-    tensors[operators[0].inputs[0]].zero_point = np.array([3])
-    assert tflite._operator_reason(operators[0], tensors) == "int8 input zero point other than 0"
+def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():
+    model = tflite.to_onnx((FIXTURES / "ops" / "cumsum_offset.tflite").read_bytes(), "cumsum")
+    scans = [node for node in model.graph.node if node.op_type == "CumSum"]
+    assert [node.domain for node in scans] == ["tigris"]

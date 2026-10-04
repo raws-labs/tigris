@@ -170,6 +170,8 @@ RANGES = {
     "div": [(-3.0, 3.0), _DIVISOR], "float_div": [(-3.0, 3.0), _DIVISOR], "float_floor_div": [(-3.0, 3.0), _DIVISOR],
     "float_floor_mod": [(-3.0, 3.0), _DIVISOR], "float_div_constant_first": [_DIVISOR],
     "float_div_broadcast": [(-3.0, 3.0), _DIVISOR],
+    # Non-negative inputs put the int8 input zero point near -128.
+    "cumsum_offset": [(0.0, 3.0)], "cumsum_offset_exclusive_reverse": [(0.0, 3.0)],
 }
 
 
@@ -252,6 +254,9 @@ ACTIVATIONS = {
     "cumsum": _unary(lambda x: tf.math.cumsum(x, 2), _MAP),
     "cumsum_exclusive_reverse": _unary(
         lambda x: tf.math.cumsum(x, -1, exclusive=True, reverse=True), _MAP),
+    "cumsum_offset": _unary(lambda x: tf.math.cumsum(x, 1), _MAP),
+    "cumsum_offset_exclusive_reverse": _unary(
+        lambda x: tf.math.cumsum(x, 2, exclusive=True, reverse=True), _MAP),
 }
 CASES.update(ACTIVATIONS)
 # TFLite Micro runs L2_POOL_2D in float only; the converter emits it for no
@@ -425,7 +430,9 @@ CASES.update(FLOAT_MODELS)
 REWRITES.update({"elu": _int8_island(), "cumsum": _int8_island(True),
                  "cumsum_exclusive_reverse": _int8_island(True),
                  "dynamic_update_slice": _int8_island(shared=True),
-                 "not_equal": _int8_island(), "add_n": _int8_island()})
+                 "not_equal": _int8_island(), "add_n": _int8_island(),
+                 "cumsum_offset": _int8_island(),
+                 "cumsum_offset_exclusive_reverse": _int8_island()})
 
 
 def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):
