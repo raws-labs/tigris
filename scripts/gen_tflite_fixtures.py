@@ -368,6 +368,28 @@ INDEXING.update({
     "conv_split": _unary(lambda x: tf.split(tf.nn.conv2d(x, _weights(11, 3, 3, 4, 6), 1, "SAME"),
                                             [2, 4], -1), (1, 6, 6, 4)),
 })
+
+
+class _Window(tf.Module):
+    """A sliding window held in a variable across invocations, as an SVDF
+    keeps its activation state; each call shifts in one projected column."""
+
+    def __init__(self):
+        super().__init__()
+        self.feature = tf.constant(np.linspace(-1.0, 1.0, 8).reshape(2, 4).astype(np.float32))
+        self.time = tf.constant(np.linspace(0.5, -0.5, 12).reshape(4, 3).astype(np.float32))
+        self.state = tf.Variable(tf.zeros((1, 4, 3)), trainable=False)
+
+    def __call__(self, x):
+        window = tf.concat([self.state[:, :, 1:], tf.expand_dims(tf.matmul(x, self.feature), 2)], 2)
+        self.state.assign(window)
+        return tf.reduce_sum(window * self.time, 2)
+
+
+_WINDOW = _Window()
+# The int8 conversion keeps the variable in float, so the case is float only.
+# Cases whose model holds variables convert against the object that owns them.
+TRACKABLES = {"variable_window": _WINDOW}
 CASES.update(INDEXING)
 
 # Comparisons end in bool outputs; the logical, select and cast operators take
@@ -445,6 +467,7 @@ _FLOAT_TIER1 = (
     *ACTIVATIONS, *INDEXING, *BOOLEAN,
 )
 FLOAT_MODELS["float_l2_pool"] = CASES["float_l2_pool"]
+FLOAT_MODELS["float_variable_window"] = _unary(lambda x: _WINDOW(x), (1, 2))
 for _name in _FLOAT_TIER1:
     FLOAT_MODELS[f"float_{_name}"] = CASES[_name]
     if _name in REWRITES:
@@ -459,7 +482,7 @@ REWRITES.update({"elu": _int8_island(), "cumsum": _int8_island(True),
                  "cumsum_offset_exclusive_reverse": _int8_island()})
 
 
-def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):
+def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True, trackable=None):
     specs = [tf.TensorSpec(shape, tf.float32) for shape in shapes]
     concrete = tf.function(fn).get_concrete_function(*specs)
 
@@ -468,7 +491,8 @@ def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True):
             yield [rng.uniform(lo, hi, shape).astype(np.float32)
                    for shape, (lo, hi) in zip(shapes, ranges)]
 
-    converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete], tf.function(fn))
+    converter = tf.lite.TFLiteConverter.from_concrete_functions(
+        [concrete], trackable if trackable is not None else tf.function(fn))
     if not quantize:
         return converter.convert()
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -496,7 +520,8 @@ def generate(name: str) -> bool:
     rng = np.random.default_rng(sum(name.encode()))
     ranges = RANGES.get(name)
     model = _convert(fn, shapes, ranges or [(-3.0, 3.0)] * len(shapes), rng,
-                     float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS)
+                     float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS,
+                     trackable=TRACKABLES.get(name.removeprefix("float_")))
     if name in REWRITES:
         model = REWRITES[name](model)
     micro_interpreter = micro.Interpreter.from_bytes(model, arena_size=1024 * 1024)

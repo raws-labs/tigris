@@ -12,7 +12,7 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris import (
-    SCHEMA_VERSION,
+    SCHEMA_VERSION_BINARY_REQUANT,
     SUPPORTED_SCHEMA_VERSIONS,
     TILE_AXIS_HEIGHT_OR_LENGTH,
 )
@@ -70,7 +70,8 @@ def test_magic_and_version(linear_3op_path):
 
     assert data[:4] == MAGIC
     version = struct.unpack_from("<I", data, 4)[0]
-    assert version == SCHEMA_VERSION
+    # Only a plan with state is written at the newest schema.
+    assert version == SCHEMA_VERSION_BINARY_REQUANT
 
 
 def test_file_size_matches(linear_3op_path):
@@ -139,7 +140,7 @@ def test_roundtrip_linear(linear_3op_path):
 
     assert plan["model_name"] == "linear_3op"
     assert plan["num_ops"] == 3
-    assert plan["version"] == SCHEMA_VERSION
+    assert plan["version"] == SCHEMA_VERSION_BINARY_REQUANT
 
     # All activation tensors (non-constant) should be present
     tensor_names = {t["name"] for t in plan["tensors"]}
@@ -475,6 +476,13 @@ def test_immutable_supported_schema_fixtures():
             3,
             1,
         ),
+        (
+            10,
+            "schema-v10-state.tgrs",
+            "fe2148637eeb705040f0aba7f829dbdd0464d21a57b37a871bd8d2f73d478f32",
+            0,
+            3,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -492,6 +500,14 @@ def test_immutable_supported_schema_fixtures():
             attribute = plan["op_attributes"][0]
             assert attribute["type"] == OP_ATTR_BINARY_REQUANT
             assert len(attribute["data"]) == 24
+        if version == 10:
+            # A variable enters and leaves through the state buffer, outside
+            # the model's interface, starting from its initial value.
+            (entry,) = plan["state"]["entries"]
+            assert entry["bytes"] == 48 and plan["state"]["bytes"] == 48
+            assert entry["input"] not in plan["model_inputs"]
+            assert entry["output"] not in plan["model_outputs"]
+            assert entry["initial"] == bytes(48)
         if version == 5:
             assert plan["tile_plans"][0]["axis"] == 1
             assert plan["tile_plans"][0]["num_tiles"] > 1

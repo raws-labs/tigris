@@ -5,6 +5,8 @@ TFLite semantics a QDQ ONNX graph states exactly and refuses everything else
 by name, so a model is never compiled with a reinterpreted operator.
 """
 
+import json
+
 import numpy as np
 import onnx
 from onnx import TensorProto, helper
@@ -16,6 +18,9 @@ MAGIC = b"TFL3"
 # Metadata stating that every model input and output of rank 3 or more is held
 # channels-last, as the TFLite tensor is laid out.
 BOUNDARY_LAYOUT_KEY = "tigris.boundary_layout"
+# Variables a model keeps across invocations: a JSON list of
+# {"input", "output", "initial"} value names, one entry per variable.
+STATE_KEY = "tigris.state"
 
 # Field slots in the TFLite schema (tensorflow/lite/schema/schema.fbs).
 _MODEL_VERSION, _MODEL_OPCODES, _MODEL_SUBGRAPHS, _MODEL_DESCRIPTION, _MODEL_BUFFERS = 0, 1, 2, 3, 4
@@ -178,8 +183,12 @@ def unsupported(data: bytes) -> list[str]:
     """Why the model cannot be converted, one reason per line; empty when it can."""
     model, graphs = _read(data)
     reasons = []
-    if len(graphs) != 1:
-        reasons.append(f"{len(graphs)} subgraphs; only single-subgraph models convert")
+    init = _initializer_subgraphs(graphs)
+    for position in range(1, len(graphs)):
+        if position not in init:
+            reasons.append(f"subgraph {position}: control flow does not convert yet")
+        elif _variable_initials(graphs, {position}) is None:
+            reasons.append(f"subgraph {position}: only constant variable initial values convert")
     for _, tensors, inputs, outputs, operators in graphs[:1]:
         indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
         consumed = {i for op in operators for i in op.inputs}
@@ -201,6 +210,39 @@ def unsupported(data: bytes) -> list[str]:
                 kinds = ", ".join(sorted({op.kind for op in ops}))
                 reasons.append(f"{reason}: {len(ops)} operators ({kinds})")
     return reasons
+
+
+def _var_name(op: "_Operator") -> str:
+    """The variable a VAR_HANDLE names: its container and shared name."""
+    if op.options is None:
+        return ""
+    return f"{op.options.string(0)}/{op.options.string(1)}"
+
+
+def _initializer_subgraphs(graphs) -> set[int]:
+    """Subgraphs the main graph runs once through CALL_ONCE."""
+    return {op.option(0, "i") for op in graphs[0][4] if op.kind == "CALL_ONCE"} if graphs else set()
+
+
+def _variable_initials(graphs, positions):
+    """{variable: array} assigned by the CALL_ONCE subgraphs, or None when one
+    does anything but assign constants to variables."""
+    initials = {}
+    for position in positions:
+        if not 0 < position < len(graphs):
+            return None
+        _, tensors, _, _, operators = graphs[position]
+        handles = {}
+        for op in operators:
+            if op.kind == "VAR_HANDLE":
+                handles[op.outputs[0]] = _var_name(op)
+            elif (op.kind == "ASSIGN_VARIABLE" and op.inputs[0] in handles
+                  and _is_constant(tensors[op.inputs[1]])
+                  and tensors[op.inputs[1]].type == "FLOAT32"):
+                initials[handles[op.inputs[0]]] = tensors[op.inputs[1]].array()
+            else:
+                return None
+    return initials
 
 
 def _activation(code: int) -> str:
@@ -237,13 +279,15 @@ _BOOL_SLOTS = {**{kind: ((), True) for kind in _COMPARISONS},
                "LOGICAL_AND": ((0, 1), True), "LOGICAL_OR": ((0, 1), True),
                "LOGICAL_NOT": ((0,), True), "SELECT_V2": ((0,), False), "CAST": ((0,), False),
                "REDUCE_ALL": ((0,), True)}
+# Resource variables: a handle names a variable, which is read and assigned.
+_VARIABLES = ("CALL_ONCE", "VAR_HANDLE", "READ_VARIABLE", "ASSIGN_VARIABLE")
 # Index outputs: int32 positions, only as model outputs.
 _INDEX = {"ARG_MAX": "ArgMax", "ARG_MIN": "ArgMin"}
 # Reductions over one run of adjacent axes, and the prefix sum over one axis.
 _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum",
                "REDUCE_ALL": "ReduceAll"}
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
-              *_INDEX, *_BOOL_SLOTS, "ADD_N",
+              *_INDEX, *_BOOL_SLOTS, *_VARIABLES, "ADD_N",
               "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
               "CUMSUM", "MEAN",
               "TRANSPOSE",
@@ -273,6 +317,12 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         return "not supported"
     ins = [tensors[i] if i >= 0 else None for i in op.inputs]
     outs = [tensors[i] for i in op.outputs]
+    if op.kind in _VARIABLES:
+        values = [t for t in [*ins, *outs] if t is not None and t.type != "RESOURCE"]
+        if any(t.type != "FLOAT32" for t in values):
+            # The converter keeps variables in float even in int8 models.
+            return "variables other than float32"
+        return ""
     for position in _CONSTANT_OPERANDS.get(op.kind, ()):
         if position < len(ins) and ins[position] is not None and not _is_constant(ins[position]):
             return f"input {position} must be a constant"
@@ -497,6 +547,10 @@ class _Converter:
         self.consumed = set(consumed)
         # Output shapes of the operators ONNX has no standard form for.
         self.value_info = []
+        # Resource handles by tensor, and per variable its state input and
+        # latest value.
+        self.handles: dict[int, str] = {}
+        self.variables: dict[str, dict] = {}
 
     def value(self, index: int, rank: int | None = None) -> str:
         """The ONNX value of a tensor; a constant is broadcast-aligned to `rank`."""
@@ -601,6 +655,16 @@ class _Converter:
 
     def convert(self, op: _Operator) -> None:
         ins, outs = op.inputs, op.outputs
+        if op.kind in _VARIABLES:
+            # A read sees the variable's latest value: the state input, or what
+            # this invocation assigned before it.
+            if op.kind == "VAR_HANDLE":
+                self.handles[outs[0]] = _var_name(op)
+            elif op.kind == "READ_VARIABLE":
+                self.values[outs[0]] = self.variables[self.handles[ins[0]]]["current"]
+            elif op.kind == "ASSIGN_VARIABLE":
+                self.variables[self.handles[ins[0]]]["current"] = self.value(ins[1])
+            return
         out = self.tensors[outs[0]]
         tag = out.name + "_float"
         kind = op.kind
@@ -1210,14 +1274,42 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
                               tensor.name + "_zero_point")
             converter.values[index] = b.node("DequantizeLinear", [tensor.name, scale, zero],
                                              tensor.name + "_float")
+    # Each variable enters as a state input holding its value from the last
+    # invocation, initially what the CALL_ONCE subgraph assigns.
+    initials = _variable_initials(graphs, _initializer_subgraphs(graphs)) or {}
+    handles = {op.outputs[0]: _var_name(op) for op in operators if op.kind == "VAR_HANDLE"}
+    shapes = {}
+    for op in operators:
+        if op.kind == "READ_VARIABLE":
+            shapes.setdefault(handles[op.inputs[0]], list(tensors[op.outputs[0]].shape))
+        elif op.kind == "ASSIGN_VARIABLE":
+            shapes.setdefault(handles[op.inputs[0]], list(tensors[op.inputs[1]].shape))
+    state = []
+    for position, (variable, shape) in enumerate(shapes.items()):
+        name = f"state{position}_{variable.strip('/')}"
+        initial = initials.get(variable, np.zeros(shape, np.float32)).reshape(shape)
+        onnx_inputs.append(helper.make_tensor_value_info(name + "_in", TensorProto.FLOAT,
+                                                         _onnx_shape(shape)))
+        b._names.add(name + "_in")
+        converter.variables[variable] = {"current": name + "_in", "name": name, "shape": shape}
+        state.append({"input": name + "_in", "output": None,
+                      "initial": b.constant(initial.astype(np.float32).transpose(
+                          _to_first(len(shape))), name + "_initial")})
     for op in operators:
         converter.convert(op)
+    state_outputs = []
+    for entry, variable in zip(state, shapes):
+        current = converter.variables[variable]
+        if current["current"] != entry["input"]:
+            entry["output"] = b.node("Identity", [current["current"]], current["name"] + "_out")
+            state_outputs.append(helper.make_tensor_value_info(
+                entry["output"], TensorProto.FLOAT, _onnx_shape(current["shape"])))
     # An index is stored as the operator writes it, in TFLite's axis order.
     onnx_outputs = [helper.make_tensor_value_info(
         tensors[index].name if index in converter.int8_outputs else converter.values[index],
         boundary_type[tensors[index].type],
         list(tensors[index].shape) if index in indices else _onnx_shape(tensors[index].shape))
-        for index in outputs]
+        for index in outputs] + state_outputs
     opsets = [helper.make_opsetid("", 17)]
     if converter.value_info:
         opsets.append(helper.make_opsetid("tigris", 1))
@@ -1225,6 +1317,9 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
                                                 b.initializers, value_info=converter.value_info),
                               opset_imports=opsets)
     model.ir_version = 8
-    onnx.helper.set_model_props(model, {BOUNDARY_LAYOUT_KEY: "channels_last"})
+    props = {BOUNDARY_LAYOUT_KEY: "channels_last"}
+    if state:
+        props[STATE_KEY] = json.dumps(state)
+    onnx.helper.set_model_props(model, props)
     onnx.checker.check_model(model)
     return model

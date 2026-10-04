@@ -244,11 +244,42 @@ def generate_c(
             plan, backend, is_quantized, core_header, core_name
         )
     if backend == "esp-nn":
-        return header_comment + _generate_esp(plan, is_quantized)
+        app = _generate_esp(plan, is_quantized)
     elif backend == "cmsis-nn":
-        return header_comment + _generate_cmsis(plan, is_quantized)
+        app = _generate_cmsis(plan, is_quantized)
     else:
-        return header_comment + _generate_posix(plan, is_quantized)
+        app = _generate_posix(plan, is_quantized)
+    return header_comment + _with_state(app, plan)
+
+
+# The one inference each example application runs.
+_APP_RUN = re.compile(
+    r"tigris_exec_error_t eerr = tigris_run_with_workspace_buffer\(\n"
+    r"(?P<indent>[ ]+)&plan, &mem, (?P<dispatch>\w+), NULL, &stats,\n"
+    r"[ ]+executor_workspace, sizeof\(executor_workspace\)\);")
+
+
+def _with_state(app: str, plan: dict) -> str:
+    """An example application for a plan that keeps variables: a static state
+    buffer, prepared with the initial values before the run that uses it."""
+    size = plan["state"]["bytes"]
+    if not size:
+        return app
+    runs = list(_APP_RUN.finditer(app))
+    if len(runs) != 1:
+        raise ValueError("generated application has no single inference to give state")
+    indent, dispatch = runs[0]["indent"], runs[0]["dispatch"]
+    outer = indent[:-4]
+    block = (
+        f"static uint8_t generated_state[{size}];\n"
+        f"{outer}tigris_exec_error_t eerr = tigris_state_init(\n"
+        f"{indent}&plan, generated_state, sizeof(generated_state));\n"
+        f"{outer}if (eerr == TIGRIS_EXEC_OK)\n"
+        f"{indent}eerr = tigris_run_with_state(\n"
+        f"{indent}    &plan, &mem, {dispatch}, NULL, &stats,\n"
+        f"{indent}    executor_workspace, sizeof(executor_workspace),\n"
+        f"{indent}    generated_state, sizeof(generated_state));")
+    return app[:runs[0].start()] + block + app[runs[0].end():]
 
 
 def _validate_core_name(core_name: str) -> None:
@@ -295,6 +326,10 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
 #define {macro_prefix}_CORE_FAST_ARENA_BYTES {fast_arena_required}u
 #define {macro_prefix}_EXECUTOR_WORKSPACE_BYTES \\
     TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS({workspace_limits_args})
+/* Variables the model keeps across runs; 0 when it keeps none. A plan with
+ * state runs through {core_name}_run_with_state on a buffer of this size,
+ * prepared once with tigris_state_init(), which also resets it. */
+#define {macro_prefix}_STATE_BYTES {plan['state']['bytes']}u
 
 typedef void (*{core_name}_input_init_fn)(
     void *data, uint32_t size_bytes, uint16_t tensor_index, void *user_ctx);
@@ -330,6 +365,12 @@ tigris_exec_error_t {core_name}_run(
 tigris_exec_error_t {core_name}_run_with_workspace_buffer(
     const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats,
     void *workspace, size_t workspace_size);
+
+/* Plan-sized run that reads and updates the state buffer; required for a
+ * plan with state, valid for any plan. */
+tigris_exec_error_t {core_name}_run_with_state(
+    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats,
+    void *workspace, size_t workspace_size, void *state, size_t state_size);
 
 #endif
 """
@@ -460,6 +501,15 @@ tigris_exec_error_t {core_name}_run_with_workspace_buffer(
 {{
     return tigris_run_with_workspace_buffer(
         plan, mem, {dispatch}, NULL, stats, workspace, workspace_size);
+}}
+
+tigris_exec_error_t {core_name}_run_with_state(
+    const tigris_plan_t *plan, tigris_mem_t *mem, tigris_exec_stats_t *stats,
+    void *workspace, size_t workspace_size, void *state, size_t state_size)
+{{
+    return tigris_run_with_state(
+        plan, mem, {dispatch}, NULL, stats, workspace, workspace_size,
+        state, state_size);
 }}
 '''
 

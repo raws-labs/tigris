@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 
 from tigris import (
-    SCHEMA_VERSION,
+    SCHEMA_VERSION_BINARY_REQUANT,
+    SCHEMA_VERSION_STATE,
     TILE_AXIS_HEIGHT_OR_LENGTH,
     TILE_AXIS_HW,
     TILE_AXIS_NONE,
@@ -60,6 +61,9 @@ from .defs import (
     QUANT_SECTION_HEADER_STRUCT,
     SEC_INDEX_POOL,
     SEC_OP_ATTRIBUTES,
+    SEC_STATE,
+    STATE_ENTRY_SIZE,
+    STATE_HEADER_SIZE,
     SEC_OPS,
     SEC_QUANT_PARAMS,
     SEC_SHAPE_POOL,
@@ -78,6 +82,7 @@ from .defs import (
     STAGE_TILE_PLAN_INDEX_OFFSET,
     TENSOR_FLAG_CONSTANT,
     TENSOR_FLAG_LINEAR,
+    TENSOR_FLAG_STATE,
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
     TENSOR_STRUCT,
@@ -693,6 +698,47 @@ def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
 # Section builders
 
 
+def _state_names(ag: AnalyzedGraph) -> set[str]:
+    """The model inputs and outputs that carry variables, not the interface."""
+    names = set()
+    for port in ag.state_ports:
+        names.add(ag.model_inputs[port.input])
+        if port.output is not None:
+            names.add(ag.model_outputs[port.output])
+    return names
+
+
+def _build_state(ag: AnalyzedGraph, tensor_idx: dict[str, int]) -> bytes:
+    """The state section: count(u16) pad(u16) state_bytes(u32), then per
+    variable input(u16) output(u16, 0xFFFF none) offset(u32) bytes(u32)
+    initial(u32, offset of its initial value in this section), then the
+    initial values in each tensor's stored order."""
+    if not ag.state_ports:
+        return b""
+    entries, initials = [], bytearray()
+    offset = 0
+    head = STATE_HEADER_SIZE + STATE_ENTRY_SIZE * len(ag.state_ports)
+    for port in ag.state_ports:
+        name = ag.model_inputs[port.input]
+        info = ag.tensors[name]
+        out = ag.model_outputs[port.output] if port.output is not None else None
+        if out is not None and (ag.tensors[out].shape != info.shape
+                                or ag.tensors[out].dtype != info.dtype
+                                or ag.tensors[out].layout != info.layout):
+            raise ValueError(f"state {name!r} leaves in a different shape, dtype or layout")
+        axis_map = serialized_axis_map(len(info.shape), info.layout)
+        perm = sorted(range(len(axis_map)), key=lambda axis: axis_map[axis])
+        value = np.ascontiguousarray(
+            np.asarray(port.initial, np.float32).reshape(info.shape).transpose(perm))
+        data = value.tobytes()
+        entries.append(struct.pack("<HHIII", tensor_idx[name],
+                                   tensor_idx[out] if out is not None else 0xFFFF,
+                                   offset, len(data), head + len(initials)))
+        initials.extend(data)
+        offset += (len(data) + 3) & ~3
+    return struct.pack("<HHI", len(entries), 0, offset) + b"".join(entries) + bytes(initials)
+
+
 def _build_tensors(
     ag: AnalyzedGraph,
     strings: _StringTable,
@@ -704,6 +750,7 @@ def _build_tensors(
     tensor_idx: dict[str, int] = {}
     idx = 0
     no_qp = NO_QUANT_PARAM
+    state_names = _state_names(ag)
 
     for name, info in ag.tensors.items():
         if info.is_constant:
@@ -728,10 +775,13 @@ def _build_tensors(
         flags = 0
         if info.is_constant:
             flags |= TENSOR_FLAG_CONSTANT
-        if name in ag.model_inputs:
-            flags |= TENSOR_FLAG_MODEL_INPUT
-        if name in ag.model_outputs:
-            flags |= TENSOR_FLAG_MODEL_OUTPUT
+        if name in state_names:
+            flags |= TENSOR_FLAG_STATE
+        else:
+            if name in ag.model_inputs:
+                flags |= TENSOR_FLAG_MODEL_INPUT
+            if name in ag.model_outputs:
+                flags |= TENSOR_FLAG_MODEL_OUTPUT
         if info.layout is Layout.LINEAR:
             flags |= TENSOR_FLAG_LINEAR
 
@@ -1579,8 +1629,12 @@ def emit_binary_bytes(
         ag, strings, shapes, quant_idx_map or None
     )
 
-    model_inp_indices = [tensor_idx[n] for n in ag.model_inputs if n in tensor_idx]
-    model_out_indices = [tensor_idx[n] for n in ag.model_outputs if n in tensor_idx]
+    state_names = _state_names(ag)
+    model_inp_indices = [tensor_idx[n] for n in ag.model_inputs
+                         if n in tensor_idx and n not in state_names]
+    model_out_indices = [tensor_idx[n] for n in ag.model_outputs
+                         if n in tensor_idx and n not in state_names]
+    state_data = _build_state(ag, tensor_idx)
     model_io_off, model_io_count = index_pool.add(model_inp_indices + model_out_indices)
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
@@ -1632,6 +1686,8 @@ def emit_binary_bytes(
         section_parts.append((SEC_WEIGHT_BLOCKS, weight_blocks_data))
     if op_attributes_data:
         section_parts.append((SEC_OP_ATTRIBUTES, op_attributes_data))
+    if state_data:
+        section_parts.append((SEC_STATE, state_data))
 
     section_dir_size = (len(section_parts) + 1) * SECTION_ENTRY_SIZE  # +1 for sentinel
     body_start = HEADER_SIZE + section_dir_size
@@ -1680,7 +1736,7 @@ def emit_binary_bytes(
         header_flags |= FLAG_XIP
     header = HEADER_STRUCT.pack(
         MAGIC,
-        SCHEMA_VERSION,
+        SCHEMA_VERSION_STATE if state_data else SCHEMA_VERSION_BINARY_REQUANT,
         file_size,
         HEADER_SIZE,  # section_dir starts right after header
         num_tensors,

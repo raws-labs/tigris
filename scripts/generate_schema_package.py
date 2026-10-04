@@ -50,6 +50,8 @@ def schema_package() -> dict[str, object]:
             "op_attribute": defs.OP_ATTRIBUTE_SIZE,
             "quant_param": defs.QUANT_PARAM_SIZE,
             "section_entry": defs.SECTION_ENTRY_SIZE,
+            "state_entry": defs.STATE_ENTRY_SIZE,
+            "state_header": defs.STATE_HEADER_SIZE,
             "stage": defs.STAGE_SIZE,
             "tensor": defs.TENSOR_SIZE,
             "tile_plan": defs.TILE_PLAN_SIZE,
@@ -63,6 +65,7 @@ def schema_package() -> dict[str, object]:
             "stage_assignment_v5": (
                 "stage table authoritative; operator byte is canonical low-byte hint"
             ),
+            "state_v10": "only a plan with a state section is written at schema 10",
         },
         "section_alignment": defs.PLAN_SECTION_ALIGNMENT,
         "tensor_flags": {
@@ -70,6 +73,7 @@ def schema_package() -> dict[str, object]:
             "linear": defs.TENSOR_FLAG_LINEAR,
             "model_input": defs.TENSOR_FLAG_MODEL_INPUT,
             "model_output": defs.TENSOR_FLAG_MODEL_OUTPUT,
+            "state": defs.TENSOR_FLAG_STATE,
         },
         "tile_axes": {
             "height_or_length": TILE_AXIS_HEIGHT_OR_LENGTH,
@@ -83,6 +87,7 @@ def schema_package() -> dict[str, object]:
             "ops": defs.SEC_OPS,
             "quant_params": defs.SEC_QUANT_PARAMS,
             "shape_pool": defs.SEC_SHAPE_POOL,
+            "state": defs.SEC_STATE,
             "stages": defs.SEC_STAGES,
             "strings": defs.SEC_STRINGS,
             "tensors": defs.SEC_TENSORS,

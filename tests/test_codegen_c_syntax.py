@@ -222,3 +222,28 @@ def test_bool_harness_and_core_are_valid_c99(tmp_path, kind, quantized):
                                  f"-I{_RUNTIME_INCLUDE}", f"-I{tmp_path}", str(source)],
                                 text=True, capture_output=True, check=False)
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("backend", ["reference", "esp-nn", "cmsis-nn"])
+def test_stateful_harness_and_core_are_valid_c99(tmp_path, backend):
+    """A plan keeping a variable gets a state buffer, prepared before the run
+    that reads and updates it."""
+    data = (Path(__file__).parent / "schema_compat" / "schema-v10-state.tgrs").read_bytes()
+    header = tmp_path / "generated_core.h"
+    header.write_text(generate_core_header(data))
+    assert "_STATE_BYTES 48u" in header.read_text()
+    command = [_CC, "-std=c99", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
+               f"-I{_RUNTIME_INCLUDE}", f"-I{tmp_path}"]
+    if backend == "esp-nn":
+        stub_dir = tmp_path / "esp-stubs"
+        stub_dir.mkdir()
+        _write_esp_stubs(stub_dir)
+        command.append(f"-I{stub_dir}")
+    for fmt in ("app", "core"):
+        code = generate_c(data, backend, output_format=fmt, core_header=header.name)
+        assert ("tigris_state_init" in code) == (fmt == "app")
+        source = tmp_path / f"state_{fmt}.c"
+        source.write_text(code)
+        result = subprocess.run([*command, str(source)], text=True, capture_output=True,
+                                check=False)
+        assert result.returncode == 0, result.stdout + result.stderr

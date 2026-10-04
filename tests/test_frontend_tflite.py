@@ -216,3 +216,25 @@ def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():
     model = tflite.to_onnx((FIXTURES / "ops" / "cumsum_offset.tflite").read_bytes(), "cumsum")
     scans = [node for node in model.graph.node if node.op_type == "CumSum"]
     assert [node.domain for node in scans] == ["tigris"]
+
+
+def test_a_variable_is_kept_across_runs_and_reset(tmp_path):
+    """The window variable carries from run to run, as TFLite Micro keeps it,
+    and a reset starts it over."""
+    Session = _session()
+    model = FIXTURES / "ops" / "float_variable_window.tflite"
+    golden = np.load(model.with_suffix(".npz"))
+    plan = tmp_path / "window.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    assert read_binary_plan(plan.read_bytes())["version"] == 10
+    with Session(plan) as session:
+        assert [i["name"] for i in session.inputs] == ["serving_default_x:0"]
+        assert len(session.outputs) == 1
+        name = session.outputs[0]["name"]
+        first = session.run({"serving_default_x:0": golden["input_0"][0]})[name]
+        session.run({"serving_default_x:0": golden["input_0"][1]})
+        session.reset_state()
+        again = session.run({"serving_default_x:0": golden["input_0"][0]})[name]
+    np.testing.assert_array_equal(first, golden["output_0"][0])
+    np.testing.assert_array_equal(again, first)
