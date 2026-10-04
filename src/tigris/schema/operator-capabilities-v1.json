@@ -385,7 +385,7 @@
     },
     {
       "constraints": [
-        "rank-3 mean over serialized axis 1; untiled execution. A rank-4 mean over both spatial axes is rewritten to GlobalAveragePool instead"
+        "rank-3 mean over one axis; independent height or row bands. A rank-4 mean over both spatial axes is rewritten to GlobalAveragePool instead"
       ],
       "opcode": 26,
       "operator": "ReduceMean",
@@ -789,7 +789,7 @@
     },
     {
       "constraints": [
-        "one axis of a rank-3 tensor, untiled; rank-4 spatial max with keepdims uses GlobalMaxPool; int8 quantization must match"
+        "one axis of a rank-3 tensor; independent height or row bands; rank-4 spatial max with keepdims uses GlobalMaxPool; int8 quantization must match"
       ],
       "opcode": 60,
       "operator": "ReduceMax",
@@ -802,7 +802,7 @@
     },
     {
       "constraints": [
-        "one axis of a rank-3 tensor, untiled; int8 quantization must match"
+        "one axis of a rank-3 tensor; independent height or row bands; int8 quantization must match"
       ],
       "opcode": 61,
       "operator": "ReduceMin",
@@ -815,7 +815,7 @@
     },
     {
       "constraints": [
-        "one axis of a rank-3 tensor, untiled; int8 rejects reference arithmetic overflow"
+        "one axis of a rank-3 tensor; independent height or row bands; int8 rejects reference arithmetic overflow"
       ],
       "opcode": 62,
       "operator": "ReduceSum",
@@ -828,7 +828,7 @@
     },
     {
       "constraints": [
-        "one axis of a rank-3 tensor, untiled; exclusive and reverse; int8 input zero point 0"
+        "one axis of a rank-3 tensor; independent height or row bands; exclusive and reverse; int8 input zero point 0"
       ],
       "opcode": 63,
       "operator": "CumSum",
@@ -841,7 +841,7 @@
     },
     {
       "constraints": [
-        "one axis of a tensor of rank 1 to 6, untiled; int32 indices in model outputs or index operands; first index wins ties"
+        "one axis of a tensor of rank 1 to 6; independent height or row bands; int32 indices in model outputs or index operands; first index wins ties"
       ],
       "opcode": 64,
       "operator": "ArgMax",
@@ -854,7 +854,7 @@
     },
     {
       "constraints": [
-        "one axis of a tensor of rank 1 to 6, untiled; int32 indices in model outputs or index operands; first index wins ties"
+        "one axis of a tensor of rank 1 to 6; independent height or row bands; int32 indices in model outputs or index operands; first index wins ties"
       ],
       "opcode": 65,
       "operator": "ArgMin",
@@ -867,7 +867,7 @@
     },
     {
       "constraints": [
-        "constant or runtime int32 indices; untiled; identical int8 quantization"
+        "constant or runtime int32 indices; independent bands with constant indices; identical int8 quantization"
       ],
       "opcode": 66,
       "operator": "Gather",
@@ -880,7 +880,7 @@
     },
     {
       "constraints": [
-        "constant or runtime int32 indices; untiled; identical int8 quantization"
+        "constant or runtime int32 indices; independent bands with constant indices; identical int8 quantization"
       ],
       "opcode": 67,
       "operator": "GatherND",
@@ -893,7 +893,7 @@
     },
     {
       "constraints": [
-        "constant indices or bounds; untiled; identical int8 quantization"
+        "constant indices or bounds; bands along an unchanged axis; identical int8 quantization"
       ],
       "opcode": 68,
       "operator": "StridedSlice",
@@ -906,7 +906,7 @@
     },
     {
       "constraints": [
-        "constant indices or bounds; untiled; identical int8 quantization"
+        "constant indices or bounds; bands along an unchanged axis; identical int8 quantization"
       ],
       "opcode": 69,
       "operator": "MirrorPad",
@@ -919,7 +919,7 @@
     },
     {
       "constraints": [
-        "constant indices or bounds; untiled; identical int8 quantization"
+        "constant indices or bounds; bands along an unchanged axis; identical int8 quantization"
       ],
       "opcode": 70,
       "operator": "ReverseV2",
@@ -932,7 +932,7 @@
     },
     {
       "constraints": [
-        "constant or runtime int32 indices; untiled; identical int8 quantization"
+        "constant or runtime int32 indices; independent bands with constant indices; identical int8 quantization"
       ],
       "opcode": 71,
       "operator": "EmbeddingLookup",
@@ -945,7 +945,7 @@
     },
     {
       "constraints": [
-        "constant or runtime int32 starts, clamped to the update domain; untiled; identical int8 quantization"
+        "constant or runtime int32 starts, clamped to the update domain; bands require constant starts and a dynamic update spanning the band axis; identical int8 quantization"
       ],
       "opcode": 72,
       "operator": "DynamicUpdateSlice",
@@ -1101,7 +1101,7 @@
     },
     {
       "constraints": [
-        "one axis of a rank-3 bool tensor, untiled"
+        "one axis of a rank-3 bool tensor; independent height or row bands"
       ],
       "opcode": 84,
       "operator": "ReduceAll",
