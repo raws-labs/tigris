@@ -222,6 +222,9 @@ CASES.update({
 CASES["softmax"] = _unary(tf.nn.softmax, (1, 10))
 CASES.update({
     "pack": _binary(lambda x, y: tf.stack([x, y], axis=1), (1, 4, 6), (1, 4, 6)),
+    "pack_outer": _binary(lambda x, y: tf.stack([x, y], axis=0), (1, 4), (1, 4)),
+    "concat_outer": _binary(lambda x, y: tf.concat([x, y], 0), (2, 3, 4), (1, 3, 4)),
+    "concat_rank2": _binary(lambda x, y: tf.concat([x, y], 1), (3, 4), (3, 2)),
     "unpack": _unary(lambda x: tf.unstack(x, axis=1), (1, 3, 4, 6)),
     "slice": _unary(lambda x: tf.slice(x, [0, 1, 2, 0], [1, 3, 3, 4]), _MAP),
     "strided_slice": _unary(lambda x: x[:, 1:5, :, 1:3], _MAP),
@@ -345,6 +348,26 @@ INDEXING = {
 if _xla is not None:
     INDEXING["dynamic_update_slice"] = _binary(
         lambda x, u: _xla.dynamic_update_slice(x, u, tf.constant([0, 3, 1, 0])), _MAP, (1, 2, 3, 4))
+# A Keras LSTM unrolled over its time steps, which the converter writes as
+# plain operators; seeded weights keep the case reproducible.
+_LSTM = tf.keras.layers.LSTM(4, return_sequences=True, unroll=True,
+                             kernel_initializer=tf.keras.initializers.RandomNormal(seed=1),
+                             recurrent_initializer=tf.keras.initializers.RandomNormal(seed=2),
+                             bias_initializer="ones")
+_LSTM.build((1, 3, 2))
+INDEXING["lstm_unrolled"] = _unary(_LSTM, (1, 3, 2))
+# Weighted operators with a non-zero bias, which TFLite adds after the sum.
+INDEXING.update({
+    "conv_bias": _unary(lambda x: tf.nn.conv2d(x, _weights(5, 3, 3, 4, 6), 1, "SAME")
+                        + _weights(6, 6), (1, 7, 7, 4)),
+    "depthwise_bias": _unary(lambda x: tf.nn.depthwise_conv2d(
+        x, _weights(7, 3, 3, 4, 1), [1, 1, 1, 1], "SAME") + _weights(8, 4), (1, 7, 7, 4)),
+    "fully_connected_bias": _unary(lambda x: tf.matmul(x, _weights(9, 8, 5)) + _weights(10, 5),
+                                   (3, 8)),
+    # A per-channel convolution feeding a byte copy that needs equal encodings.
+    "conv_split": _unary(lambda x: tf.split(tf.nn.conv2d(x, _weights(11, 3, 3, 4, 6), 1, "SAME"),
+                                            [2, 4], -1), (1, 6, 6, 4)),
+})
 CASES.update(INDEXING)
 
 # Comparisons end in bool outputs; the logical, select and cast operators take
@@ -418,6 +441,7 @@ _FLOAT_TIER1 = (
     "slice", "strided_slice", "strided_slice_shrink", "gather", "gather_scalar",
     "space_to_depth", "depth_to_space", "space_to_batch", "batch_to_space", "broadcast_to",
     "add_rank", "mul_rank_vector", "maximum_rank", "less_rank", "select_v2_rank",
+    "pack_outer", "concat_outer", "concat_rank2",
     *ACTIVATIONS, *INDEXING, *BOOLEAN,
 )
 FLOAT_MODELS["float_l2_pool"] = CASES["float_l2_pool"]

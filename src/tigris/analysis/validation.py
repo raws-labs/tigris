@@ -225,6 +225,15 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             continue
 
         reasons: list[str] = []
+        # An int8 activation's plan record states one scale and zero point; it
+        # may also carry its producer's per-channel requantization, which
+        # readers ignore, so a per-axis encoding could not be told apart.
+        for name in (*op.inputs, *op.outputs):
+            info = ag.tensors.get(name)
+            if (info is not None and info.dtype == 3 and info.quant is not None
+                    and not info.is_constant and name not in ag.weight_data
+                    and (info.quant.scale.size != 1 or info.quant.zero_point.size != 1)):
+                reasons.append(f"int8 activation {name!r} is not quantized per tensor")
         reasons.extend(_bool_and_sum_reasons(ag, op))
         backend = "s8_ref" if ag.is_quantized else "reference"
         if op.op_type not in effective_operators(backend):

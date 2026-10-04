@@ -980,6 +980,13 @@ def _reduction_graph(kind, *, axes=(1,), shape=(2, 5, 3), keep=True, quantized=F
     return graph
 
 
+def test_int8_activations_quantized_per_axis_are_refused_for_any_operator():
+    graph = _reduction_graph("ReduceMax", quantized=True)
+    graph.tensors["x"].quant = QuantParam(scale=np.array([0.125, 0.25], np.float32),
+                                          zero_point=np.array([0, 0], np.int8))
+    assert "'x' is not quantized per tensor" in validate_operator_support(graph).describe()
+
+
 def test_int8_cumsum_off_a_zero_input_zero_point_needs_tflite_semantics():
     """ONNX's CumSum sums dequantized values; only the TFLite form, which seeds
     the sum with the scaled input zero point, runs off a zero point of 0."""
