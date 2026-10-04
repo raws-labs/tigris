@@ -33,13 +33,16 @@ def describe_interface(ag) -> list[tuple[str, str]]:
     and the encoding the plan stores it in where the two differ.
     """
     rows: list[tuple[str, str]] = []
+    ports = getattr(ag, "state_ports", [])
+    state = ({("Input", port.input) for port in ports}
+             | {("Output", port.output) for port in ports if port.output is not None})
     for label, names, declared_dtypes in (
         ("Input", ag.model_inputs, ag.model_input_dtypes),
         ("Output", ag.model_outputs, ag.model_output_dtypes),
     ):
         for index, name in enumerate(names):
             info = ag.tensors.get(name)
-            if info is None:
+            if info is None or (label, index) in state:
                 continue
             shape = "x".join(str(dim) for dim in source_shape(ag, info.shape)) or "scalar"
             declared = (
@@ -55,4 +58,8 @@ def describe_interface(ag) -> list[tuple[str, str]]:
                     f", zero point {int(info.quant.zero_point[0])}"
                 )
             rows.append((label, text))
+    if ports:
+        size = sum(port.initial.size * 4 for port in ports)
+        rows.append(("State", f"{len(ports)} variable{'s' if len(ports) != 1 else ''}, "
+                              f"{size} bytes kept across runs"))
     return rows

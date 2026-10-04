@@ -228,6 +228,13 @@ class MemoryBudget:
 
 
 @dataclass
+class StatePort:
+    input: int
+    output: int | None
+    initial: np.ndarray
+
+
+@dataclass
 class AnalyzedGraph:
     """Central object enriched by each pipeline stage."""
 
@@ -255,6 +262,10 @@ class AnalyzedGraph:
     # a terminal Transpose included, and reports give shapes in the file's
     # order. A plain ONNX model keeps a terminal Transpose in ONNX order.
     channels_last_source: bool = False
+    # Variables kept across invocations: each a model input holding the value
+    # from the last invocation and, when this one assigns it, a model output,
+    # by position in model_inputs and model_outputs, with its initial value.
+    state_ports: list["StatePort"] = field(default_factory=list)
 
     # Populated by loader - raw weight arrays keyed by initializer name
     weight_data: dict[str, np.ndarray] = field(default_factory=dict)

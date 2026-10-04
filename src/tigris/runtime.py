@@ -56,6 +56,7 @@ def _library():
         "run": (ct.c_char_p, [ct.c_void_p, ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint32), ct.c_uint32,
                               ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint32), ct.c_uint32]),
         "metric": (ct.c_uint64, [ct.c_void_p, ct.c_uint32]),
+        "reset_state": (ct.c_char_p, [ct.c_void_p]),
     }
     try:
         lib.tigris_host_abi.restype = ct.c_uint32
@@ -183,6 +184,14 @@ class Session:
             self._check(self._lib.tigris_host_run(self._handle, pointers(arrays), sizes(arrays), len(arrays),
                                                  pointers(outputs), sizes(outputs), len(outputs)))
             return {info["name"]: value for info, value in zip(self.outputs, outputs)}
+
+    def reset_state(self):
+        """Return every variable the plan keeps across runs to its initial
+        value, as when the session was opened."""
+        with self._lock:
+            if not self._handle:
+                raise RuntimeError("Session is closed")
+            self._check(self._lib.tigris_host_reset_state(self._handle))
 
     @property
     def memory(self) -> dict[str, int]:

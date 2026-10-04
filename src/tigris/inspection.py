@@ -182,6 +182,12 @@ def _plan(data: bytes) -> dict:
         reference(block["stage_idx"], "stages")
         if block["first_weight_idx"] + block["num_weights"] > len(plan["weights"]):
             raise ValueError("Weight block extends beyond weight table")
+    for entry in plan["state"]["entries"]:
+        reference(entry["input"], "tensors")
+        if entry["output"] is not None:
+            reference(entry["output"], "tensors")
+        # The initial value is reported by its size; the bytes stay in the plan.
+        entry["initial"] = len(entry["initial"])
     plan.pop("magic")
     plan.pop("op_attributes")
     return plan

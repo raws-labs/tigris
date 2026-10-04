@@ -20,6 +20,11 @@ SEC_WEIGHTS = 8
 SEC_QUANT_PARAMS = 9
 SEC_WEIGHT_BLOCKS = 10
 SEC_OP_ATTRIBUTES = 11
+# Variables kept across invocations: offsets in the caller's state buffer and
+# initial values.
+SEC_STATE = 12
+STATE_HEADER_SIZE = 8
+STATE_ENTRY_SIZE = 16
 
 SECTION_TYPES = (
     SEC_TENSORS,
@@ -185,6 +190,8 @@ TENSOR_FLAG_MODEL_OUTPUT = 0x04
 # the plan: a model output written by a terminal Transpose keeps ONNX order
 # while every other output is channels-last, and nothing said which.
 TENSOR_FLAG_LINEAR = 0x08
+# A variable's value entering or leaving an invocation through the state buffer.
+TENSOR_FLAG_STATE = 0x10
 
 # Stage flags - packed into the head stage's _reserved1 field.
 STAGE_FLAG_LINE_BUFFERED = 0x0001

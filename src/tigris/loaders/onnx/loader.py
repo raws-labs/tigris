@@ -1,14 +1,16 @@
 """ONNX model loading, shape inference, and topological sorting."""
 
+import json
 from pathlib import Path
 
+import numpy as np
 import onnx
 from onnx import helper as onnx_helper
 from onnx import numpy_helper, shape_inference
 
 from tigris.frontends import load_onnx
-from tigris.frontends.tflite import BOUNDARY_LAYOUT_KEY
-from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
+from tigris.frontends.tflite import BOUNDARY_LAYOUT_KEY, STATE_KEY
+from tigris.graph.ir import AnalyzedGraph, OpNode, StatePort, TensorInfo
 from tigris.loaders.onnx.shapes import bind_free_dims, fold_shape_subgraph
 
 # One binding pass plus one fold usually resolves a stock export.  A fold can
@@ -165,6 +167,16 @@ def load_model(
         if inp.name not in initializer_names
     ]
     ag.model_output_dtypes = [_extract_dtype(out.type) for out in graph.output]
+    state = next((json.loads(prop.value) for prop in model.metadata_props
+                  if prop.key == STATE_KEY), [])
+    for entry in state:
+        if entry["input"] not in ag.model_inputs or entry["initial"] not in ag.weight_data or (
+                entry["output"] is not None and entry["output"] not in ag.model_outputs):
+            raise ValueError(f"state entry {entry!r} does not name the model's own values")
+        ag.state_ports.append(StatePort(
+            input=ag.model_inputs.index(entry["input"]),
+            output=None if entry["output"] is None else ag.model_outputs.index(entry["output"]),
+            initial=np.asarray(ag.weight_data[entry["initial"]])))
 
     # --- Build OpNodes ----------------------------------------------------
     nodes_by_output: dict[str, int] = {}  # tensor_name -> node index

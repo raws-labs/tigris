@@ -32,6 +32,7 @@ from .defs import (
     SECTION_ENTRY_STRUCT,
     SEC_INDEX_POOL,
     SEC_OP_ATTRIBUTES,
+    SEC_STATE,
     SEC_OPS,
     SEC_QUANT_PARAMS,
     SEC_SHAPE_POOL,
@@ -100,7 +101,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         if sec_type == 0:
             found_sentinel = True
             break
-        if sec_type > SEC_OP_ATTRIBUTES:
+        if sec_type > SEC_STATE:
             raise ValueError(f"Unknown section type: {sec_type}")
         if sec_type in sections:
             raise ValueError(f"Duplicate section type: {sec_type}")
@@ -437,6 +438,22 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
             })
 
     # Resolve model I/O from index pool
+    # Variables kept across invocations, with their initial values.
+    state = {"bytes": 0, "entries": []}
+    state_base = sections.get(SEC_STATE, 0)
+    if state_base:
+        _check_range(SEC_STATE, state_base, 8)
+        count, _reserved, state["bytes"] = struct.unpack_from("<HHI", data, state_base)
+        _check_range(SEC_STATE, state_base + 8, 16 * count)
+        for i in range(count):
+            entry_in, entry_out, offset, size, initial = struct.unpack_from(
+                "<HHIII", data, state_base + 8 + 16 * i)
+            _check_range(SEC_STATE, state_base + initial, size)
+            state["entries"].append({
+                "input": entry_in, "output": None if entry_out == 0xFFFF else entry_out,
+                "offset": offset, "bytes": size,
+                "initial": data[state_base + initial:state_base + initial + size]})
+
     all_io = _read_index_pool(model_io_off, num_model_inputs + num_model_outputs)
     model_inputs_idx = all_io[:num_model_inputs]
     model_outputs_idx = all_io[num_model_inputs:]
@@ -466,4 +483,5 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         "weight_blocks": weight_blocks,
         "weight_blocks_compression": weight_blocks_compression,
         "op_attributes": op_attributes,
+        "state": state,
     }
