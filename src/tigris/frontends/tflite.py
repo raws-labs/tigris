@@ -191,13 +191,21 @@ def unsupported(data: bytes) -> list[str]:
             reasons.append(f"subgraph {position}: only constant variable initial values convert")
     for _, tensors, inputs, outputs, operators in graphs[:1]:
         indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
-        consumed = {i for op in operators for i in op.inputs}
+        slots = {op.inputs[_INDEX_SLOTS[op.kind]] for op in operators if op.kind in _INDEX_SLOTS}
+        index_inputs = {i for i in inputs if tensors[i].type == "INT32"}
         for index in list(inputs) + list(outputs):
-            if tensors[index].type not in ("INT8", "FLOAT32", "BOOL") and index not in indices:
+            if (tensors[index].type not in ("INT8", "FLOAT32", "BOOL") and index not in indices
+                    and index not in index_inputs):
                 reasons.append(f"model boundary {tensors[index].name!r} is {tensors[index].type}")
-        for index in sorted(indices):
-            if index not in outputs or index in consumed:
-                reasons.append(f"index {tensors[index].name!r} is not only a model output")
+        for index in sorted(indices | index_inputs):
+            uses = [op for op in operators if index in op.inputs]
+            if any(op.kind not in _INDEX_SLOTS or op.inputs[_INDEX_SLOTS[op.kind]] != index
+                   for op in uses):
+                reasons.append(f"index {tensors[index].name!r} feeds an operand other than indices")
+        for index in sorted(slots - indices - index_inputs):
+            if not _is_constant(tensors[index]):
+                reasons.append(f"indices {tensors[index].name!r} are computed by an operator "
+                               "other than ARG_MAX or ARG_MIN")
         grouped: dict[str, list[_Operator]] = {}
         for op in operators:
             reason = _operator_reason(op, tensors)
@@ -281,8 +289,10 @@ _BOOL_SLOTS = {**{kind: ((), True) for kind in _COMPARISONS},
                "REDUCE_ALL": ((0,), True)}
 # Resource variables: a handle names a variable, which is read and assigned.
 _VARIABLES = ("CALL_ONCE", "VAR_HANDLE", "READ_VARIABLE", "ASSIGN_VARIABLE")
-# Index outputs: int32 positions, only as model outputs.
+# Index outputs: int32 positions, as model outputs or the indices of the operators below.
 _INDEX = {"ARG_MAX": "ArgMax", "ARG_MIN": "ArgMin"}
+# The operand holding indices or start positions, which may be computed at run time.
+_INDEX_SLOTS = {"GATHER": 1, "GATHER_ND": 1, "EMBEDDING_LOOKUP": 0, "DYNAMIC_UPDATE_SLICE": 2}
 # Reductions over one run of adjacent axes, and the prefix sum over one axis.
 _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum",
                "REDUCE_ALL": "ReduceAll"}
@@ -325,7 +335,10 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         return ""
     for position in _CONSTANT_OPERANDS.get(op.kind, ()):
         if position < len(ins) and ins[position] is not None and not _is_constant(ins[position]):
-            return f"input {position} must be a constant"
+            if position != _INDEX_SLOTS.get(op.kind):
+                return f"input {position} must be a constant"
+            if ins[position].type != "INT32":
+                return f"{ins[position].type} run-time indices; the runtime takes int32"
     data = [t for i, t in enumerate(ins) if t is not None and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
     if op.kind in _WEIGHTED:
         source, position, bias_position = _WEIGHTED[op.kind]
@@ -452,7 +465,8 @@ def _gather_run(op: _Operator, ins: list[_Tensor]):
 
 
 def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
-    data = [t for t in ins if not _is_constant(t)]
+    slot = _INDEX_SLOTS.get(op.kind)
+    data = [t for i, t in enumerate(ins) if not _is_constant(t) and i != slot]
     if not _same_quantization([*data, *outs]):
         return "inputs and outputs quantized differently"
     if op.kind == "STRIDED_SLICE":
@@ -800,7 +814,8 @@ class _Converter:
                 fill = float((int(self.ints(ins[2])[0]) - source.zero_point[0]) * source.scale[0])
             y = b.node("Pad", [self.value(ins[0]), pads, b.constant(np.float32(fill), tag + "_fill")],
                        tag, mode="constant")
-        elif kind == "GATHER" and _gather_run(op, [self.tensors[i] for i in ins]) is None:
+        elif kind == "GATHER" and (not _is_constant(self.tensors[ins[1]])
+                                   or _gather_run(op, [self.tensors[i] for i in ins]) is None):
             y = self._gather("Gather", ins[0], ins[1], op.option(0, "i"), op, tag)
         elif kind == "EMBEDDING_LOOKUP":
             y = self._gather("Gather", ins[1], ins[0], 0, op, tag)
@@ -826,6 +841,13 @@ class _Converter:
             axes = b.constant(np.asarray(self.ints(ins[1]), np.int64), tag + "_axes")
             y = self.tflite_order_out(self.custom("ReverseV2", [x, axes], tag + "_reversed",
                                                   out.shape), outs[0], tag)
+        elif kind == "DYNAMIC_UPDATE_SLICE" and not _is_constant(self.tensors[ins[2]]):
+            # Run-time starts are in TFLite's axis order, so the update runs there.
+            rank = len(out.shape)
+            x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
+            u = self.last_to_last(self.value(ins[1]), rank, tag + "_update", ins[1], True)
+            y = self.tflite_order_out(self.custom("DynamicUpdateSlice", [x, u, self.value(ins[2])],
+                                                  tag + "_updated", out.shape), outs[0], tag)
         elif kind == "DYNAMIC_UPDATE_SLICE":
             rank = len(out.shape)
             starts = [self.ints(ins[2])[a] for a in _to_first(rank)]
@@ -1061,7 +1083,8 @@ class _Converter:
         TFLite's axis order, where its axis and index tuples are stated."""
         rank = len(self.tensors[data].shape)
         x = self.last_to_last(self.value(data), rank, tag + "_last", data, True)
-        indices = self.b.constant(np.asarray(self.tensors[ids].array(), np.int64), tag + "_indices")
+        indices = (self.b.constant(np.asarray(self.tensors[ids].array(), np.int64), tag + "_indices")
+                   if _is_constant(self.tensors[ids]) else self.value(ids))
         attributes = {} if axis is None else {"axis": axis % rank}
         batch = op.option(1, "i") if op.kind == "GATHER" else 0
         if batch:
@@ -1266,7 +1289,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         b._names.add(tensor.name)
         onnx_inputs.append(helper.make_tensor_value_info(
             tensor.name, boundary_type[tensor.type], _onnx_shape(tensor.shape)))
-        if tensor.type in ("FLOAT32", "BOOL"):
+        if tensor.type in ("FLOAT32", "BOOL", "INT32"):
             converter.values[index] = tensor.name
         else:
             scale = b.constant(np.float32(tensor.scale[0]), tensor.name + "_scale")

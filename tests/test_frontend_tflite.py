@@ -253,6 +253,33 @@ def test_a_reduction_over_axes_that_are_not_adjacent_is_refused():
     assert any("axes that are not adjacent" in reason for reason in tflite.unsupported(bytes(data)))
 
 
+def _read_edited(monkeypatch, name, edit):
+    """The fixture `name` as the frontend reads it, after `edit(tensors, operators)`."""
+    data = (FIXTURES / "ops" / f"{name}.tflite").read_bytes()
+    model, graphs = tflite._read(data)
+    edit(graphs[0][1], graphs[0][4])
+    monkeypatch.setattr(tflite, "_read", lambda _: (model, graphs))
+    return tflite.unsupported(data)
+
+
+def test_run_time_indices_come_from_a_model_input_or_an_arg_max(monkeypatch):
+    """Indices stay positions: an index tensor feeds only index operands, and
+    indices computed at run time come from ARG_MAX or ARG_MIN."""
+    def swap(tensors, operators):
+        gather = next(op for op in operators if op.kind == "GATHER")
+        gather.inputs = [gather.inputs[1], gather.inputs[0]]
+    reasons = _read_edited(monkeypatch, "float_arg_max_gather", swap)
+    assert any("feeds an operand other than indices" in r for r in reasons)
+    assert any("other than ARG_MAX or ARG_MIN" in r for r in reasons)
+
+
+def test_int64_run_time_indices_are_refused(monkeypatch):
+    def widen(tensors, operators):
+        tensors[operators[0].inputs[1]].type = "INT64"
+    reasons = _read_edited(monkeypatch, "float_gather_runtime", widen)
+    assert any("INT64 run-time indices; the runtime takes int32" in r for r in reasons)
+
+
 def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():
     model = tflite.to_onnx((FIXTURES / "ops" / "cumsum_offset.tflite").read_bytes(), "cumsum")
     scans = [node for node in model.graph.node if node.op_type == "CumSum"]
