@@ -59,7 +59,7 @@ def describe_interface(ag) -> list[tuple[str, str]]:
                 )
             rows.append((label, text))
     if ports:
-        size = sum(port.initial.size * 4 for port in ports)
+        size = sum(ag.tensors[ag.model_inputs[port.input]].size_bytes for port in ports)
         rows.append(("State", f"{len(ports)} variable{'s' if len(ports) != 1 else ''}, "
                               f"{size} bytes kept across runs"))
     return rows

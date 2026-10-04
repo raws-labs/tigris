@@ -469,6 +469,104 @@ def _embedding_lookup(model: bytes) -> bytes:
 
 REWRITES["embedding_lookup"] = _embedding_lookup
 REWRITES["embedding_lookup_runtime"] = _embedding_lookup
+def _one_operator(code, options_type, options, tensors, op_inputs, op_outputs, inputs, outputs):
+    """A model of one builtin operator. `tensors` are (shape, type, data, scale,
+    zero point, variable) records; data None marks an activation."""
+    tree = schema.ModelT()
+    tree.version = 3
+    tree.buffers = [schema.BufferT()]
+    graph = schema.SubGraphT()
+    graph.tensors = []
+    for i, (shape, kind, data, scale, zero_point, variable) in enumerate(tensors):
+        tensor = schema.TensorT()
+        tensor.name = f"t{i}".encode()
+        tensor.shape = np.asarray(shape, np.int32)
+        tensor.type = kind
+        tensor.isVariable = variable
+        tensor.buffer = len(tree.buffers)
+        buffer = schema.BufferT()
+        if data is not None:
+            buffer.data = np.frombuffer(np.ascontiguousarray(data).tobytes(), np.uint8)
+        tree.buffers.append(buffer)
+        if scale is not None:
+            quant = schema.QuantizationParametersT()
+            quant.scale = np.asarray([scale], np.float32)
+            quant.zeroPoint = np.asarray([zero_point], np.int64)
+            tensor.quantization = quant
+        graph.tensors.append(tensor)
+    op = schema.OperatorT()
+    op.opcodeIndex = 0
+    op.inputs = np.asarray(op_inputs, np.int32)
+    op.outputs = np.asarray(op_outputs, np.int32)
+    op.builtinOptionsType = options_type
+    op.builtinOptions = options
+    graph.operators = [op]
+    graph.inputs = np.asarray(inputs, np.int32)
+    graph.outputs = np.asarray(outputs, np.int32)
+    tree.subgraphs = [graph]
+    opcode = schema.OperatorCodeT()
+    opcode.builtinCode = code
+    opcode.deprecatedBuiltinCode = min(code, 127)
+    opcode.version = 1
+    tree.operatorCodes = [opcode]
+    builder = flatbuffers.Builder(4096)
+    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
+    return bytes(builder.Output())
+
+
+def _quantize(values, scale, dtype):
+    info = np.iinfo(dtype)
+    return np.clip(np.round(values / scale), info.min, info.max).astype(dtype)
+
+
+def _svdf(batch, features, units, rank, memory, activation, quantized=False):
+    """SVDF on a [batch, features] input, its state a variable tensor; seeded
+    weights. The int8 form keeps its state and time weights in int16. TFLite
+    Micro's Prepare dereferences the bias, so every case has one."""
+    rng = np.random.default_rng(features * 100 + units * 10 + rank)
+    filters = units * rank
+    feature = rng.normal(0.0, 0.4, (filters, features)).astype(np.float32)
+    time = rng.normal(0.0, 0.4, (filters, memory)).astype(np.float32)
+    offsets = rng.normal(0.0, 0.3, (units,)).astype(np.float32)
+    options = schema.SVDFOptionsT()
+    options.rank = rank
+    options.fusedActivationFunction = activation
+    T = schema.TensorType
+    if not quantized:
+        tensors = [((batch, features), T.FLOAT32, None, None, 0, False),
+                   ((filters, features), T.FLOAT32, feature, None, 0, False),
+                   ((filters, memory), T.FLOAT32, time, None, 0, False),
+                   ((units,), T.FLOAT32, offsets, None, 0, False),
+                   ((batch, filters * memory), T.FLOAT32, None, None, 0, True),
+                   ((batch, units), T.FLOAT32, None, None, 0, False)]
+    else:
+        x_scale, state_scale, out_scale = 6.0 / 255, 8.0 / 32767, 0.06
+        f_scale = float(np.abs(feature).max()) / 127
+        t_scale = float(np.abs(time).max()) / 32767
+        b_scale = float(np.float32(state_scale) * np.float32(t_scale))
+        tensors = [((batch, features), T.INT8, None, x_scale, 2, False),
+                   ((filters, features), T.INT8, _quantize(feature, f_scale, np.int8), f_scale, 0, False),
+                   ((filters, memory), T.INT16, _quantize(time, t_scale, np.int16), t_scale, 0, False),
+                   ((units,), T.INT32, _quantize(offsets, b_scale, np.int32), b_scale, 0, False),
+                   ((batch, filters * memory), T.INT16, None, state_scale, 0, True),
+                   ((batch, units), T.INT8, None, out_scale, -3, False)]
+    op_inputs = [0, 1, 2, 3, 4]
+    return _one_operator(schema.BuiltinOperator.SVDF, schema.BuiltinOptions.SVDFOptions,
+                         options, tensors, op_inputs, [5], [0], [5])
+
+
+# Models no converter writes, built operator by operator.
+_RELU = schema.ActivationFunctionType.RELU
+_NONE = schema.ActivationFunctionType.NONE
+HANDMADE = {
+    "float_svdf": lambda: _svdf(1, 8, 4, 1, 5, _NONE),
+    "float_svdf_rank2_relu": lambda: _svdf(2, 6, 3, 2, 4, _RELU),
+    "svdf": lambda: _svdf(1, 8, 4, 2, 5, _NONE, quantized=True),
+    "svdf_batch": lambda: _svdf(2, 6, 3, 1, 4, _NONE, quantized=True),
+}
+# TFLite's float SVDF sums in another order than TFLite Micro, so the two
+# differ in the last bits; TFLite Micro's outputs are recorded for these.
+SUMMATION_ORDER = {"float_svdf", "float_svdf_rank2_relu"}
 # The tier-1 cases again, converted without quantization.
 _FLOAT_TIER1 = (
     "max_pool_valid", "max_pool_same", "avg_pool_valid", "avg_pool_same", "concat_channels",
@@ -540,13 +638,16 @@ def _inputs(details, rng, value_range=None, index_range=None):
 
 def generate(name: str) -> bool:
     """Writes the case; True when TFLite Micro deviates from the reference kernels."""
-    shapes, fn = CASES[name]
     rng = np.random.default_rng(sum(name.encode()))
     ranges = RANGES.get(name)
-    model = _convert(fn, shapes, ranges or [(-3.0, 3.0)] * len(shapes), rng,
-                     float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS,
-                     trackable=TRACKABLES.get(name.removeprefix("float_")),
-                     index_inputs=INDEX_INPUTS.get(name.removeprefix("float_")))
+    if name in HANDMADE:
+        model = HANDMADE[name]()
+    else:
+        shapes, fn = CASES[name]
+        model = _convert(fn, shapes, ranges or [(-3.0, 3.0)] * len(shapes), rng,
+                         float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS,
+                         trackable=TRACKABLES.get(name.removeprefix("float_")),
+                         index_inputs=INDEX_INPUTS.get(name.removeprefix("float_")))
     if name in REWRITES:
         model = REWRITES[name](model)
     micro_interpreter = micro.Interpreter.from_bytes(model, arena_size=1024 * 1024)
@@ -597,7 +698,8 @@ def generate(name: str) -> bool:
                 continue
             reference_outputs.append([reference.get_tensor(d["index"]).copy()
                                       for d in reference.get_output_details()])
-    has_reference = reference is not None and name not in BROKEN_REFERENCE
+    has_reference = (reference is not None and name not in BROKEN_REFERENCE
+                     and name not in SUMMATION_ORDER)
     deviates = has_reference and any(not np.array_equal(m, r) for ms, rs in
                                      zip(micro_outputs, reference_outputs) for m, r in zip(ms, rs))
     outputs = reference_outputs if deviates else micro_outputs
@@ -637,7 +739,7 @@ def main(names: list[str]) -> None:
         for name in REFERENCE_MODELS:
             generate_model(name)
         return
-    deviations = [name for name in names or sorted(CASES) if generate(name)]
+    deviations = [name for name in names or sorted({*CASES, *HANDMADE}) if generate(name)]
     if deviations:
         print("recorded from the reference kernels: " + ", ".join(deviations))
     print(f"tensorflow {tf.__version__}, tflite-micro {version('tflite-micro')}")

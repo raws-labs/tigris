@@ -25,7 +25,7 @@ STATE_KEY = "tigris.state"
 # Field slots in the TFLite schema (tensorflow/lite/schema/schema.fbs).
 _MODEL_VERSION, _MODEL_OPCODES, _MODEL_SUBGRAPHS, _MODEL_DESCRIPTION, _MODEL_BUFFERS = 0, 1, 2, 3, 4
 _SG_TENSORS, _SG_INPUTS, _SG_OUTPUTS, _SG_OPERATORS, _SG_NAME = 0, 1, 2, 3, 4
-_T_SHAPE, _T_TYPE, _T_BUFFER, _T_NAME, _T_QUANT = 0, 1, 2, 3, 4
+_T_SHAPE, _T_TYPE, _T_BUFFER, _T_NAME, _T_QUANT, _T_VARIABLE = 0, 1, 2, 3, 4, 5
 _Q_SCALE, _Q_ZERO_POINT, _Q_DIMENSION = 2, 3, 6
 _B_DATA, _B_OFFSET, _B_SIZE = 0, 1, 2
 _OP_OPCODE, _OP_INPUTS, _OP_OUTPUTS, _OP_OPTIONS = 0, 1, 2, 4
@@ -137,6 +137,8 @@ class _Tensor:
         self.scale = np.asarray(quant.scalars(_Q_SCALE, "f") if quant else [], np.float32)
         self.zero_point = np.asarray(quant.scalars(_Q_ZERO_POINT, "q") if quant else [], np.int64)
         self.quantized_dimension = quant.scalar(_Q_DIMENSION, "i") if quant else 0
+        # A variable tensor keeps what an operator wrote into it for the next invocation.
+        self.variable = bool(table.scalar(_T_VARIABLE, "B"))
         self._model = model
 
     @property
@@ -202,6 +204,18 @@ def unsupported(data: bytes) -> list[str]:
             if any(op.kind not in _INDEX_SLOTS or op.inputs[_INDEX_SLOTS[op.kind]] != index
                    for op in uses):
                 reasons.append(f"index {tensors[index].name!r} feeds an operand other than indices")
+        held = {op.inputs[_STATEFUL[op.kind]] for op in operators if op.kind in _STATEFUL}
+        for index, tensor in enumerate(tensors):
+            if not tensor.variable:
+                continue
+            uses = [op for op in operators if index in op.inputs]
+            if (index in inputs or index in outputs or len(uses) != 1 or index not in held
+                    or any(index in op.outputs for op in operators)):
+                reasons.append(f"variable tensor {tensor.name!r} is not the state of one "
+                               "SVDF")
+        for index in sorted(held):
+            if not tensors[index].variable:
+                reasons.append(f"state {tensors[index].name!r} is not a variable tensor")
         for index in sorted(slots - indices - index_inputs):
             if not _is_constant(tensors[index]):
                 reasons.append(f"indices {tensors[index].name!r} are computed by an operator "
@@ -287,6 +301,9 @@ _BOOL_SLOTS = {**{kind: ((), True) for kind in _COMPARISONS},
                "LOGICAL_AND": ((0, 1), True), "LOGICAL_OR": ((0, 1), True),
                "LOGICAL_NOT": ((0,), True), "SELECT_V2": ((0,), False), "CAST": ((0,), False),
                "REDUCE_ALL": ((0,), True)}
+# Operators that keep state in a variable tensor, at this operand.
+_STATEFUL = {"SVDF": 4}
+_STATE_TYPES = {"FLOAT32": TensorProto.FLOAT, "INT16": TensorProto.INT16}
 # Resource variables: a handle names a variable, which is read and assigned.
 _VARIABLES = ("CALL_ONCE", "VAR_HANDLE", "READ_VARIABLE", "ASSIGN_VARIABLE")
 # Index outputs: int32 positions, as model outputs or the indices of the operators below.
@@ -297,7 +314,7 @@ _INDEX_SLOTS = {"GATHER": 1, "GATHER_ND": 1, "EMBEDDING_LOOKUP": 0, "DYNAMIC_UPD
 _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum",
                "REDUCE_ALL": "ReduceAll"}
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
-              *_INDEX, *_BOOL_SLOTS, *_VARIABLES, "ADD_N",
+              *_INDEX, *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N",
               "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
               "CUMSUM", "MEAN",
               "TRANSPOSE",
@@ -315,7 +332,7 @@ _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V":
                       "REDUCE_MIN": (1,), "SUM": (1,), "CUMSUM": (1,), "GATHER_ND": (1,),
                       "MIRROR_PAD": (1,), "REVERSE_V2": (1,), "EMBEDDING_LOOKUP": (0,),
                       "DYNAMIC_UPDATE_SLICE": (2,), "ARG_MAX": (1,), "ARG_MIN": (1,),
-                      "REDUCE_ALL": (1,)}
+                      "REDUCE_ALL": (1,), "SVDF": (1, 2, 3)}
 
 
 def _is_constant(tensor: _Tensor) -> bool:
@@ -339,6 +356,8 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                 return f"input {position} must be a constant"
             if ins[position].type != "INT32":
                 return f"{ins[position].type} run-time indices; the runtime takes int32"
+    if op.kind == "SVDF":
+        return _svdf_reason(op, ins, outs)
     data = [t for i, t in enumerate(ins) if t is not None and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
     if op.kind in _WEIGHTED:
         source, position, bias_position = _WEIGHTED[op.kind]
@@ -464,6 +483,30 @@ def _gather_run(op: _Operator, ins: list[_Tensor]):
     return axis, indices[0], len(indices), len(ins[1].shape) == 0
 
 
+def _svdf_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    x, feature, time, bias, state = ins
+    y = outs[0]
+    if bias is None:
+        # TFLite Micro's Prepare reads the bias whether or not it is there.
+        return "no bias, which TFLite Micro requires"
+    if len(x.shape) != 2 or op.option(0, "i") <= 0:
+        return "input of rank other than 2"
+    if x.type == "FLOAT32":
+        if any(t.type != "FLOAT32" for t in (feature, time, bias, state, y)):
+            return "float32 input with operands of another dtype"
+        fused = _activation(op.option(1, "b"))
+        if fused not in ("none", "relu", "relu6"):
+            return f"fused {fused}"
+        return ""
+    if x.type != "INT8" or y.type != "INT8" or feature.type != "INT8" or bias.type != "INT32":
+        return "activations must be all int8 or all float32"
+    if time.type != "INT16" or state.type != "INT16":
+        return "int8 state; the converter writes int16"
+    if any(len(t.scale) != 1 for t in (x, feature, time, state, y)):
+        return "operands must be quantized per tensor"
+    return ""
+
+
 def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
     slot = _INDEX_SLOTS.get(op.kind)
     data = [t for i, t in enumerate(ins) if not _is_constant(t) and i != slot]
@@ -565,6 +608,8 @@ class _Converter:
         # latest value.
         self.handles: dict[int, str] = {}
         self.variables: dict[str, dict] = {}
+        # Per variable tensor, its state input and the value written for the next run.
+        self.held_state: dict[int, dict] = {}
 
     def value(self, index: int, rank: int | None = None) -> str:
         """The ONNX value of a tensor; a constant is broadcast-aligned to `rank`."""
@@ -691,6 +736,9 @@ class _Converter:
             y = b.node(_INDEX[kind], [x], tag, axis=self.ints(ins[1])[0] % rank, keepdims=0,
                        select_last_index=0)
             self.values[outs[0]] = b.node("Cast", [y], out.name, to=TensorProto.INT32)
+            return
+        if kind == "SVDF":
+            self.finish(self._svdf(op, tag), outs[0])
             return
         if kind in ("CONV_2D", "DEPTHWISE_CONV_2D"):
             y = self._conv(op, tag)
@@ -1095,6 +1143,34 @@ class _Converter:
             y = self.b.node(kind, [x, indices], tag + "_gathered", **attributes)
         return self.tflite_order_out(y, op.outputs[0], tag)
 
+    def _svdf(self, op: _Operator, tag: str) -> str:
+        """SVDF in the compiler's own form, its state passed in and out. An int8
+        SVDF takes its constants as stored, with their scales stated; its int16
+        state stays raw. TFLite Micro applies no activation to an int8 SVDF."""
+        b = self.b
+        x, feature, time, bias, state = op.inputs
+        quantized = self.tensors[x].type == "INT8"
+        attributes = {"rank": op.option(0, "i"),
+                      "activation": "none" if quantized else _activation(op.option(1, "b"))}
+        if quantized:
+            attributes.update(feature_scale=float(self.tensors[feature].scale[0]),
+                              time_scale=float(self.tensors[time].scale[0]),
+                              state_scale=float(self.tensors[state].scale[0]),
+                              state_zero_point=int(self.tensors[state].zero_point[0]))
+        constants = [b.constant(self.tensors[i].array(), f"{tag}_{part}")
+                     for i, part in ((feature, "feature"), (time, "time"), (bias, "bias"))]
+        y, kept = b.unique(tag), b.unique(tag + "_state")
+        b.nodes.append(helper.make_node("Svdf", [self.value(x), *constants,
+                                                 self.held_state[state]["input"]],
+                                        [y, kept], domain="tigris", **attributes))
+        held = self.tensors[state]
+        self.value_info += [
+            helper.make_tensor_value_info(y, TensorProto.FLOAT,
+                                          list(self.tensors[op.outputs[0]].shape)),
+            helper.make_tensor_value_info(kept, _STATE_TYPES[held.type], list(held.shape))]
+        self.held_state[state]["output"] = kept
+        return y
+
     def _strided_slice(self, op: _Operator, tag: str) -> str:
         """A STRIDED_SLICE with any strides, as an ONNX Slice in TFLite's axis
         order; a dropped axis is a slice of one, reshaped away."""
@@ -1318,9 +1394,30 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         state.append({"input": name + "_in", "output": None,
                       "initial": b.constant(initial.astype(np.float32).transpose(
                           _to_first(len(shape))), name + "_initial")})
+    # A variable tensor enters as a state input, zero before the first run as
+    # TFLite Micro resets it; the operator's write leaves as the state output.
+    for op in operators:
+        if op.kind in _STATEFUL:
+            index = op.inputs[_STATEFUL[op.kind]]
+            tensor = tensors[index]
+            name = b.unique(f"state{len(state)}_{tensor.name}_in")
+            onnx_inputs.append(helper.make_tensor_value_info(
+                name, _STATE_TYPES[tensor.type], list(tensor.shape)))
+            initial = b.constant(np.zeros(tensor.shape, _NUMPY[tensor.type]),
+                                 name.removesuffix("_in") + "_initial")
+            converter.held_state[index] = {"input": name, "output": None}
+            converter.values[index] = name
+            state.append({"input": name, "output": None, "initial": initial})
     for op in operators:
         converter.convert(op)
+    for entry, held in zip(state[len(state) - len(converter.held_state):],
+                           converter.held_state.values()):
+        entry["output"] = held["output"]
     state_outputs = []
+    for index, held in converter.held_state.items():
+        tensor = tensors[index]
+        state_outputs.append(helper.make_tensor_value_info(
+            held["output"], _STATE_TYPES[tensor.type], list(tensor.shape)))
     for entry, variable in zip(state, shapes):
         current = converter.variables[variable]
         if current["current"] != entry["input"]:

@@ -307,3 +307,13 @@ class AnalyzedGraph:
     def fast_memory_reserve_bytes(self) -> int:
         """Bytes held outside the activation arena. Compat accessor over ``budget``."""
         return self.budget.fast_reserve
+
+
+def state_tensor_names(ag: "AnalyzedGraph") -> set[str]:
+    """The model inputs and outputs that carry variables, not the interface."""
+    names = set()
+    for port in ag.state_ports:
+        names.add(ag.model_inputs[port.input])
+        if port.output is not None:
+            names.add(ag.model_outputs[port.output])
+    return names

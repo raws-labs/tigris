@@ -7,6 +7,8 @@ from tigris.emitters.binary.defs import OP_TYPE_MAP
 
 DATA = 0
 DATA_OR_BOOL = 255
+# Data, or int16 on a tensor that holds state between runs.
+STATE = 254
 
 
 @dataclass(frozen=True)
@@ -20,9 +22,11 @@ class DTypeSignature:
 class AuxiliaryDType:
     terminal_only: bool
     requires_source: bool = False
+    state_only: bool = False
 
 
-AUXILIARY_DTYPES = {6: AuxiliaryDType(False, requires_source=True), 9: AuxiliaryDType(False)}
+AUXILIARY_DTYPES = {6: AuxiliaryDType(False, requires_source=True), 9: AuxiliaryDType(False),
+                    5: AuxiliaryDType(False, state_only=True)}
 OP_DTYPE_SIGNATURES = {kind: DTypeSignature() for kind in OP_TYPE_MAP}
 OP_DTYPE_SIGNATURES.update({
     **{kind: DTypeSignature(inputs=(DATA, 6, 6))
@@ -41,13 +45,18 @@ OP_DTYPE_SIGNATURES.update({
     "Where": DTypeSignature(inputs=(9, DATA, DATA)),
     "Cast": DTypeSignature(inputs=(9, 9, 9)),
     "ReduceAll": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
+    # Constant operands sit between the input and the state; slots skip them.
+    # The output role admits int16 only on the next state, a state tensor.
+    "Svdf": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
 })
 
 
-def check_dtype_signatures(tensors, operators, model_inputs, model_outputs):
-    """Return data tensors by dtype and errors for (name, dtype, constant, quantized) records."""
+def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, state=()):
+    """Return data tensors by dtype and errors for (name, dtype, constant, quantized) records.
+    `state` names the tensors that carry state between runs."""
+    state = set(state)
     by_name = {name: (dtype, constant, quantized) for name, dtype, constant, quantized in tensors}
     data = {}
     issues = []
@@ -57,6 +66,10 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs):
         policy = AUXILIARY_DTYPES.get(dtype)
         if policy is None:
             data.setdefault(dtype, []).append(name)
+            continue
+        if policy.state_only:
+            if name not in state:
+                issues.append(f"ONNX dtype {dtype} tensor {name} must hold state between runs")
             continue
         if quantized:
             issues.append(f"auxiliary tensor {name} cannot carry quantization")
@@ -79,6 +92,11 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs):
                     continue
                 dtype = tensor[0]
                 expected = slots[min(position, len(slots) - 1)]
+                if expected == STATE:
+                    if dtype not in {1, 3} and not (dtype == 5 and name in state):
+                        issues.append(f"{kind} {direction} {position} ({name}) requires data "
+                                      f"or int16 state, got ONNX dtype {dtype}")
+                    continue
                 if expected == DATA_OR_BOOL:
                     if dtype not in {1, 3, 9} or dtype != by_name[inputs[0]][0]:
                         issues.append(f"{kind} must preserve its data or bool dtype")

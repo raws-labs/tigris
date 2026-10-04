@@ -182,16 +182,16 @@ def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
 
 
 def test_an_unsupported_operator_is_refused_by_name(tmp_path):
-    svdf = tflite._BUILTIN_OPERATORS.index("SVDF")
-    path = tmp_path / "kws_svdf.tflite"
-    path.write_bytes(_with_operator_replaced(KWS.read_bytes(), "FULLY_CONNECTED", svdf))
+    sparse = tflite._BUILTIN_OPERATORS.index("EMBEDDING_LOOKUP_SPARSE")
+    path = tmp_path / "kws_sparse.tflite"
+    path.write_bytes(_with_operator_replaced(KWS.read_bytes(), "FULLY_CONNECTED", sparse))
 
     report = inspect_file(path)
     assert report["format"] == "tflite"
-    assert any("SVDF: not supported" in reason for reason in report["unsupported"])
+    assert any("EMBEDDING_LOOKUP_SPARSE: not supported" in reason for reason in report["unsupported"])
     result = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-o", str(tmp_path / "x.tgrs")])
     assert result.exit_code != 0
-    assert "SVDF: not supported" in result.output
+    assert "EMBEDDING_LOOKUP_SPARSE: not supported" in result.output
     assert not (tmp_path / "x.tgrs").exists()
 
 
@@ -278,6 +278,29 @@ def test_int64_run_time_indices_are_refused(monkeypatch):
         tensors[operators[0].inputs[1]].type = "INT64"
     reasons = _read_edited(monkeypatch, "float_gather_runtime", widen)
     assert any("INT64 run-time indices; the runtime takes int32" in r for r in reasons)
+
+
+def test_an_svdf_without_bias_is_refused(monkeypatch):
+    """TFLite Micro's SVDF Prepare reads the bias whether or not it is there."""
+    def drop(tensors, operators):
+        operators[0].inputs = [*operators[0].inputs[:3], -1, operators[0].inputs[4]]
+    reasons = _read_edited(monkeypatch, "float_svdf", drop)
+    assert any("no bias, which TFLite Micro requires" in r for r in reasons)
+
+
+def test_an_int8_svdf_keeps_int16_state(monkeypatch):
+    def narrow(tensors, operators):
+        for position in (2, 4):
+            tensors[operators[0].inputs[position]].type = "INT8"
+    reasons = _read_edited(monkeypatch, "svdf", narrow)
+    assert any("int8 state; the converter writes int16" in r for r in reasons)
+
+
+def test_a_variable_tensor_is_only_svdf_state(monkeypatch):
+    def mark(tensors, operators):
+        tensors[operators[0].inputs[0]].variable = True
+    reasons = _read_edited(monkeypatch, "float_svdf", mark)
+    assert any("is not the state of one SVDF" in r for r in reasons)
 
 
 def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():

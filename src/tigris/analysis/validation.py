@@ -17,6 +17,7 @@ from tigris.analysis.partition_spatial import (
 from tigris.analysis.broadcast import DENSE, PERIODIC, stored_operands
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
+from tigris.graph.ir import state_tensor_names
 from tigris.dtypes import check_dtype_signatures
 from tigris.graph.ir import (
     AnalyzedGraph,
@@ -96,7 +97,7 @@ def validate_execution_dtype(ag: AnalyzedGraph) -> ExecutionDTypeValidation:
         [(name, tensor.dtype, tensor.is_constant, tensor.quant is not None)
          for name, tensor in ag.tensors.items()],
         [(op.op_type, op.inputs, op.outputs) for op in ag.ops],
-        ag.model_inputs, ag.model_outputs)
+        ag.model_inputs, ag.model_outputs, state_tensor_names(ag))
     if signature_issues:
         return ExecutionDTypeValidation(dtype=None, issues=signature_issues)
 
