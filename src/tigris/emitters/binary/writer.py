@@ -921,7 +921,8 @@ def _build_op_attributes(
         if op.op_type == "CumSum":
             records.append((op_index, OP_ATTR_CUMSUM_OPTIONS, bytes([
                 int(op.attrs.get("exclusive", 0)), int(op.attrs.get("reverse", 0))])))
-        if op.op_type in {"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin"}:
+        if op.op_type in {"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin",
+                          "ReduceAll"}:
             axes = op.attrs.get("axes")
             if not axes:
                 raise ValueError(f"{op.op_type} '{op.name}' must state its axes")

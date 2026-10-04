@@ -36,6 +36,7 @@ OP_DTYPE_SIGNATURES.update({
     "Not": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
     "Where": DTypeSignature(inputs=(9, DATA, DATA)),
     "Cast": DTypeSignature(inputs=(9, 9, 9)),
+    "ReduceAll": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
 })

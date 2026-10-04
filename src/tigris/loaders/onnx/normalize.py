@@ -193,6 +193,7 @@ _METADATA_INPUTS: dict[str, int] = {
     "ReduceMin": 1,
     "ReduceSum": 1,
     "CumSum": 1,
+    "ReduceAll": 1,
     "Reshape": 1,
     "Resize": 1,
     "Squeeze": 1,
@@ -411,7 +412,7 @@ def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
         return Layout.LINEAR
     if op.op_type in _SPATIAL_LAYOUT_OPS:
         return Layout.SPATIAL
-    if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin"}:
+    if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin", "ReduceAll"}:
         return Layout.LINEAR
     if op.op_type in _LINEAR_LAYOUT_OPS:
         return Layout.LINEAR
@@ -1330,6 +1331,19 @@ def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
             if op.op_type == "L2Normalization":
                 op.attrs = {"axis": int(axes.reshape(-1)[0]),
                             "epsilon": float(epsilon.reshape(-1)[0])}
+        elif op.op_type == "Cast" and len(op.inputs) == 1 and int(op.attrs.get("to", 0)) == 9:
+            # All of a bool axis: the minimum of its values as uint8, which
+            # ONNX can state where it has no bool reduction.
+            reduce = match(op.inputs[0], "ReduceMin", 1)
+            widen = match(reduce.inputs[0], "Cast", 1) if reduce is not None else None
+            source = ag.tensors.get(widen.inputs[0]) if widen is not None else None
+            if source is None or source.dtype != 9 or int(widen.attrs.get("to", 0)) != 2:
+                continue
+            attrs = {"axes": list(reduce.attrs.get("axes", [])),
+                     "keepdims": int(reduce.attrs.get("keepdims", 1))}
+            replace(op, "ReduceAll", widen.inputs.copy(), [widen, reduce])
+            if op.op_type == "ReduceAll":
+                op.attrs = attrs
         elif op.op_type == "Reciprocal" and len(op.inputs) == 1:
             inner = match(op.inputs[0], "Sqrt", 1)
             if inner is not None:
@@ -2904,7 +2918,7 @@ def _normalize_arg_outputs(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 def _normalize_reduction_axes(ag: AnalyzedGraph) -> AnalyzedGraph:
     for op in ag.ops:
-        if op.op_type not in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum"}:
+        if op.op_type not in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ReduceAll"}:
             continue
         source = ag.tensors.get(op.inputs[0]) if op.inputs else None
         rank = len(source.shape) if source is not None else 0

@@ -110,6 +110,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Where",
     "Cast",
     "Sum",
+    "ReduceAll",
     "Split",
 })
 
@@ -246,6 +247,7 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     ),
     "ReduceMax": ("one axis of a rank-3 tensor, untiled; rank-4 spatial max with keepdims uses GlobalMaxPool; int8 quantization must match",),
     "ReduceMin": ("one axis of a rank-3 tensor, untiled; int8 quantization must match",),
+    "ReduceAll": ("one axis of a rank-3 bool tensor, untiled",),
     "ReduceSum": ("one axis of a rank-3 tensor, untiled; int8 rejects reference arithmetic overflow",),
     "Gather": ("constant indices or bounds; untiled; identical int8 quantization",),
     "GatherND": ("constant indices or bounds; untiled; identical int8 quantization",),

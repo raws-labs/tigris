@@ -82,6 +82,7 @@
     "Or": 79,
     "PRelu": 55,
     "Pad": 14,
+    "ReduceAll": 84,
     "ReduceMax": 60,
     "ReduceMean": 26,
     "ReduceMin": 61,

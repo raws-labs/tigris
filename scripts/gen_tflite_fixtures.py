@@ -349,6 +349,8 @@ BOOLEAN = {
     "select_v2_broadcast": _binary(lambda x, y: tf.where(x > 0.5, x, y), _MAP, (1, 1, 1, 4)),
     "cast_bool": _binary(lambda x, y: tf.cast(x > y, tf.float32), _MAP, _MAP),
     "add_n": _TRIPLE,
+    "reduce_all_channels": _unary(lambda x: tf.reduce_all(x > -2.0, -1), _MAP),
+    "reduce_all_spatial": _unary(lambda x: tf.reduce_all(x > -2.9, [1, 2], keepdims=True), _MAP),
 }
 CASES.update(BOOLEAN)
 
