@@ -287,7 +287,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     or float(output.quant.scale[0]) != scale
                     or output.quant.zero_point.size != 1 or int(output.quant.zero_point[0]) != zero):
                 reasons.append(f"{op.op_type} requires output scale {scale} and zero point {zero}")
-        if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin"}:
+        if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin", "ReduceAll"}:
             source = ag.tensors.get(op.inputs[0]) if op.inputs else None
             output = ag.tensors.get(op.outputs[0]) if op.outputs else None
             axes = op.attrs.get("axes", [])
@@ -310,7 +310,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         shape.pop(axis)
                 if tuple(shape) != output.shape:
                     reasons.append("output shape does not match the reduction axis")
-                if ag.is_quantized and op.op_type not in {"ArgMax", "ArgMin"}:
+                if ag.is_quantized and op.op_type not in {"ArgMax", "ArgMin", "ReduceAll"}:
                     quants = [source.quant, output.quant]
                     if any(q is None or q.scale.size != 1 or q.zero_point.size != 1 for q in quants):
                         reasons.append("int8 reductions require per-tensor quantization")

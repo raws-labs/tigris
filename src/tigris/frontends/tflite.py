@@ -235,11 +235,13 @@ _LOGICAL = {"LOGICAL_AND": "And", "LOGICAL_OR": "Or", "LOGICAL_NOT": "Not"}
 # Input positions that hold bool, and whether the output does.
 _BOOL_SLOTS = {**{kind: ((), True) for kind in _COMPARISONS},
                "LOGICAL_AND": ((0, 1), True), "LOGICAL_OR": ((0, 1), True),
-               "LOGICAL_NOT": ((0,), True), "SELECT_V2": ((0,), False), "CAST": ((0,), False)}
+               "LOGICAL_NOT": ((0,), True), "SELECT_V2": ((0,), False), "CAST": ((0,), False),
+               "REDUCE_ALL": ((0,), True)}
 # Index outputs: int32 positions, only as model outputs.
 _INDEX = {"ARG_MAX": "ArgMax", "ARG_MIN": "ArgMin"}
 # Reductions over one run of adjacent axes, and the prefix sum over one axis.
-_REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum"}
+_REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum",
+               "REDUCE_ALL": "ReduceAll"}
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
               *_INDEX, *_BOOL_SLOTS, "ADD_N",
               "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
@@ -258,7 +260,8 @@ _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V":
                       "BROADCAST_TO": (1,), "PRELU": (1,), "REDUCE_MAX": (1,),
                       "REDUCE_MIN": (1,), "SUM": (1,), "CUMSUM": (1,), "GATHER_ND": (1,),
                       "MIRROR_PAD": (1,), "REVERSE_V2": (1,), "EMBEDDING_LOOKUP": (0,),
-                      "DYNAMIC_UPDATE_SLICE": (2,), "ARG_MAX": (1,), "ARG_MIN": (1,)}
+                      "DYNAMIC_UPDATE_SLICE": (2,), "ARG_MAX": (1,), "ARG_MIN": (1,),
+                      "REDUCE_ALL": (1,)}
 
 
 def _is_constant(tensor: _Tensor) -> bool:
@@ -299,11 +302,12 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                 outs[0].scale.size != 1 or outs[0].scale[0] != 1 or outs[0].zero_point[0] != 0):
             # TFLite copies the raw 0 or 1 into the int8 output.
             return "int8 output encoding other than scale 1 and zero point 0"
-        data = [t for i, t in enumerate(ins) if t is not None and i not in positions]
+        data = [t for i, t in enumerate(ins) if t is not None and i not in positions
+                and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
         if bool_output:
             outs = []
         dynamic = [t for t in ins if t is not None and not _is_constant(t)]
-        if any(len(t.shape) != len(op_outputs[0].shape) for t in dynamic):
+        if op.kind != "REDUCE_ALL" and any(len(t.shape) != len(op_outputs[0].shape) for t in dynamic):
             return "operands of different rank"
     if op.kind in _INDEX:
         if outs[0].type != "INT32":
@@ -929,6 +933,13 @@ class _Converter:
         elif op.kind == "SUM":
             y = b.node("ReduceSum", [x, b.constant(np.asarray([axis], np.int64), tag + "_axes")],
                        tag + "_reduced", keepdims=1)
+            kept = [rows[0], 1, rows[2]]
+        elif op.kind == "REDUCE_ALL":
+            # ONNX has no bool reduction: the minimum of the values as uint8,
+            # which the compiler folds back into one operator.
+            widened = b.node("Cast", [x], tag + "_widened", to=TensorProto.UINT8)
+            lowest = b.node("ReduceMin", [widened], tag + "_lowest", axes=[axis], keepdims=1)
+            y = b.node("Cast", [lowest], tag + "_reduced", to=TensorProto.BOOL)
             kept = [rows[0], 1, rows[2]]
         else:
             y = b.node(_REDUCTIONS[op.kind], [x], tag + "_reduced", axes=[axis], keepdims=1)

@@ -683,6 +683,27 @@ def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
                         mem_budget="4K", reference_unoptimized=True)
 
 
+def _reduce_all_case(axis: int, keep: bool) -> ContractCase:
+    """All of one bool axis, stated as the uint8 minimum ONNX can express."""
+    shape = [2, 7, 4]
+    output_shape = shape.copy()
+    if keep:
+        output_shape[axis] = 1
+    else:
+        output_shape.pop(axis)
+    data = np.random.default_rng(417 + axis).uniform(size=shape) > 0.15
+    nodes = [helper.make_node("Cast", ["input"], ["widened"], to=TensorProto.UINT8),
+             helper.make_node("ReduceMin", ["widened"], ["lowest"], axes=[axis - 3], keepdims=int(keep)),
+             helper.make_node("Cast", ["lowest"], ["output"], to=TensorProto.BOOL)]
+    label = f"bool_reduceall_axis{axis}_keep{int(keep)}"
+    model = _model(label, nodes,
+                   [helper.make_tensor_value_info("input", TensorProto.BOOL, shape)],
+                   [helper.make_tensor_value_info("output", TensorProto.BOOL, output_shape)], [])
+    operators = ("Transpose", "ReduceAll", "Transpose") if keep else ("Transpose", "ReduceAll")
+    return ContractCase(label, model, copy.deepcopy(model), {"input": data}, operators,
+                        mem_budget="4K", reference_unoptimized=True)
+
+
 def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase:
     shape = [2, 3, 4]
     data = ((np.arange(24).reshape(shape) * 7) % 31 - 15).astype(np.float32) * 0.125
@@ -6629,6 +6650,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         *[_reduction_case("CumSum", axis, quantized=q, exclusive=ex, reverse=rev)
           for axis in range(3) for q in (False, True)
           for ex in (False, True) for rev in (False, True)],
+        *[_reduce_all_case(axis, keep) for axis in range(3) for keep in (False, True)],
         *[_bool_case(kind, quantized=q, tiled=tiled)
           for kind in ("Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Not", "Where", "Cast", "Sum")
           for q in (False, True) if not (q and kind in {"And", "Or", "Not"})

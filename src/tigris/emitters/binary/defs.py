@@ -172,6 +172,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "Where": 81,
     "Cast": 82,
     "Sum": 83,
+    "ReduceAll": 84,
 }
 OP_TYPE_UNKNOWN = 255
 
