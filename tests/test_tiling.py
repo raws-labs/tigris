@@ -581,3 +581,41 @@ def test_band_cannot_cut_a_reduced_indexed_or_modified_axis(kind):
     graph = AnalyzedGraph(tensors=tensors, ops=[op])
     assert not _independent_band(graph, op)
     assert not _independent_band(graph, op, row_tiled=False)
+
+
+@pytest.mark.parametrize("source,target,expected", [
+    ((2, 11, 12), (2, 33, 4), (2, 11, 12, 33, 4)),
+    ((2, 33, 4), (2, 11, 12), (2, 33, 4, 11, 12)),
+    ((1, 3, 3, 8), (1, 3, 3, 2, 2, 2), (1, 3, 24, 3, 24)),
+    ((1, 6, 6, 4), (1, 36, 4), (1, 6, 24, 36, 4)),
+    ((1, 6, 6, 4), (36, 1, 4), None),
+])
+def test_reshape_band_mapping(source, target, expected):
+    from tigris.analysis.partition_spatial import _reshape_band
+    from tigris.graph.ir import Layout, Stage
+
+    graph = AnalyzedGraph(tensors={name: TensorInfo(name, shape, dtype=1, layout=Layout.LINEAR)
+                                  for name, shape in (("x", source), ("y", target))},
+                          ops=[OpNode("reshape", "Reshape", ["x"], ["y"])])
+    stage = Stage(0, [0], ["x"], ["y"])
+    assert _reshape_band(graph, stage) == expected
+    stage.chain_len = 2
+    stage.chain_id = 0
+    assert _reshape_band(graph, stage) is None
+    stage.chain_len = 0
+    graph.tensors["x"].layout = Layout.SPATIAL
+    assert _reshape_band(graph, stage) is None
+
+
+def test_reshape_band_solver_preserves_integral_endpoints():
+    from tigris.analysis.partition_spatial import _reshape_tile_for_bytes
+
+    mapping = (2, 33, 4, 11, 12)
+    plan = _reshape_tile_for_bytes(mapping, 256, 32, 4)
+    assert plan.tileable and plan.tile_height == 6 and plan.num_tiles == 6
+    assert plan.tiled_peak_bytes == 192
+    for start in range(0, 33, plan.tile_height):
+        end = min(33, start + plan.tile_height)
+        assert start * 4 % 12 == 0 and end * 4 % 12 == 0
+    refused = _reshape_tile_for_bytes(mapping, 95, 32, 4)
+    assert not refused.tileable and refused.min_tile_bytes == 96

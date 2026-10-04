@@ -153,7 +153,7 @@ def test_independent_axis_uses_tight_budget(name, kind, tmp_path):
     ("float_cumsum_offset", "CumSum"), ("float_reduce_max_spatial", "ReduceMax"),
     ("float_reduce_min_rows", "ReduceMin"), ("float_sum_spatial", "ReduceSum"),
 ])
-def test_independent_axis_does_not_hide_an_infeasible_reshape(name, kind, tmp_path):
+def test_independent_axis_and_reshape_fit_tight_budget(name, kind, tmp_path):
     from tigris.cli import _run_pipeline
 
     model = FIXTURES / "ops" / (name + ".tflite")
@@ -162,10 +162,16 @@ def test_independent_axis_does_not_hide_an_infeasible_reshape(name, kind, tmp_pa
                  if any(graph.ops[i].op_type == kind for i in stage.op_indices))
     assert stage.tile_plan.tileable and stage.tile_plan.num_tiles > 1
     assert stage.tile_plan.tiled_peak_bytes <= 256
-    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256",
-                                     "-o", str(tmp_path / "model.tgrs")])
-    assert result.exit_code != 0
-    assert "untileable operators: Reshape" in result.output
+    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
+    reshapes = [stage for stage in graph.stages if stage.peak_bytes > 256
+                and any(graph.ops[i].op_type == "Reshape" for i in stage.op_indices)]
+    assert reshapes and all(s.tile_plan.tileable and s.tile_plan.num_tiles > 1 for s in reshapes)
+
+
+@pytest.mark.parametrize("name", ["float_depth_to_space", "float_space_to_depth", "float_reshape"])
+def test_reshape_rank_boundary_fits_tight_budget(name, tmp_path):
+    model = FIXTURES / "ops" / (name + ".tflite")
+    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
 
 
 def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
