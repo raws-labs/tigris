@@ -127,6 +127,47 @@ def test_resize_downscales_in_height_bands(model, tmp_path):
     assert any(tile["num_tiles"] > 1 for tile in plan["tile_plans"])
 
 
+
+@pytest.mark.parametrize("name,kind", [
+    ("cumsum", "CumSum"), ("cumsum_offset", "CumSum"),
+    ("cumsum_offset_exclusive_reverse", "CumSum"),
+    ("dynamic_update_slice", "DynamicUpdateSlice"), ("float_gather_indices", "Gather"),
+    ("float_reverse_channels", "ReverseV2"),
+    ("reverse_channels", "ReverseV2"), ("mirror_pad_reflect", "MirrorPad"),
+    ("mirror_pad_symmetric", "MirrorPad"),
+])
+def test_independent_axis_uses_tight_budget(name, kind, tmp_path):
+    from tigris.emitters.binary.defs import OP_TYPE_MAP
+
+    model = FIXTURES / "ops" / (name + ".tflite")
+    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
+    plan = read_binary_plan((tmp_path / "model.tgrs").read_bytes())
+    stage = next(stage for stage in plan["stages"]
+                 if any(plan["ops"][i]["op_type"] == OP_TYPE_MAP[kind] for i in stage["ops"]))
+    assert stage["tile_plan_idx"] != 65535
+    tile = plan["tile_plans"][stage["tile_plan_idx"]]
+    assert tile["tileable"] and tile["num_tiles"] > 1 and tile["tiled_peak_bytes"] <= 256
+
+
+@pytest.mark.parametrize("name,kind", [
+    ("float_cumsum_offset", "CumSum"), ("float_reduce_max_spatial", "ReduceMax"),
+    ("float_reduce_min_rows", "ReduceMin"), ("float_sum_spatial", "ReduceSum"),
+])
+def test_independent_axis_does_not_hide_an_infeasible_reshape(name, kind, tmp_path):
+    from tigris.cli import _run_pipeline
+
+    model = FIXTURES / "ops" / (name + ".tflite")
+    graph, _ = _run_pipeline(str(model), ("256",), report_bindings=False)
+    stage = next(stage for stage in graph.stages
+                 if any(graph.ops[i].op_type == kind for i in stage.op_indices))
+    assert stage.tile_plan.tileable and stage.tile_plan.num_tiles > 1
+    assert stage.tile_plan.tiled_peak_bytes <= 256
+    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256",
+                                     "-o", str(tmp_path / "model.tgrs")])
+    assert result.exit_code != 0
+    assert "untileable operators: Reshape" in result.output
+
+
 def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
     """A copy whose operator code for `kind` names builtin `code` instead."""
     buffer = bytearray(data)

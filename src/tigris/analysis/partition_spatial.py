@@ -688,6 +688,61 @@ def _whole_band_operands(stage_ops: list[OpNode]) -> set[str]:
     return whole
 
 
+
+_ROW_REDUCTIONS = frozenset({"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",
+                             "CumSum", "ArgMax", "ArgMin"})
+_ROW_MOVEMENT = frozenset({"Gather", "GatherND", "EmbeddingLookup", "StridedSlice",
+                          "MirrorPad", "ReverseV2", "DynamicUpdateSlice"})
+
+
+
+def _height_view(info) -> tuple[int, int, int] | None:
+    shape = serialized_shape(info.shape, info.layout)
+    if len(shape) not in (3, 4):
+        return None
+    return shape[0], shape[1], math.prod(shape[2:])
+
+
+def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True) -> bool:
+    """The existing row or height axis survives the operation unchanged."""
+    if op.op_type not in _ROW_REDUCTIONS | _ROW_MOVEMENT or not op.inputs or len(op.outputs) != 1:
+        return False
+    source, target = ag.tensors[op.inputs[0]], ag.tensors[op.outputs[0]]
+    view = _row_view if row_tiled else _height_view
+    first, last = view(source), view(target)
+    if first is None or last is None or first[:2] != last[:2]:
+        return False
+    rank = len(source.shape)
+    row = rank - 2 if row_tiled else 1
+    if not row_tiled and (len(target.shape) != rank or first[1] <= 1):
+        return False
+    if any(not ag.tensors[name].is_constant and (view(ag.tensors[name]) is None or
+           view(ag.tensors[name])[:2] != first[:2]) for name in op.inputs[1:]):
+        return False
+    if op.op_type in _ROW_REDUCTIONS:
+        axes = op.attrs.get("axes", [])
+        return len(axes) == 1 and serialized_axis_map(rank, source.layout)[axes[0]] != row
+    metadata = op.attrs.get("movement", [])
+    if not metadata:
+        return False
+    if op.op_type in {"Gather", "GatherND", "EmbeddingLookup"}:
+        if len(op.inputs) != 2 or not ag.tensors[op.inputs[1]].is_constant:
+            return False
+        if op.op_type == "GatherND":
+            return metadata[metadata[0]] <= row
+        return metadata[0] != row and metadata[1] <= row
+    if op.op_type == "StridedSlice":
+        shrink = metadata[3 * rank] if len(metadata) > 3 * rank else 0
+        return not shrink & (1 << row) and metadata[3 * row:3 * row + 3] == [0, source.shape[row], 1]
+    if op.op_type == "MirrorPad":
+        return metadata[1 + 2 * row:3 + 2 * row] == [0, 0]
+    if op.op_type == "ReverseV2":
+        return not metadata[0] & (1 << row)
+    return (len(op.inputs) == 2 and not ag.tensors[op.inputs[1]].is_constant
+            and len(metadata) == 2 * rank and metadata[row] == 0
+            and metadata[rank + row] == source.shape[row])
+
+
 def _stage_is_row_tiled(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -721,7 +776,7 @@ def _stage_is_row_tiled(
 
     whole_operands = _whole_band_operands(stage_ops)
     for op in stage_ops:
-        if (op.op_type not in _ROW_TILING_OPS
+        if ((op.op_type not in _ROW_TILING_OPS and not _independent_band(ag, op))
                 or len(op.inputs) < 1 or len(op.outputs) != 1):
             return False
         for position, name in enumerate(op.inputs):
@@ -758,7 +813,7 @@ def _stage_is_row_tiled(
 
 
 def _solve_row_tile(
-    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int, view_of=_row_view
 ) -> TilePlan:
     """Size the band of rows a matrix pipeline takes at a time.
 
@@ -767,7 +822,7 @@ def _solve_row_tile(
     every tensor whatever the band.
     """
     first_output = stage_ops[0].outputs[0]
-    batch, rows, _ = _row_view(ag.tensors[first_output])
+    batch, rows, _ = view_of(ag.tensors[first_output])
     align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
     # A tensor the band cuts costs its row size for every row in the band, on
@@ -785,7 +840,7 @@ def _solve_row_tile(
             continue
         seen.add(name)
         info = ag.tensors[name]
-        view = _row_view(info)
+        view = view_of(info)
         if (name not in whole_operands and view is not None
                 and (view[0], view[1]) == (batch, rows)):
             per_row.append(batch * view[2] * info.elem_size)
@@ -1471,6 +1526,10 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         # pipeline's rows are independent, so it bands along them.
         if _stage_is_row_tiled(ag, stage, stage_ops):
             stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget)
+            continue
+
+        if len(stage_ops) == 1 and _independent_band(ag, stage_ops[0], row_tiled=False):
+            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, _height_view)
             continue
 
         # A global reduction has no output axis to tile, so the runtime walks

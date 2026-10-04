@@ -523,3 +523,61 @@ def test_half_pixel_bilinear_band_reaches_one_row_further():
     assert compute_receptive_field([half]) == (3, 3)
     assert compute_receptive_field([asym]) == (2, 2)
     assert compute_receptive_field([nearest]) == (1, 1)
+
+
+@pytest.mark.parametrize("kind", ["ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",
+                                  "CumSum", "ArgMax", "ArgMin", "Gather", "GatherND", "EmbeddingLookup",
+                                  "StridedSlice", "MirrorPad", "ReverseV2", "DynamicUpdateSlice"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_independent_operator_band_fits_256_bytes(tmp_path, kind, quantized):
+    import onnx
+    from scripts.crossrepo_contract import _arg_case, _movement_case, _reduce_all_case, _reduction_case
+    from tigris.cli import _run_pipeline
+
+    if kind in {"ArgMax", "ArgMin"}:
+        case = _arg_case(kind, 2, quantized, True, tiled=True)
+    elif kind == "ReduceAll":
+        case = _reduce_all_case(2, True, tiled=True)
+    elif kind in {"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum"}:
+        case = _reduction_case(kind, 2, quantized=quantized, tiled=True)
+    else:
+        case = _movement_case(kind, quantized, 2 if kind == "Gather" else 0, tiled=True)
+    path = tmp_path / "band.onnx"
+    onnx.save(case.compile_model, path)
+    graph, _ = _run_pipeline(str(path), ("256", "16K"))
+    stage = next(s for s in graph.stages if any(graph.ops[i].op_type == kind for i in s.op_indices))
+    assert stage.tile_plan and stage.tile_plan.tileable and stage.tile_plan.num_tiles > 1
+    assert stage.tile_plan.tiled_peak_bytes <= 256
+    assert validate_memory_plan(graph).feasible
+
+
+@pytest.mark.parametrize("kind", ["ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin",
+                                  "Gather", "GatherND", "EmbeddingLookup", "StridedSlice", "MirrorPad",
+                                  "ReverseV2", "DynamicUpdateSlice"])
+def test_band_cannot_cut_a_reduced_indexed_or_modified_axis(kind):
+    from tigris.analysis.partition_spatial import _independent_band
+    from tigris.graph.ir import Layout
+
+    tensors = {name: TensorInfo(name, (2, 7, 4), dtype=1, layout=Layout.LINEAR) for name in ("x", "y", "u")}
+    tensors["indices"] = TensorInfo("indices", (7,), dtype=6, is_constant=True)
+    attributes = {"axes": [1]}
+    inputs = ["x"]
+    if kind in {"Gather", "EmbeddingLookup"}:
+        attributes = {"movement": [1, 0, 1, 7]}
+        inputs.append("indices")
+    elif kind == "GatherND":
+        attributes = {"movement": [2, 7, 2]}
+        inputs.append("indices")
+    elif kind == "StridedSlice":
+        attributes = {"movement": [0, 2, 1, 0, 7, 2, 0, 4, 1]}
+    elif kind == "MirrorPad":
+        attributes = {"movement": [0, 0, 0, 1, 1, 0, 0]}
+    elif kind == "ReverseV2":
+        attributes = {"movement": [2]}
+    elif kind == "DynamicUpdateSlice":
+        attributes = {"movement": [0, 1, 0, 2, 6, 4]}
+        inputs.append("u")
+    op = OpNode("band", kind, inputs, ["y"], attrs=attributes)
+    graph = AnalyzedGraph(tensors=tensors, ops=[op])
+    assert not _independent_band(graph, op)
+    assert not _independent_band(graph, op, row_tiled=False)

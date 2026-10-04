@@ -647,8 +647,11 @@ def _linear_spatial_max_case(*, quantized: bool) -> ContractCase:
 
 
 def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
-                    exclusive: bool = False, reverse: bool = False) -> ContractCase:
-    shape = [2, 7, 4]
+                    exclusive: bool = False, reverse: bool = False, tiled: bool = False) -> ContractCase:
+    shape = [2, 137 if tiled else 7, 4]
+    if kind == "ReduceMean" and tiled:
+        shape = [2, 4, 137]
+        axis = 1
     output_shape = shape.copy()
     if kind != "CumSum":
         if keep:
@@ -676,17 +679,21 @@ def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
         nodes += _qdq(target, "y_s", "y_z", "output")
     label = (f"{'int8' if quantized else 'float'}_{kind.lower()}_axis{axis}"
              f"_keep{int(keep)}_exclusive{int(exclusive)}_reverse{int(reverse)}")
+    label += "_tiled" if tiled else ""
     model = _model(label, nodes,
                    [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
                    [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)], initializers)
     operators = ("Transpose", kind, "Transpose") if keep or kind == "CumSum" else ("Transpose", kind)
+    if kind == "ReduceMean":
+        operators = (kind,)
     return ContractCase(label, model, copy.deepcopy(model), {"input": data}, operators,
-                        mem_budget="4K", reference_unoptimized=True)
+                        mem_budget="256" if tiled else "4K", slow_budget="16K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True)
 
 
-def _reduce_all_case(axis: int, keep: bool) -> ContractCase:
+def _reduce_all_case(axis: int, keep: bool, tiled: bool = False) -> ContractCase:
     """All of one bool axis, stated as the uint8 minimum ONNX can express."""
-    shape = [2, 7, 4]
+    shape = [2, 137 if tiled else 7, 4]
     output_shape = shape.copy()
     if keep:
         output_shape[axis] = 1
@@ -697,17 +704,19 @@ def _reduce_all_case(axis: int, keep: bool) -> ContractCase:
              helper.make_node("ReduceMin", ["widened"], ["lowest"], axes=[axis - 3], keepdims=int(keep)),
              helper.make_node("Cast", ["lowest"], ["output"], to=TensorProto.BOOL)]
     label = f"bool_reduceall_axis{axis}_keep{int(keep)}"
+    label += "_tiled" if tiled else ""
     model = _model(label, nodes,
                    [helper.make_tensor_value_info("input", TensorProto.BOOL, shape)],
                    [helper.make_tensor_value_info("output", TensorProto.BOOL, output_shape)], [])
     operators = ("Transpose", "ReduceAll", "Transpose") if keep else ("Transpose", "ReduceAll")
     return ContractCase(label, model, copy.deepcopy(model), {"input": data}, operators,
-                        mem_budget="4K", reference_unoptimized=True)
+                        mem_budget="256" if tiled else "4K", slow_budget="16K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True)
 
 
-def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase:
-    shape = [2, 3, 4]
-    data = ((np.arange(24).reshape(shape) * 7) % 31 - 15).astype(np.float32) * 0.125
+def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = False) -> ContractCase:
+    shape = [2, 37 if tiled else 3, 4]
+    data = ((np.arange(np.prod(shape)).reshape(shape) * 7) % 31 - 15).astype(np.float32) * 0.125
     nodes, initializers, reference_nodes = [], [], []
     inputs = {"input": data}
     model_inputs = [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)]
@@ -725,13 +734,13 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase
 
     if kind == "Gather":
         axis = variant % 3
-        indices = [shape[axis] - 1, 0, shape[axis] - 1]
+        indices = [shape[axis] - 1, 0] if tiled and axis == 0 else [shape[axis] - 1, 0, shape[axis] - 1]
         node = helper.make_node(kind, [source, integer("indices", indices)], [target], axis=axis)
         nodes.append(node)
         reference_nodes.append(copy.deepcopy(node))
         expected = np.take(data, indices, axis=axis)
     elif kind == "GatherND":
-        indices = [[1, 2], [0, 0], [1, 0]]
+        indices = [[1], [0]] if tiled else [[1, 2], [0, 0], [1, 0]]
         node = helper.make_node(kind, [source, integer("indices", indices)], [target])
         nodes.append(node)
         reference_nodes.append(copy.deepcopy(node))
@@ -746,6 +755,8 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase
             expected = data[:, -1, ::-2]
         else:
             starts, ends, steps = ([1, 2, 3], [-2**63] * 3, [-1, -2, -2]) if variant else ([0, 0, 0], shape, [1, 2, 2])
+            if tiled:
+                steps = [1, 1, 2]
             args = [source, integer("starts", starts), integer("ends", ends), integer("axes", [0, 1, 2]), integer("steps", steps)]
             node = helper.make_node("Slice", args, [target])
             nodes.append(node)
@@ -753,7 +764,7 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase
             expected = data[tuple(slice(s, e, t) for s, e, t in zip(starts, ends, steps))]
     elif kind == "MirrorPad":
         mode = "symmetric" if variant else "reflect"
-        pads = [[1, 1], [2, 1], [0, 2]]
+        pads = [[0, 0], [0, 0], [1, 2]] if tiled else [[1, 1], [2, 1], [0, 2]]
         integer("pads", np.array(pads).T.reshape(-1))
         if variant:
             nodes.append(helper.make_node(kind, [source, "pads"], [target], mode=mode, domain="tigris"))
@@ -767,18 +778,22 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase
             previous = name
         expected = np.pad(data, pads, mode=mode)
     elif kind == "ReverseV2":
-        nodes.append(helper.make_node(kind, [source, integer("axes", [0, 1])], [target], domain="tigris"))
-        reference_nodes += [helper.make_node("Gather", [source, integer("first", [1, 0])], ["rev"], axis=0),
-                            helper.make_node("Gather", ["rev", integer("last", [2, 1, 0])], [target], axis=1)]
-        expected = data[::-1, ::-1, :]
+        if tiled:
+            nodes.append(helper.make_node(kind, [source, integer("axes", [2])], [target], domain="tigris"))
+            reference_nodes.append(helper.make_node("Gather", [source, integer("last", [3, 2, 1, 0])], [target], axis=2))
+        else:
+            nodes.append(helper.make_node(kind, [source, integer("axes", [0, 1])], [target], domain="tigris"))
+            reference_nodes += [helper.make_node("Gather", [source, integer("first", [1, 0])], ["rev"], axis=0),
+                                helper.make_node("Gather", ["rev", integer("last", [2, 1, 0])], [target], axis=1)]
+        expected = data[:, :, ::-1] if tiled else data[::-1, ::-1, :]
     elif kind == "EmbeddingLookup":
-        indices = [1, 0, 1]
+        indices = [1, 0] if tiled else [1, 0, 1]
         name = integer("indices", indices)
         nodes.append(helper.make_node(kind, [source, name], [target], domain="tigris"))
         reference_nodes.append(helper.make_node("Gather", [source, name], [target], axis=0))
         expected = data[indices]
     else:
-        update = np.full((1, 2, 2), 3.5, np.float32)
+        update = np.full((2, shape[1], 2) if tiled else (1, 2, 2), 3.5, np.float32)
         starts = [99, -4, 1]
         if variant:
             initializers.append(numpy_helper.from_array(update, "update"))
@@ -802,6 +817,7 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase
         nodes.extend(_qdq(target, "y_s", "y_z", "output"))
         reference_nodes.extend(_qdq(target, "y_s", "y_z", "output"))
     label = f"{'int8' if quantized else 'float'}_{kind.lower()}_{variant}"
+    label += "_tiled" if tiled else ""
     output = helper.make_tensor_value_info("output", TensorProto.FLOAT, expected.shape)
 
     def build(body):
@@ -822,8 +838,9 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0) -> ContractCase
     if expected.ndim >= 3:
         operators.append("Transpose")
     return ContractCase(label, build(nodes), build(reference_nodes), inputs, tuple(operators),
-                        mem_budget="8K", reference_unoptimized=True,
-                        compression="lz4" if kind == "Gather" and variant == 0 else None)
+                        mem_budget="256" if tiled else "8K", slow_budget="16K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True,
+                        compression="lz4" if kind == "Gather" and variant == 0 and not tiled else None)
 
 
 
@@ -941,8 +958,8 @@ def _bool_composition_case(quantized: bool, tiled: bool) -> ContractCase:
                         slow_budget=case.slow_budget, expect_tiled=tiled, expect_chain=tiled, reference_unoptimized=True)
 
 
-def _arg_case(kind: str, axis: int, quantized: bool, keep: bool) -> ContractCase:
-    shape = [2, 7, 4]
+def _arg_case(kind: str, axis: int, quantized: bool, keep: bool, tiled: bool = False) -> ContractCase:
+    shape = [2, 137 if tiled else 7, 4]
     target = shape.copy()
     if keep:
         target[axis] = 1
@@ -957,11 +974,13 @@ def _arg_case(kind: str, axis: int, quantized: bool, keep: bool) -> ContractCase
         source = "x"
     nodes.append(helper.make_node(kind, [source], ["output"], axis=axis - 3, keepdims=int(keep)))
     label = f"{kind.lower()}_axis{axis}_int8{int(quantized)}_keep{int(keep)}"
+    label += "_tiled" if tiled else ""
     model = _model(label, nodes,
                    [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
                    [helper.make_tensor_value_info("output", TensorProto.INT64, target)], initializers)
     return ContractCase(label, model, copy.deepcopy(model), {"input": data}, ("Transpose", kind),
-                        mem_budget="4K", reference_unoptimized=True)
+                        mem_budget="256" if tiled else "4K", slow_budget="16K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True)
 
 
 def _activation_case(kind: str, *, quantized: bool = False) -> ContractCase:
@@ -6690,6 +6709,14 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
         _linear_spatial_max_case(quantized=False),
         _linear_spatial_max_case(quantized=True),
+        *[_movement_case(kind, q, variant, tiled=True)
+          for kind, variant in (("Gather", 0), ("Gather", 2), ("GatherND", 0), ("EmbeddingLookup", 0),
+                                ("StridedSlice", 0), ("MirrorPad", 0), ("ReverseV2", 0), ("DynamicUpdateSlice", 0))
+          for q in (False, True)],
+        *[_reduction_case(kind, 2, quantized=q, tiled=True)
+          for kind in ("ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum") for q in (False, True)],
+        _reduce_all_case(2, True, tiled=True),
+        *[_arg_case(kind, 2, q, True, tiled=True) for kind in ("ArgMax", "ArgMin") for q in (False, True)],
         *[_movement_case(kind, q, variant)
           for kind, variants in (("Gather", 3), ("GatherND", 1), ("StridedSlice", 3),
                                  ("MirrorPad", 2), ("ReverseV2", 1), ("EmbeddingLookup", 1),
