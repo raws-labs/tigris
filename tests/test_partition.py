@@ -1,6 +1,6 @@
 """Tests for tigris.analysis.partition_temporal."""
 
-from tigris.graph.ir import AnalyzedGraph, OpNode, TensorLifetime
+from tigris.graph.ir import AnalyzedGraph, Layout, OpNode, TensorInfo, TensorLifetime
 from tigris.loaders import load_model
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
@@ -128,3 +128,19 @@ def test_partition_handles_thousands_of_tight_budget_stages():
     assert len(ag.stages) == 2000
     assert all(stage.peak_bytes == 64 for stage in ag.stages)
     assert all(len(stage.warnings) == 1 for stage in ag.stages)
+
+
+def test_reshape_alias_is_materialized_at_stage_boundary():
+    ag = AnalyzedGraph(
+        ops=[OpNode(name="reshape", op_type="Reshape", inputs=["x"], outputs=["r"], step=0),
+             OpNode(name="relu", op_type="Relu", inputs=["r"], outputs=["y"], step=1)],
+        tensors={name: TensorInfo(name=name, shape=shape, dtype=1, layout=Layout.LINEAR)
+                 for name, shape in (("x", (1, 4, 8)), ("r", (8, 1, 4)), ("y", (8, 1, 4)))},
+        model_inputs=["x"], model_outputs=["y"],
+    )
+    compute_lifetimes(ag)
+    assert ag.lifetimes["r"].size_bytes == 0
+    partition_temporal(ag, budget=256, forced_cuts=frozenset({1}))
+    assert [s.peak_bytes for s in ag.stages] == [128, 256]
+    partition_temporal(ag, budget=256)
+    assert len(ag.stages) == 1 and ag.stages[0].peak_bytes == 256

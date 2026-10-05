@@ -718,8 +718,10 @@ def _reduce_all_case(axis: int, keep: bool, tiled: bool = False) -> ContractCase
                         expect_tiled=tiled, reference_unoptimized=True)
 
 
-def _reshape_band_case(quantized: bool, merge: bool) -> ContractCase:
+def _reshape_band_case(quantized: bool, merge: bool, contiguous: bool = False) -> ContractCase:
     source, target = ([2, 33, 4], [2, 11, 12]) if merge else ([2, 11, 12], [2, 33, 4])
+    if contiguous:
+        source, target = ([36, 1, 4], [1, 6, 6, 4]) if merge else ([1, 6, 6, 4], [36, 1, 4])
     data = ((np.arange(np.prod(source)).reshape(source) % 101) - 50).astype(np.float32) * 0.125
     initializers = [numpy_helper.from_array(np.array(target, np.int64), "shape")]
     nodes = []
@@ -733,9 +735,14 @@ def _reshape_band_case(quantized: bool, merge: bool) -> ContractCase:
     model = _model("reshape_band", nodes,
                    [helper.make_tensor_value_info("input", TensorProto.FLOAT, source)],
                    [helper.make_tensor_value_info("output", TensorProto.FLOAT, target)], initializers)
-    return ContractCase(f"{'int8' if quantized else 'float'}_reshape_{'merge' if merge else 'split'}",
+    label = f"{'int8' if quantized else 'float'}_reshape_{'merge' if merge else 'split'}"
+    if contiguous:
+        label += "_contiguous"
+    # Budgets also fit interface transposes; the 576/144-byte reshape still tiles.
+    return ContractCase(label,
                         model, model, {"input": data}, ("Transpose", "Reshape", "Transpose"),
-                        mem_budget="256", slow_budget="16K", expect_tiled=True, exact_untiled=True)
+                        mem_budget=("128" if quantized else "384") if contiguous else "256",
+                        slow_budget="16K", expect_tiled=True, exact_untiled=True)
 
 
 def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = False) -> ContractCase:
@@ -6566,6 +6573,7 @@ def _run_case(
         actual_outputs, reference_outputs, _output_scales(plan)
     )
     if case.exact_untiled:
+        assert plan["version"] == 9
         reshape_stages = [stage for stage in plan["stages"] if any(
             plan["ops"][i]["op_type"] == OP_TYPE_MAP["Reshape"] for i in stage["ops"])]
         assert reshape_stages and all(stage["tile_plan_idx"] != 65535 and
@@ -6574,6 +6582,7 @@ def _run_case(
         untiled = _compile_plan(compile_path, untiled_path, mem_budget="64K", slow_budget="16K",
                                 compression=None, xip=False)
         assert not any(tile["tileable"] for tile in untiled["tile_plans"])
+        assert untiled["version"] == 9
         untiled_outputs = case_dir / "untiled.bin"
         _run([str(runner), str(untiled_path), str(inputs_path), str(untiled_outputs),
               str(untiled["_compiler_scheduled_peak"])], f"{case.name} untiled execution")
@@ -7063,6 +7072,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _lstm_case(),
     ]
     cases.extend(_reshape_band_case(quantized, merge)
+                 for quantized in (False, True) for merge in (False, True))
+    cases.extend(_reshape_band_case(quantized, merge, contiguous=True)
                  for quantized in (False, True) for merge in (False, True))
     covered_operators = {
         operator for case in cases for operator in case.expected_operators

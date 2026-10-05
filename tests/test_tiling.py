@@ -588,7 +588,9 @@ def test_band_cannot_cut_a_reduced_indexed_or_modified_axis(kind):
     ((2, 33, 4), (2, 11, 12), (2, 33, 4, 11, 12)),
     ((1, 3, 3, 8), (1, 3, 3, 2, 2, 2), (1, 3, 24, 3, 24)),
     ((1, 6, 6, 4), (1, 36, 4), (1, 6, 24, 36, 4)),
-    ((1, 6, 6, 4), (36, 1, 4), None),
+    ((1, 6, 6, 4), (36, 1, 4), (1, 6, 24, 36, 4)),
+    ((36, 1, 4), (1, 6, 6, 4), (1, 36, 4, 6, 24)),
+    ((1, 1, 6, 6, 4), (36, 1, 4), (1, 6, 24, 36, 4)),
 ])
 def test_reshape_band_mapping(source, target, expected):
     from tigris.analysis.partition_spatial import _reshape_band
@@ -619,3 +621,33 @@ def test_reshape_band_solver_preserves_integral_endpoints():
         assert start * 4 % 12 == 0 and end * 4 % 12 == 0
     refused = _reshape_tile_for_bytes(mapping, 95, 32, 4)
     assert not refused.tileable and refused.min_tile_bytes == 96
+
+
+@pytest.mark.parametrize("source,target,expected", [
+    ((2, 3, 4), (3, 2, 4), (1, 2, 12, 3, 8)),
+    ((3, 2, 4), (2, 3, 4), (1, 3, 8, 2, 12)),
+])
+def test_reshape_refuses_strided_intervals_as_contiguous(source, target, expected):
+    from tigris.analysis.partition_spatial import _reshape_band, _reshape_tile_for_bytes
+    from tigris.graph.ir import Layout, Stage
+
+    graph = AnalyzedGraph(tensors={name: TensorInfo(name, shape, dtype=1, layout=Layout.LINEAR)
+                                  for name, shape in (("x", source), ("y", target))},
+                          ops=[OpNode("reshape", "Reshape", ["x"], ["y"])])
+    mapping = _reshape_band(graph, Stage(0, [0], ["x"], ["y"]))
+    # Axis 1 has multiple leading blocks on each side. Only whole axis-0
+    # intervals are contiguous, and their first integral band is the tensor.
+    assert mapping == expected
+    assert not _reshape_tile_for_bytes(mapping, 64, 32, 4).tileable
+
+
+def test_contiguous_reshape_rounds_bands_to_integral_endpoints():
+    from tigris.analysis.partition_spatial import _reshape_tile_for_bytes
+
+    mapping = (1, 36, 4, 6, 24)
+    plan = _reshape_tile_for_bytes(mapping, 255, 32, 4)
+    assert plan.tileable and plan.tile_height == 12 and plan.num_tiles == 3
+    for start in range(0, 36, plan.tile_height):
+        assert start * 4 % 24 == 0
+        assert min(36, start + plan.tile_height) * 4 % 24 == 0
+    assert not _reshape_tile_for_bytes(mapping, 95, 32, 4).tileable

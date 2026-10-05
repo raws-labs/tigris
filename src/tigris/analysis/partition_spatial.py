@@ -723,6 +723,10 @@ def _reshape_band(ag: AnalyzedGraph, stage: Stage):
     own = all(len(t.shape) == 2 or t.layout is Layout.LINEAR for t in (source, target))
     candidates = [(len(a) - 2, len(b) - 2)] if own else []
     candidates.append((1, 1))
+    # The first non-unit axis has one leading block on each side. Its row
+    # interval is contiguous even when the two axis positions differ.
+    candidates.append((next((i for i, extent in enumerate(a) if extent != 1), 0),
+                       next((i for i, extent in enumerate(b) if extent != 1), 0)))
     for ia, ib in candidates:
         blocks, other = math.prod(a[:ia]), math.prod(b[:ib])
         ri, ci, ro, co = a[ia], math.prod(a[ia + 1:]), b[ib], math.prod(b[ib + 1:])
