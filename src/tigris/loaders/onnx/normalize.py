@@ -57,6 +57,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     declared_outputs = list(ag.model_outputs)
     ag = _adopt_tflite_cumsum(ag)
     ag = _adopt_svdf(ag)
+    ag = _adopt_lstm(ag)
     ag = _normalize_arg_outputs(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
@@ -91,6 +92,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _absorb_activations(ag)
     ag = _fold_split_into_its_weight(ag)
     ag = _assign_tensor_layouts(ag)
+    ag = _align_state_layouts(ag)
     ag = _normalize_concat_axis(ag)
     ag = _mark_untileable_broadcasts(ag)
     ag = _gather_one_index_to_split(ag)
@@ -284,6 +286,7 @@ _SPATIAL_LAYOUT_OPS = frozenset({
 # the reduction axis and compute something else.
 _LINEAR_LAYOUT_OPS = frozenset({
     "MatMul",
+    "Lstm",
 })
 
 
@@ -473,6 +476,19 @@ def _agreed_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
     spatial = layouts.count(Layout.SPATIAL)
     linear = layouts.count(Layout.LINEAR)
     return Layout.SPATIAL if spatial > linear else Layout.LINEAR
+
+
+def _align_state_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """A state leaves in the layout it entered in. Below rank 3 the two layouts
+    store the same bytes, so the output takes the input's."""
+    for port in ag.state_ports:
+        if port.output is None:
+            continue
+        entered = ag.tensors[ag.model_inputs[port.input]]
+        left = ag.tensors[ag.model_outputs[port.output]]
+        if len(entered.shape) < 3:
+            left.layout = entered.layout
+    return ag
 
 
 def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -2944,6 +2960,38 @@ def _adopt_svdf(ag: AnalyzedGraph) -> AnalyzedGraph:
             raise ValueError(f"Svdf activation {activation!r} is not supported")
         if activation != "none":
             op.attrs["fused_activation"] = {"relu": "Relu", "relu6": "Relu6"}[activation]
+    return ag
+
+
+def _adopt_lstm(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """The compiler's own LSTM: a sequence [batch, steps, features], or
+    [steps, batch, features] when time_major, then the input and recurrent
+    weights and the biases of gates i, f, c, o, then hidden and cell states
+    [batch, units]; it writes the hidden sequence and both states back."""
+    for op in ag.ops:
+        if op.op_type != "tigris::Lstm":
+            continue
+        op.op_type = "Lstm"
+        if len(op.inputs) != 15 or len(op.outputs) != 3:
+            raise ValueError("Lstm requires fifteen inputs and three outputs")
+        x, y = ag.tensors[op.inputs[0]], ag.tensors[op.outputs[0]]
+        weights = [ag.weight_data.get(name) for name in op.inputs[1:13]]
+        if any(w is None for w in weights):
+            raise ValueError("Lstm requires constant weights and biases")
+        if len(x.shape) != 3:
+            raise ValueError("Lstm requires a rank-3 input")
+        time_major = int(op.attrs.get("time_major", 0))
+        steps, batch = (x.shape[0], x.shape[1]) if time_major else (x.shape[1], x.shape[0])
+        features = x.shape[2]
+        units = weights[0].shape[0]
+        expected = [(units, features)] * 4 + [(units, units)] * 4 + [(units,)] * 4
+        sequence = (steps, batch, units) if time_major else (batch, steps, units)
+        states = [ag.tensors[name] for name in (*op.inputs[13:], *op.outputs[1:])]
+        if ([w.shape for w in weights] != expected or tuple(y.shape) != sequence
+                or any(tuple(s.shape) != (batch, units) for s in states)):
+            raise ValueError("Lstm shapes do not agree")
+        if float(op.attrs.get("cell_clip", 0.0)) < 0.0:
+            raise ValueError("Lstm cell clip must not be negative")
     return ag
 
 

@@ -74,11 +74,13 @@ OP_ATTR_CONSTANTS = 14  # uint16 weight index per constant operand, in operand o
                         # NO_WEIGHT for an absent optional one
 OP_ATTR_SVDF = 15  # int32: rank; for int8 also the state zero point and the
                    # input-to-state and state-to-output multiplier/shift pairs
+OP_ATTR_LSTM = 16  # int32 time_major (0 or 1), then float32 cell clip (0: none)
 
 OP_ATTR_KINDS = (
     OP_ATTR_COMPARISON_REQUANT,
     OP_ATTR_CONSTANTS,
     OP_ATTR_SVDF,
+    OP_ATTR_LSTM,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ATTR_EPSILON,
     OP_ATTR_ALPHA,
@@ -187,6 +189,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "Sum": 83,
     "ReduceAll": 84,
     "Svdf": 85,
+    "Lstm": 86,
 }
 OP_TYPE_UNKNOWN = 255
 

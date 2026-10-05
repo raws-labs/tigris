@@ -48,6 +48,7 @@ OP_DTYPE_SIGNATURES.update({
     # Constant operands sit between the input and the state; slots skip them.
     # The output role admits int16 only on the next state, a state tensor.
     "Svdf": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
+    "Lstm": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
 })

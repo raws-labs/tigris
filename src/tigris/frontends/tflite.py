@@ -204,7 +204,8 @@ def unsupported(data: bytes) -> list[str]:
             if any(op.kind not in _INDEX_SLOTS or op.inputs[_INDEX_SLOTS[op.kind]] != index
                    for op in uses):
                 reasons.append(f"index {tensors[index].name!r} feeds an operand other than indices")
-        held = {op.inputs[_STATEFUL[op.kind]] for op in operators if op.kind in _STATEFUL}
+        held = {op.inputs[slot] for op in operators if op.kind in _STATEFUL
+                for slot in _STATEFUL[op.kind]}
         for index, tensor in enumerate(tensors):
             if not tensor.variable:
                 continue
@@ -212,7 +213,7 @@ def unsupported(data: bytes) -> list[str]:
             if (index in inputs or index in outputs or len(uses) != 1 or index not in held
                     or any(index in op.outputs for op in operators)):
                 reasons.append(f"variable tensor {tensor.name!r} is not the state of one "
-                               "SVDF")
+                               "SVDF or LSTM")
         for index in sorted(held):
             if not tensors[index].variable:
                 reasons.append(f"state {tensors[index].name!r} is not a variable tensor")
@@ -302,7 +303,7 @@ _BOOL_SLOTS = {**{kind: ((), True) for kind in _COMPARISONS},
                "LOGICAL_NOT": ((0,), True), "SELECT_V2": ((0,), False), "CAST": ((0,), False),
                "REDUCE_ALL": ((0,), True)}
 # Operators that keep state in a variable tensor, at this operand.
-_STATEFUL = {"SVDF": 4}
+_STATEFUL = {"SVDF": (4,), "UNIDIRECTIONAL_SEQUENCE_LSTM": (18, 19)}
 _STATE_TYPES = {"FLOAT32": TensorProto.FLOAT, "INT16": TensorProto.INT16}
 # Resource variables: a handle names a variable, which is read and assigned.
 _VARIABLES = ("CALL_ONCE", "VAR_HANDLE", "READ_VARIABLE", "ASSIGN_VARIABLE")
@@ -358,6 +359,8 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                 return f"{ins[position].type} run-time indices; the runtime takes int32"
     if op.kind == "SVDF":
         return _svdf_reason(op, ins, outs)
+    if op.kind == "UNIDIRECTIONAL_SEQUENCE_LSTM":
+        return _lstm_reason(op, ins, outs)
     data = [t for i, t in enumerate(ins) if t is not None and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
     if op.kind in _WEIGHTED:
         source, position, bias_position = _WEIGHTED[op.kind]
@@ -505,6 +508,30 @@ def _svdf_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
     if any(len(t.scale) != 1 for t in (x, feature, time, state, y)):
         return "operands must be quantized per tensor"
     return ""
+
+
+# Operand positions of the LSTM's gate weights and biases, gates in order i, f, c, o.
+_LSTM_CONSTANTS = (*range(1, 9), *range(12, 16))
+
+
+def _lstm_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    """What TFLite Micro runs: every gate present, no peepholes, projection or
+    layer normalization, and a tanh cell activation."""
+    ins = ins + [None] * (24 - len(ins))
+    if any(ins[i] is None for i in (0, *_LSTM_CONSTANTS, 18, 19)):
+        return "a missing gate, which TFLite Micro requires"
+    if any(ins[i] is not None for i in (9, 10, 11, 16, 17, 20, 21, 22, 23)):
+        return "peepholes, projection or layer normalization, which TFLite Micro does not run"
+    if len(ins[0].shape) != 3:
+        return "input of rank other than 3"
+    if _activation(op.option(0, "b")) != "tanh":
+        return f"cell activation {_activation(op.option(0, 'b'))}"
+    if any(not _is_constant(ins[i]) for i in _LSTM_CONSTANTS):
+        return "weights and biases must be constant"
+    tensors = [ins[i] for i in (0, *_LSTM_CONSTANTS, 18, 19)] + outs
+    if all(t.type == "FLOAT32" for t in tensors):
+        return ""
+    return "int8 LSTM does not convert yet"
 
 
 def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
@@ -739,6 +766,9 @@ class _Converter:
             return
         if kind == "SVDF":
             self.finish(self._svdf(op, tag), outs[0])
+            return
+        if kind == "UNIDIRECTIONAL_SEQUENCE_LSTM":
+            self.finish(self._lstm(op, tag), outs[0])
             return
         if kind in ("CONV_2D", "DEPTHWISE_CONV_2D"):
             y = self._conv(op, tag)
@@ -1171,6 +1201,28 @@ class _Converter:
         self.held_state[state]["output"] = kept
         return y
 
+    def _lstm(self, op: _Operator, tag: str) -> str:
+        """UNIDIRECTIONAL_SEQUENCE_LSTM in the compiler's own form, run in
+        TFLite's axis order, its hidden and cell states passed in and out."""
+        b = self.b
+        ins = op.inputs
+        x = self.last_to_last(self.value(ins[0]), 3, tag + "_last", ins[0], True)
+        constants = [b.constant(self.tensors[ins[i]].array(), f"{tag}_w{i}") for i in _LSTM_CONSTANTS]
+        y = b.unique(tag + "_sequence")
+        kept = [b.unique(tag + "_hidden"), b.unique(tag + "_cell")]
+        b.nodes.append(helper.make_node(
+            "Lstm", [x, *constants, *(self.held_state[i]["input"] for i in ins[18:20])],
+            [y, *kept], domain="tigris", time_major=int(op.option(3, "?", False)),
+            cell_clip=float(op.option(1, "f", 0.0))))
+        out = self.tensors[op.outputs[0]]
+        self.value_info.append(helper.make_tensor_value_info(y, TensorProto.FLOAT, list(out.shape)))
+        for index, name in zip(ins[18:20], kept):
+            held = self.tensors[index]
+            self.value_info.append(helper.make_tensor_value_info(
+                name, _STATE_TYPES[held.type], list(held.shape)))
+            self.held_state[index]["output"] = name
+        return self.tflite_order_out(y, op.outputs[0], tag)
+
     def _strided_slice(self, op: _Operator, tag: str) -> str:
         """A STRIDED_SLICE with any strides, as an ONNX Slice in TFLite's axis
         order; a dropped axis is a slice of one, reshaped away."""
@@ -1396,18 +1448,17 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
                           _to_first(len(shape))), name + "_initial")})
     # A variable tensor enters as a state input, zero before the first run as
     # TFLite Micro resets it; the operator's write leaves as the state output.
-    for op in operators:
-        if op.kind in _STATEFUL:
-            index = op.inputs[_STATEFUL[op.kind]]
-            tensor = tensors[index]
-            name = b.unique(f"state{len(state)}_{tensor.name}_in")
-            onnx_inputs.append(helper.make_tensor_value_info(
-                name, _STATE_TYPES[tensor.type], list(tensor.shape)))
-            initial = b.constant(np.zeros(tensor.shape, _NUMPY[tensor.type]),
-                                 name.removesuffix("_in") + "_initial")
-            converter.held_state[index] = {"input": name, "output": None}
-            converter.values[index] = name
-            state.append({"input": name, "output": None, "initial": initial})
+    for index in [op.inputs[slot] for op in operators if op.kind in _STATEFUL
+                  for slot in _STATEFUL[op.kind]]:
+        tensor = tensors[index]
+        name = b.unique(f"state{len(state)}_{tensor.name}_in")
+        onnx_inputs.append(helper.make_tensor_value_info(
+            name, _STATE_TYPES[tensor.type], list(tensor.shape)))
+        initial = b.constant(np.zeros(tensor.shape, _NUMPY[tensor.type]),
+                             name.removesuffix("_in") + "_initial")
+        converter.held_state[index] = {"input": name, "output": None}
+        converter.values[index] = name
+        state.append({"input": name, "output": None, "initial": initial})
     for op in operators:
         converter.convert(op)
     for entry, held in zip(state[len(state) - len(converter.held_state):],

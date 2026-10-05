@@ -1124,6 +1124,19 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "constraints": [
+        "hidden and cell state kept between runs; every gate, no peepholes, projection or layer normalization; tanh cell activation; float32; untiled"
+      ],
+      "opcode": 86,
+      "operator": "Lstm",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
     }
   ],
   "schema_version": 10,

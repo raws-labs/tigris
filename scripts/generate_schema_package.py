@@ -35,6 +35,7 @@ def schema_package() -> dict[str, object]:
             "comparison_requant": defs.OP_ATTR_COMPARISON_REQUANT,
             "constants": defs.OP_ATTR_CONSTANTS,
             "svdf": defs.OP_ATTR_SVDF,
+            "lstm": defs.OP_ATTR_LSTM,
             "epsilon": defs.OP_ATTR_EPSILON,
             "pads": defs.OP_ATTR_PADS,
             "pool_rounding": defs.OP_ATTR_POOL_ROUNDING,
