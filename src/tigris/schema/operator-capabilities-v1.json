@@ -1127,15 +1127,15 @@
     },
     {
       "constraints": [
-        "hidden and cell state kept between runs; every gate, no peepholes, projection or layer normalization; tanh cell activation; float32; untiled"
+        "hidden and cell state kept between runs; every gate, no peepholes, projection or layer normalization; tanh cell activation; int8 with an int16 cell state; untiled"
       ],
       "opcode": 86,
       "operator": "Lstm",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
         "reference": "native",
-        "s8_ref": "unsupported"
+        "s8_ref": "native"
       }
     }
   ],

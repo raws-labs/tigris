@@ -304,7 +304,7 @@ _BOOL_SLOTS = {**{kind: ((), True) for kind in _COMPARISONS},
                "REDUCE_ALL": ((0,), True)}
 # Operators that keep state in a variable tensor, at this operand.
 _STATEFUL = {"SVDF": (4,), "UNIDIRECTIONAL_SEQUENCE_LSTM": (18, 19)}
-_STATE_TYPES = {"FLOAT32": TensorProto.FLOAT, "INT16": TensorProto.INT16}
+_STATE_TYPES = {"FLOAT32": TensorProto.FLOAT, "INT16": TensorProto.INT16, "INT8": TensorProto.INT8}
 # Resource variables: a handle names a variable, which is read and assigned.
 _VARIABLES = ("CALL_ONCE", "VAR_HANDLE", "READ_VARIABLE", "ASSIGN_VARIABLE")
 # Index outputs: int32 positions, as model outputs or the indices of the operators below.
@@ -531,7 +531,16 @@ def _lstm_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
     tensors = [ins[i] for i in (0, *_LSTM_CONSTANTS, 18, 19)] + outs
     if all(t.type == "FLOAT32" for t in tensors):
         return ""
-    return "int8 LSTM does not convert yet"
+    x, hidden, cell, y = ins[0], ins[18], ins[19], outs[0]
+    if (x.type != "INT8" or hidden.type != "INT8" or y.type != "INT8"
+            or any(ins[i].type != "INT8" for i in range(1, 9))
+            or any(ins[i].type != "INT32" for i in range(12, 16))):
+        return "activations must be all int8 or all float32"
+    if cell.type != "INT16" or cell.zero_point.size != 1 or cell.zero_point[0] != 0:
+        return "cell state other than symmetric int16"
+    if any(len(t.scale) != 1 for t in (x, hidden, cell, y, *(ins[i] for i in range(1, 9)))):
+        return "operands must be quantized per tensor"
+    return ""
 
 
 def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
@@ -1208,20 +1217,32 @@ class _Converter:
         ins = op.inputs
         x = self.last_to_last(self.value(ins[0]), 3, tag + "_last", ins[0], True)
         constants = [b.constant(self.tensors[ins[i]].array(), f"{tag}_w{i}") for i in _LSTM_CONSTANTS]
+        attributes = {"time_major": int(op.option(3, "?", False)),
+                      "cell_clip": float(op.option(1, "f", 0.0))}
+        if self.tensors[ins[0]].type == "INT8":
+            # Integer weights pass as stored, their scales stated; the int16
+            # cell state stays raw.
+            attributes.update(weight_scales=[float(self.tensors[ins[i]].scale[0]) for i in range(1, 9)],
+                              cell_scale=float(self.tensors[ins[19]].scale[0]))
         y = b.unique(tag + "_sequence")
         kept = [b.unique(tag + "_hidden"), b.unique(tag + "_cell")]
         b.nodes.append(helper.make_node(
-            "Lstm", [x, *constants, *(self.held_state[i]["input"] for i in ins[18:20])],
-            [y, *kept], domain="tigris", time_major=int(op.option(3, "?", False)),
-            cell_clip=float(op.option(1, "f", 0.0))))
+            "Lstm", [x, *constants, self.value(ins[18]), self.held_state[ins[19]]["input"]],
+            [y, *kept], domain="tigris", **attributes))
         out = self.tensors[op.outputs[0]]
         self.value_info.append(helper.make_tensor_value_info(y, TensorProto.FLOAT, list(out.shape)))
         for index, name in zip(ins[18:20], kept):
             held = self.tensors[index]
-            self.value_info.append(helper.make_tensor_value_info(
-                name, _STATE_TYPES[held.type], list(held.shape)))
+            if held.type == "INT8":
+                self.value_info.append(helper.make_tensor_value_info(
+                    name, TensorProto.FLOAT, list(held.shape)))
+                scale, point = self.held_state[index]["quantization"]
+                name = b.node("QuantizeLinear", [name, scale, point], name + "_q")
+            else:
+                self.value_info.append(helper.make_tensor_value_info(
+                    name, _STATE_TYPES[held.type], list(held.shape)))
             self.held_state[index]["output"] = name
-        return self.tflite_order_out(y, op.outputs[0], tag)
+        return self.tflite_order_out(self.held(y, op.outputs[0], tag + "_q"), op.outputs[0], tag)
 
     def _strided_slice(self, op: _Operator, tag: str) -> str:
         """A STRIDED_SLICE with any strides, as an ONNX Slice in TFLite's axis
@@ -1454,10 +1475,20 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         name = b.unique(f"state{len(state)}_{tensor.name}_in")
         onnx_inputs.append(helper.make_tensor_value_info(
             name, _STATE_TYPES[tensor.type], list(tensor.shape)))
-        initial = b.constant(np.zeros(tensor.shape, _NUMPY[tensor.type]),
+        # An int8 variable starts at its zero point and is read through its
+        # quantization; an int16 one is passed to its operator as stored.
+        zero = int(tensor.zero_point[0]) if tensor.type == "INT8" else 0
+        initial = b.constant(np.full(tensor.shape, zero, _NUMPY[tensor.type]),
                              name.removesuffix("_in") + "_initial")
         converter.held_state[index] = {"input": name, "output": None}
-        converter.values[index] = name
+        if tensor.type == "INT8":
+            scale = b.constant(np.float32(tensor.scale[0]), name + "_scale")
+            point = b.constant(np.array(zero, np.int8), name + "_zero_point")
+            converter.values[index] = b.node("DequantizeLinear", [name, scale, point],
+                                             name + "_float")
+            converter.held_state[index]["quantization"] = (scale, point)
+        else:
+            converter.values[index] = name
         state.append({"input": name, "output": None, "initial": initial})
     for op in operators:
         converter.convert(op)
