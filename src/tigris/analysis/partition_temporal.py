@@ -37,13 +37,18 @@ class _StageCost:
         self._produced_open = 0
         self._dying: dict[int, int] = {}
         self._input_covered: dict[str, int] = {}
+        self._storage: dict[str, str] = {}
         self.peak = 0
 
     def _size(self, name: str) -> int | None:
         lt = self._ag.lifetimes.get(name)
         if lt is None:
             return None
-        return _aligned_size(lt.size_bytes, self._align)
+        # A boundary reload materializes even a graph-wide reshape alias.
+        size = lt.size_bytes
+        if size == 0 and lt.birth_step < self._start:
+            size = self._ag.tensors[name].size_bytes
+        return _aligned_size(size, self._align)
 
     def _charge(self, step: int, size: int) -> None:
         total = self._bytes_at.get(step, 0) + size
@@ -62,6 +67,9 @@ class _StageCost:
             size = self._size(name)
             if size is None:
                 continue
+            if size == 0 and op.op_type in {"Reshape", "Flatten"}:
+                source = next(n for n in op.inputs if n in self._ag.lifetimes)
+                self._storage[name] = self._storage.get(source, source)
             self._produced_open += size
             death = self._ag.lifetimes[name].death_step
             self._dying[death] = self._dying.get(death, 0) + size
@@ -70,6 +78,7 @@ class _StageCost:
         # A stage input is loaded at the start of the stage, so a later read
         # widens what it has already cost, back to the first op.
         for name in op.inputs:
+            name = self._storage.get(name, name)
             size = self._size(name)
             if size is None:
                 continue

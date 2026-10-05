@@ -174,6 +174,29 @@ def test_reshape_rank_boundary_fits_tight_budget(name, tmp_path):
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
 
 
+@pytest.mark.parametrize("name,kind,count", [
+    ("float_reduce_max_channels", "ReduceMax", 2),
+    ("float_sum_channels", "ReduceSum", 2),
+    ("float_cumsum_exclusive_reverse", "CumSum", 2),
+])
+def test_contiguous_reshape_preserves_downstream_budget_errors(name, kind, count, tmp_path):
+    from tigris.cli import _run_pipeline
+    from tigris.analysis.validation import validate_memory_plan
+
+    model = FIXTURES / "ops" / (name + ".tflite")
+    graph, _ = _run_pipeline(str(model), ("256",), report_bindings=False)
+    reshapes = [s for s in graph.stages if any(graph.ops[i].op_type == "Reshape" for i in s.op_indices)]
+    assert len(reshapes) == count
+    oversized = [s for s in reshapes if s.peak_bytes > 256]
+    assert oversized and all(s.tile_plan.tileable and s.tile_plan.num_tiles > 1 for s in oversized)
+    issues = validate_memory_plan(graph).issues
+    assert len(issues) == 1 and kind in issues[0].reason
+    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256",
+                                     "-o", str(tmp_path / "model.tgrs")])
+    assert result.exit_code != 0 and kind in result.output
+    assert not (tmp_path / "model.tgrs").exists()
+
+
 def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
     """A copy whose operator code for `kind` names builtin `code` instead."""
     buffer = bytearray(data)
