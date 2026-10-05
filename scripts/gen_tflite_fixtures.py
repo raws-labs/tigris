@@ -172,6 +172,8 @@ RANGES = {
     "float_div_broadcast": [(-3.0, 3.0), _DIVISOR],
     # Non-negative inputs put the int8 input zero point near -128.
     "cumsum_offset": [(0.0, 3.0)], "cumsum_offset_exclusive_reverse": [(0.0, 3.0)],
+    # Past both of the float logistic's cutoffs, -9 and about 16.6.
+    "float_logistic_tails": [(-24.0, 24.0)],
 }
 
 
@@ -555,6 +557,35 @@ def _svdf(batch, features, units, rank, memory, activation, quantized=False):
                          options, tensors, op_inputs, [5], [0], [5])
 
 
+def _lstm(time_major, batch, steps, features, units, cell_clip=0.0):
+    """UNIDIRECTIONAL_SEQUENCE_LSTM without peepholes, projection or layer
+    normalization, which TFLite Micro does not run; its hidden and cell states
+    are variable tensors. Seeded weights, gates in TFLite's order i, f, c, o."""
+    rng = np.random.default_rng(steps * 100 + features * 10 + units)
+    T = schema.TensorType
+    shape = (steps, batch, features) if time_major else (batch, steps, features)
+    out = (steps, batch, units) if time_major else (batch, steps, units)
+    tensors = [(shape, T.FLOAT32, None, None, 0, False)]
+    for columns in (features, units):
+        for _ in range(4):
+            tensors.append(((units, columns), T.FLOAT32,
+                            rng.normal(0.0, 0.5, (units, columns)).astype(np.float32), None, 0, False))
+    for _ in range(4):
+        tensors.append(((units,), T.FLOAT32, rng.normal(0.0, 0.3, (units,)).astype(np.float32),
+                        None, 0, False))
+    tensors += [((batch, units), T.FLOAT32, None, None, 0, True),
+                ((batch, units), T.FLOAT32, None, None, 0, True),
+                (out, T.FLOAT32, None, None, 0, False)]
+    options = schema.UnidirectionalSequenceLSTMOptionsT()
+    options.fusedActivationFunction = schema.ActivationFunctionType.TANH
+    options.cellClip = cell_clip
+    options.timeMajor = time_major
+    op_inputs = [0, *range(1, 9), -1, -1, -1, *range(9, 13), -1, -1, 13, 14, -1, -1, -1, -1]
+    return _one_operator(schema.BuiltinOperator.UNIDIRECTIONAL_SEQUENCE_LSTM,
+                         schema.BuiltinOptions.UnidirectionalSequenceLSTMOptions, options,
+                         tensors, op_inputs, [15], [0], [15])
+
+
 # Models no converter writes, built operator by operator.
 _RELU = schema.ActivationFunctionType.RELU
 _NONE = schema.ActivationFunctionType.NONE
@@ -563,10 +594,13 @@ HANDMADE = {
     "float_svdf_rank2_relu": lambda: _svdf(2, 6, 3, 2, 4, _RELU),
     "svdf": lambda: _svdf(1, 8, 4, 2, 5, _NONE, quantized=True),
     "svdf_batch": lambda: _svdf(2, 6, 3, 1, 4, _NONE, quantized=True),
+    "float_lstm": lambda: _lstm(False, 1, 3, 4, 5),
+    "float_lstm_time_major_clip": lambda: _lstm(True, 2, 3, 3, 4, cell_clip=0.8),
 }
-# TFLite's float SVDF sums in another order than TFLite Micro, so the two
-# differ in the last bits; TFLite Micro's outputs are recorded for these.
-SUMMATION_ORDER = {"float_svdf", "float_svdf_rank2_relu"}
+# TFLite's float SVDF and LSTM compute in another order than TFLite Micro, so
+# the two differ in the last bits; TFLite Micro's outputs are recorded for these.
+SUMMATION_ORDER = {"float_svdf", "float_svdf_rank2_relu", "float_lstm",
+                   "float_lstm_time_major_clip"}
 # The tier-1 cases again, converted without quantization.
 _FLOAT_TIER1 = (
     "max_pool_valid", "max_pool_same", "avg_pool_valid", "avg_pool_same", "concat_channels",
@@ -582,6 +616,7 @@ _FLOAT_TIER1 = (
     *ACTIVATIONS, *INDEXING, *BOOLEAN,
 )
 FLOAT_MODELS["float_l2_pool"] = CASES["float_l2_pool"]
+FLOAT_MODELS["float_logistic_tails"] = _unary(tf.sigmoid, (1, 64))
 FLOAT_MODELS["float_variable_window"] = _unary(lambda x: _WINDOW(x), (1, 2))
 for _name in _FLOAT_TIER1:
     FLOAT_MODELS[f"float_{_name}"] = CASES[_name]

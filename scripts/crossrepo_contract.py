@@ -895,6 +895,61 @@ def _svdf_case() -> ContractCase:
                         inputs={"x": x}, expected_operators=("Svdf",))
 
 
+def _lstm_case() -> ContractCase:
+    """A float LSTM over three steps from its zero initial state, against ONNX's
+    own LSTM operator, which orders the gates i, o, f, c."""
+    rng = np.random.default_rng(86)
+    batch, steps, features, units = 2, 3, 3, 4
+    w_in = rng.normal(0.0, 0.5, (4, units, features)).astype(np.float32)
+    w_rec = rng.normal(0.0, 0.5, (4, units, units)).astype(np.float32)
+    bias = rng.normal(0.0, 0.3, (4, units)).astype(np.float32)
+    x = rng.uniform(-2.0, 2.0, (batch, steps, features)).astype(np.float32)
+    shape_s, shape_y = [batch, units], [batch, steps, units]
+    weights = [numpy_helper.from_array(w, f"w{k}")
+               for k, w in enumerate([*w_in, *w_rec, *bias])]
+    weights += [numpy_helper.from_array(np.zeros(shape_s, np.float32), name)
+                for name in ("hidden_initial", "cell_initial")]
+    states = [helper.make_tensor_value_info(name, TensorProto.FLOAT, shape_s)
+              for name in ("hidden_out", "cell_out")]
+    compile_graph = helper.make_graph(
+        [helper.make_node("Lstm", ["x", *(f"w{k}" for k in range(12)), "hidden_in", "cell_in"],
+                          ["y", "hidden_out", "cell_out"], domain="tigris", time_major=0,
+                          cell_clip=0.0)],
+        "lstm",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x.shape)),
+         *(helper.make_tensor_value_info(name, TensorProto.FLOAT, shape_s)
+           for name in ("hidden_in", "cell_in"))],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape_y), *states],
+        weights,
+        value_info=[helper.make_tensor_value_info("y", TensorProto.FLOAT, shape_y), *states])
+    compile_model = helper.make_model(compile_graph, opset_imports=[
+        helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    compile_model.ir_version = 9
+    helper.set_model_props(compile_model, {STATE_KEY: json.dumps([
+        {"input": "hidden_in", "output": "hidden_out", "initial": "hidden_initial"},
+        {"input": "cell_in", "output": "cell_out", "initial": "cell_initial"}])})
+    onnx_order = [0, 3, 1, 2]
+    reference = _model(
+        "lstm_reference",
+        # ONNX Runtime's LSTM runs time-major only.
+        [helper.make_node("Transpose", ["x"], ["steps_first"], perm=[1, 0, 2]),
+         helper.make_node("LSTM", ["steps_first", "W", "R", "B"], ["sequence"], hidden_size=units),
+         helper.make_node("Squeeze", ["sequence", "direction_axis"], ["squeezed"]),
+         helper.make_node("Transpose", ["squeezed"], ["y"], perm=[1, 0, 2])],
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x.shape))],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape_y)],
+        [numpy_helper.from_array(w_in[onnx_order].reshape(1, 4 * units, features), "W"),
+         numpy_helper.from_array(w_rec[onnx_order].reshape(1, 4 * units, units), "R"),
+         numpy_helper.from_array(np.concatenate(
+             [bias[onnx_order].reshape(-1), np.zeros(4 * units, np.float32)])[None], "B"),
+         numpy_helper.from_array(np.asarray([1], np.int64), "direction_axis")],
+        opset=14)
+    return ContractCase(name="lstm", compile_model=compile_model, reference_model=reference,
+                        inputs={"x": x},
+                        # Rank-3 boundaries are stored channels-last; Lstm reads model order.
+                        expected_operators=("Transpose", "Lstm", "Transpose"))
+
+
 def _runtime_index_case(kind: str, quantized: bool, variant: int = 0, arg: str | None = None,
                         cast: bool = False) -> ContractCase:
     case = _movement_case(kind, quantized, variant)
@@ -6970,6 +7025,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _qdq_convtranspose_2d_tiled_case(),
         _convtranspose_2d_partial_edge_case(),
         _svdf_case(),
+        _lstm_case(),
     ]
     covered_operators = {
         operator for case in cases for operator in case.expected_operators

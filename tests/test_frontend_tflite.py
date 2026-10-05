@@ -303,6 +303,25 @@ def test_a_variable_tensor_is_only_svdf_state(monkeypatch):
     assert any("is not the state of one SVDF" in r for r in reasons)
 
 
+@pytest.mark.parametrize(("edit", "reason"), [
+    (lambda ops: ops[0].inputs.__setitem__(1, -1), "a missing gate, which TFLite Micro requires"),
+    (lambda ops: ops[0].inputs.__setitem__(9, 5), "peepholes, projection or layer normalization"),
+])
+def test_an_lstm_tflite_micro_cannot_run_is_refused(monkeypatch, edit, reason):
+    def change(tensors, operators):
+        operators[0].inputs = list(operators[0].inputs)
+        edit(operators)
+    reasons = _read_edited(monkeypatch, "float_lstm", change)
+    assert any(reason in r for r in reasons)
+
+
+def test_an_lstm_cell_activation_other_than_tanh_is_refused(monkeypatch):
+    def relu(tensors, operators):
+        operators[0].option = lambda slot, fmt, default=0: 1 if slot == 0 else default
+    reasons = _read_edited(monkeypatch, "float_lstm", relu)
+    assert any("cell activation relu" in r for r in reasons)
+
+
 def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():
     model = tflite.to_onnx((FIXTURES / "ops" / "cumsum_offset.tflite").read_bytes(), "cumsum")
     scans = [node for node in model.graph.node if node.op_type == "CumSum"]

@@ -43,6 +43,7 @@ from .defs import (
     OP_ATTR_COMPARISON_REQUANT,
     OP_ATTR_CONSTANTS,
     OP_ATTR_SVDF,
+    OP_ATTR_LSTM,
     OP_ATTR_ALPHA,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
@@ -942,6 +943,10 @@ def _build_op_attributes(
         if op.op_type == "Svdf":
             records.append((op_index, OP_ATTR_SVDF, _svdf_payload(ag, op)))
             continue
+        if op.op_type == "Lstm":
+            records.append((op_index, OP_ATTR_LSTM, struct.pack(
+                "<if", int(op.attrs.get("time_major", 0)), float(op.attrs.get("cell_clip", 0.0)))))
+            continue
         if op.op_type in {"Resize", "ResizeLinear"}:
             scales = op.attrs.get("resize_scales")
             if scales is not None:
@@ -1051,7 +1056,7 @@ def _build_op_attributes(
 
 
 # Operators whose constants are listed by OP_ATTR_CONSTANTS, not weight and bias.
-_MANY_CONSTANTS = {"Svdf"}
+_MANY_CONSTANTS = {"Svdf", "Lstm"}
 
 
 def _resolve_weight_bias(op: OpNode, weight_idx: dict[str, int]) -> tuple[int, int]:
