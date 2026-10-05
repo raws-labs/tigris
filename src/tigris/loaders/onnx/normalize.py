@@ -2992,6 +2992,9 @@ def _adopt_lstm(ag: AnalyzedGraph) -> AnalyzedGraph:
             raise ValueError("Lstm shapes do not agree")
         if float(op.attrs.get("cell_clip", 0.0)) < 0.0:
             raise ValueError("Lstm cell clip must not be negative")
+        if "weight_scales" in op.attrs and (len(op.attrs["weight_scales"]) != 8
+                                            or "cell_scale" not in op.attrs):
+            raise ValueError("an integer Lstm states its eight weight scales and its cell scale")
     return ag
 
 

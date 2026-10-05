@@ -920,6 +920,38 @@ def _svdf_payload(ag: AnalyzedGraph, op: OpNode) -> bytes:
     return struct.pack("<6i", rank, int(op.attrs["state_zero_point"]), *first, *second)
 
 
+def _lstm_payload(ag: AnalyzedGraph, op: OpNode) -> bytes:
+    """time_major and the cell clip; an int8 Lstm adds the input and hidden
+    zero points, the cell scale's power of two, the clip in cell units, then
+    per gate i, f, c, o the input and recurrent (multiplier, shift) into the
+    2^-12 gate scale, and the forget, input and output products' pairs. Each
+    is formed as TFLite Micro's Prepare forms it."""
+    payload = struct.pack("<if", int(op.attrs.get("time_major", 0)),
+                          float(op.attrs.get("cell_clip", 0.0)))
+    if not ag.is_quantized:
+        return payload
+    x = ag.tensors[op.inputs[0]].quant
+    hidden = ag.tensors[op.inputs[13]].quant
+    x_scale, h_scale = float(np.float32(x.scale[0])), float(np.float32(hidden.scale[0]))
+    weights = [float(np.float32(scale)) for scale in op.attrs["weight_scales"]]
+    cell = np.float32(op.attrs["cell_scale"])
+    f32 = np.float32
+    power = int(_round_half_away(float(f32(np.log(cell)) * (f32(1.0) / f32(np.log(f32(2.0)))))))
+    clip = float(np.float32(op.attrs.get("cell_clip", 0.0)))
+    clipped = int(min(max(clip / float(cell), -32768.0), 32767.0))
+    gate, nonlinear = 2.0 ** -12, 2.0 ** -15
+    pairs = []
+    for k in range(4):
+        pairs += _compute_multiplier_shift(x_scale * weights[k] / gate)
+        pairs += _compute_multiplier_shift(h_scale * weights[4 + k] / gate)
+    pairs += _compute_multiplier_shift(nonlinear * float(cell) / float(cell))
+    pairs += _compute_multiplier_shift(nonlinear * nonlinear / float(cell))
+    pairs += _compute_multiplier_shift(nonlinear * nonlinear / h_scale)
+    return payload + struct.pack(
+        f"<4i{len(pairs)}i", int(x.zero_point[0]), int(hidden.zero_point[0]), power, clipped,
+        *pairs)
+
+
 def _build_op_attributes(
     ag: AnalyzedGraph, tensor_idx: dict[str, int],
     quant_idx_map: dict[str, int] | None = None,
@@ -944,8 +976,7 @@ def _build_op_attributes(
             records.append((op_index, OP_ATTR_SVDF, _svdf_payload(ag, op)))
             continue
         if op.op_type == "Lstm":
-            records.append((op_index, OP_ATTR_LSTM, struct.pack(
-                "<if", int(op.attrs.get("time_major", 0)), float(op.attrs.get("cell_clip", 0.0)))))
+            records.append((op_index, OP_ATTR_LSTM, _lstm_payload(ag, op)))
             continue
         if op.op_type in {"Resize", "ResizeLinear"}:
             scales = op.attrs.get("resize_scales")

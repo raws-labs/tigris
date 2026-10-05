@@ -328,6 +328,22 @@ def test_an_lstm_cell_activation_other_than_tanh_is_refused(monkeypatch):
     assert any("cell activation relu" in r for r in reasons)
 
 
+def test_an_int8_lstm_cell_is_symmetric_int16(monkeypatch):
+    def offset(tensors, operators):
+        tensors[operators[0].inputs[19]].zero_point = np.asarray([5], np.int64)
+    reasons = _read_edited(monkeypatch, "lstm", offset)
+    assert any("cell state other than symmetric int16" in r for r in reasons)
+
+
+def test_an_int8_lstm_with_per_channel_weights_is_refused(monkeypatch):
+    """TFLite Micro's LSTM reads one multiplier per gate projection."""
+    def per_channel(tensors, operators):
+        weight = tensors[operators[0].inputs[1]]
+        weight.scale = np.repeat(weight.scale, weight.shape[0])
+    reasons = _read_edited(monkeypatch, "lstm", per_channel)
+    assert any("quantized per tensor" in r for r in reasons)
+
+
 def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():
     model = tflite.to_onnx((FIXTURES / "ops" / "cumsum_offset.tflite").read_bytes(), "cumsum")
     scans = [node for node in model.graph.node if node.op_type == "CumSum"]
