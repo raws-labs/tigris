@@ -1,6 +1,6 @@
 """Fail-closed validation of compiler deployment plans."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import numpy as np
@@ -725,6 +725,13 @@ def validate_memory_plan(
             )
         )
 
+    # The subgraphs control flow runs use the same fast arena in turn.
+    for position, sub in enumerate(ag.subgraphs, start=1):
+        nested = validate_memory_plan(sub, fast_reserve_bytes=fast_reserve_bytes)
+        scheduled_peak = max(scheduled_peak, nested.scheduled_peak_bytes)
+        issues.extend(replace(issue, reason=f"subgraph {position}: {issue.reason}")
+                      for issue in nested.issues)
+
     return MemoryPlanValidation(
         scheduled_peak_bytes=scheduled_peak,
         issues=tuple(issues),
@@ -735,6 +742,10 @@ def _execution_unit_requirement(
     ag: AnalyzedGraph, stage: Stage
 ) -> tuple[int, str, bool]:
     """Return ``(required_bytes, reason, invalid)`` for an execution unit."""
+    # A control-flow operator copies its operands and results in slow memory
+    # and holds nothing in the fast arena; its subgraphs are validated apart.
+    if any(ag.ops[i].op_type in CONTROL_FLOW for i in stage.op_indices):
+        return 0, "control flow", False
     if stage.chain_id != 0xFFFF:
         chain_stages = sorted(
             (candidate for candidate in ag.stages if candidate.chain_id == stage.chain_id),

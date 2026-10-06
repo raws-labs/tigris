@@ -13,6 +13,7 @@ from enum import Enum
 
 import numpy as np
 
+from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.analysis.lifetime import _same_stored_bytes
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.analysis.partition_temporal import partition_temporal
@@ -1577,6 +1578,8 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue  # fits, no tiling needed
 
         stage_ops = [ag.ops[i] for i in stage.op_indices]
+        if any(op.op_type in CONTROL_FLOW for op in stage_ops):
+            continue  # runs in slow memory; its subgraphs are tiled apart
 
         reshape = _reshape_band(ag, stage)
         if reshape is not None:
