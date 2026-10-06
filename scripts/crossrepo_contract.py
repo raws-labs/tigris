@@ -1097,6 +1097,64 @@ def _if_case(take_then: bool) -> ContractCase:
                                             "Relu", "Add", "Mul", "Add"))
 
 
+def _if_tiled_case(take_then: bool) -> ContractCase:
+    """An If whose branches are convolutions over a feature map too large for
+    the budget, so the branch stages run in tiles."""
+    rng = np.random.default_rng(87)
+    x = rng.uniform(-1.0, 1.0, (1, 4, 8, 8)).astype(np.float32)
+    x = np.abs(x) if take_then else -np.abs(x)
+    kernels = {part: rng.normal(0.0, 0.3, (4, 4, 3, 3)).astype(np.float32)
+               for part in ("then_a", "then_b", "else_a")}
+    shape = [1, 4, 8, 8]
+    weights = [numpy_helper.from_array(np.asarray([1, 1, 256], np.int64), "rows"),
+               numpy_helper.from_array(np.asarray([2], np.int64), "axes"),
+               numpy_helper.from_array(np.asarray(0.0, np.float32), "zero")]
+
+    def conv(source, kernel, result):
+        return helper.make_node("Conv", [source, kernel], [result], pads=[1, 1, 1, 1])
+
+    def branch(name, explicit):
+        x_name = f"{name}_x" if explicit else "x"
+        if name == "then":
+            nodes = [conv(x_name, "then_a", "then_h"), helper.make_node("Relu", ["then_h"], ["then_r"]),
+                     conv("then_r", "then_b", "then_y")]
+            constants = ["then_a", "then_b"]
+        else:
+            nodes = [conv(x_name, "else_a", "else_y")]
+            constants = ["else_a"]
+        inputs = [helper.make_tensor_value_info(x_name, TensorProto.FLOAT, shape)] if explicit else []
+        return helper.make_graph(nodes, name, inputs,
+                                 [helper.make_tensor_value_info(f"{name}_y", TensorProto.FLOAT, shape)],
+                                 [numpy_helper.from_array(kernels[c], c) for c in constants])
+
+    condition = [helper.make_node("Reshape", ["x", "rows"], ["row"]),
+                 helper.make_node("ReduceSum", ["row", "axes"], ["sum"], keepdims=0),
+                 helper.make_node("Greater", ["sum", "zero"], ["positive"])]
+    compile_graph = helper.make_graph(
+        [*condition, helper.make_node("If", ["positive", "x"], ["y"], domain="tigris",
+                                      then_branch=branch("then", True), else_branch=branch("else", True))],
+        "if_tiled", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)], weights,
+        value_info=[helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
+    compile_model = helper.make_model(compile_graph, opset_imports=[
+        helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    compile_model.ir_version = 9
+    reference = _model(
+        "if_tiled_reference",
+        [*condition, helper.make_node("If", ["positive"], ["y"], then_branch=branch("then", False),
+                                      else_branch=branch("else", False))],
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)], weights, opset=17)
+    return ContractCase(name="if_tiled_then" if take_then else "if_tiled_else",
+                        compile_model=compile_model, reference_model=reference, inputs={"x": x},
+                        expected_operators=("Reshape", "Transpose", "ReduceSum", "Greater", "If",
+                                            "Conv", "Conv", "Conv"),
+                        # The then branch's two convolutions run as one tiled,
+                        # line-buffered chain; the plan holds both branches.
+                        mem_budget="1536", expect_tiled=True, expect_chain=True,
+                        expect_line_buffered=True)
+
+
 def _while_case() -> ContractCase:
     """A While growing x until its sum reaches 40, against ONNX's Loop, which
     tests the first condition outside its body and each later one inside."""
@@ -7250,6 +7308,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _if_case(True),
         _if_case(False),
         _while_case(),
+        _if_tiled_case(True),
+        _if_tiled_case(False),
     ]
     cases.extend(_reshape_band_case(quantized, merge)
                  for quantized in (False, True) for merge in (False, True))
