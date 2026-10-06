@@ -1000,9 +1000,9 @@ def _build_op_attributes(
                 a["use_regular_nms"], 0, a["score_threshold"], a["iou_threshold"], *a["scales"])))
             continue
         if op.op_type in CONTROL_FLOW:
-            # Graph 0 is the main graph; a subgraph's index is its position plus one.
+            # Flattening named each subgraph by its place; graph 0 is the main graph.
             records.append((op_index, OP_ATTR_SUBGRAPHS, struct.pack(
-                "<2H", *(op.attrs[key] + 1 for key in CONTROL_FLOW[op.op_type]))))
+                "<2H", *(op.attrs[key] for key in CONTROL_FLOW[op.op_type]))))
             continue
         if op.op_type in {"Resize", "ResizeLinear"}:
             scales = op.attrs.get("resize_scales")
@@ -1616,9 +1616,9 @@ def emit_binary_bytes(
     serialized after the main graph's stages."""
     if not ag.subgraphs:
         return _emit(ag, compress, xip)
-    from tigris.graph.subgraphs import flatten_subgraphs
+    from tigris.graph.subgraphs import all_graphs, flatten_subgraphs
 
-    for graph in (*ag.subgraphs, ag):
+    for graph in all_graphs(ag):
         _emit(graph, compress, xip, serialize=False)
     merged, ranges = flatten_subgraphs(ag)
     return _emit(merged, compress, xip, ranges=ranges, validate=False)

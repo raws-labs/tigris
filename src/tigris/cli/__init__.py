@@ -142,10 +142,13 @@ def _run_pipeline(
         return graph
 
     # Each subgraph a control-flow operator runs is planned as a graph of its
-    # own under the same budget.
-    ag.subgraphs = [planned(compute_memory_timeline(compute_lifetimes(sub), capture_live_tensors=False))
-                    for sub in ag.subgraphs]
-    ag = planned(ag)
+    # own under the same budget, those it runs in turn first.
+    def planned_below(graph):
+        graph.subgraphs = [planned(planned_below(compute_memory_timeline(
+            compute_lifetimes(sub), capture_live_tensors=False))) for sub in graph.subgraphs]
+        return graph
+
+    ag = planned(planned_below(ag))
 
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
     if len(mem) > 1 and slow_budget <= 0:

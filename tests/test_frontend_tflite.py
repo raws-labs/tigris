@@ -413,9 +413,9 @@ def test_an_if_on_operands_other_than_float32_is_refused(monkeypatch):
 def test_state_inside_an_if_branch_is_refused(monkeypatch):
     data = (FIXTURES / "ops" / "float_if.tflite").read_bytes()
     model, graphs = tflite._read(data)
-    graphs[1][4][0].kind = "WHILE"
+    graphs[1][4][0].kind = "READ_VARIABLE"
     monkeypatch.setattr(tflite, "_read", lambda _: (model, graphs))
-    assert any("state or control flow inside a branch" in r for r in tflite.unsupported(data))
+    assert any("state inside a subgraph" in r for r in tflite.unsupported(data))
 
 
 def test_a_while_counting_in_int32_is_refused(monkeypatch):
