@@ -998,7 +998,7 @@ def test_int8_cumsum_off_a_zero_input_zero_point_needs_tflite_semantics():
     assert validate_operator_support(graph).supported
 
 
-@pytest.mark.parametrize("kind", ["ReduceMax", "ReduceMin", "ReduceSum", "CumSum"])
+@pytest.mark.parametrize("kind", ["ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum"])
 @pytest.mark.parametrize("axes,shape", [([], (2, 5, 3)), ([0, 1], (2, 5, 3)),
                                        ([3], (2, 5, 3)), ([1], (2, 5, 3, 4))])
 def test_reductions_reject_axes_and_ranks_outside_native_contract(kind, axes, shape):

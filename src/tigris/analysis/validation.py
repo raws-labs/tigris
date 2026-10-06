@@ -298,7 +298,8 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     or float(output.quant.scale[0]) != scale
                     or output.quant.zero_point.size != 1 or int(output.quant.zero_point[0]) != zero):
                 reasons.append(f"{op.op_type} requires output scale {scale} and zero point {zero}")
-        if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin", "ReduceAll"}:
+        if op.op_type in {"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin",
+                          "ReduceAll"}:
             source = ag.tensors.get(op.inputs[0]) if op.inputs else None
             output = ag.tensors.get(op.outputs[0]) if op.outputs else None
             axes = op.attrs.get("axes", [])
