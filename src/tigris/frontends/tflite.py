@@ -535,7 +535,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
             return reason
     if op.kind == "L2_NORMALIZATION" and op.option(0, "b") != 0:
         return f"fused {_activation(op.option(0, 'b'))}"
-    if op.kind in _REDUCTIONS:
+    if op.kind in _REDUCTIONS or op.kind == "MEAN":
         axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
         if not axes or axes != list(range(axes[0], axes[-1] + 1)):
             return "axes that are not adjacent"
@@ -652,6 +652,14 @@ def _lstm_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
     if any(len(t.scale) != 1 for t in (x, hidden, cell, y, *(ins[i] for i in range(1, 9)))):
         return "operands must be quantized per tensor"
     return ""
+
+
+def _spatial_mean(op: _Operator, tensors) -> bool:
+    """A MEAN over the height and width of a feature map, which the compiler
+    runs as a global average pool."""
+    source = tensors[op.inputs[0]]
+    axes = sorted({a % len(source.shape) for a in tensors[op.inputs[1]].array().reshape(-1).tolist()})
+    return len(source.shape) == 4 and axes == [1, 2]
 
 
 def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
@@ -971,6 +979,8 @@ class _Converter:
             y = b.node("Sqrt", [pooled], tag)
         elif kind in _REDUCTIONS or kind == "CUMSUM":
             y = self._reduction(op, tag)
+        elif kind == "MEAN" and not _spatial_mean(op, self.tensors):
+            y = self._reduction(op, tag)
         elif kind == "MEAN":
             source = self.tensors[ins[0]]
             rank = len(source.shape)
@@ -1258,7 +1268,8 @@ class _Converter:
             y = b.node("Cast", [lowest], tag + "_reduced", to=TensorProto.BOOL)
             kept = [rows[0], 1, rows[2]]
         else:
-            y = b.node(_REDUCTIONS[op.kind], [x], tag + "_reduced", axes=[axis], keepdims=1)
+            kind = "ReduceMean" if op.kind == "MEAN" else _REDUCTIONS[op.kind]
+            y = b.node(kind, [x], tag + "_reduced", axes=[axis], keepdims=1)
             kept = [rows[0], 1, rows[2]]
         if kept == list(out.shape):
             return b.node("Identity", [y], tag)
