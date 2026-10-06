@@ -33,6 +33,7 @@ from .defs import (
     SEC_INDEX_POOL,
     SEC_OP_ATTRIBUTES,
     SEC_STATE,
+    SEC_SUBGRAPHS,
     SEC_OPS,
     SEC_QUANT_PARAMS,
     SEC_SHAPE_POOL,
@@ -101,7 +102,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         if sec_type == 0:
             found_sentinel = True
             break
-        if sec_type > SEC_STATE:
+        if sec_type > SEC_SUBGRAPHS:
             raise ValueError(f"Unknown section type: {sec_type}")
         if sec_type in sections:
             raise ValueError(f"Duplicate section type: {sec_type}")
@@ -439,6 +440,18 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
 
     # Resolve model I/O from index pool
     # Variables kept across invocations, with their initial values.
+    subgraphs = []
+    if SEC_SUBGRAPHS in sections:
+        base = sections[SEC_SUBGRAPHS]
+        _check_range(SEC_SUBGRAPHS, base, 4)
+        (count, _reserved) = struct.unpack_from("<HH", data, base)
+        _check_range(SEC_SUBGRAPHS, base + 4, 12 * count)
+        for k in range(count):
+            first, length, in_off, in_count, out_off, out_count = struct.unpack_from(
+                "<6H", data, base + 4 + 12 * k)
+            subgraphs.append({"first_stage": first, "num_stages": length,
+                              "inputs": _read_index_pool(in_off, in_count),
+                              "outputs": _read_index_pool(out_off, out_count)})
     state = {"bytes": 0, "entries": []}
     state_base = sections.get(SEC_STATE, 0)
     if state_base:
@@ -484,4 +497,5 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         "weight_blocks_compression": weight_blocks_compression,
         "op_attributes": op_attributes,
         "state": state,
+        "subgraphs": subgraphs,
     }

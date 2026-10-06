@@ -369,6 +369,22 @@ def test_an_int8_lstm_with_per_channel_weights_is_refused(monkeypatch):
     assert any("quantized per tensor" in r for r in reasons)
 
 
+def test_an_if_on_operands_beyond_rank_2_is_refused(monkeypatch):
+    def widen(tensors, operators):
+        branching = next(op for op in operators if op.kind == "IF")
+        tensors[branching.inputs[1]].shape = np.asarray([1, 2, 2], np.int32)
+    reasons = _read_edited(monkeypatch, "float_if", widen)
+    assert any("operands other than float32 of rank 2 at most" in r for r in reasons)
+
+
+def test_state_inside_an_if_branch_is_refused(monkeypatch):
+    data = (FIXTURES / "ops" / "float_if.tflite").read_bytes()
+    model, graphs = tflite._read(data)
+    graphs[1][4][0].kind = "WHILE"
+    monkeypatch.setattr(tflite, "_read", lambda _: (model, graphs))
+    assert any("state or control flow inside a branch" in r for r in tflite.unsupported(data))
+
+
 def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():
     model = tflite.to_onnx((FIXTURES / "ops" / "cumsum_offset.tflite").read_bytes(), "cumsum")
     scans = [node for node in model.graph.node if node.op_type == "CumSum"]

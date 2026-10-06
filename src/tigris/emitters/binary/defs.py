@@ -23,6 +23,11 @@ SEC_OP_ATTRIBUTES = 11
 # Variables kept across invocations: offsets in the caller's state buffer and
 # initial values.
 SEC_STATE = 12
+SEC_SUBGRAPHS = 13  # u16 count, u16 0, then per graph (main first): u16 first stage,
+                    # u16 stages, u16 inputs offset, u16 inputs, u16 outputs offset,
+                    # u16 outputs (offsets into the index pool)
+SUBGRAPH_HEADER_SIZE = 4
+SUBGRAPH_ENTRY_SIZE = 12
 STATE_HEADER_SIZE = 8
 STATE_ENTRY_SIZE = 16
 
@@ -74,6 +79,7 @@ OP_ATTR_CONSTANTS = 14  # uint16 weight index per constant operand, in operand o
                         # NO_WEIGHT for an absent optional one
 OP_ATTR_SVDF = 15  # int32: rank; for int8 also the state zero point and the
                    # input-to-state and state-to-output multiplier/shift pairs
+OP_ATTR_SUBGRAPHS = 17  # u16 graph indices a control-flow operator runs (If: then, else)
 OP_ATTR_LSTM = 16  # int32 time_major (0 or 1), float32 cell clip (0: none); int8
                    # adds zero points, cell power, clip and 11 multiplier pairs
 
@@ -82,6 +88,7 @@ OP_ATTR_KINDS = (
     OP_ATTR_CONSTANTS,
     OP_ATTR_SVDF,
     OP_ATTR_LSTM,
+    OP_ATTR_SUBGRAPHS,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ATTR_EPSILON,
     OP_ATTR_ALPHA,
@@ -191,6 +198,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "ReduceAll": 84,
     "Svdf": 85,
     "Lstm": 86,
+    "If": 87,
 }
 OP_TYPE_UNKNOWN = 255
 

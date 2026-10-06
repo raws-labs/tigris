@@ -639,6 +639,13 @@ _FLOAT_TIER1 = (
 )
 FLOAT_MODELS["float_l2_pool"] = CASES["float_l2_pool"]
 FLOAT_MODELS["float_logistic_tails"] = _unary(tf.sigmoid, (1, 64))
+# A branch chosen at run time; TFLite writes IF over two branch subgraphs.
+FLOAT_MODELS["float_if"] = _unary(
+    lambda x: tf.cond(tf.reduce_sum(x) > 0.0, lambda: x * 2.0 + 1.0, lambda: tf.nn.relu(x) - 3.0),
+    (1, 4))
+FLOAT_MODELS["float_if_two_operands"] = _binary(
+    lambda x, y: tf.cond(tf.reduce_max(x) > tf.reduce_max(y), lambda: x + y, lambda: x * y),
+    (1, 6), (1, 6))
 FLOAT_MODELS["float_variable_window"] = _unary(lambda x: _WINDOW(x), (1, 2))
 for _name in _FLOAT_TIER1:
     FLOAT_MODELS[f"float_{_name}"] = CASES[_name]

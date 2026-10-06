@@ -266,6 +266,8 @@ class AnalyzedGraph:
     # from the last invocation and, when this one assigns it, a model output,
     # by position in model_inputs and model_outputs, with its initial value.
     state_ports: list["StatePort"] = field(default_factory=list)
+    # Graphs a control-flow operator runs, referenced by index from its attributes.
+    subgraphs: list["AnalyzedGraph"] = field(default_factory=list)
 
     # Populated by loader - raw weight arrays keyed by initializer name
     weight_data: dict[str, np.ndarray] = field(default_factory=dict)

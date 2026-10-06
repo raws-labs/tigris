@@ -58,6 +58,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _adopt_tflite_cumsum(ag)
     ag = _adopt_svdf(ag)
     ag = _adopt_lstm(ag)
+    ag = _adopt_if(ag)
     ag = _normalize_arg_outputs(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
@@ -2995,6 +2996,31 @@ def _adopt_lstm(ag: AnalyzedGraph) -> AnalyzedGraph:
         if "weight_scales" in op.attrs and (len(op.attrs["weight_scales"]) != 8
                                             or "cell_scale" not in op.attrs):
             raise ValueError("an integer Lstm states its eight weight scales and its cell scale")
+    return ag
+
+
+def _adopt_if(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """The compiler's own If: a one-element bool condition and operands in;
+    each branch a subgraph taking the operands and giving the results, in the
+    same shapes and dtypes."""
+    for op in ag.ops:
+        if op.op_type != "tigris::If":
+            continue
+        op.op_type = "If"
+        branches = [ag.subgraphs[op.attrs[key]] for key in ("then_branch", "else_branch")]
+        condition = ag.tensors[op.inputs[0]]
+        if condition.dtype != 9 or int(np.prod(condition.shape)) != 1:
+            raise ValueError("If requires a one-element bool condition")
+        operands = [ag.tensors[name] for name in op.inputs[1:]]
+        results = [ag.tensors[name] for name in op.outputs]
+        for branch in branches:
+            entering = [branch.tensors[name] for name in branch.model_inputs]
+            leaving = [branch.tensors[name] for name in branch.model_outputs]
+            if ([(t.shape, t.dtype) for t in entering] != [(t.shape, t.dtype) for t in operands]
+                    or [(t.shape, t.dtype) for t in leaving] != [(t.shape, t.dtype) for t in results]):
+                raise ValueError("If branches must take its operands and give its results")
+            if any(len(t.shape) > 2 for t in (*entering, *leaving)):
+                raise ValueError("If operands and results are of rank 2 at most")
     return ag
 
 
