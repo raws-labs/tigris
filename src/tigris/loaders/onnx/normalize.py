@@ -417,6 +417,10 @@ def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
             return Layout.LINEAR
     if op.op_type in _MOVEMENT_OPS:
         return Layout.LINEAR
+    if op.op_type in ("If", "While"):
+        # A subgraph holds its inputs and outputs as a graph boundary does,
+        # and the operands are copied in byte for byte.
+        return Layout.SPATIAL
     if op.op_type in _SPATIAL_LAYOUT_OPS:
         return Layout.SPATIAL
     if op.op_type in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin", "ReduceAll"}:
@@ -3020,8 +3024,6 @@ def _adopt_if(ag: AnalyzedGraph) -> AnalyzedGraph:
             if ([(t.shape, t.dtype) for t in entering] != [(t.shape, t.dtype) for t in operands]
                     or [(t.shape, t.dtype) for t in leaving] != [(t.shape, t.dtype) for t in results]):
                 raise ValueError("If branches must take its operands and give its results")
-            if any(len(t.shape) > 2 for t in (*entering, *leaving)):
-                raise ValueError("If operands and results are of rank 2 at most")
     return ag
 
 
@@ -3048,8 +3050,6 @@ def _adopt_while(ag: AnalyzedGraph) -> AnalyzedGraph:
             raise ValueError("While condition and body must take and give its loop variables")
         if len(verdict) != 1 or verdict[0].dtype != 9 or int(np.prod(verdict[0].shape)) != 1:
             raise ValueError("While condition must give one bool")
-        if any(len(shape) > 2 for shape, _ in variables):
-            raise ValueError("While loop variables are of rank 2 at most")
     return ag
 
 

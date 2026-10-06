@@ -369,12 +369,12 @@ def test_an_int8_lstm_with_per_channel_weights_is_refused(monkeypatch):
     assert any("quantized per tensor" in r for r in reasons)
 
 
-def test_an_if_on_operands_beyond_rank_2_is_refused(monkeypatch):
-    def widen(tensors, operators):
+def test_an_if_on_operands_other_than_float32_is_refused(monkeypatch):
+    def narrow(tensors, operators):
         branching = next(op for op in operators if op.kind == "IF")
-        tensors[branching.inputs[1]].shape = np.asarray([1, 2, 2], np.int32)
-    reasons = _read_edited(monkeypatch, "float_if", widen)
-    assert any("operands other than float32 of rank 2 at most" in r for r in reasons)
+        tensors[branching.inputs[1]].type = "INT8"
+    reasons = _read_edited(monkeypatch, "float_if", narrow)
+    assert any("operands other than float32" in r for r in reasons)
 
 
 def test_state_inside_an_if_branch_is_refused(monkeypatch):

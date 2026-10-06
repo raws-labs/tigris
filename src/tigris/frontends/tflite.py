@@ -140,10 +140,12 @@ class _Tensor:
         # A variable tensor keeps what an operator wrote into it for the next invocation.
         self.variable = bool(table.scalar(_T_VARIABLE, "B"))
         self._model = model
+        # The value of a constant the frontend computed itself.
+        self.folded: bytes | None = None
 
     @property
     def data(self) -> bytes:
-        return self._model.buffer(self.buffer)
+        return self.folded if self.folded is not None else self._model.buffer(self.buffer)
 
     def array(self) -> np.ndarray:
         dtype = _NUMPY.get(self.type)
@@ -174,7 +176,38 @@ def _read(data: bytes):
         operators = [_Operator(model, op, i) for i, op in enumerate(subgraph.tables(_SG_OPERATORS))]
         graphs.append((subgraph.string(_SG_NAME), tensors, subgraph.scalars(_SG_INPUTS, "i"),
                        subgraph.scalars(_SG_OUTPUTS, "i"), operators))
+    # The converter passes a constant an IF branch reads as one of its
+    # operands; inside the branch it is that constant, from the same buffer.
+    for op in graphs[0][4] if graphs else ():
+        if op.kind != "IF":
+            continue
+        for slot in (0, 1):
+            position = op.option(slot, "i")
+            if not 0 < position < len(graphs):
+                continue
+            _, branch_tensors, branch_inputs, _, _ = graphs[position]
+            for operand, entering in zip(op.inputs[1:], branch_inputs):
+                if operand >= 0 and _is_constant(graphs[0][1][operand]):
+                    branch_tensors[entering].buffer = graphs[0][1][operand].buffer
+            graphs[position] = _fold_constant_transposes(graphs[position])
     return model, graphs
+
+
+def _fold_constant_transposes(graph):
+    """A branch transposing a constant, as the converter leaves a weight it
+    passed in, reads the transposed constant instead."""
+    name, tensors, inputs, outputs, operators = graph
+    kept = []
+    for op in operators:
+        if (op.kind == "TRANSPOSE" and all(i >= 0 and _is_constant(tensors[i]) for i in op.inputs)
+                and op.outputs[0] not in outputs):
+            source, perm = tensors[op.inputs[0]], tensors[op.inputs[1]].array().reshape(-1)
+            result = tensors[op.outputs[0]]
+            result.folded = np.ascontiguousarray(source.array().transpose(perm)).tobytes()
+            result.buffer = 1 << 30
+            continue
+        kept.append(op)
+    return name, tensors, inputs, outputs, kept
 
 
 def _dtype_name(tensor: _Tensor) -> str:
@@ -268,8 +301,8 @@ def _branch_reasons(graph, role: str = "branch") -> list[str]:
             reasons.append("a condition other than one bool")
         outputs = []
     for index in [*inputs, *outputs]:
-        if tensors[index].type != "FLOAT32" or len(tensors[index].shape) > 2:
-            reasons.append(f"subgraph boundary {tensors[index].name!r} other than float32 of rank 2 at most")
+        if tensors[index].type != "FLOAT32" and not _is_constant(tensors[index]):
+            reasons.append(f"subgraph boundary {tensors[index].name!r} other than float32")
     return reasons
 
 
@@ -282,6 +315,8 @@ def _branch_graph(graph, name: str) -> onnx.GraphProto:
     b = converter.b
     graph_inputs = []
     for position, index in enumerate(inputs):
+        if _is_constant(tensors[index]):
+            continue
         input_name = b.unique(f"{name}_in{position}")
         graph_inputs.append(helper.make_tensor_value_info(
             input_name, TensorProto.FLOAT, _onnx_shape(tensors[index].shape)))
@@ -423,15 +458,15 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     if op.kind == "IF":
         if ins[0].type != "BOOL" or int(np.prod(ins[0].shape)) != 1:
             return "a condition other than one bool"
-        if any(t.type != "FLOAT32" or len(t.shape) > 2 for t in [*ins[1:], *outs]):
-            return "operands other than float32 of rank 2 at most"
+        if any(t.type != "FLOAT32" for t in [*(t for t in ins[1:] if not _is_constant(t)), *outs]):
+            return "operands other than float32"
         return ""
     if op.kind == "WHILE":
         if any(t.type == "INT32" for t in ins):
             # A loop counter needs int32 arithmetic the runtime does not have.
             return "int32 loop variables"
-        if any(t.type != "FLOAT32" or len(t.shape) > 2 for t in [*ins, *outs]):
-            return "loop variables other than float32 of rank 2 at most"
+        if any(t.type != "FLOAT32" for t in [*ins, *outs]):
+            return "loop variables other than float32"
         return ""
     if op.kind == "SVDF":
         return _svdf_reason(op, ins, outs)
@@ -1300,8 +1335,11 @@ class _Converter:
         graphs = {role: _branch_graph(self.graphs[op.option(slot, "i")], f"{tag}_{role}")
                   for slot, role in enumerate(roles)}
         results = [b.unique(f"{tag}_{n}") for n in range(len(op.outputs))]
+        # A constant operand is read inside the branch itself.
+        operands = [i for n, i in enumerate(op.inputs)
+                    if op.kind != "IF" or n == 0 or not _is_constant(self.tensors[i])]
         b.nodes.append(helper.make_node(
-            kind, [self.value(i) for i in op.inputs], results, domain="tigris", **graphs))
+            kind, [self.value(i) for i in operands], results, domain="tigris", **graphs))
         for index, name in zip(op.outputs, results):
             self.value_info.append(helper.make_tensor_value_info(
                 name, TensorProto.FLOAT, _onnx_shape(self.tensors[index].shape)))
