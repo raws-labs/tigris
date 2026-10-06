@@ -179,7 +179,7 @@ def test_reshape_rank_boundary_fits_tight_budget(name, tmp_path):
     ("float_sum_channels", "ReduceSum", 2),
     ("float_cumsum_exclusive_reverse", "CumSum", 2),
 ])
-def test_contiguous_reshape_preserves_downstream_budget_errors(name, kind, count, tmp_path):
+def test_contiguous_reshape_and_leading_operator_fit_tight_budget(name, kind, count, tmp_path):
     from tigris.cli import _run_pipeline
     from tigris.analysis.validation import validate_memory_plan
 
@@ -189,12 +189,14 @@ def test_contiguous_reshape_preserves_downstream_budget_errors(name, kind, count
     assert len(reshapes) == count
     oversized = [s for s in reshapes if s.peak_bytes > 256]
     assert oversized and all(s.tile_plan.tileable and s.tile_plan.num_tiles > 1 for s in oversized)
-    issues = validate_memory_plan(graph).issues
-    assert len(issues) == 1 and kind in issues[0].reason
-    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256",
-                                     "-o", str(tmp_path / "model.tgrs")])
-    assert result.exit_code != 0 and kind in result.output
-    assert not (tmp_path / "model.tgrs").exists()
+    assert validate_memory_plan(graph).feasible
+    stage = next(s for s in graph.stages if any(graph.ops[i].op_type == kind for i in s.op_indices))
+    assert len(stage.op_indices) == 1 and stage.chain_len == 0
+    assert stage.tile_plan.original_height == 36 and stage.tile_plan.num_tiles > 1
+    assert stage.tile_plan.tiled_peak_bytes <= 256
+    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
+    assert read_binary_plan((tmp_path / "model.tgrs").read_bytes())["version"] == 9
+
 
 
 def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:

@@ -752,18 +752,38 @@ def _reshape_tile_for_bytes(mapping, budget: int, alignment: int, element: int) 
                     tiled_peak_bytes=_align_up(blocks * band * width * element, alignment))
 
 
-def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True) -> bool:
-    """The existing row or height axis survives the operation unchanged."""
+def _leading_view(info) -> tuple[int, int, int] | None:
+    shape = serialized_shape(info.shape, info.layout)
+    if not 2 <= len(shape) <= 6 or min(shape) <= 0:
+        return None
+    axis = next((i for i, extent in enumerate(shape) if extent != 1), 0)
+    return 1, shape[axis], math.prod(shape[axis + 1:])
+
+
+def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True,
+                      leading: bool = False) -> bool:
+    """The selected stored band axis survives the operation unchanged."""
     if op.op_type not in _ROW_REDUCTIONS | _ROW_MOVEMENT or not op.inputs or len(op.outputs) != 1:
         return False
     source, target = ag.tensors[op.inputs[0]], ag.tensors[op.outputs[0]]
-    view = _row_view if row_tiled else _height_view
+    view = _leading_view if leading else _row_view if row_tiled else _height_view
     first, last = view(source), view(target)
     if first is None or last is None or first[:2] != last[:2]:
         return False
     rank = len(source.shape)
     row = rank - 2 if row_tiled else 1
-    if not row_tiled and (len(target.shape) != rank or first[1] <= 1):
+    if leading:
+        shape = serialized_shape(source.shape, source.layout)
+        row = next((i for i, extent in enumerate(shape) if extent != 1), 0)
+        for name in [*op.inputs, *op.outputs]:
+            info = ag.tensors[name]
+            if info.is_constant:
+                continue
+            other = serialized_shape(info.shape, info.layout)
+            if (len(other) != rank or math.prod(other[:row]) != 1 or
+                    other[row] != shape[row] or shape[row] <= 1):
+                return False
+    if not leading and not row_tiled and (len(target.shape) != rank or first[1] <= 1):
         return False
     if any(not ag.tensors[name].is_constant and (view(ag.tensors[name]) is None or
            view(ag.tensors[name])[:2] != first[:2]) for name in op.inputs[1:]):
@@ -782,14 +802,14 @@ def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True) -> 
         return metadata[0] != row and metadata[1] <= row
     if op.op_type == "StridedSlice":
         shrink = metadata[3 * rank] if len(metadata) > 3 * rank else 0
-        return not shrink & (1 << row) and metadata[3 * row:3 * row + 3] == [0, source.shape[row], 1]
+        return not shrink & (1 << row) and metadata[3 * row:3 * row + 3] == [0, serialized_shape(source.shape, source.layout)[row], 1]
     if op.op_type == "MirrorPad":
         return metadata[1 + 2 * row:3 + 2 * row] == [0, 0]
     if op.op_type == "ReverseV2":
         return not metadata[0] & (1 << row)
     return (len(op.inputs) == 2 and not ag.tensors[op.inputs[1]].is_constant
             and len(metadata) == 2 * rank and metadata[row] == 0
-            and metadata[rank + row] == source.shape[row])
+            and metadata[rank + row] == serialized_shape(source.shape, source.layout)[row])
 
 
 def _stage_is_row_tiled(
@@ -1585,6 +1605,11 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         if len(stage_ops) == 1 and _independent_band(ag, stage_ops[0], row_tiled=False):
             stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, _height_view)
+            continue
+
+        if (len(stage_ops) == 1 and not stage.chain_len and
+                _independent_band(ag, stage_ops[0], leading=True)):
+            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, _leading_view)
             continue
 
         # A global reduction has no output axis to tile, so the runtime walks
