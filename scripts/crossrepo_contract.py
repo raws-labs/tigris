@@ -651,11 +651,14 @@ def _linear_spatial_max_case(*, quantized: bool) -> ContractCase:
 
 
 def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
-                    exclusive: bool = False, reverse: bool = False, tiled: bool = False) -> ContractCase:
+                    exclusive: bool = False, reverse: bool = False, tiled: bool = False,
+                    leading: bool = False) -> ContractCase:
     shape = [2, 137 if tiled else 7, 4]
     if kind == "ReduceMean" and tiled:
         shape = [2, 4, 137]
         axis = 1
+    if leading:
+        shape = [37, 4, 1] if kind == "ReduceMean" else [37, 1, 4]
     output_shape = shape.copy()
     if kind != "CumSum":
         if keep:
@@ -683,7 +686,7 @@ def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
         nodes += _qdq(target, "y_s", "y_z", "output")
     label = (f"{'int8' if quantized else 'float'}_{kind.lower()}_axis{axis}"
              f"_keep{int(keep)}_exclusive{int(exclusive)}_reverse{int(reverse)}")
-    label += "_tiled" if tiled else ""
+    label += "_leading" if leading else "_tiled" if tiled else ""
     model = _model(label, nodes,
                    [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
                    [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)], initializers)
@@ -691,13 +694,15 @@ def _reduction_case(kind: str, axis: int, *, quantized: bool, keep: bool = True,
     if kind == "ReduceMean":
         operators = (kind,)
     return ContractCase(label, model, copy.deepcopy(model), {"input": data}, operators,
-                        mem_budget="256" if tiled else "4K", slow_budget="16K" if tiled else None,
-                        expect_tiled=tiled, reference_unoptimized=True)
+                        mem_budget=("128" if quantized else "384") if leading else "256" if tiled else "4K",
+                        slow_budget="16K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True, exact_untiled=leading)
 
 
-def _reduce_all_case(axis: int, keep: bool, tiled: bool = False) -> ContractCase:
+def _reduce_all_case(axis: int, keep: bool, tiled: bool = False,
+                   leading: bool = False) -> ContractCase:
     """All of one bool axis, stated as the uint8 minimum ONNX can express."""
-    shape = [2, 137 if tiled else 7, 4]
+    shape = [37, 1, 4] if leading else [2, 137 if tiled else 7, 4]
     output_shape = shape.copy()
     if keep:
         output_shape[axis] = 1
@@ -708,14 +713,15 @@ def _reduce_all_case(axis: int, keep: bool, tiled: bool = False) -> ContractCase
              helper.make_node("ReduceMin", ["widened"], ["lowest"], axes=[axis - 3], keepdims=int(keep)),
              helper.make_node("Cast", ["lowest"], ["output"], to=TensorProto.BOOL)]
     label = f"bool_reduceall_axis{axis}_keep{int(keep)}"
-    label += "_tiled" if tiled else ""
+    label += "_leading" if leading else "_tiled" if tiled else ""
     model = _model(label, nodes,
                    [helper.make_tensor_value_info("input", TensorProto.BOOL, shape)],
                    [helper.make_tensor_value_info("output", TensorProto.BOOL, output_shape)], [])
     operators = ("Transpose", "ReduceAll", "Transpose") if keep else ("Transpose", "ReduceAll")
     return ContractCase(label, model, copy.deepcopy(model), {"input": data}, operators,
-                        mem_budget="256" if tiled else "4K", slow_budget="16K" if tiled else None,
-                        expect_tiled=tiled, reference_unoptimized=True)
+                        mem_budget="128" if leading else "256" if tiled else "4K",
+                        slow_budget="16K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True, exact_untiled=leading)
 
 
 def _reshape_band_case(quantized: bool, merge: bool, contiguous: bool = False) -> ContractCase:
@@ -745,8 +751,11 @@ def _reshape_band_case(quantized: bool, merge: bool, contiguous: bool = False) -
                         slow_budget="16K", expect_tiled=True, exact_untiled=True)
 
 
-def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = False) -> ContractCase:
+def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = False,
+                   leading: bool = False) -> ContractCase:
     shape = [2, 37 if tiled else 3, 4]
+    if leading:
+        shape = [37, 1, 4]
     data = ((np.arange(np.prod(shape)).reshape(shape) * 7) % 31 - 15).astype(np.float32) * 0.125
     nodes, initializers, reference_nodes = [], [], []
     inputs = {"input": data}
@@ -824,7 +833,7 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = F
         reference_nodes.append(helper.make_node("Gather", [source, name], [target], axis=0))
         expected = data[indices]
     else:
-        update = np.full((2, shape[1], 2) if tiled else (1, 2, 2), 3.5, np.float32)
+        update = np.full((shape[0], shape[1], 2) if tiled else (1, 2, 2), 3.5, np.float32)
         starts = [99, -4, 1]
         if variant:
             initializers.append(numpy_helper.from_array(update, "update"))
@@ -848,7 +857,7 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = F
         nodes.extend(_qdq(target, "y_s", "y_z", "output"))
         reference_nodes.extend(_qdq(target, "y_s", "y_z", "output"))
     label = f"{'int8' if quantized else 'float'}_{kind.lower()}_{variant}"
-    label += "_tiled" if tiled else ""
+    label += "_leading" if leading else "_tiled" if tiled else ""
     output = helper.make_tensor_value_info("output", TensorProto.FLOAT, expected.shape)
 
     def build(body):
@@ -869,10 +878,59 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = F
     if expected.ndim >= 3:
         operators.append("Transpose")
     return ContractCase(label, build(nodes), build(reference_nodes), inputs, tuple(operators),
-                        mem_budget="256" if tiled else "8K", slow_budget="16K" if tiled else None,
-                        expect_tiled=tiled, reference_unoptimized=True,
+                        mem_budget=("128" if quantized else "384") if leading else "256" if tiled else "8K",
+                        slow_budget="16K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True, exact_untiled=leading,
                         compression="lz4" if kind == "Gather" and variant == 0 and not tiled else None)
 
+
+
+def _leading_index_case(kind: str, quantized: bool) -> ContractCase:
+    shape = [1, 1, 37, 1, 4]
+    data = ((np.arange(148).reshape(37, 1, 4) % 23) - 11).astype(np.float32) * 0.125
+    indices = np.array([[[0, 0]]] if kind == "GatherND" else [0], np.int64)
+    initializers = [numpy_helper.from_array(indices, "indices"),
+                    numpy_helper.from_array(np.array([3, 2, 1, 0], np.int64), "order"),
+                    numpy_helper.from_array(np.array(shape, np.int64), "expanded_shape"),
+                    numpy_helper.from_array(np.array([37, 1, 4], np.int64), "interface_shape")]
+    nodes = []
+    source, target = "input", "output"
+    if quantized:
+        initializers += _scalars(x=(0.125, -17), y=(0.125, -17))
+        nodes += _qdq("input", "x_s", "x_z", "x")
+        source, target = "x", "raw"
+    nodes.append(helper.make_node("Gather", [source, "order"], ["ordered"], axis=2))
+    if quantized:
+        nodes += _qdq("ordered", "x_s", "x_z", "ordered_encoded")
+    nodes.append(helper.make_node("Reshape", ["ordered_encoded" if quantized else "ordered", "expanded_shape"], ["expanded"]))
+    if quantized:
+        nodes += _qdq("expanded", "x_s", "x_z", "expanded_encoded")
+    reference = copy.deepcopy(nodes)
+    nodes.append(helper.make_node(kind, ["expanded_encoded" if quantized else "expanded", "indices"], ["indexed"],
+                                  domain="tigris" if kind == "EmbeddingLookup" else ""))
+    reference.append(helper.make_node("Gather" if kind == "EmbeddingLookup" else kind,
+                                     ["expanded_encoded" if quantized else "expanded", "indices"], ["indexed"]))
+    if quantized:
+        nodes += _qdq("indexed", "x_s", "x_z", "indexed_encoded")
+        reference += _qdq("indexed", "x_s", "x_z", "indexed_encoded")
+    tail = helper.make_node("Reshape", ["indexed_encoded" if quantized else "indexed", "interface_shape"], [target])
+    nodes.append(tail)
+    reference.append(copy.deepcopy(tail))
+    if quantized:
+        nodes += _qdq(target, "y_s", "y_z", "output")
+        reference += _qdq(target, "y_s", "y_z", "output")
+    def model(body):
+        m = helper.make_model(helper.make_graph(body, "leading_index",
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [37, 1, 4])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [37, 1, 4])], initializers,
+            value_info=[helper.make_tensor_value_info("indexed", TensorProto.FLOAT, shape)]),
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("tigris", 1)])
+        m.ir_version = 8
+        return m
+    return ContractCase(f"{kind.lower()}_leading_int8{int(quantized)}", model(nodes), model(reference),
+                        {"input": data}, ("Transpose", "Gather", "Reshape", kind, "Reshape", "Transpose"),
+                        mem_budget="128" if quantized else "384",
+                        slow_budget="16K", expect_tiled=True, exact_untiled=True, reference_unoptimized=True)
 
 
 def _svdf_case() -> ContractCase:
@@ -1093,8 +1151,9 @@ def _bool_composition_case(quantized: bool, tiled: bool) -> ContractCase:
                         slow_budget=case.slow_budget, expect_tiled=tiled, expect_chain=tiled, reference_unoptimized=True)
 
 
-def _arg_case(kind: str, axis: int, quantized: bool, keep: bool, tiled: bool = False) -> ContractCase:
-    shape = [2, 137 if tiled else 7, 4]
+def _arg_case(kind: str, axis: int, quantized: bool, keep: bool, tiled: bool = False,
+                   leading: bool = False) -> ContractCase:
+    shape = [37, 1, 4] if leading else [2, 137 if tiled else 7, 4]
     target = shape.copy()
     if keep:
         target[axis] = 1
@@ -1109,13 +1168,14 @@ def _arg_case(kind: str, axis: int, quantized: bool, keep: bool, tiled: bool = F
         source = "x"
     nodes.append(helper.make_node(kind, [source], ["output"], axis=axis - 3, keepdims=int(keep)))
     label = f"{kind.lower()}_axis{axis}_int8{int(quantized)}_keep{int(keep)}"
-    label += "_tiled" if tiled else ""
+    label += "_leading" if leading else "_tiled" if tiled else ""
     model = _model(label, nodes,
                    [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
                    [helper.make_tensor_value_info("output", TensorProto.INT64, target)], initializers)
     return ContractCase(label, model, copy.deepcopy(model), {"input": data}, ("Transpose", kind),
-                        mem_budget="256" if tiled else "4K", slow_budget="16K" if tiled else None,
-                        expect_tiled=tiled, reference_unoptimized=True)
+                        mem_budget=("128" if quantized else "384") if leading else "256" if tiled else "4K",
+                        slow_budget="16K" if tiled else None,
+                        expect_tiled=tiled, reference_unoptimized=True, exact_untiled=leading)
 
 
 def _activation_case(kind: str, *, quantized: bool = False) -> ContractCase:
@@ -6574,10 +6634,11 @@ def _run_case(
     )
     if case.exact_untiled:
         assert plan["version"] == 9
-        reshape_stages = [stage for stage in plan["stages"] if any(
-            plan["ops"][i]["op_type"] == OP_TYPE_MAP["Reshape"] for i in stage["ops"])]
-        assert reshape_stages and all(stage["tile_plan_idx"] != 65535 and
-            plan["tile_plans"][stage["tile_plan_idx"]]["num_tiles"] > 1 for stage in reshape_stages)
+        banded_types = {OP_TYPE_MAP[k] for k in case.expected_operators if k != "Transpose"}
+        banded_stages = [stage for stage in plan["stages"] if any(
+            plan["ops"][i]["op_type"] in banded_types for i in stage["ops"])]
+        assert banded_stages and all(stage["tile_plan_idx"] != 65535 and
+            plan["tile_plans"][stage["tile_plan_idx"]]["num_tiles"] > 1 for stage in banded_stages)
         untiled_path = case_dir / "untiled.tgrs"
         untiled = _compile_plan(compile_path, untiled_path, mem_budget="64K", slow_budget="16K",
                                 compression=None, xip=False)
@@ -7075,6 +7136,18 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
                  for quantized in (False, True) for merge in (False, True))
     cases.extend(_reshape_band_case(quantized, merge, contiguous=True)
                  for quantized in (False, True) for merge in (False, True))
+    cases.extend(_reduction_case(kind, 2, quantized=q, tiled=True, leading=True,
+                                  exclusive=kind == "CumSum", reverse=kind == "CumSum")
+                 for q in (False, True)
+                 for kind in ("ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum"))
+    cases.extend(_movement_case(kind, q, 2 if kind == "Gather" else 0, tiled=True, leading=True)
+                 for q in (False, True)
+                 for kind in ("Gather", "StridedSlice", "MirrorPad", "ReverseV2", "DynamicUpdateSlice"))
+    cases.extend(_arg_case(kind, 2, q, True, tiled=True, leading=True)
+                 for q in (False, True) for kind in ("ArgMax", "ArgMin"))
+    cases.append(_reduce_all_case(2, True, tiled=True, leading=True))
+    cases.extend(_leading_index_case(kind, q)
+                 for q in (False, True) for kind in ("GatherND", "EmbeddingLookup"))
     covered_operators = {
         operator for case in cases for operator in case.expected_operators
     }

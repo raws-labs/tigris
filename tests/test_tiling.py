@@ -651,3 +651,81 @@ def test_contiguous_reshape_rounds_bands_to_integral_endpoints():
         assert start * 4 % 24 == 0
         assert min(36, start + plan.tile_height) * 4 % 24 == 0
     assert not _reshape_tile_for_bytes(mapping, 95, 32, 4).tileable
+
+
+@pytest.mark.parametrize("kind", ["ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",
+                                  "CumSum", "ArgMax", "ArgMin", "Gather", "GatherND", "EmbeddingLookup",
+                                  "StridedSlice", "MirrorPad", "ReverseV2", "DynamicUpdateSlice"])
+def test_leading_independent_operator_band(kind):
+    from tigris.analysis.partition_spatial import _independent_band, _leading_view, _solve_row_tile
+    from tigris.graph.ir import Layout, Stage
+
+    shape = (1, 1, 37, 1, 4) if kind in {"GatherND", "EmbeddingLookup"} else (37, 1, 4)
+    rank = len(shape)
+    tensors = {n: TensorInfo(n, shape, dtype=1, layout=Layout.LINEAR) for n in ("x", "y", "u")}
+    tensors["indices"] = TensorInfo("indices", (1,), dtype=6, is_constant=True)
+    inputs, attrs = ["x"], {"axes": [rank - 1]}
+    if kind in {"Gather", "EmbeddingLookup"}:
+        attrs = {"movement": [2 if kind == "Gather" else 0, 0, 1, 1]}
+        inputs.append("indices")
+    elif kind == "GatherND":
+        attrs = {"movement": [3, 1, 1, 2]}
+        inputs.append("indices")
+    elif kind == "StridedSlice":
+        attrs = {"movement": [0, 37, 1, 0, 1, 1, 0, 4, 1]}
+    elif kind == "MirrorPad":
+        attrs = {"movement": [0, 0, 0, 0, 0, 0, 0]}
+    elif kind == "ReverseV2":
+        attrs = {"movement": [4]}
+    elif kind == "DynamicUpdateSlice":
+        attrs = {"movement": [0, 0, 0, 37, 1, 4]}
+        inputs.append("u")
+    op = OpNode("band", kind, inputs, ["y"], attrs=attrs)
+    graph = AnalyzedGraph(tensors=tensors, ops=[op])
+    assert _independent_band(graph, op, leading=True)
+    stage = Stage(0, [0], [n for n in inputs if n != "indices"], ["y"])
+    tile = _solve_row_tile(graph, stage, [op], 256, _leading_view)
+    assert tile.tileable and tile.original_height == 37 and tile.num_tiles > 1
+    assert tile.tiled_peak_bytes <= 256
+    tensors["y"].shape = (2, *shape[1:])
+    assert not _independent_band(graph, op, leading=True)
+
+
+@pytest.mark.parametrize("kind", ["ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",
+                                  "CumSum", "ArgMax", "ArgMin", "ReverseV2"])
+def test_leading_band_cannot_cut_the_operator_axis(kind):
+    from tigris.analysis.partition_spatial import _independent_band
+    from tigris.graph.ir import Layout
+
+    tensors = {n: TensorInfo(n, (37, 1, 4), dtype=1, layout=Layout.LINEAR) for n in ("x", "y")}
+    attrs = {"movement": [1]} if kind == "ReverseV2" else {"axes": [0]}
+    op = OpNode("band", kind, ["x"], ["y"], attrs=attrs)
+    assert not _independent_band(AnalyzedGraph(tensors=tensors, ops=[op]), op, leading=True)
+
+
+@pytest.mark.parametrize("source,target", [((1, 37, 8), (2, 37, 4)), ((2, 37, 4), (1, 37, 8))])
+def test_leading_band_requires_one_block_before_its_axis(source, target):
+    from tigris.analysis.partition_spatial import _independent_band
+    from tigris.graph.ir import Layout
+
+    tensors = {n: TensorInfo(n, shape, dtype=1, layout=Layout.LINEAR)
+               for n, shape in (("x", source), ("y", target))}
+    op = OpNode("band", "ReverseV2", ["x"], ["y"], attrs={"movement": [4]})
+    assert not _independent_band(AnalyzedGraph(tensors=tensors, ops=[op]), op, leading=True)
+
+
+@pytest.mark.parametrize("combined", [False, True])
+def test_leading_bands_do_not_extend_chains_or_combined_stages(combined):
+    from tigris.analysis.partition_spatial import _assign_tile_plans
+    from tigris.graph.ir import Layout, MemoryBudget, Stage
+
+    tensors = {n: TensorInfo(n, shape, dtype=1, layout=Layout.LINEAR)
+               for n, shape in (("x", (37, 1, 4)), ("y", (37, 1, 1)), ("z", (37, 1, 1)))}
+    ops = [OpNode("max", "ReduceMax", ["x"], ["y"], attrs={"axes": [2]})]
+    if combined:
+        ops.append(OpNode("relu", "Relu", ["y"], ["z"]))
+    stage = Stage(0, list(range(len(ops))), ["x"], ["z" if combined else "y"], peak_bytes=1024,
+                  chain_len=0 if combined else 2)
+    graph = AnalyzedGraph(tensors=tensors, ops=ops, stages=[stage], budget=MemoryBudget(fast=256))
+    _assign_tile_plans(graph)
+    assert stage.tile_plan is not None and not stage.tile_plan.tileable
