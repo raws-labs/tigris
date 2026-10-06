@@ -173,6 +173,7 @@ RANGES = {
     # Non-negative inputs put the int8 input zero point near -128.
     "cumsum_offset": [(0.0, 3.0)], "cumsum_offset_exclusive_reverse": [(0.0, 3.0)],
     "float_while": [(0.5, 3.0)], "float_while_two_variables": [(0.5, 3.0), (0.5, 3.0)],
+    "float_while_feature_map": [(0.5, 3.0)],
     # Past both of the float logistic's cutoffs, -9 and about 16.6.
     "float_logistic_tails": [(-24.0, 24.0)],
 }
@@ -653,6 +654,15 @@ FLOAT_MODELS["float_while_two_variables"] = _binary(
     lambda x, y: tf.while_loop(lambda a, b: tf.reduce_sum(a) < 30.0,
                                lambda a, b: [a + b, b * 1.1], [x, y])[0],
     (1, 4), (1, 4))
+_BRANCH_FILTER = _weights(91, 3, 3, 4, 4)
+FLOAT_MODELS["float_if_feature_map"] = _unary(
+    lambda x: tf.cond(tf.reduce_sum(x) > 0.0,
+                      lambda: tf.nn.conv2d(x, _BRANCH_FILTER, 1, "SAME"),
+                      lambda: tf.nn.relu(x) * 0.5),
+    _MAP)
+FLOAT_MODELS["float_while_feature_map"] = _unary(
+    lambda x: tf.while_loop(lambda v: tf.reduce_sum(v) < 200.0, lambda v: [v * 1.5 + 0.25], [x])[0],
+    (1, 4, 4, 2))
 FLOAT_MODELS["float_if_two_operands"] = _binary(
     lambda x, y: tf.cond(tf.reduce_max(x) > tf.reduce_max(y), lambda: x + y, lambda: x * y),
     (1, 6), (1, 6))
