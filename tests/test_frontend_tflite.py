@@ -385,6 +385,14 @@ def test_state_inside_an_if_branch_is_refused(monkeypatch):
     assert any("state or control flow inside a branch" in r for r in tflite.unsupported(data))
 
 
+def test_a_while_counting_in_int32_is_refused(monkeypatch):
+    """A loop counter needs int32 arithmetic, which the runtime does not have."""
+    def count(tensors, operators):
+        tensors[operators[0].inputs[0]].type = "INT32"
+    reasons = _read_edited(monkeypatch, "float_while", count)
+    assert any("int32 loop variables" in r for r in reasons)
+
+
 def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():
     model = tflite.to_onnx((FIXTURES / "ops" / "cumsum_offset.tflite").read_bytes(), "cumsum")
     scans = [node for node in model.graph.node if node.op_type == "CumSum"]

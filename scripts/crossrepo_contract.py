@@ -1097,6 +1097,62 @@ def _if_case(take_then: bool) -> ContractCase:
                                             "Relu", "Add", "Mul", "Add"))
 
 
+def _while_case() -> ContractCase:
+    """A While growing x until its sum reaches 40, against ONNX's Loop, which
+    tests the first condition outside its body and each later one inside."""
+    x = np.asarray([[0.5, 1.25, 2.0, 0.75]], np.float32)
+    shape = [1, 4]
+
+    def info(name, kind=TensorProto.FLOAT, dims=None):
+        return helper.make_tensor_value_info(name, kind, shape if dims is None else dims)
+
+    def constants(prefix):
+        return [numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), f"{prefix}rows"),
+                numpy_helper.from_array(np.asarray([2], np.int64), f"{prefix}axes"),
+                numpy_helper.from_array(np.asarray(40.0, np.float32), f"{prefix}limit"),
+                numpy_helper.from_array(np.asarray(1.5, np.float32), f"{prefix}rate"),
+                numpy_helper.from_array(np.asarray(0.25, np.float32), f"{prefix}step")]
+
+    def below(value, prefix, result):
+        # The runtime reduces a rank-3 tensor along one axis.
+        return [helper.make_node("Reshape", [value, f"{prefix}rows"], [f"{prefix}row"]),
+                helper.make_node("ReduceSum", [f"{prefix}row", f"{prefix}axes"], [f"{prefix}sum"],
+                                 keepdims=0),
+                helper.make_node("Less", [f"{prefix}sum", f"{prefix}limit"], [result])]
+
+    def grow(value, prefix, result):
+        return [helper.make_node("Mul", [value, f"{prefix}rate"], [f"{prefix}scaled"]),
+                helper.make_node("Add", [f"{prefix}scaled", f"{prefix}step"], [result])]
+
+    condition = helper.make_graph(below("c_in", "c_", "c_out"), "condition", [info("c_in")],
+                                  [info("c_out", TensorProto.BOOL, [1, 1])], constants("c_"))
+    body = helper.make_graph(grow("b_in", "b_", "b_out"), "body", [info("b_in")], [info("b_out")],
+                             constants("b_"))
+    compile_graph = helper.make_graph(
+        [helper.make_node("While", ["x"], ["y"], domain="tigris", cond_branch=condition,
+                          body_branch=body)],
+        "while", [info("x")], [info("y")], value_info=[info("y")])
+    compile_model = helper.make_model(compile_graph, opset_imports=[
+        helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    compile_model.ir_version = 9
+    loop_body = helper.make_graph(
+        [*grow("v", "l_", "next"), *below("next", "l_", "again_2d"),
+         helper.make_node("Squeeze", ["again_2d"], ["again"])],
+        "loop_body",
+        [info("iteration", TensorProto.INT64, []), info("keep", TensorProto.BOOL, []), info("v")],
+        [info("again", TensorProto.BOOL, []), info("next")], constants("l_"))
+    reference = _model(
+        "while_reference",
+        [*below("x", "r_", "first_2d"), helper.make_node("Squeeze", ["first_2d"], ["first"]),
+         helper.make_node("Loop", ["", "first", "x"], ["y"], body=loop_body)],
+        [info("x")], [info("y")], constants("r_"), opset=17)
+    return ContractCase(name="while", compile_model=compile_model, reference_model=reference,
+                        inputs={"x": x},
+                        # The main graph's While, then the condition's and body's stages.
+                        expected_operators=("While", "Reshape", "Transpose", "ReduceSum", "Less",
+                                            "Mul", "Add"))
+
+
 def _runtime_index_case(kind: str, quantized: bool, variant: int = 0, arg: str | None = None,
                         cast: bool = False) -> ContractCase:
     case = _movement_case(kind, quantized, variant)
@@ -7193,6 +7249,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _lstm_case(),
         _if_case(True),
         _if_case(False),
+        _while_case(),
     ]
     cases.extend(_reshape_band_case(quantized, merge)
                  for quantized in (False, True) for merge in (False, True))

@@ -115,13 +115,15 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Svdf",
     "Lstm",
     "If",
+    "While",
 })
 
 # Operators the executor runs itself rather than a kernel dispatcher.
-EXECUTOR_OPERATORS = frozenset({"If"})
+EXECUTOR_OPERATORS = frozenset({"If", "While"})
 
 _S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS - frozenset({
     "If",
+    "While",
     "L2Pool",
     "Neg",
     "Exp",
@@ -256,6 +258,7 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "ReduceMin": ("one axis of a rank-3 tensor; independent height or row bands; int8 quantization must match",),
     "ReduceAll": ("one axis of a rank-3 bool tensor; independent height or row bands",),
     "If": ("one bool condition; branches run as their own stages; float32 operands of rank 2 at most; no nesting",),
+    "While": ("a condition giving one bool and a body, each run as its own stages; float32 loop variables of rank 2 at most; no nesting",),
     "Svdf": ("state kept between runs; int8 with int16 state and time weights; untiled",),
     "Lstm": ("hidden and cell state kept between runs; every gate, no peepholes, projection or layer normalization; tanh cell activation; int8 with an int16 cell state; untiled",),
     "ReduceSum": ("one axis of a rank-3 tensor; independent height or row bands; int8 rejects reference arithmetic overflow",),
