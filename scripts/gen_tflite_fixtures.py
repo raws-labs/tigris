@@ -180,6 +180,7 @@ RANGES = {
     "cumsum_offset": [(0.0, 3.0)], "cumsum_offset_exclusive_reverse": [(0.0, 3.0)],
     "float_while": [(0.5, 3.0)], "float_while_two_variables": [(0.5, 3.0), (0.5, 3.0)],
     "float_while_feature_map": [(0.5, 3.0)],
+    "float_if_if": [(-2.8, 2.5)],
     # Past both of the float logistic's cutoffs, -9 and about 16.6.
     "float_logistic_tails": [(-24.0, 24.0)],
 }
@@ -774,6 +775,12 @@ FLOAT_MODELS["float_if_feature_map"] = _unary(
 FLOAT_MODELS["float_while_feature_map"] = _unary(
     lambda x: tf.while_loop(lambda v: tf.reduce_sum(v) < 200.0, lambda v: [v * 1.5 + 0.25], [x])[0],
     (1, 4, 4, 2))
+# A branch inside a branch.
+FLOAT_MODELS["float_if_if"] = _unary(
+    lambda x: tf.cond(tf.reduce_sum(x) > 0.0,
+                      lambda: tf.cond(tf.reduce_max(x) > 2.0, lambda: x * 0.5, lambda: x + 1.0),
+                      lambda: tf.nn.relu(x) - 3.0),
+    (1, 4))
 FLOAT_MODELS["float_if_two_operands"] = _binary(
     lambda x, y: tf.cond(tf.reduce_max(x) > tf.reduce_max(y), lambda: x + y, lambda: x * y),
     (1, 6), (1, 6))

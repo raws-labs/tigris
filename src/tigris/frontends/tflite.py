@@ -179,19 +179,23 @@ def _read(data: bytes):
                        subgraph.scalars(_SG_OUTPUTS, "i"), operators))
     # The converter passes a constant an IF branch reads as one of its
     # operands; inside the branch it is that constant, from the same buffer.
-    for op in graphs[0][4] if graphs else ():
-        if op.kind != "IF":
-            continue
-        for slot in (0, 1):
-            position = op.option(slot, "i")
-            if not 0 < position < len(graphs):
+    # Each graph is folded before the constants it passes on are read.
+    for index in range(len(graphs)):
+        graphs[index] = _fold_constants(graphs[index])
+        _, outer, _, _, operators = graphs[index]
+        for op in operators:
+            if op.kind != "IF":
                 continue
-            _, branch_tensors, branch_inputs, _, _ = graphs[position]
-            for operand, entering in zip(op.inputs[1:], branch_inputs):
-                if operand >= 0 and _is_constant(graphs[0][1][operand]):
-                    branch_tensors[entering].buffer = graphs[0][1][operand].buffer
-                    branch_tensors[entering].folded = graphs[0][1][operand].folded
-    return model, [_fold_constants(graph) for graph in graphs]
+            for slot in (0, 1):
+                position = op.option(slot, "i")
+                if not 0 < position < len(graphs):
+                    continue
+                _, branch_tensors, branch_inputs, _, _ = graphs[position]
+                for operand, entering in zip(op.inputs[1:], branch_inputs):
+                    if operand >= 0 and _is_constant(outer[operand]):
+                        branch_tensors[entering].buffer = outer[operand].buffer
+                        branch_tensors[entering].folded = outer[operand].folded
+    return model, graphs
 
 
 def _constant_result(op: "_Operator", tensors) -> "np.ndarray | None":
@@ -298,14 +302,20 @@ def unsupported(data: bytes) -> list[str]:
 
 
 def _branch_subgraphs(graphs) -> dict[int, str]:
-    """Subgraphs the main graph runs, by role: IF branches, WHILE conditions
-    and bodies."""
+    """Subgraphs control flow runs, from the main graph down, by role: IF
+    branches, WHILE conditions and bodies."""
     roles = {}
-    for op in (graphs[0][4] if graphs else ()):
-        if op.kind == "IF":
-            roles.update({op.option(0, "i"): "branch", op.option(1, "i"): "branch"})
-        elif op.kind == "WHILE":
-            roles.update({op.option(0, "i"): "condition", op.option(1, "i"): "body"})
+    pending = [0] if graphs else []
+    while pending:
+        for op in graphs[pending.pop()][4]:
+            if op.kind not in ("IF", "WHILE"):
+                continue
+            found = ({op.option(0, "i"): "branch", op.option(1, "i"): "branch"} if op.kind == "IF"
+                     else {op.option(0, "i"): "condition", op.option(1, "i"): "body"})
+            for position, role in found.items():
+                if 0 < position < len(graphs) and position not in roles:
+                    roles[position] = role
+                    pending.append(position)
     return roles
 
 
@@ -315,8 +325,8 @@ def _branch_reasons(graph, role: str = "branch") -> list[str]:
     _, tensors, inputs, outputs, operators = graph
     reasons = []
     for op in operators:
-        if op.kind in (*_VARIABLES, *_STATEFUL, "IF", "WHILE"):
-            reasons.append(f"operator {op.index} {op.kind}: state or control flow inside a branch")
+        if op.kind in (*_VARIABLES, *_STATEFUL):
+            reasons.append(f"operator {op.index} {op.kind}: state inside a subgraph")
             continue
         reason = _operator_reason(op, tensors)
         if reason:
@@ -331,12 +341,13 @@ def _branch_reasons(graph, role: str = "branch") -> list[str]:
     return reasons
 
 
-def _branch_graph(graph, name: str) -> onnx.GraphProto:
-    """One IF branch as an ONNX graph whose inputs are the IF operands and whose
-    outputs are its results, each held by an operator of the branch."""
-    _, tensors, inputs, outputs, operators = graph
+def _branch_graph(graphs, position: int, name: str) -> onnx.GraphProto:
+    """One subgraph as an ONNX graph whose inputs are the operands it receives
+    and whose outputs are its results, each held by an operator of it."""
+    _, tensors, inputs, outputs, operators = graphs[position]
     consumed = {i for op in operators for i in op.inputs}
     converter = _Converter(tensors, (), consumed)
+    converter.graphs = graphs
     b = converter.b
     graph_inputs = []
     for position, index in enumerate(inputs):
@@ -1460,7 +1471,7 @@ class _Converter:
         b = self.b
         kind, roles = (("If", ("then_branch", "else_branch")) if op.kind == "IF"
                        else ("While", ("cond_branch", "body_branch")))
-        graphs = {role: _branch_graph(self.graphs[op.option(slot, "i")], f"{tag}_{role}")
+        graphs = {role: _branch_graph(self.graphs, op.option(slot, "i"), f"{tag}_{role}")
                   for slot, role in enumerate(roles)}
         results = [b.unique(f"{tag}_{n}") for n in range(len(op.outputs))]
         # A constant operand is read inside the branch itself.

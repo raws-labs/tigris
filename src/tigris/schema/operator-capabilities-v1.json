@@ -1140,7 +1140,7 @@
     },
     {
       "constraints": [
-        "one bool condition; branches run as their own stages; float32 operands; no nesting"
+        "one bool condition; branches run as their own stages; float32 operands; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
       ],
       "opcode": 87,
       "operator": "If",
@@ -1153,7 +1153,7 @@
     },
     {
       "constraints": [
-        "a condition giving one bool and a body, each run as its own stages; float32 loop variables; no nesting"
+        "a condition giving one bool and a body, each run as its own stages; float32 loop variables; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
       ],
       "opcode": 88,
       "operator": "While",

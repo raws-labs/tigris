@@ -19,30 +19,35 @@ class SubgraphRange:
 
 
 def flatten_subgraphs(ag: AnalyzedGraph) -> tuple[AnalyzedGraph, list[SubgraphRange]]:
-    """The main graph with every subgraph's tensors, weights, operators and
-    stages appended after its own, names prefixed so they cannot collide, and
-    the stage range of each graph; range 0 is the main graph's. Each graph's
-    tensors stay one block, which the runtime requires of the tensor table."""
-    ops = list(ag.ops)
-    stages = list(ag.stages)
-    tensors = dict(ag.tensors)
-    weights = dict(ag.weight_data)
-    ranges = [SubgraphRange(0, len(ag.stages), tuple(ag.model_inputs), tuple(ag.model_outputs))]
-    for position, sub in enumerate(ag.subgraphs, start=1):
-        if sub.subgraphs:
-            raise ValueError("control flow inside a subgraph is not supported")
-        prefix = f"sg{position}/"
-        names = {name: prefix + name for name in sub.tensors}
-        for name, info in sub.tensors.items():
+    """The main graph and every subgraph below it in one graph: each graph's
+    tensors, weights, operators and stages appended after those of the graphs
+    placed before it, names prefixed so they cannot collide, and the stage range
+    of each graph, the main graph first. A graph is placed before the subgraphs
+    it runs, and a control-flow operator names them by their place. Each
+    graph's tensors stay one block, which the runtime requires of the tensor
+    table."""
+    ops: list = []
+    stages: list = []
+    tensors: dict = {}
+    weights: dict = {}
+    ranges: list = []
+
+    def place(graph: AnalyzedGraph) -> int:
+        position = len(ranges)
+        ranges.append(None)
+        prefix = f"sg{position}/" if position else ""
+        names = {name: prefix + name for name in graph.tensors}
+        for name, info in graph.tensors.items():
             tensors[names[name]] = replace(info, name=names[name])
-        for name, array in sub.weight_data.items():
+        for name, array in graph.weight_data.items():
             weights[names.get(name, prefix + name)] = array
         op_offset, stage_offset = len(ops), len(stages)
-        for op in sub.ops:
-            ops.append(replace(op, inputs=[names.get(n, n) for n in op.inputs],
-                               outputs=[names.get(n, n) for n in op.outputs],
-                               stage=op.stage + stage_offset if op.stage >= 0 else op.stage))
-        for stage in sub.stages:
+        placed = [replace(op, inputs=[names.get(n, n) for n in op.inputs],
+                          outputs=[names.get(n, n) for n in op.outputs], attrs=dict(op.attrs),
+                          stage=op.stage + stage_offset if op.stage >= 0 else op.stage)
+                  for op in graph.ops]
+        ops.extend(placed)
+        for stage in graph.stages:
             stages.append(replace(
                 stage,
                 stage_id=stage.stage_id + stage_offset,
@@ -50,12 +55,23 @@ def flatten_subgraphs(ag: AnalyzedGraph) -> tuple[AnalyzedGraph, list[SubgraphRa
                 input_tensors=[names.get(n, n) for n in stage.input_tensors],
                 output_tensors=[names.get(n, n) for n in stage.output_tensors],
                 chain_id=stage.chain_id + stage_offset if stage.chain_id != 0xFFFF else 0xFFFF))
-        ranges.append(SubgraphRange(stage_offset, len(sub.stages),
-                                    tuple(names[n] for n in sub.model_inputs),
-                                    tuple(names[n] for n in sub.model_outputs)))
+        ranges[position] = SubgraphRange(stage_offset, len(graph.stages),
+                                         tuple(names[n] for n in graph.model_inputs),
+                                         tuple(names[n] for n in graph.model_outputs))
+        for op in placed:
+            for key in CONTROL_FLOW.get(op.op_type, ()):
+                op.attrs[key] = place(graph.subgraphs[op.attrs[key]])
+        return position
+
+    place(ag)
     merged = replace(ag, ops=ops, stages=stages, tensors=tensors, weight_data=weights,
                      subgraphs=[])
     return merged, ranges
+
+
+def all_graphs(ag: AnalyzedGraph) -> list[AnalyzedGraph]:
+    """The graph and every subgraph below it."""
+    return [ag, *(graph for sub in ag.subgraphs for graph in all_graphs(sub))]
 
 
 def control_flow_cuts(ag: AnalyzedGraph) -> frozenset[int]:

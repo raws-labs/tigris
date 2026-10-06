@@ -1223,6 +1223,74 @@ def _if_tiled_case(take_then: bool) -> ContractCase:
                         expect_line_buffered=True)
 
 
+def _nested_if_case() -> ContractCase:
+    """An If whose then branch holds another If; inputs reach each innermost
+    branch once across the runs the reference checks."""
+    x = np.asarray([[0.5, 2.5, -0.25, 1.0]], np.float32)
+    shape = [1, 4]
+    weights = [numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), "rows"),
+               numpy_helper.from_array(np.asarray([2], np.int64), "axes"),
+               numpy_helper.from_array(np.asarray(0.0, np.float32), "zero"),
+               numpy_helper.from_array(np.asarray(2.0, np.float32), "two")]
+
+    def info(name):
+        return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+
+    def test(value, prefix, op, limit, result, rows="rows"):
+        return [helper.make_node("Reshape", [value, rows], [f"{prefix}row"]),
+                helper.make_node(op, [f"{prefix}row", "axes"] if op == "ReduceSum" else [f"{prefix}row"],
+                                 [f"{prefix}reduced"], keepdims=0,
+                                 **({} if op == "ReduceSum" else {"axes": [2]})),
+                helper.make_node("Greater", [f"{prefix}reduced", limit], [result])]
+
+    def leaf(name, op, constant, explicit):
+        x_name = f"{name}_x" if explicit else "outer_x"
+        return helper.make_graph(
+            [helper.make_node(op, [x_name, f"{name}_c"], [f"{name}_y"])], name,
+            [info(x_name)] if explicit else [], [info(f"{name}_y")],
+            [numpy_helper.from_array(np.asarray(constant, np.float32), f"{name}_c")])
+
+    def outer_then(explicit):
+        x_name = "then_x" if explicit else "outer_x"
+        nodes = [helper.make_node("Identity", ["x" if not explicit else x_name], ["outer_x"])] if not explicit else []
+        inner_in = x_name
+        # A branch holds its own constants.
+        nodes += test(inner_in, "inner_", "ReduceMax", "inner_two", "large", rows="inner_rows")
+        nodes.append(helper.make_node(
+            "If", ["large", inner_in] if explicit else ["large"], ["then_y"],
+            **({"domain": "tigris"} if explicit else {}),
+            then_branch=leaf("half", "Mul", 0.5, explicit), else_branch=leaf("more", "Add", 1.0, explicit)))
+        return helper.make_graph(
+            nodes, "then", [info(x_name)] if explicit else [], [info("then_y")],
+            [numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), "inner_rows"),
+             numpy_helper.from_array(np.asarray(2.0, np.float32), "inner_two")])
+
+    def outer_else(explicit):
+        return leaf("less", "Sub", 3.0, explicit) if explicit else helper.make_graph(
+            [helper.make_node("Sub", ["x", "less_c"], ["less_y"])], "less", [], [info("less_y")],
+            [numpy_helper.from_array(np.asarray(3.0, np.float32), "less_c")])
+
+    condition = test("x", "outer_", "ReduceSum", "zero", "positive")
+    compile_graph = helper.make_graph(
+        [*condition, helper.make_node("If", ["positive", "x"], ["y"], domain="tigris",
+                                      then_branch=outer_then(True), else_branch=outer_else(True))],
+        "nested_if", [info("x")], [info("y")], weights, value_info=[info("y")])
+    compile_model = helper.make_model(compile_graph, opset_imports=[
+        helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    compile_model.ir_version = 9
+    reference = _model(
+        "nested_if_reference",
+        [*condition, helper.make_node("If", ["positive"], ["y"], then_branch=outer_then(False),
+                                      else_branch=outer_else(False))],
+        [info("x")], [info("y")], weights, opset=17)
+    return ContractCase(name="nested_if", compile_model=compile_model, reference_model=reference,
+                        inputs={"x": x},
+                        expected_operators=("Reshape", "Transpose", "ReduceSum", "Greater", "If",
+                                            "Reshape", "Transpose", "ReduceMax", "Greater", "If",
+                                            # Sub by a constant folds into Add.
+                                            "Mul", "Add", "Add"))
+
+
 def _while_case() -> ContractCase:
     """A While growing x until its sum reaches 40, against ONNX's Loop, which
     tests the first condition outside its body and each later one inside."""
@@ -7379,6 +7447,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _while_case(),
         _if_tiled_case(True),
         _if_tiled_case(False),
+        _nested_if_case(),
     ]
     cases.extend(_reshape_band_case(quantized, merge)
                  for quantized in (False, True) for merge in (False, True))
