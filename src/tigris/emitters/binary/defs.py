@@ -79,7 +79,8 @@ OP_ATTR_CONSTANTS = 14  # uint16 weight index per constant operand, in operand o
                         # NO_WEIGHT for an absent optional one
 OP_ATTR_SVDF = 15  # int32: rank; for int8 also the state zero point and the
                    # input-to-state and state-to-output multiplier/shift pairs
-OP_ATTR_SUBGRAPHS = 17  # u16 graph indices a control-flow operator runs (If: then, else)
+OP_ATTR_SUBGRAPHS = 17  # u16 graph indices a control-flow operator runs
+                        # (If: then, else; While: condition, body)
 OP_ATTR_LSTM = 16  # int32 time_major (0 or 1), float32 cell clip (0: none); int8
                    # adds zero points, cell power, clip and 11 multiplier pairs
 
@@ -199,6 +200,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "Svdf": 85,
     "Lstm": 86,
     "If": 87,
+    "While": 88,
 }
 OP_TYPE_UNKNOWN = 255
 

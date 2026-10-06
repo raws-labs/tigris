@@ -59,6 +59,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _adopt_svdf(ag)
     ag = _adopt_lstm(ag)
     ag = _adopt_if(ag)
+    ag = _adopt_while(ag)
     ag = _normalize_arg_outputs(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
@@ -3021,6 +3022,34 @@ def _adopt_if(ag: AnalyzedGraph) -> AnalyzedGraph:
                 raise ValueError("If branches must take its operands and give its results")
             if any(len(t.shape) > 2 for t in (*entering, *leaving)):
                 raise ValueError("If operands and results are of rank 2 at most")
+    return ag
+
+
+def _forms(graph: AnalyzedGraph, names) -> list:
+    return [(graph.tensors[n].shape, graph.tensors[n].dtype) for n in names]
+
+
+def _adopt_while(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """The compiler's own While: loop variables in and out; the condition
+    subgraph takes them and gives one bool, the body takes and gives them."""
+    for op in ag.ops:
+        if op.op_type != "tigris::While":
+            continue
+        op.op_type = "While"
+        condition = ag.subgraphs[op.attrs["cond_branch"]]
+        body = ag.subgraphs[op.attrs["body_branch"]]
+        variables = [(ag.tensors[n].shape, ag.tensors[n].dtype) for n in op.inputs]
+        verdict = [condition.tensors[n] for n in condition.model_outputs]
+        if (len(op.outputs) != len(op.inputs)
+                or [(ag.tensors[n].shape, ag.tensors[n].dtype) for n in op.outputs] != variables
+                or _forms(condition, condition.model_inputs) != variables
+                or _forms(body, body.model_inputs) != variables
+                or _forms(body, body.model_outputs) != variables):
+            raise ValueError("While condition and body must take and give its loop variables")
+        if len(verdict) != 1 or verdict[0].dtype != 9 or int(np.prod(verdict[0].shape)) != 1:
+            raise ValueError("While condition must give one bool")
+        if any(len(shape) > 2 for shape, _ in variables):
+            raise ValueError("While loop variables are of rank 2 at most")
     return ag
 
 

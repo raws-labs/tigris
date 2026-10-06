@@ -1150,6 +1150,19 @@
         "reference": "native",
         "s8_ref": "unsupported"
       }
+    },
+    {
+      "constraints": [
+        "a condition giving one bool and a body, each run as its own stages; float32 loop variables of rank 2 at most; no nesting"
+      ],
+      "opcode": 88,
+      "operator": "While",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
     }
   ],
   "schema_version": 10,

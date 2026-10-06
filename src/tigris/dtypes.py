@@ -50,6 +50,7 @@ OP_DTYPE_SIGNATURES.update({
     "Svdf": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     "Lstm": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     "If": DTypeSignature(inputs=(9, DATA, DATA)),
+    "While": DTypeSignature(),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
 })

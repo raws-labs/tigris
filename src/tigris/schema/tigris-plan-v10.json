@@ -116,7 +116,8 @@
     "Tanh": 20,
     "Transpose": 29,
     "Unsqueeze": 28,
-    "Where": 81
+    "Where": 81,
+    "While": 88
   },
   "record_sizes": {
     "header": 48,

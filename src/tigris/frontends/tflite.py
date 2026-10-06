@@ -189,9 +189,10 @@ def unsupported(data: bytes) -> list[str]:
     branches = _branch_subgraphs(graphs)
     for position in range(1, len(graphs)):
         if position in branches:
-            reasons += [f"subgraph {position}: {r}" for r in _branch_reasons(graphs[position])]
+            reasons += [f"subgraph {position}: {r}"
+                        for r in _branch_reasons(graphs[position], branches[position])]
         elif position not in init:
-            reasons.append(f"subgraph {position}: control flow other than IF does not convert yet")
+            reasons.append(f"subgraph {position}: control flow other than IF and WHILE does not convert yet")
         elif _variable_initials(graphs, {position}) is None:
             reasons.append(f"subgraph {position}: only constant variable initial values convert")
     for _, tensors, inputs, outputs, operators in graphs[:1]:
@@ -238,15 +239,21 @@ def unsupported(data: bytes) -> list[str]:
     return reasons
 
 
-def _branch_subgraphs(graphs) -> set[int]:
-    """Subgraphs the main graph runs as IF branches."""
-    return ({p for op in graphs[0][4] if op.kind == "IF" for p in (op.option(0, "i"), op.option(1, "i"))}
-            if graphs else set())
+def _branch_subgraphs(graphs) -> dict[int, str]:
+    """Subgraphs the main graph runs, by role: IF branches, WHILE conditions
+    and bodies."""
+    roles = {}
+    for op in (graphs[0][4] if graphs else ()):
+        if op.kind == "IF":
+            roles.update({op.option(0, "i"): "branch", op.option(1, "i"): "branch"})
+        elif op.kind == "WHILE":
+            roles.update({op.option(0, "i"): "condition", op.option(1, "i"): "body"})
+    return roles
 
 
-def _branch_reasons(graph) -> list[str]:
-    """Why a branch subgraph cannot run: its operators, and anything beyond a
-    plain float32 computation of its inputs."""
+def _branch_reasons(graph, role: str = "branch") -> list[str]:
+    """Why a subgraph cannot run: its operators, and anything beyond a plain
+    float32 computation of its inputs; a condition gives one bool."""
     _, tensors, inputs, outputs, operators = graph
     reasons = []
     for op in operators:
@@ -256,9 +263,13 @@ def _branch_reasons(graph) -> list[str]:
         reason = _operator_reason(op, tensors)
         if reason:
             reasons.append(f"operator {op.index} {op.kind}: {reason}")
+    if role == "condition":
+        if len(outputs) != 1 or tensors[outputs[0]].type != "BOOL" or int(np.prod(tensors[outputs[0]].shape)) != 1:
+            reasons.append("a condition other than one bool")
+        outputs = []
     for index in [*inputs, *outputs]:
         if tensors[index].type != "FLOAT32" or len(tensors[index].shape) > 2:
-            reasons.append(f"branch boundary {tensors[index].name!r} other than float32 of rank 2 at most")
+            reasons.append(f"subgraph boundary {tensors[index].name!r} other than float32 of rank 2 at most")
     return reasons
 
 
@@ -281,7 +292,8 @@ def _branch_graph(graph, name: str) -> onnx.GraphProto:
     for position, index in enumerate(outputs):
         result = b.node("Identity", [converter.value(index)], f"{name}_out{position}")
         graph_outputs.append(helper.make_tensor_value_info(
-            result, TensorProto.FLOAT, _onnx_shape(tensors[index].shape)))
+            result, TensorProto.BOOL if tensors[index].type == "BOOL" else TensorProto.FLOAT,
+            _onnx_shape(tensors[index].shape)))
     return helper.make_graph(b.nodes, name, graph_inputs, graph_outputs, b.initializers,
                              value_info=converter.value_info)
 
@@ -366,7 +378,7 @@ _INDEX_SLOTS = {"GATHER": 1, "GATHER_ND": 1, "EMBEDDING_LOOKUP": 0, "DYNAMIC_UPD
 _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum",
                "REDUCE_ALL": "ReduceAll"}
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
-              *_INDEX, *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N", "IF",
+              *_INDEX, *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N", "IF", "WHILE",
               "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
               "CUMSUM", "MEAN",
               "TRANSPOSE",
@@ -413,6 +425,13 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
             return "a condition other than one bool"
         if any(t.type != "FLOAT32" or len(t.shape) > 2 for t in [*ins[1:], *outs]):
             return "operands other than float32 of rank 2 at most"
+        return ""
+    if op.kind == "WHILE":
+        if any(t.type == "INT32" for t in ins):
+            # A loop counter needs int32 arithmetic the runtime does not have.
+            return "int32 loop variables"
+        if any(t.type != "FLOAT32" or len(t.shape) > 2 for t in [*ins, *outs]):
+            return "loop variables other than float32 of rank 2 at most"
         return ""
     if op.kind == "SVDF":
         return _svdf_reason(op, ins, outs)
@@ -831,8 +850,8 @@ class _Converter:
                        select_last_index=0)
             self.values[outs[0]] = b.node("Cast", [y], out.name, to=TensorProto.INT32)
             return
-        if kind == "IF":
-            self._if(op, tag)
+        if kind in ("IF", "WHILE"):
+            self._control_flow(op, tag)
             return
         if kind == "SVDF":
             self.finish(self._svdf(op, tag), outs[0])
@@ -1271,16 +1290,18 @@ class _Converter:
         self.held_state[state]["output"] = kept
         return y
 
-    def _if(self, op: _Operator, tag: str) -> None:
-        """IF in the compiler's own form: the condition and the operands in,
-        each branch an ONNX graph taking the operands as its inputs."""
+    def _control_flow(self, op: _Operator, tag: str) -> None:
+        """IF or WHILE in the compiler's own form, each subgraph an ONNX graph
+        whose inputs are the operands it receives: an IF's operands after the
+        condition, a WHILE's loop variables."""
         b = self.b
-        branches = [_branch_graph(self.graphs[op.option(slot, "i")], f"{tag}_{part}")
-                    for slot, part in ((0, "then"), (1, "else"))]
+        kind, roles = (("If", ("then_branch", "else_branch")) if op.kind == "IF"
+                       else ("While", ("cond_branch", "body_branch")))
+        graphs = {role: _branch_graph(self.graphs[op.option(slot, "i")], f"{tag}_{role}")
+                  for slot, role in enumerate(roles)}
         results = [b.unique(f"{tag}_{n}") for n in range(len(op.outputs))]
         b.nodes.append(helper.make_node(
-            "If", [self.value(i) for i in op.inputs], results, domain="tigris",
-            then_branch=branches[0], else_branch=branches[1]))
+            kind, [self.value(i) for i in op.inputs], results, domain="tigris", **graphs))
         for index, name in zip(op.outputs, results):
             self.value_info.append(helper.make_tensor_value_info(
                 name, TensorProto.FLOAT, _onnx_shape(self.tensors[index].shape)))

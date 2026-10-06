@@ -172,6 +172,7 @@ RANGES = {
     "float_div_broadcast": [(-3.0, 3.0), _DIVISOR],
     # Non-negative inputs put the int8 input zero point near -128.
     "cumsum_offset": [(0.0, 3.0)], "cumsum_offset_exclusive_reverse": [(0.0, 3.0)],
+    "float_while": [(0.5, 3.0)], "float_while_two_variables": [(0.5, 3.0), (0.5, 3.0)],
     # Past both of the float logistic's cutoffs, -9 and about 16.6.
     "float_logistic_tails": [(-24.0, 24.0)],
 }
@@ -643,6 +644,15 @@ FLOAT_MODELS["float_logistic_tails"] = _unary(tf.sigmoid, (1, 64))
 FLOAT_MODELS["float_if"] = _unary(
     lambda x: tf.cond(tf.reduce_sum(x) > 0.0, lambda: x * 2.0 + 1.0, lambda: tf.nn.relu(x) - 3.0),
     (1, 4))
+# A loop run until a condition fails; TFLite writes WHILE over a condition and
+# a body subgraph. Positive inputs that only grow keep every loop finite.
+FLOAT_MODELS["float_while"] = _unary(
+    lambda x: tf.while_loop(lambda v: tf.reduce_sum(v) < 40.0, lambda v: [v * 1.5 + 0.25], [x])[0],
+    (1, 4))
+FLOAT_MODELS["float_while_two_variables"] = _binary(
+    lambda x, y: tf.while_loop(lambda a, b: tf.reduce_sum(a) < 30.0,
+                               lambda a, b: [a + b, b * 1.1], [x, y])[0],
+    (1, 4), (1, 4))
 FLOAT_MODELS["float_if_two_operands"] = _binary(
     lambda x, y: tf.cond(tf.reduce_max(x) > tf.reduce_max(y), lambda: x + y, lambda: x * y),
     (1, 6), (1, 6))

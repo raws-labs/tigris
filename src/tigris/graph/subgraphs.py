@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from tigris.graph.ir import AnalyzedGraph
 
 # Operators that run subgraphs, by the attributes naming them.
-CONTROL_FLOW = {"If": ("then_branch", "else_branch")}
+CONTROL_FLOW = {"If": ("then_branch", "else_branch"), "While": ("cond_branch", "body_branch")}
 
 
 @dataclass(frozen=True)

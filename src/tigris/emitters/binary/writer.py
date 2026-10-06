@@ -14,6 +14,7 @@ from tigris import (
     TILE_AXIS_NONE,
 )
 from tigris.analysis.broadcast import BINARY_OPS, padded
+from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
@@ -991,10 +992,10 @@ def _build_op_attributes(
         if op.op_type == "Lstm":
             records.append((op_index, OP_ATTR_LSTM, _lstm_payload(ag, op)))
             continue
-        if op.op_type == "If":
+        if op.op_type in CONTROL_FLOW:
             # Graph 0 is the main graph; a subgraph's index is its position plus one.
             records.append((op_index, OP_ATTR_SUBGRAPHS, struct.pack(
-                "<2H", op.attrs["then_branch"] + 1, op.attrs["else_branch"] + 1)))
+                "<2H", *(op.attrs[key] + 1 for key in CONTROL_FLOW[op.op_type]))))
             continue
         if op.op_type in {"Resize", "ResizeLinear"}:
             scales = op.attrs.get("resize_scales")
