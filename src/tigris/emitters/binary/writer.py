@@ -44,6 +44,7 @@ from .defs import (
     OP_ATTR_CONSTANTS,
     OP_ATTR_SVDF,
     OP_ATTR_LSTM,
+    OP_ATTR_SUBGRAPHS,
     OP_ATTR_ALPHA,
     OP_ATTR_BINARY_REQUANT,
     OP_ATTR_CONSTANT_OPERAND,
@@ -66,6 +67,7 @@ from .defs import (
     SEC_INDEX_POOL,
     SEC_OP_ATTRIBUTES,
     SEC_STATE,
+    SEC_SUBGRAPHS,
     STATE_ENTRY_SIZE,
     STATE_HEADER_SIZE,
     SEC_OPS,
@@ -709,6 +711,17 @@ def _state_names(ag: AnalyzedGraph) -> set[str]:
 _STATE_DTYPES = {1: np.float32, 3: np.int8, 5: np.int16}
 
 
+def _build_subgraphs(ranges, tensor_idx: dict[str, int], index_pool: "_IndexPool") -> bytes:
+    """The subgraph section: count(u16) pad(u16), then per graph, the main one
+    first, its stage range and its input and output tensors in the index pool."""
+    entries = []
+    for graph in ranges:
+        inputs = index_pool.add([tensor_idx[name] for name in graph.inputs])
+        outputs = index_pool.add([tensor_idx[name] for name in graph.outputs])
+        entries.append(struct.pack("<6H", graph.first_stage, graph.num_stages, *inputs, *outputs))
+    return struct.pack("<HH", len(entries), 0) + b"".join(entries)
+
+
 def _build_state(ag: AnalyzedGraph, tensor_idx: dict[str, int]) -> bytes:
     """The state section: count(u16) pad(u16) state_bytes(u32), then per
     variable input(u16) output(u16, 0xFFFF none) offset(u32) bytes(u32)
@@ -977,6 +990,11 @@ def _build_op_attributes(
             continue
         if op.op_type == "Lstm":
             records.append((op_index, OP_ATTR_LSTM, _lstm_payload(ag, op)))
+            continue
+        if op.op_type == "If":
+            # Graph 0 is the main graph; a subgraph's index is its position plus one.
+            records.append((op_index, OP_ATTR_SUBGRAPHS, struct.pack(
+                "<2H", op.attrs["then_branch"] + 1, op.attrs["else_branch"] + 1)))
             continue
         if op.op_type in {"Resize", "ResizeLinear"}:
             scales = op.attrs.get("resize_scales")
@@ -1585,7 +1603,24 @@ def emit_binary(
 def emit_binary_bytes(
     ag: AnalyzedGraph, compress: str | None = None, xip: bool = False,
 ) -> bytes:
-    """Build the complete binary plan and return as bytes.
+    """Build the complete binary plan and return as bytes. Each subgraph a
+    control-flow operator runs is validated as a graph of its own, then
+    serialized after the main graph's stages."""
+    if not ag.subgraphs:
+        return _emit(ag, compress, xip)
+    from tigris.graph.subgraphs import flatten_subgraphs
+
+    for graph in (*ag.subgraphs, ag):
+        _emit(graph, compress, xip, serialize=False)
+    merged, ranges = flatten_subgraphs(ag)
+    return _emit(merged, compress, xip, ranges=ranges, validate=False)
+
+
+def _emit(
+    ag: AnalyzedGraph, compress: str | None = None, xip: bool = False,
+    *, serialize: bool = True, validate: bool = True, ranges=None,
+) -> bytes:
+    """Validate a graph for emission and, when `serialize`, the plan bytes.
 
     Args:
         ag: Analyzed graph to serialize.
@@ -1603,15 +1638,15 @@ def emit_binary_bytes(
     if not 0 <= ag.peak_memory_bytes <= 0xFFFFFFFF:
         raise ValueError("Peak activation memory exceeds the uint32 plan-format limit")
 
-    dtype_validation = validate_execution_dtype(ag)
-    if not dtype_validation.supported:
+    dtype_validation = validate_execution_dtype(ag) if validate else None
+    if dtype_validation is not None and not dtype_validation.supported:
         raise ValueError(
             "Cannot emit a plan with unsupported tensor dtypes: "
             + dtype_validation.describe()
         )
 
-    operator_validation = validate_operator_support(ag)
-    if not operator_validation.supported:
+    operator_validation = validate_operator_support(ag) if validate else None
+    if operator_validation is not None and not operator_validation.supported:
         raise ValueError(
             "Cannot emit a plan with unsupported operators: "
             + operator_validation.describe()
@@ -1639,7 +1674,7 @@ def emit_binary_bytes(
             f"({ag.mem_budget:,} bytes)"
         )
 
-    if ag.mem_budget > 0:
+    if validate and ag.mem_budget > 0:
         validation = validate_memory_plan(
             ag,
             fast_reserve_bytes=0 if reserved_activation_budget else compressed_reserve,
@@ -1647,6 +1682,9 @@ def emit_binary_bytes(
         if not validation.feasible:
             details = "; ".join(issue.describe() for issue in validation.issues)
             raise ValueError(f"Cannot emit an infeasible memory plan: {details}")
+
+    if not serialize:
+        return b""
 
     # The serialized plan budget is the activation arena.  The compile command
     # already partitions with the compressed-weight reservation removed.  Keep
@@ -1699,6 +1737,7 @@ def emit_binary_bytes(
     model_out_indices = [tensor_idx[n] for n in ag.model_outputs
                          if n in tensor_idx and n not in state_names]
     state_data = _build_state(ag, tensor_idx)
+    subgraph_data = _build_subgraphs(ranges, tensor_idx, index_pool) if ranges else b""
     model_io_off, model_io_count = index_pool.add(model_inp_indices + model_out_indices)
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
@@ -1752,6 +1791,8 @@ def emit_binary_bytes(
         section_parts.append((SEC_OP_ATTRIBUTES, op_attributes_data))
     if state_data:
         section_parts.append((SEC_STATE, state_data))
+    if subgraph_data:
+        section_parts.append((SEC_SUBGRAPHS, subgraph_data))
 
     section_dir_size = (len(section_parts) + 1) * SECTION_ENTRY_SIZE  # +1 for sentinel
     body_start = HEADER_SIZE + section_dir_size
@@ -1800,7 +1841,7 @@ def emit_binary_bytes(
         header_flags |= FLAG_XIP
     header = HEADER_STRUCT.pack(
         MAGIC,
-        SCHEMA_VERSION_STATE if state_data else SCHEMA_VERSION_BINARY_REQUANT,
+        SCHEMA_VERSION_STATE if state_data or subgraph_data else SCHEMA_VERSION_BINARY_REQUANT,
         file_size,
         HEADER_SIZE,  # section_dir starts right after header
         num_tensors,

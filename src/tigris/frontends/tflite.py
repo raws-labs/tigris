@@ -186,9 +186,12 @@ def unsupported(data: bytes) -> list[str]:
     model, graphs = _read(data)
     reasons = []
     init = _initializer_subgraphs(graphs)
+    branches = _branch_subgraphs(graphs)
     for position in range(1, len(graphs)):
-        if position not in init:
-            reasons.append(f"subgraph {position}: control flow does not convert yet")
+        if position in branches:
+            reasons += [f"subgraph {position}: {r}" for r in _branch_reasons(graphs[position])]
+        elif position not in init:
+            reasons.append(f"subgraph {position}: control flow other than IF does not convert yet")
         elif _variable_initials(graphs, {position}) is None:
             reasons.append(f"subgraph {position}: only constant variable initial values convert")
     for _, tensors, inputs, outputs, operators in graphs[:1]:
@@ -233,6 +236,54 @@ def unsupported(data: bytes) -> list[str]:
                 kinds = ", ".join(sorted({op.kind for op in ops}))
                 reasons.append(f"{reason}: {len(ops)} operators ({kinds})")
     return reasons
+
+
+def _branch_subgraphs(graphs) -> set[int]:
+    """Subgraphs the main graph runs as IF branches."""
+    return ({p for op in graphs[0][4] if op.kind == "IF" for p in (op.option(0, "i"), op.option(1, "i"))}
+            if graphs else set())
+
+
+def _branch_reasons(graph) -> list[str]:
+    """Why a branch subgraph cannot run: its operators, and anything beyond a
+    plain float32 computation of its inputs."""
+    _, tensors, inputs, outputs, operators = graph
+    reasons = []
+    for op in operators:
+        if op.kind in (*_VARIABLES, *_STATEFUL, "IF", "WHILE"):
+            reasons.append(f"operator {op.index} {op.kind}: state or control flow inside a branch")
+            continue
+        reason = _operator_reason(op, tensors)
+        if reason:
+            reasons.append(f"operator {op.index} {op.kind}: {reason}")
+    for index in [*inputs, *outputs]:
+        if tensors[index].type != "FLOAT32" or len(tensors[index].shape) > 2:
+            reasons.append(f"branch boundary {tensors[index].name!r} other than float32 of rank 2 at most")
+    return reasons
+
+
+def _branch_graph(graph, name: str) -> onnx.GraphProto:
+    """One IF branch as an ONNX graph whose inputs are the IF operands and whose
+    outputs are its results, each held by an operator of the branch."""
+    _, tensors, inputs, outputs, operators = graph
+    consumed = {i for op in operators for i in op.inputs}
+    converter = _Converter(tensors, (), consumed)
+    b = converter.b
+    graph_inputs = []
+    for position, index in enumerate(inputs):
+        input_name = b.unique(f"{name}_in{position}")
+        graph_inputs.append(helper.make_tensor_value_info(
+            input_name, TensorProto.FLOAT, _onnx_shape(tensors[index].shape)))
+        converter.values[index] = input_name
+    for op in operators:
+        converter.convert(op)
+    graph_outputs = []
+    for position, index in enumerate(outputs):
+        result = b.node("Identity", [converter.value(index)], f"{name}_out{position}")
+        graph_outputs.append(helper.make_tensor_value_info(
+            result, TensorProto.FLOAT, _onnx_shape(tensors[index].shape)))
+    return helper.make_graph(b.nodes, name, graph_inputs, graph_outputs, b.initializers,
+                             value_info=converter.value_info)
 
 
 def _var_name(op: "_Operator") -> str:
@@ -315,7 +366,7 @@ _INDEX_SLOTS = {"GATHER": 1, "GATHER_ND": 1, "EMBEDDING_LOOKUP": 0, "DYNAMIC_UPD
 _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum",
                "REDUCE_ALL": "ReduceAll"}
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
-              *_INDEX, *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N",
+              *_INDEX, *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N", "IF",
               "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
               "CUMSUM", "MEAN",
               "TRANSPOSE",
@@ -357,6 +408,12 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
                 return f"input {position} must be a constant"
             if ins[position].type != "INT32":
                 return f"{ins[position].type} run-time indices; the runtime takes int32"
+    if op.kind == "IF":
+        if ins[0].type != "BOOL" or int(np.prod(ins[0].shape)) != 1:
+            return "a condition other than one bool"
+        if any(t.type != "FLOAT32" or len(t.shape) > 2 for t in [*ins[1:], *outs]):
+            return "operands other than float32 of rank 2 at most"
+        return ""
     if op.kind == "SVDF":
         return _svdf_reason(op, ins, outs)
     if op.kind == "UNIDIRECTIONAL_SEQUENCE_LSTM":
@@ -655,7 +712,8 @@ class _Converter:
         array = tensor.array()
         rank = rank or array.ndim
         array = array.reshape((1,) * (rank - array.ndim) + array.shape)
-        axis = _onnx_axis(tensor.quantized_dimension + rank - len(tensor.shape), rank)
+        # A scalar has no axis to quantize along.
+        axis = _onnx_axis(tensor.quantized_dimension + rank - len(tensor.shape), rank) if rank else 0
         array = array.transpose(_to_first(rank))
         if tensor.type in ("FLOAT32", "BOOL"):
             return self.b.constant(array, tensor.name)
@@ -772,6 +830,9 @@ class _Converter:
             y = b.node(_INDEX[kind], [x], tag, axis=self.ints(ins[1])[0] % rank, keepdims=0,
                        select_last_index=0)
             self.values[outs[0]] = b.node("Cast", [y], out.name, to=TensorProto.INT32)
+            return
+        if kind == "IF":
+            self._if(op, tag)
             return
         if kind == "SVDF":
             self.finish(self._svdf(op, tag), outs[0])
@@ -1210,6 +1271,21 @@ class _Converter:
         self.held_state[state]["output"] = kept
         return y
 
+    def _if(self, op: _Operator, tag: str) -> None:
+        """IF in the compiler's own form: the condition and the operands in,
+        each branch an ONNX graph taking the operands as its inputs."""
+        b = self.b
+        branches = [_branch_graph(self.graphs[op.option(slot, "i")], f"{tag}_{part}")
+                    for slot, part in ((0, "then"), (1, "else"))]
+        results = [b.unique(f"{tag}_{n}") for n in range(len(op.outputs))]
+        b.nodes.append(helper.make_node(
+            "If", [self.value(i) for i in op.inputs], results, domain="tigris",
+            then_branch=branches[0], else_branch=branches[1]))
+        for index, name in zip(op.outputs, results):
+            self.value_info.append(helper.make_tensor_value_info(
+                name, TensorProto.FLOAT, _onnx_shape(self.tensors[index].shape)))
+            self.finish(name, index)
+
     def _lstm(self, op: _Operator, tag: str) -> str:
         """UNIDIRECTIONAL_SEQUENCE_LSTM in the compiler's own form, run in
         TFLite's axis order, its hidden and cell states passed in and out."""
@@ -1425,6 +1501,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     _, tensors, inputs, outputs, operators = graphs[0]
     consumed = {i for op in operators for i in op.inputs}
     converter = _Converter(tensors, outputs, consumed)
+    converter.graphs = graphs
     b = converter.b
     boundary_type = {"INT8": TensorProto.INT8, "FLOAT32": TensorProto.FLOAT,
                      "INT32": TensorProto.INT32, "BOOL": TensorProto.BOOL}

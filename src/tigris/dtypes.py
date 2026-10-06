@@ -49,6 +49,7 @@ OP_DTYPE_SIGNATURES.update({
     # The output role admits int16 only on the next state, a state tensor.
     "Svdf": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     "Lstm": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
+    "If": DTypeSignature(inputs=(9, DATA, DATA)),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
 })

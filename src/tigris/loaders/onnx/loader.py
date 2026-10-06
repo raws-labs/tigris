@@ -122,13 +122,29 @@ def load_model(
         input_shapes = _file_shapes_only(model, input_shapes)
     bindings = resolve_shapes(model, input_shapes)
 
-    graph = model.graph
-    ag = AnalyzedGraph()
+    ag = _graph_to_ag(model.graph, model.opset_import)
     ag.model_name = Path(path).stem
     ag.channels_last_source = channels_last
     ag.shape_bindings = bindings
+    state = next((json.loads(prop.value) for prop in model.metadata_props
+                  if prop.key == STATE_KEY), [])
+    for entry in state:
+        if entry["input"] not in ag.model_inputs or entry["initial"] not in ag.weight_data or (
+                entry["output"] is not None and entry["output"] not in ag.model_outputs):
+            raise ValueError(f"state entry {entry!r} does not name the model's own values")
+        ag.state_ports.append(StatePort(
+            input=ag.model_inputs.index(entry["input"]),
+            output=None if entry["output"] is None else ag.model_outputs.index(entry["output"]),
+            initial=np.asarray(ag.weight_data[entry["initial"]])))
+    return ag
+
+
+def _graph_to_ag(graph: onnx.GraphProto, opset_import) -> AnalyzedGraph:
+    """One graph's operators and tensors; a graph-valued attribute becomes a
+    subgraph of its own, referenced by index."""
+    ag = AnalyzedGraph()
     ag.opset = next(
-        (entry.version for entry in model.opset_import if entry.domain in ("", "ai.onnx")),
+        (entry.version for entry in opset_import if entry.domain in ("", "ai.onnx")),
         0,
     )
 
@@ -167,16 +183,6 @@ def load_model(
         if inp.name not in initializer_names
     ]
     ag.model_output_dtypes = [_extract_dtype(out.type) for out in graph.output]
-    state = next((json.loads(prop.value) for prop in model.metadata_props
-                  if prop.key == STATE_KEY), [])
-    for entry in state:
-        if entry["input"] not in ag.model_inputs or entry["initial"] not in ag.weight_data or (
-                entry["output"] is not None and entry["output"] not in ag.model_outputs):
-            raise ValueError(f"state entry {entry!r} does not name the model's own values")
-        ag.state_ports.append(StatePort(
-            input=ag.model_inputs.index(entry["input"]),
-            output=None if entry["output"] is None else ag.model_outputs.index(entry["output"]),
-            initial=np.asarray(ag.weight_data[entry["initial"]])))
 
     # --- Build OpNodes ----------------------------------------------------
     nodes_by_output: dict[str, int] = {}  # tensor_name -> node index
@@ -185,6 +191,11 @@ def load_model(
         name = node.name or f"{node.op_type}_{i}"
         attrs: dict = {}
         for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.GRAPH:
+                branch = _infer(onnx_helper.make_model(attr.g, opset_imports=list(opset_import)))
+                ag.subgraphs.append(_graph_to_ag(branch.graph, opset_import))
+                attrs[attr.name] = len(ag.subgraphs) - 1
+                continue
             val = onnx_helper.get_attribute_value(attr)
             # Convert bytes to str for cleaner downstream usage
             if isinstance(val, bytes):

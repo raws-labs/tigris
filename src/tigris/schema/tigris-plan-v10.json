@@ -25,6 +25,7 @@
     "pads": 5,
     "pool_rounding": 8,
     "resize_scales": 10,
+    "subgraphs": 17,
     "svdf": 15,
     "transpose_perm": 1
   },
@@ -65,6 +66,7 @@
     "Greater": 76,
     "GreaterOrEqual": 77,
     "HardSwish": 37,
+    "If": 87,
     "InstanceNormalization": 23,
     "L2Normalization": 58,
     "L2Pool": 59,
@@ -125,6 +127,8 @@
     "stage": 28,
     "state_entry": 16,
     "state_header": 8,
+    "subgraph_entry": 12,
+    "subgraph_header": 4,
     "tensor": 16,
     "tile_plan": 24,
     "weight_block": 20,
@@ -141,6 +145,7 @@
     "stages": 3,
     "state": 12,
     "strings": 7,
+    "subgraphs": 13,
     "tensors": 1,
     "tile_plans": 4,
     "weight_blocks": 10,
@@ -164,6 +169,7 @@
     "scope": "wire_format",
     "stage_assignment_v5": "stage table authoritative; operator byte is canonical low-byte hint",
     "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
-    "state_v10": "only a plan with a state section is written at schema 10"
+    "state_v10": "only a plan with a state section is written at schema 10",
+    "subgraphs_v10": "a plan with control flow is written at schema 10; graph 0 is the main graph"
   }
 }

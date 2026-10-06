@@ -111,7 +111,9 @@ def partition_temporal(
     Stage inputs = tensors produced outside the stage but consumed inside.
     Stage outputs = tensors produced inside the stage but consumed later (or model outputs).
     """
-    cuts = forced_cuts or frozenset()
+    from tigris.graph.subgraphs import control_flow_cuts
+
+    cuts = (forced_cuts or frozenset()) | control_flow_cuts(ag)
     ag.budget = replace(ag.budget, fast=budget)
     num_ops = len(ag.ops)
     if num_ops == 0:

@@ -1037,6 +1037,66 @@ def _lstm_case() -> ContractCase:
                         expected_operators=("Transpose", "Lstm", "Transpose"))
 
 
+def _if_case(take_then: bool) -> ContractCase:
+    """An If on the sign of a sum, each branch a different computation of x;
+    the input is chosen so the given branch runs."""
+    x = np.asarray([[0.5, -1.25, 2.0, 0.75]], np.float32) * (1.0 if take_then else -1.0)
+    weights = [numpy_helper.from_array(np.asarray([2], np.int64), "axes"),
+               numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), "rows"),
+               numpy_helper.from_array(np.asarray(0.0, np.float32), "zero")]
+
+    def branch(name, nodes, constants, explicit):
+        inputs = [helper.make_tensor_value_info(f"{name}_x", TensorProto.FLOAT, [1, 4])] if explicit else []
+        return helper.make_graph(nodes(f"{name}_x" if explicit else "x", name), name, inputs,
+                                 [helper.make_tensor_value_info(f"{name}_y", TensorProto.FLOAT, [1, 4])],
+                                 constants(name))
+
+    def then_nodes(x, name):
+        return [helper.make_node("Mul", [x, f"{name}_two"], [f"{name}_twice"]),
+                helper.make_node("Add", [f"{name}_twice", f"{name}_one"], [f"{name}_y"])]
+
+    def then_constants(name):
+        return [numpy_helper.from_array(np.asarray(2.0, np.float32), f"{name}_two"),
+                numpy_helper.from_array(np.asarray(1.0, np.float32), f"{name}_one")]
+
+    def else_nodes(x, name):
+        return [helper.make_node("Relu", [x], [f"{name}_relu"]),
+                helper.make_node("Sub", [f"{name}_relu", f"{name}_three"], [f"{name}_y"])]
+
+    def else_constants(name):
+        return [numpy_helper.from_array(np.asarray(3.0, np.float32), f"{name}_three")]
+
+    # The runtime reduces a rank-3 tensor along one axis.
+    condition = [helper.make_node("Reshape", ["x", "rows"], ["row"]),
+                 helper.make_node("ReduceSum", ["row", "axes"], ["sum"], keepdims=0),
+                 helper.make_node("Greater", ["sum", "zero"], ["positive"])]
+    compile_graph = helper.make_graph(
+        [*condition, helper.make_node(
+            "If", ["positive", "x"], ["y"], domain="tigris",
+            then_branch=branch("then", then_nodes, then_constants, True),
+            else_branch=branch("else", else_nodes, else_constants, True))],
+        "if", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])], weights,
+        value_info=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])])
+    compile_model = helper.make_model(compile_graph, opset_imports=[
+        helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    compile_model.ir_version = 9
+    reference = _model(
+        "if_reference",
+        [*condition, helper.make_node(
+            "If", ["positive"], ["y"],
+            then_branch=branch("then", then_nodes, then_constants, False),
+            else_branch=branch("else", else_nodes, else_constants, False))],
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])], weights, opset=17)
+    return ContractCase(name="if_then" if take_then else "if_else", compile_model=compile_model,
+                        reference_model=reference, inputs={"x": x},
+                        # The main graph's stages, then each branch's, the else
+                        # branch's Sub folded into an Add.
+                        expected_operators=("Reshape", "Transpose", "ReduceSum", "Greater", "If",
+                                            "Relu", "Add", "Mul", "Add"))
+
+
 def _runtime_index_case(kind: str, quantized: bool, variant: int = 0, arg: str | None = None,
                         cast: bool = False) -> ContractCase:
     case = _movement_case(kind, quantized, variant)
@@ -7131,6 +7191,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _convtranspose_2d_partial_edge_case(),
         _svdf_case(),
         _lstm_case(),
+        _if_case(True),
+        _if_case(False),
     ]
     cases.extend(_reshape_band_case(quantized, merge)
                  for quantized in (False, True) for merge in (False, True))

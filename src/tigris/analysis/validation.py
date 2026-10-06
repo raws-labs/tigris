@@ -18,6 +18,7 @@ from tigris.analysis.broadcast import DENSE, PERIODIC, stored_operands
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.graph.ir import state_tensor_names
+from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.dtypes import check_dtype_signatures
 from tigris.graph.ir import (
     AnalyzedGraph,
@@ -1077,6 +1078,12 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
         group_peak = interval_bytes(min(steps), max(steps))
         if len(group) == 1 and _runs_whole(ag, group[0], fast_total):
             group_peak += untiled_stage_spill(ag, group[0], fast_total)
+        # A control-flow stage holds its own tensors while the subgraph it
+        # runs holds its peak beside them.
+        group_peak += max((slow_pool_usage(ag.subgraphs[index]).slow_peak_bytes
+                           for op in (ag.ops[i] for i in steps) if op.op_type in CONTROL_FLOW
+                           for index in (op.attrs[key] for key in CONTROL_FLOW[op.op_type])),
+                          default=0)
         peak = max(peak, group_peak)
         # Without a slow budget the requirement is still reported, but there
         # is no capacity to overflow.

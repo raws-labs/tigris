@@ -7,7 +7,7 @@ import argparse
 import re
 from pathlib import Path
 
-from tigris.capabilities import KERNEL_CAPABILITIES
+from tigris.capabilities import EXECUTOR_OPERATORS, KERNEL_CAPABILITIES
 from tigris.dtypes import OP_DTYPE_SIGNATURES
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 
@@ -94,7 +94,7 @@ def validate(runtime: Path) -> list[str]:
             continue
         expected = {
             OP_TYPE_MAP[operator]
-            for operator in KERNEL_CAPABILITIES[backend].native_operators
+            for operator in KERNEL_CAPABILITIES[backend].native_operators - EXECUTOR_OPERATORS
         }
         if actual != expected:
             code_to_operator = {value: key for key, value in OP_TYPE_MAP.items()}
@@ -103,6 +103,12 @@ def validate(runtime: Path) -> list[str]:
                 f"runtime-only={[code_to_operator[code] for code in sorted(actual - expected)]}, "
                 f"compiler-only={[code_to_operator[code] for code in sorted(expected - actual)]}"
             )
+
+    executor = (runtime / "src/tigris_executor.c").read_text()
+    names = {value: name for name, value in enum_values.items()}
+    for operator in sorted(EXECUTOR_OPERATORS):
+        if names.get(OP_TYPE_MAP[operator], "?") not in executor:
+            errors.append(f"the executor does not run {operator}")
 
     for backend in ("esp-nn", "cmsis-nn"):
         if "tigris_dispatch_kernel_s8" not in sources[backend]:

@@ -130,19 +130,28 @@ def _run_pipeline(
             f"({total_budget:,} bytes)"
         )
     budget = total_budget - fast_reserve_bytes
-    if budget > 0:
-        with console.status("Partitioning..."):
-            ag = partition_temporal(ag, budget)
-        with console.status("Computing spatial partitioning..."):
-            ag = partition_spatial(ag)
-            ag = detect_and_solve_chains(ag)
 
-    ag.budget = replace(ag.budget, fast_reserve=fast_reserve_bytes)
+    def planned(graph):
+        if budget > 0:
+            with console.status("Partitioning..."):
+                graph = partition_temporal(graph, budget)
+            with console.status("Computing spatial partitioning..."):
+                graph = partition_spatial(graph)
+                graph = detect_and_solve_chains(graph)
+        graph.budget = replace(graph.budget, fast_reserve=fast_reserve_bytes)
+        return graph
+
+    # Each subgraph a control-flow operator runs is planned as a graph of its
+    # own under the same budget.
+    ag.subgraphs = [planned(compute_memory_timeline(compute_lifetimes(sub), capture_live_tensors=False))
+                    for sub in ag.subgraphs]
+    ag = planned(ag)
 
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
     if len(mem) > 1 and slow_budget <= 0:
         raise click.ClickException("Slow-memory budget must be greater than zero")
-    ag.budget = replace(ag.budget, slow=slow_budget)
+    for graph in (*ag.subgraphs, ag):
+        graph.budget = replace(graph.budget, slow=slow_budget)
 
     return ag, total_budget
 

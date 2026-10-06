@@ -1137,6 +1137,19 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "constraints": [
+        "one bool condition; branches run as their own stages; float32 operands of rank 2 at most; no nesting"
+      ],
+      "opcode": 87,
+      "operator": "If",
+      "routes": {
+        "cmsis-nn": "unsupported",
+        "esp-nn": "unsupported",
+        "reference": "native",
+        "s8_ref": "unsupported"
+      }
     }
   ],
   "schema_version": 10,
