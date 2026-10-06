@@ -21,7 +21,8 @@ class SubgraphRange:
 def flatten_subgraphs(ag: AnalyzedGraph) -> tuple[AnalyzedGraph, list[SubgraphRange]]:
     """The main graph with every subgraph's tensors, weights, operators and
     stages appended after its own, names prefixed so they cannot collide, and
-    the stage range of each graph; range 0 is the main graph's."""
+    the stage range of each graph; range 0 is the main graph's. Each graph's
+    tensors stay one block, which the runtime requires of the tensor table."""
     ops = list(ag.ops)
     stages = list(ag.stages)
     tensors = dict(ag.tensors)
