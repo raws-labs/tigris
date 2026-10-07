@@ -101,3 +101,62 @@ class Table:
 
     def string(self, slot: int) -> str:
         return self.bytes(slot).decode("utf-8", errors="replace")
+
+
+# FlexBuffers value types read by flexbuffer_map.
+_FLEX_NULL, _FLEX_INT, _FLEX_UINT, _FLEX_FLOAT = 0, 1, 2, 3
+_FLEX_INDIRECT = {6: _FLEX_INT, 7: _FLEX_UINT, 8: _FLEX_FLOAT}
+_FLEX_MAP, _FLEX_BOOL = 9, 26
+
+
+def _flex_read(data: bytes, position: int, width: int, kind: int):
+    if width not in (1, 2, 4, 8) or position < 0 or position + width > len(data):
+        raise ValueError(f"FlexBuffer value at byte {position} runs past the buffer")
+    if kind == _FLEX_FLOAT:
+        if width < 4:
+            raise ValueError(f"FlexBuffer float of {width} bytes")
+        return struct.unpack_from("<f" if width == 4 else "<d", data, position)[0]
+    letter = {1: "b", 2: "h", 4: "i", 8: "q"}[width]
+    return struct.unpack_from("<" + (letter if kind == _FLEX_INT else letter.upper()), data, position)[0]
+
+
+def _flex_target(data: bytes, position: int, width: int) -> int:
+    return position - _flex_read(data, position, width, _FLEX_UINT)
+
+
+def flexbuffer_map(data: bytes) -> dict:
+    """The scalar entries of a FlexBuffer whose root is a map, as TFLite stores
+    custom operator options: int, unsigned, float and bool values by key, None
+    for a null or a value of another type."""
+    if len(data) < 3:
+        raise ValueError("buffer too short for a FlexBuffer")
+    root_width, packed = data[-1], data[-2]
+    root = len(data) - 2 - root_width
+    if packed >> 2 != _FLEX_MAP:
+        raise ValueError("FlexBuffer root is not a map")
+    width = 1 << (packed & 3)
+    values = _flex_target(data, root, root_width)
+    length = _flex_read(data, values - width, width, _FLEX_UINT)
+    keys = _flex_target(data, values - 3 * width, width)
+    key_width = _flex_read(data, values - 2 * width, width, _FLEX_UINT)
+    if values + length * (width + 1) > len(data):
+        raise ValueError("FlexBuffer map runs past the buffer")
+    entries = {}
+    for i in range(length):
+        start = _flex_target(data, keys + i * key_width, key_width)
+        end = data.find(b"\0", start) if 0 <= start < len(data) else -1
+        if end < 0:
+            raise ValueError("FlexBuffer key runs past the buffer")
+        element = data[values + length * width + i]
+        kind, position, element_width = element >> 2, values + i * width, width
+        if kind in _FLEX_INDIRECT:
+            position = _flex_target(data, position, width)
+            kind, element_width = _FLEX_INDIRECT[kind], 1 << (element & 3)
+        if kind in (_FLEX_INT, _FLEX_UINT, _FLEX_FLOAT):
+            value = _flex_read(data, position, element_width, kind)
+        elif kind == _FLEX_BOOL:
+            value = bool(_flex_read(data, position, element_width, _FLEX_UINT))
+        else:
+            value = None
+        entries[data[start:end].decode("utf-8", errors="replace")] = value
+    return entries

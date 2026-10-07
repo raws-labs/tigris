@@ -1109,6 +1109,18 @@ def test_auxiliary_dtype_placement_and_operator_slots(monkeypatch):
     assert check_dtype_signatures([("p", 9, False, True)], [], ["p"], ["p"])[1]
 
 
+def test_float32_results_stand_apart_from_int8_data():
+    """Detections are float32 in an int8 plan, and no operator reads them."""
+    from tigris.dtypes import check_dtype_signatures
+    tensors = [("x", 3, False, True), ("s", 3, False, True), ("b", 1, False, False),
+               ("c", 1, False, False), ("y", 3, False, True)]
+    detect = ("DetectionPostProcess", ["x", "s"], ["b", "c"])
+    data, issues = check_dtype_signatures(tensors, [detect], ["x", "s"], ["b", "c"])
+    assert data == {3: ["x", "s", "y"]} and not issues
+    _, issues = check_dtype_signatures(tensors, [detect, ("Relu", ["b"], ["y"])], ["x", "s"], ["y"])
+    assert any("must not be read" in issue for issue in issues)
+
+
 @pytest.mark.parametrize("kind", ["StridedSlice", "MirrorPad", "ReverseV2"])
 def test_movement_refuses_runtime_bounds(tmp_path, kind):
     from scripts.crossrepo_contract import _movement_case

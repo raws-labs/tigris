@@ -60,6 +60,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _adopt_lstm(ag)
     ag = _adopt_if(ag)
     ag = _adopt_while(ag)
+    ag = _adopt_detection(ag)
     ag = _normalize_arg_outputs(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
@@ -2966,6 +2967,47 @@ def _adopt_svdf(ag: AnalyzedGraph) -> AnalyzedGraph:
             raise ValueError(f"Svdf activation {activation!r} is not supported")
         if activation != "none":
             op.attrs["fused_activation"] = {"relu": "Relu", "relu6": "Relu6"}[activation]
+    return ag
+
+
+def detection_scratch_bytes(boxes: int, detections: int, candidates: int) -> int:
+    """The runtime's TIGRIS_DETECTION_SCRATCH_BYTES."""
+    return 4 * (9 * boxes + max(boxes, candidates) + 2 * candidates + detections) + boxes
+
+
+def _adopt_detection(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """The compiler's own DetectionPostProcess: box encodings [1, 4, boxes] and
+    scores [1, columns, boxes] in NCL, constant anchors [boxes, 4]; float32
+    boxes [1, 4, detections], classes and scores [1, detections] and the count
+    [1]. A float32 output holding the runtime's working memory is added."""
+    for op in ag.ops:
+        if op.op_type != "tigris::DetectionPostProcess":
+            continue
+        op.op_type = "DetectionPostProcess"
+        if len(op.inputs) != 3 or len(op.outputs) != 4:
+            raise ValueError("DetectionPostProcess requires three inputs and four outputs")
+        anchors = ag.weight_data.get(op.inputs[2])
+        boxes, scores = (ag.tensors[name] for name in op.inputs[:2])
+        a = op.attrs
+        count, classes, detections = (anchors.shape[0] if anchors is not None else 0,
+                                      int(a.get("num_classes", 0)), int(a.get("max_detections", 0)))
+        regular = int(a.get("use_regular_nms", 0))
+        if (anchors is None or anchors.shape != (count, 4) or tuple(boxes.shape) != (1, 4, count)
+                or len(scores.shape) != 3 or scores.shape[0] != 1 or scores.shape[2] != count
+                or not 1 <= classes <= scores.shape[1] <= classes + 1 or not 0 < count <= 65535):
+            raise ValueError("DetectionPostProcess shapes do not agree")
+        expected = [(1, 4, detections), (1, detections), (1, detections), (1,)]
+        if detections <= 0 or [tuple(ag.tensors[n].shape) for n in op.outputs] != expected:
+            raise ValueError("DetectionPostProcess outputs do not agree with its detections")
+        per_class = int(a.get("detections_per_class", 100))
+        if regular not in (0, 1) or (regular and per_class <= 0) or len(a.get("scales", ())) != 4:
+            raise ValueError("DetectionPostProcess options are not supported")
+        a.update(max_detections=detections, detections_per_class=per_class, num_classes=classes,
+                 use_regular_nms=regular, scales=[float(v) for v in a["scales"]])
+        size = detection_scratch_bytes(count, detections, detections + (per_class if regular else 0))
+        scratch = f"{op.outputs[0]}_scratch"
+        ag.tensors[scratch] = TensorInfo(name=scratch, shape=(-(-size // 4),), dtype=1)
+        op.outputs.append(scratch)
     return ag
 
 

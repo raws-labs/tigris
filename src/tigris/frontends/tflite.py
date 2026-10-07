@@ -11,7 +11,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
-from tigris.frontends.flatbuffer import Table
+from tigris.frontends.flatbuffer import Table, flexbuffer_map
 from tigris.frontends.qdq import GraphBuilder, same_padding
 
 MAGIC = b"TFL3"
@@ -28,7 +28,7 @@ _SG_TENSORS, _SG_INPUTS, _SG_OUTPUTS, _SG_OPERATORS, _SG_NAME = 0, 1, 2, 3, 4
 _T_SHAPE, _T_TYPE, _T_BUFFER, _T_NAME, _T_QUANT, _T_VARIABLE = 0, 1, 2, 3, 4, 5
 _Q_SCALE, _Q_ZERO_POINT, _Q_DIMENSION = 2, 3, 6
 _B_DATA, _B_OFFSET, _B_SIZE = 0, 1, 2
-_OP_OPCODE, _OP_INPUTS, _OP_OUTPUTS, _OP_OPTIONS = 0, 1, 2, 4
+_OP_OPCODE, _OP_INPUTS, _OP_OUTPUTS, _OP_OPTIONS, _OP_CUSTOM_OPTIONS = 0, 1, 2, 4, 5
 _OC_DEPRECATED_CODE, _OC_CUSTOM, _OC_VERSION, _OC_CODE = 0, 1, 2, 3
 
 _BUILTIN_OPERATORS = (
@@ -162,6 +162,7 @@ class _Operator:
         self.inputs = table.scalars(_OP_INPUTS, "i")
         self.outputs = table.scalars(_OP_OUTPUTS, "i")
         self.options = table.table(_OP_OPTIONS)
+        self.custom_options = table.bytes(_OP_CUSTOM_OPTIONS)
         self.index = index
 
     def option(self, slot: int, fmt: str, default=0):
@@ -443,6 +444,10 @@ _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMEN
               "TRANSPOSE",
               "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
               "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE")
+# The SSD box decoding and non-max suppression TFLite Micro registers as a
+# custom operator.
+_DETECTION = "CUSTOM:TFLite_Detection_PostProcess"
+_SUPPORTED = (*_SUPPORTED, _DETECTION)
 # Positions of the data, weights and bias operands of the weighted operators.
 _WEIGHTED = {"CONV_2D": (0, 1, 2), "DEPTHWISE_CONV_2D": (0, 1, 2), "FULLY_CONNECTED": (0, 1, 2),
              "TRANSPOSE_CONV": (2, 1, 3)}
@@ -467,6 +472,8 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         return "not supported"
     ins = [tensors[i] if i >= 0 else None for i in op.inputs]
     outs = [tensors[i] for i in op.outputs]
+    if op.kind == _DETECTION:
+        return _detection_reason(op, ins, outs)
     if op.kind in _VARIABLES:
         values = [t for t in [*ins, *outs] if t is not None and t.type != "RESOURCE"]
         if any(t.type != "FLOAT32" for t in values):
@@ -678,6 +685,62 @@ def _lstm_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
     return ""
 
 
+def _detection_options(op: _Operator) -> dict:
+    """The options as TFLite Micro reads them, with its defaults."""
+    found = flexbuffer_map(op.custom_options)
+
+    def number(key, kind, default=None):
+        value = found.get(key)
+        if value is None:
+            if default is None:
+                raise ValueError(f"option {key} is missing")
+            return default
+        return kind(value)
+
+    return {"max_detections": number("max_detections", int),
+            "max_classes_per_detection": number("max_classes_per_detection", int),
+            "detections_per_class": number("detections_per_class", int, 100),
+            "use_regular_nms": number("use_regular_nms", bool, False),
+            "score_threshold": float(np.float32(number("nms_score_threshold", float))),
+            "iou_threshold": float(np.float32(number("nms_iou_threshold", float))),
+            "num_classes": number("num_classes", int),
+            "scales": [float(np.float32(number(f"{axis}_scale", float))) for axis in "yxhw"]}
+
+
+def _detection_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    if len(ins) != 3 or any(t is None for t in ins) or len(outs) != 4:
+        return "operands other than box encodings, scores and anchors, and four outputs"
+    try:
+        options = _detection_options(op)
+    except ValueError as error:
+        return str(error)
+    boxes, scores, anchors = ins
+    if any(t.type != "FLOAT32" for t in (*ins, *outs)):
+        # TFLite Micro reads float operands; an int8 model dequantizes them first.
+        return "operands or outputs other than float32"
+    if not _is_constant(anchors):
+        return "anchors that are not a constant"
+    count, classes, detections = (len(boxes.shape) == 3 and boxes.shape[1], options["num_classes"],
+                                  options["max_detections"])
+    if (tuple(boxes.shape) != (1, count, 4) or len(scores.shape) != 3
+            or tuple(scores.shape[:2]) != (1, count) or tuple(anchors.shape) != (count, 4)):
+        return "shapes other than box encodings [1, boxes, 4], scores [1, boxes, classes] and anchors [boxes, 4]"
+    if not 1 <= classes <= scores.shape[2] <= classes + 1:
+        return "scores for other than the classes and at most one background column"
+    if not 0.0 < options["iou_threshold"] <= 1.0:
+        return "an IoU threshold outside (0, 1]"
+    if options["use_regular_nms"]:
+        if options["detections_per_class"] <= 0:
+            return "no detections per class"
+    elif options["max_classes_per_detection"] != 1:
+        # TFLite Micro's fast form writes past its outputs for more than one.
+        return "more than one class per detection in the fast form"
+    if detections <= 0 or [tuple(t.shape) for t in outs] != [
+            (1, detections, 4), (1, detections), (1, detections), (1,)]:
+        return "outputs other than [1, detections, 4], [1, detections], [1, detections] and [1]"
+    return ""
+
+
 def _spatial_mean(op: _Operator, tensors) -> bool:
     """A MEAN over the height and width of a feature map, which the compiler
     runs as a global average pool."""
@@ -789,6 +852,7 @@ class _Converter:
         self.variables: dict[str, dict] = {}
         # Per variable tensor, its state input and the value written for the next run.
         self.held_state: dict[int, dict] = {}
+        self.detection_operands: set[int] = set()
 
     def value(self, index: int, rank: int | None = None) -> str:
         """The ONNX value of a tensor; a constant is broadcast-aligned to `rank`."""
@@ -919,6 +983,13 @@ class _Converter:
             return
         if kind in ("IF", "WHILE"):
             self._control_flow(op, tag)
+            return
+        if kind == "DEQUANTIZE" and outs[0] in self.detection_operands:
+            # The detection operator reads the int8 tensor through its quantization.
+            self.values[outs[0]] = self.value(ins[0])
+            return
+        if kind == _DETECTION:
+            self._detection(op, tag)
             return
         if kind == "SVDF":
             self.finish(self._svdf(op, tag), outs[0])
@@ -1360,6 +1431,28 @@ class _Converter:
         self.held_state[state]["output"] = kept
         return y
 
+    def _detection(self, op: _Operator, tag: str) -> None:
+        """TFLite_Detection_PostProcess in the compiler's own form; its four
+        float32 outputs are the model's detections."""
+        b = self.b
+        options = _detection_options(op)
+        boxes, scores, anchors = op.inputs
+        names = [b.unique(f"{tag}_{part}") for part in ("boxes", "classes", "scores", "count")]
+        b.nodes.append(helper.make_node(
+            "DetectionPostProcess",
+            [self.value(boxes), self.value(scores),
+             b.constant(self.tensors[anchors].array(), tag + "_anchors")],
+            names, domain="tigris",
+            max_detections=options["max_detections"],
+            detections_per_class=options["detections_per_class"],
+            use_regular_nms=int(options["use_regular_nms"]),
+            score_threshold=options["score_threshold"], iou_threshold=options["iou_threshold"],
+            num_classes=options["num_classes"], scales=options["scales"]))
+        for name, index in zip(names, op.outputs):
+            self.value_info.append(helper.make_tensor_value_info(
+                name, TensorProto.FLOAT, _onnx_shape(self.tensors[index].shape)))
+            self.finish(name, index)
+
     def _control_flow(self, op: _Operator, tag: str) -> None:
         """IF or WHILE in the compiler's own form, each subgraph an ONNX graph
         whose inputs are the operands it receives: an IF's operands after the
@@ -1596,6 +1689,15 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     consumed = {i for op in operators for i in op.inputs}
     converter = _Converter(tensors, outputs, consumed)
     converter.graphs = graphs
+    # Dequantized tensors only a detection operator reads.
+    readers = {}
+    for op in operators:
+        for i in op.inputs:
+            readers.setdefault(i, set()).add(op.kind)
+    converter.detection_operands = {
+        op.outputs[0] for op in operators
+        if op.kind == "DEQUANTIZE" and readers.get(op.outputs[0]) == {_DETECTION}
+        and op.outputs[0] not in outputs}
     b = converter.b
     boundary_type = {"INT8": TensorProto.INT8, "FLOAT32": TensorProto.FLOAT,
                      "INT32": TensorProto.INT32, "BOOL": TensorProto.BOOL}

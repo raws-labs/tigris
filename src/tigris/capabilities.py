@@ -116,6 +116,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Lstm",
     "If",
     "While",
+    "DetectionPostProcess",
 })
 
 # Operators the executor runs itself rather than a kernel dispatcher.
@@ -260,6 +261,7 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "If": ("one bool condition; branches run as their own stages; float32 operands; no nesting",),
     "While": ("a condition giving one bool and a body, each run as its own stages; float32 loop variables; no nesting",),
     "Svdf": ("state kept between runs; int8 with int16 state and time weights; untiled",),
+    "DetectionPostProcess": ("SSD center-size box decoding and fast or regular non-max suppression as TFLite Micro runs them; float32 anchors; int8 or float32 encodings and scores; float32 results no operator reads; one class per detection in the fast form; untiled",),
     "Lstm": ("hidden and cell state kept between runs; every gate, no peepholes, projection or layer normalization; tanh cell activation; int8 with an int16 cell state; untiled",),
     "ReduceSum": ("one axis of a rank-3 tensor; independent height or row bands; int8 rejects reference arithmetic overflow",),
     "Gather": ("constant or runtime int32 indices; independent bands with constant indices; identical int8 quantization",),

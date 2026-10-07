@@ -83,6 +83,9 @@ OP_ATTR_SUBGRAPHS = 17  # u16 graph indices a control-flow operator runs
                         # (If: then, else; While: condition, body)
 OP_ATTR_LSTM = 16  # int32 time_major (0 or 1), float32 cell clip (0: none); int8
                    # adds zero points, cell power, clip and 11 multiplier pairs
+OP_ATTR_DETECTION = 18  # uint16 max detections, detections per class, classes; uint8
+                        # regular (1) or fast (0), a zero byte; float32 score and IoU
+                        # thresholds, y, x, h, w scales
 
 OP_ATTR_KINDS = (
     OP_ATTR_COMPARISON_REQUANT,
@@ -90,6 +93,7 @@ OP_ATTR_KINDS = (
     OP_ATTR_SVDF,
     OP_ATTR_LSTM,
     OP_ATTR_SUBGRAPHS,
+    OP_ATTR_DETECTION,
     OP_ATTR_TRANSPOSE_PERM,
     OP_ATTR_EPSILON,
     OP_ATTR_ALPHA,
@@ -201,6 +205,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "Lstm": 86,
     "If": 87,
     "While": 88,
+    "DetectionPostProcess": 89,
 }
 OP_TYPE_UNKNOWN = 255
 

@@ -37,6 +37,7 @@ def schema_package() -> dict[str, object]:
             "svdf": defs.OP_ATTR_SVDF,
             "lstm": defs.OP_ATTR_LSTM,
             "subgraphs": defs.OP_ATTR_SUBGRAPHS,
+            "detection": defs.OP_ATTR_DETECTION,
             "epsilon": defs.OP_ATTR_EPSILON,
             "pads": defs.OP_ATTR_PADS,
             "pool_rounding": defs.OP_ATTR_POOL_ROUNDING,

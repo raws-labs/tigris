@@ -45,6 +45,7 @@ from .defs import (
     OP_ATTR_CONSTANTS,
     OP_ATTR_SVDF,
     OP_ATTR_LSTM,
+    OP_ATTR_DETECTION,
     OP_ATTR_SUBGRAPHS,
     OP_ATTR_ALPHA,
     OP_ATTR_BINARY_REQUANT,
@@ -992,6 +993,12 @@ def _build_op_attributes(
         if op.op_type == "Lstm":
             records.append((op_index, OP_ATTR_LSTM, _lstm_payload(ag, op)))
             continue
+        if op.op_type == "DetectionPostProcess":
+            a = op.attrs
+            records.append((op_index, OP_ATTR_DETECTION, struct.pack(
+                "<3H2B6f", a["max_detections"], a["detections_per_class"], a["num_classes"],
+                a["use_regular_nms"], 0, a["score_threshold"], a["iou_threshold"], *a["scales"])))
+            continue
         if op.op_type in CONTROL_FLOW:
             # Graph 0 is the main graph; a subgraph's index is its position plus one.
             records.append((op_index, OP_ATTR_SUBGRAPHS, struct.pack(
@@ -1106,7 +1113,7 @@ def _build_op_attributes(
 
 
 # Operators whose constants are listed by OP_ATTR_CONSTANTS, not weight and bias.
-_MANY_CONSTANTS = {"Svdf", "Lstm"}
+_MANY_CONSTANTS = {"Svdf", "Lstm", "DetectionPostProcess"}
 
 
 def _resolve_weight_bias(op: OpNode, weight_idx: dict[str, int]) -> tuple[int, int]:
