@@ -311,6 +311,39 @@ def test_int64_run_time_indices_are_refused(monkeypatch):
     assert any("INT64 run-time indices; the runtime takes int32" in r for r in reasons)
 
 
+def test_flexbuffer_map_reads_scalar_options():
+    from tigris.frontends.flatbuffer import flexbuffer_map
+    data = bytes.fromhex(
+        "6d61785f646574656374696f6e73006e6d735f696f755f7468726573686f6c64007573655f726567756c61"
+        "725f6e6d730003322413000000060000000100000003000000030000000000003f01000000060e6a0f2601")
+    assert flexbuffer_map(data) == {"max_detections": 3, "nms_iou_threshold": 0.5,
+                                    "use_regular_nms": True}
+    with pytest.raises(ValueError):
+        flexbuffer_map(data[40:])
+
+
+@pytest.mark.parametrize(("option", "value", "reason"), [
+    ("max_classes_per_detection", 2, "more than one class per detection in the fast form"),
+    ("nms_iou_threshold", 1.5, "an IoU threshold outside (0, 1]"),
+    ("num_classes", 1, "scores for other than the classes and at most one background column"),
+    ("max_detections", None, "option max_detections is missing"),
+])
+def test_a_detection_tflite_micro_cannot_run_is_refused(monkeypatch, option, value, reason):
+    """TFLite Micro's fast form writes past its outputs for more than one
+    class per detection; the other options it checks or requires."""
+    read = tflite.flexbuffer_map
+    monkeypatch.setattr(tflite, "flexbuffer_map", lambda data: {**read(data), option: value})
+    data = (FIXTURES / "ops" / "float_detection_fast.tflite").read_bytes()
+    assert any(reason in r for r in tflite.unsupported(data))
+
+
+def test_detection_anchors_are_a_constant(monkeypatch):
+    def run_time(tensors, operators):
+        tensors[operators[0].inputs[2]].buffer = 0
+    reasons = _read_edited(monkeypatch, "float_detection_regular", run_time)
+    assert any("anchors that are not a constant" in r for r in reasons)
+
+
 def test_an_svdf_without_bias_is_refused(monkeypatch):
     """TFLite Micro's SVDF Prepare reads the bias whether or not it is there."""
     def drop(tensors, operators):

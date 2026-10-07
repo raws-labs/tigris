@@ -1163,6 +1163,19 @@
         "reference": "native",
         "s8_ref": "unsupported"
       }
+    },
+    {
+      "constraints": [
+        "SSD center-size box decoding and fast or regular non-max suppression as TFLite Micro runs them; float32 anchors; int8 or float32 encodings and scores; float32 results no operator reads; one class per detection in the fast form; untiled"
+      ],
+      "opcode": 89,
+      "operator": "DetectionPostProcess",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
   "schema_version": 10,

@@ -50,6 +50,8 @@ OP_DTYPE_SIGNATURES.update({
     "Svdf": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     "Lstm": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     "If": DTypeSignature(inputs=(9, DATA, DATA)),
+    # Float32 results in a float32 or an int8 plan, which no operator reads.
+    "DetectionPostProcess": DTypeSignature(outputs=(1,)),
     "While": DTypeSignature(),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
@@ -63,8 +65,16 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
     by_name = {name: (dtype, constant, quantized) for name, dtype, constant, quantized in tensors}
     data = {}
     issues = []
+    # Float32 written where an operator's slot states float32 stands apart
+    # from the data dtype and must not be read.
+    stated = {name for kind, _, outputs in operators
+              if OP_DTYPE_SIGNATURES.get(kind, DTypeSignature()).outputs == (1,)
+              for name in outputs}
+    for name in stated:
+        if any(name in inputs for _, inputs, _ in operators):
+            issues.append(f"float32 result {name} must not be read by another operator")
     for name, (dtype, constant, quantized) in by_name.items():
-        if constant:
+        if constant or (name in stated and dtype == 1):
             continue
         policy = AUXILIARY_DTYPES.get(dtype)
         if policy is None:

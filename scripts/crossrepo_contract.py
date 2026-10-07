@@ -982,6 +982,74 @@ def _svdf_case() -> ContractCase:
                         inputs={"x": x}, expected_operators=("Svdf",))
 
 
+def _detection_case() -> ContractCase:
+    """Fast-form DetectionPostProcess over boxes that do not overlap, so the
+    detections are the best-scoring decoded boxes, against a reference that
+    decodes them and takes the top scores."""
+    rng = np.random.default_rng(89)
+    boxes, detections = 6, 3
+    scales = [10.0, 10.0, 5.0, 5.0]
+    # Anchors a unit apart and a third of a unit wide, as [y, x, h, w].
+    anchors = np.stack([np.arange(boxes) * 1.0, np.full(boxes, 0.5),
+                        np.full(boxes, 0.3), np.full(boxes, 0.3)], 1).astype(np.float32)
+    encodings = rng.uniform(-0.5, 0.5, (1, 4, boxes)).astype(np.float32)
+    scores = np.stack([rng.uniform(0.0, 0.2, boxes), rng.permutation(np.linspace(0.3, 0.9, boxes))])
+    scores = scores[None].astype(np.float32)
+    shapes = {"encodings": [1, 4, boxes], "scores": [1, 2, boxes], "boxes": [1, 4, detections],
+              "classes": [1, detections], "best": [1, detections], "count": [1]}
+    inputs = [helper.make_tensor_value_info(n, TensorProto.FLOAT, shapes[n]) for n in ("encodings", "scores")]
+    outputs = [helper.make_tensor_value_info(n, TensorProto.FLOAT, shapes[n])
+               for n in ("boxes", "classes", "best", "count")]
+    compile_model = helper.make_model(helper.make_graph(
+        [helper.make_node("DetectionPostProcess", ["encodings", "scores", "anchors"],
+                          ["boxes", "classes", "best", "count"], domain="tigris",
+                          max_detections=detections, detections_per_class=100, use_regular_nms=0,
+                          score_threshold=0.1, iou_threshold=0.5, num_classes=1, scales=scales)],
+        "detection", inputs, outputs, [numpy_helper.from_array(anchors, "anchors")],
+        value_info=outputs), opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    compile_model.ir_version = 9
+
+    def row(values, name):
+        return numpy_helper.from_array(np.asarray(values, np.float32).reshape(1, 1, boxes), name)
+
+    reference = _model(
+        "detection_reference",
+        [helper.make_node("Split", ["encodings", "four"], ["ey", "ex", "eh", "ew"], axis=1),
+         helper.make_node("Div", ["ey", "sy"], ["dy"]), helper.make_node("Mul", ["dy", "ah"], ["my"]),
+         helper.make_node("Add", ["my", "ay"], ["cy"]),
+         helper.make_node("Div", ["ex", "sx"], ["dx"]), helper.make_node("Mul", ["dx", "aw"], ["mx"]),
+         helper.make_node("Add", ["mx", "ax"], ["cx"]),
+         helper.make_node("Div", ["eh", "sh"], ["dh"]), helper.make_node("Exp", ["dh"], ["gh"]),
+         helper.make_node("Mul", ["gh", "half_ah"], ["hh"]),
+         helper.make_node("Div", ["ew", "sw"], ["dw"]), helper.make_node("Exp", ["dw"], ["gw"]),
+         helper.make_node("Mul", ["gw", "half_aw"], ["hw"]),
+         helper.make_node("Sub", ["cy", "hh"], ["ymin"]), helper.make_node("Sub", ["cx", "hw"], ["xmin"]),
+         helper.make_node("Add", ["cy", "hh"], ["ymax"]), helper.make_node("Add", ["cx", "hw"], ["xmax"]),
+         helper.make_node("Concat", ["ymin", "xmin", "ymax", "xmax"], ["corners"], axis=1),
+         helper.make_node("Slice", ["scores", "one", "two", "one"], ["class_scores"]),
+         helper.make_node("Reshape", ["class_scores", "flat"], ["flat_scores"]),
+         helper.make_node("TopK", ["flat_scores", "k"], ["top", "order"]),
+         helper.make_node("Gather", ["corners", "order"], ["boxes"], axis=2),
+         helper.make_node("Reshape", ["top", "row_shape"], ["best"]),
+         helper.make_node("Mul", ["best", "zero"], ["classes"]),
+         helper.make_node("Shape", ["order"], ["found"]),
+         helper.make_node("Cast", ["found"], ["count"], to=TensorProto.FLOAT)],
+        inputs, outputs,
+        [numpy_helper.from_array(np.asarray([1, 1, 1, 1], np.int64), "four"),
+         *(numpy_helper.from_array(np.float32(v), n) for n, v in zip(("sy", "sx", "sh", "sw"), scales)),
+         row(anchors[:, 0], "ay"), row(anchors[:, 1], "ax"), row(anchors[:, 2], "ah"),
+         row(anchors[:, 3], "aw"), row(0.5 * anchors[:, 2], "half_ah"), row(0.5 * anchors[:, 3], "half_aw"),
+         numpy_helper.from_array(np.asarray([1], np.int64), "one"),
+         numpy_helper.from_array(np.asarray([2], np.int64), "two"),
+         numpy_helper.from_array(np.asarray([boxes], np.int64), "flat"),
+         numpy_helper.from_array(np.asarray([detections], np.int64), "k"),
+         numpy_helper.from_array(np.asarray([1, detections], np.int64), "row_shape"),
+         numpy_helper.from_array(np.float32(0.0), "zero")])
+    return ContractCase(name="detection_fast", compile_model=compile_model, reference_model=reference,
+                        inputs={"encodings": encodings, "scores": scores},
+                        expected_operators=("DetectionPostProcess",))
+
+
 def _lstm_case() -> ContractCase:
     """A float LSTM over three steps from its zero initial state, against ONNX's
     own LSTM operator, which orders the gates i, o, f, c."""
@@ -7305,6 +7373,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _convtranspose_2d_partial_edge_case(),
         _svdf_case(),
         _lstm_case(),
+        _detection_case(),
         _if_case(True),
         _if_case(False),
         _while_case(),

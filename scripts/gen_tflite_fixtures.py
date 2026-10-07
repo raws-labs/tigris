@@ -20,6 +20,7 @@ from pathlib import Path
 
 import flatbuffers
 import numpy as np
+from flatbuffers import flexbuffers
 import tensorflow as tf
 from tflite_micro.python.tflite_micro import runtime as micro
 from tflite_micro.tensorflow.lite.python import schema_py_generated as schema
@@ -170,6 +171,8 @@ _POSITIVE, _DIVISOR = (0.05, 4.0), (0.5, 3.0)
 RANGES = {
     "rsqrt": [_POSITIVE], "float_rsqrt": [_POSITIVE], "float_log": [_POSITIVE],
     "float_sqrt": [(0.0, 4.0)],
+    **{name: [(-1.0, 1.0), (0.0, 1.0)] for name in ("float_detection_fast", "float_detection_regular",
+                                                    "detection_fast", "detection_regular")},
     "div": [(-3.0, 3.0), _DIVISOR], "float_div": [(-3.0, 3.0), _DIVISOR], "float_floor_div": [(-3.0, 3.0), _DIVISOR],
     "float_floor_mod": [(-3.0, 3.0), _DIVISOR], "float_div_constant_first": [_DIVISOR],
     "float_div_broadcast": [(-3.0, 3.0), _DIVISOR],
@@ -483,8 +486,9 @@ def _one_operator(code, options_type, options, tensors, op_inputs, op_outputs, i
 
 
 def _operators(operators, tensors, inputs, outputs):
-    """A model of builtin operators in order, each (code, options type,
-    options, inputs, outputs); `tensors` as for _one_operator."""
+    """A model of operators in order, each (code, options type, options,
+    inputs, outputs); `tensors` as for _one_operator. A custom operator's code
+    is its name and its options are the FlexBuffer bytes."""
     tree = schema.ModelT()
     tree.version = 3
     tree.buffers = [schema.BufferT()]
@@ -516,8 +520,11 @@ def _operators(operators, tensors, inputs, outputs):
         op.opcodeIndex = codes.index(code)
         op.inputs = np.asarray(op_inputs, np.int32)
         op.outputs = np.asarray(op_outputs, np.int32)
-        op.builtinOptionsType = options_type
-        op.builtinOptions = options
+        if isinstance(code, str):
+            op.customOptions = np.frombuffer(options, np.uint8)
+        else:
+            op.builtinOptionsType = options_type
+            op.builtinOptions = options
         graph.operators.append(op)
     graph.inputs = np.asarray(inputs, np.int32)
     graph.outputs = np.asarray(outputs, np.int32)
@@ -525,6 +532,9 @@ def _operators(operators, tensors, inputs, outputs):
     tree.operatorCodes = []
     for code in codes:
         opcode = schema.OperatorCodeT()
+        if isinstance(code, str):
+            opcode.customCode = code.encode()
+            code = schema.BuiltinOperator.CUSTOM
         opcode.builtinCode = code
         opcode.deprecatedBuiltinCode = min(code, 127)
         opcode.version = 1
@@ -660,6 +670,41 @@ def _shape_ops(case):
     return _operators(ops, tensors, [0], [len(tensors) - 1])
 
 
+def _detection(regular, quantized=False, boxes=16, classes=3, max_detections=8):
+    """TFLite_Detection_PostProcess over an SSD head of `boxes` anchors and
+    `classes` classes after a background column; seeded anchors on an
+    overlapping grid. TFLite Micro reads float operands only, so the int8 form
+    dequantizes the box encodings and the scores in front of it."""
+    T = schema.TensorType
+    rng = np.random.default_rng(boxes * 31 + classes + 2 * regular)
+    centers = rng.uniform(0.35, 0.65, (boxes, 2))
+    sizes = rng.uniform(0.2, 0.5, (boxes, 2))
+    anchors = np.concatenate([centers, sizes], 1).astype(np.float32)
+    options = flexbuffers.Dumps({
+        "max_detections": max_detections, "max_classes_per_detection": 1,
+        "detections_per_class": 3, "use_regular_nms": bool(regular),
+        "nms_score_threshold": 0.7, "nms_iou_threshold": 0.45, "num_classes": classes,
+        "y_scale": 10.0, "x_scale": 10.0, "h_scale": 5.0, "w_scale": 5.0})
+
+    def act(shape, kind=T.FLOAT32, scale=None, zero=0):
+        return shape, kind, None, scale, zero, False
+
+    tensors = [act((1, boxes, 4)), act((1, boxes, classes + 1)),
+               ((boxes, 4), T.FLOAT32, anchors, None, 0, False),
+               act((1, max_detections, 4)), act((1, max_detections)), act((1, max_detections)),
+               act((1,))]
+    ops = [("TFLite_Detection_PostProcess", None, options, [0, 1, 2], [3, 4, 5, 6])]
+    inputs = [0, 1]
+    if quantized:
+        tensors += [act((1, boxes, 4), T.INT8, 1.0 / 64, 0),
+                    act((1, boxes, classes + 1), T.INT8, 1.0 / 255, -128)]
+        dequantize = schema.BuiltinOperator.DEQUANTIZE
+        ops = [(dequantize, schema.BuiltinOptions.NONE, None, [7], [0]),
+               (dequantize, schema.BuiltinOptions.NONE, None, [8], [1]), *ops]
+        inputs = [7, 8]
+    return _operators(ops, tensors, inputs, [3, 4, 5, 6])
+
+
 # Models no converter writes, built operator by operator.
 _RELU = schema.ActivationFunctionType.RELU
 _NONE = schema.ActivationFunctionType.NONE
@@ -673,6 +718,10 @@ HANDMADE = {
     "lstm": lambda: _lstm(False, 1, 3, 4, 5, quantized=True),
     "float_zeros_like": lambda: _shape_ops("zeros_like"),
     "float_fill": lambda: _shape_ops("fill"),
+    "float_detection_fast": lambda: _detection(False),
+    "float_detection_regular": lambda: _detection(True),
+    "detection_fast": lambda: _detection(False, quantized=True),
+    "detection_regular": lambda: _detection(True, quantized=True),
     "float_shape_reshape": lambda: _shape_ops("shape_reshape"),
     "float_broadcast_args": lambda: _shape_ops("broadcast_args"),
     "lstm_time_major_clip": lambda: _lstm(True, 2, 3, 3, 4, cell_clip=0.8, quantized=True),
@@ -681,6 +730,11 @@ HANDMADE = {
 # the two differ in the last bits; TFLite Micro's outputs are recorded for these.
 SUMMATION_ORDER = {"float_svdf", "float_svdf_rank2_relu", "float_lstm",
                    "float_lstm_time_major_clip"}
+# TFLite's detection postprocess is another implementation than TFLite
+# Micro's; TFLite Micro's outputs are recorded. Its fast form leaves the rows
+# past the detection count unwritten, so they are recorded as zero.
+DETECTION = {"float_detection_fast", "float_detection_regular", "detection_fast",
+             "detection_regular"}
 # The tier-1 cases again, converted without quantization.
 _FLOAT_TIER1 = (
     "max_pool_valid", "max_pool_same", "avg_pool_valid", "avg_pool_same", "concat_channels",
@@ -821,6 +875,9 @@ def generate(name: str) -> bool:
         # shift a 32-bit value by 32 or more, which is undefined there.
         numerator, zero_point = inputs[0], details[0]["quantization"][1]
         numerator[(numerator == zero_point) | (numerator == zero_point - 1)] = zero_point + 1
+    if name.startswith("float_detection"):
+        # Scores on a coarse grid tie, which the selection order has to settle.
+        inputs[1] = np.round(inputs[1] * 8.0) / np.float32(8.0)
     outputs_count = graph.OutputsLength()
     micro_outputs, reference_outputs = [], []
     for sample in range(SAMPLES):
@@ -828,6 +885,10 @@ def generate(name: str) -> bool:
             micro_interpreter.set_input(values[sample], index)
         micro_interpreter.invoke()
         micro_outputs.append([micro_interpreter.get_output(i).copy() for i in range(outputs_count)])
+        if name in DETECTION:
+            count = int(micro_outputs[-1][3][0])
+            for written in micro_outputs[-1][:3]:
+                written[:, count:] = 0
         if reference is not None:
             for index, values in enumerate(inputs):
                 reference.set_tensor(reference.get_input_details()[index]["index"], values[sample])
@@ -840,7 +901,7 @@ def generate(name: str) -> bool:
             reference_outputs.append([reference.get_tensor(d["index"]).copy()
                                       for d in reference.get_output_details()])
     has_reference = (reference is not None and name not in BROKEN_REFERENCE
-                     and name not in SUMMATION_ORDER)
+                     and name not in SUMMATION_ORDER and name not in DETECTION)
     deviates = has_reference and any(not np.array_equal(m, r) for ms, rs in
                                      zip(micro_outputs, reference_outputs) for m, r in zip(ms, rs))
     outputs = reference_outputs if deviates else micro_outputs
