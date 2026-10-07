@@ -479,6 +479,12 @@ REWRITES["embedding_lookup_runtime"] = _embedding_lookup
 def _one_operator(code, options_type, options, tensors, op_inputs, op_outputs, inputs, outputs):
     """A model of one builtin operator. `tensors` are (shape, type, data, scale,
     zero point, variable) records; data None marks an activation."""
+    return _operators([(code, options_type, options, op_inputs, op_outputs)], tensors, inputs, outputs)
+
+
+def _operators(operators, tensors, inputs, outputs):
+    """A model of builtin operators in order, each (code, options type,
+    options, inputs, outputs); `tensors` as for _one_operator."""
     tree = schema.ModelT()
     tree.version = 3
     tree.buffers = [schema.BufferT()]
@@ -501,21 +507,28 @@ def _one_operator(code, options_type, options, tensors, op_inputs, op_outputs, i
             quant.zeroPoint = np.asarray([zero_point], np.int64)
             tensor.quantization = quant
         graph.tensors.append(tensor)
-    op = schema.OperatorT()
-    op.opcodeIndex = 0
-    op.inputs = np.asarray(op_inputs, np.int32)
-    op.outputs = np.asarray(op_outputs, np.int32)
-    op.builtinOptionsType = options_type
-    op.builtinOptions = options
-    graph.operators = [op]
+    codes = []
+    graph.operators = []
+    for code, options_type, options, op_inputs, op_outputs in operators:
+        if code not in codes:
+            codes.append(code)
+        op = schema.OperatorT()
+        op.opcodeIndex = codes.index(code)
+        op.inputs = np.asarray(op_inputs, np.int32)
+        op.outputs = np.asarray(op_outputs, np.int32)
+        op.builtinOptionsType = options_type
+        op.builtinOptions = options
+        graph.operators.append(op)
     graph.inputs = np.asarray(inputs, np.int32)
     graph.outputs = np.asarray(outputs, np.int32)
     tree.subgraphs = [graph]
-    opcode = schema.OperatorCodeT()
-    opcode.builtinCode = code
-    opcode.deprecatedBuiltinCode = min(code, 127)
-    opcode.version = 1
-    tree.operatorCodes = [opcode]
+    tree.operatorCodes = []
+    for code in codes:
+        opcode = schema.OperatorCodeT()
+        opcode.builtinCode = code
+        opcode.deprecatedBuiltinCode = min(code, 127)
+        opcode.version = 1
+        tree.operatorCodes.append(opcode)
     builder = flatbuffers.Builder(4096)
     builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
     return bytes(builder.Output())
@@ -611,6 +624,42 @@ def _lstm(time_major, batch, steps, features, units, cell_clip=0.0, quantized=Fa
                          tensors, op_inputs, [15], [0], [15])
 
 
+def _shape_ops(case):
+    """Shape and fill operators the converter folds in static models, ahead of
+    an ADD or MUL with the input x [1, 4]."""
+    B, T = schema.BuiltinOperator, schema.TensorType
+
+    def act(shape, kind=T.FLOAT32):
+        return shape, kind, None, None, 0, False
+
+    def const(array, kind):
+        return array.shape, kind, array, None, 0, False
+
+    add = (B.ADD, schema.BuiltinOptions.NONE, None)
+    if case == "zeros_like":
+        tensors = [act((1, 4)), act((1, 4)), act((1, 4))]
+        ops = [(B.ZEROS_LIKE, schema.BuiltinOptions.NONE, None, [0], [1]), (*add, [0, 1], [2])]
+    elif case == "fill":
+        tensors = [act((1, 4)), const(np.asarray([1, 4], np.int32), T.INT32),
+                   const(np.asarray(0.5, np.float32), T.FLOAT32), act((1, 4)), act((1, 4))]
+        ops = [(B.FILL, schema.BuiltinOptions.NONE, None, [1, 2], [3]),
+               (B.MUL, schema.BuiltinOptions.NONE, None, [0, 3], [4])]
+    elif case == "shape_reshape":
+        # TFLite Micro's FILL takes constant dims only; RESHAPE reads its shape.
+        options = schema.ShapeOptionsT()
+        options.outType = T.INT32
+        tensors = [act((1, 4)), act((2,), T.INT32), act((1, 4)), act((1, 4))]
+        ops = [(B.SHAPE, schema.BuiltinOptions.ShapeOptions, options, [0], [1]),
+               (B.RESHAPE, schema.BuiltinOptions.NONE, None, [0, 1], [2]), (*add, [0, 2], [3])]
+    else:  # broadcast_args
+        tensors = [act((4,)), const(np.asarray([1, 4], np.int32), T.INT32),
+                   const(np.asarray([4], np.int32), T.INT32), act((2,), T.INT32), act((1, 4))]
+        # TFLite Micro's BROADCAST_TO takes a constant shape; RESHAPE reads it.
+        ops = [(B.BROADCAST_ARGS, schema.BuiltinOptions.NONE, None, [1, 2], [3]),
+               (B.RESHAPE, schema.BuiltinOptions.NONE, None, [0, 3], [4])]
+    return _operators(ops, tensors, [0], [len(tensors) - 1])
+
+
 # Models no converter writes, built operator by operator.
 _RELU = schema.ActivationFunctionType.RELU
 _NONE = schema.ActivationFunctionType.NONE
@@ -622,6 +671,10 @@ HANDMADE = {
     "float_lstm": lambda: _lstm(False, 1, 3, 4, 5),
     "float_lstm_time_major_clip": lambda: _lstm(True, 2, 3, 3, 4, cell_clip=0.8),
     "lstm": lambda: _lstm(False, 1, 3, 4, 5, quantized=True),
+    "float_zeros_like": lambda: _shape_ops("zeros_like"),
+    "float_fill": lambda: _shape_ops("fill"),
+    "float_shape_reshape": lambda: _shape_ops("shape_reshape"),
+    "float_broadcast_args": lambda: _shape_ops("broadcast_args"),
     "lstm_time_major_clip": lambda: _lstm(True, 2, 3, 3, 4, cell_clip=0.8, quantized=True),
 }
 # TFLite's float SVDF and LSTM compute in another order than TFLite Micro, so
