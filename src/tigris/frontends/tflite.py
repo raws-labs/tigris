@@ -189,24 +189,48 @@ def _read(data: bytes):
             for operand, entering in zip(op.inputs[1:], branch_inputs):
                 if operand >= 0 and _is_constant(graphs[0][1][operand]):
                     branch_tensors[entering].buffer = graphs[0][1][operand].buffer
-            graphs[position] = _fold_constant_transposes(graphs[position])
-    return model, graphs
+                    branch_tensors[entering].folded = graphs[0][1][operand].folded
+    return model, [_fold_constants(graph) for graph in graphs]
 
 
-def _fold_constant_transposes(graph):
-    """A branch transposing a constant, as the converter leaves a weight it
-    passed in, reads the transposed constant instead."""
+def _constant_result(op: "_Operator", tensors) -> "np.ndarray | None":
+    """What an operator computes from static shapes and constants alone, or
+    None when it reads an activation's values."""
+    ins = [tensors[i] for i in op.inputs if i >= 0]
+    out = tensors[op.outputs[0]]
+    if op.kind == "SHAPE":
+        return np.asarray(ins[0].shape, _NUMPY[out.type])
+    if op.kind == "ZEROS_LIKE":
+        # TFLite Micro writes zero bytes, whatever the quantization.
+        return np.zeros(out.shape, _NUMPY[out.type])
+    if not ins or not all(_is_constant(t) for t in ins):
+        return None
+    if op.kind == "TRANSPOSE":
+        return ins[0].array().transpose(ins[1].array().reshape(-1))
+    if op.kind == "FILL":
+        return np.full(ins[0].array().reshape(-1), ins[1].array().reshape(-1)[0], _NUMPY[out.type])
+    if op.kind == "BROADCAST_ARGS":
+        return np.asarray(np.broadcast_shapes(*(tuple(t.array().reshape(-1)) for t in ins)),
+                          _NUMPY[out.type])
+    return None
+
+
+def _fold_constants(graph):
+    """Operators computed from static shapes and constants become constants:
+    the shape and fill operators the converter folds in a static model, and a
+    transpose of a weight it passed into a branch."""
     name, tensors, inputs, outputs, operators = graph
     kept = []
     for op in operators:
-        if (op.kind == "TRANSPOSE" and all(i >= 0 and _is_constant(tensors[i]) for i in op.inputs)
-                and op.outputs[0] not in outputs):
-            source, perm = tensors[op.inputs[0]], tensors[op.inputs[1]].array().reshape(-1)
-            result = tensors[op.outputs[0]]
-            result.folded = np.ascontiguousarray(source.array().transpose(perm)).tobytes()
-            result.buffer = 1 << 30
+        result = tensors[op.outputs[0]] if len(op.outputs) == 1 else None
+        value = (_constant_result(op, tensors)
+                 if result is not None and op.outputs[0] not in outputs and result.type in _NUMPY
+                 else None)
+        if value is None:
+            kept.append(op)
             continue
-        kept.append(op)
+        result.folded = np.ascontiguousarray(value.astype(_NUMPY[result.type])).tobytes()
+        result.buffer = 1 << 30
     return name, tensors, inputs, outputs, kept
 
 
