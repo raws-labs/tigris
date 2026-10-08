@@ -824,7 +824,10 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     if constant is None:
         return [f"constant operand {name!r} has no data"]
     reasons = []
-    if ag.is_quantized:
+    if dynamic[0].dtype == 6:
+        if str(constant.dtype) != "int32":
+            reasons.append(f"constant operand {name!r} is not int32 like its operator")
+    elif ag.is_quantized:
         quant = ag.tensors[name].quant if name in ag.tensors else None
         if str(constant.dtype) != "int8" or quant is None or quant.scale.size != 1:
             reasons.append(f"constant operand {name!r} is not per-tensor int8")
@@ -1043,6 +1046,10 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
     for s in ag.stages:
         slow_names.update(s.input_tensors)
         slow_names.update(s.output_tensors)
+        # Control flow writes every result in slow memory, read later or not.
+        for i in s.op_indices:
+            if ag.ops[i].op_type in CONTROL_FLOW:
+                slow_names.update(ag.ops[i].outputs)
     slow_names -= streamed
 
     # A stage that writes its output over its own input holds one buffer, not
@@ -1133,10 +1140,14 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     if any(t is None for t in tensors):
         return ["missing operand metadata"]
     inputs, output = tensors[:-1], tensors[-1]
-    expected = ([9, 3 if ag.is_quantized else 1, 3 if ag.is_quantized else 1] if kind == "Where"
+    # Comparisons of int32 give bool; a CAST of int32 gives float32.
+    integer = kind in _COMPARISONS | {"Cast"} and inputs[0].dtype == 6
+    expected = ([6] * len(inputs) if integer
+                else [9, 3 if ag.is_quantized else 1, 3 if ag.is_quantized else 1] if kind == "Where"
                 else [9] * len(inputs) if kind in _LOGICAL_BINARY | {"Not", "Cast"}
                 else [3 if ag.is_quantized else 1] * len(inputs))
-    out_type = 9 if kind in _COMPARISONS | _LOGICAL_BINARY | {"Not"} else 3 if ag.is_quantized else 1
+    out_type = (9 if kind in _COMPARISONS | _LOGICAL_BINARY | {"Not"} else 1 if integer
+                else 3 if ag.is_quantized else 1)
     if [t.dtype for t in inputs] != expected or output.dtype != out_type:
         return ["operand dtypes do not match the operator signature"]
     if kind == "Cast" and int(op.attrs.get("to", output.dtype)) not in {1, 3}:

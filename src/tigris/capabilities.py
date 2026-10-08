@@ -208,13 +208,13 @@ _CONSTANT_OPERAND = (
 )
 
 OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
-    **{kind: ("data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1",)
+    **{kind: ("data or int32 inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1",)
        for kind in ("Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual")},
     "And": ("bool inputs and output; broadcasting and one constant operand",),
     "Or": ("bool inputs and output; broadcasting and one constant operand",),
     "Not": ("one dynamic bool input and bool output",),
     "Where": ("bool condition and data branches; three-operand broadcasting through rank 5; at most one constant; int8 branches and output share quantization",),
-    "Cast": ("dynamic bool to float32, or to int8 quantizing 0 and 1 into the output encoding",),
+    "Cast": ("dynamic bool to float32, or to int8 quantizing 0 and 1 into the output encoding; int32 to float32",),
     "Sum": ("equal-shaped dynamic data inputs; int8 input quantization must match, with all partial sums proven within int32",),
     "Pad": (
         "constant mode with non-negative pads and a constant fill; int8 keeps its "
@@ -223,13 +223,16 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "Add": (
         f"{_BROADCAST}; {_CONSTANT_OPERAND}",
         "standalone rank-3 pointwise length tiling on serialized axis 1",
+        "int32 operands and result together, wrapping on overflow, untiled and without an activation",
     ),
     "Sub": (
         f"{_BROADCAST}; {_CONSTANT_OPERAND}",
+        "int32 operands and result together, wrapping on overflow, untiled and without an activation",
     ),
     "Mul": (
         f"{_BROADCAST}; {_CONSTANT_OPERAND}",
         "standalone rank-3 pointwise length tiling on serialized axis 1",
+        "int32 operands and result together, wrapping on overflow, untiled and without an activation",
     ),
     "AveragePool": (
         "explicit padding, floor output sizing, unit dilation, and count_include_pad=0 wherever padding is non-zero",
@@ -258,8 +261,8 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "ReduceMax": ("one axis of a rank-3 tensor; independent height or row bands; rank-4 spatial max with keepdims uses GlobalMaxPool; int8 quantization must match",),
     "ReduceMin": ("one axis of a rank-3 tensor; independent height or row bands; int8 quantization must match",),
     "ReduceAll": ("one axis of a rank-3 bool tensor; independent height or row bands",),
-    "If": ("one bool condition; branches run as their own stages; float32 operands; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS",),
-    "While": ("a condition giving one bool and a body, each run as its own stages; float32 loop variables; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS",),
+    "If": ("one bool condition; branches run as their own stages; float32 or int32 operands; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS",),
+    "While": ("a condition giving one bool and a body, each run as its own stages; float32 or int32 loop variables, each from an input or a constant (uncompressed plans); nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS",),
     "Svdf": ("state kept between runs; int8 with int16 state and time weights; untiled",),
     "DetectionPostProcess": ("SSD center-size box decoding and fast or regular non-max suppression as TFLite Micro runs them; float32 anchors; int8 or float32 encodings and scores; float32 results no operator reads; one class per detection in the fast form; untiled",),
     "Lstm": ("hidden and cell state kept between runs; every gate, no peepholes, projection or layer normalization; tanh cell activation; int8 with an int16 cell state; untiled",),

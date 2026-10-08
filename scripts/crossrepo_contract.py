@@ -1291,6 +1291,54 @@ def _nested_if_case() -> ContractCase:
                                             "Mul", "Add", "Add"))
 
 
+def _while_counter_case() -> ContractCase:
+    """A While counting i from a constant 0 to 5 in int32, adding i as a float
+    to v * 1.5 each step, against the loop unrolled."""
+    x = np.asarray([[0.5, -1.25, 2.0, 0.75]], np.float32)
+
+    def info(name, kind=TensorProto.FLOAT, dims=(1, 4)):
+        return helper.make_tensor_value_info(name, kind, list(dims))
+
+    condition = helper.make_graph(
+        [helper.make_node("Less", ["c_i", "c_five"], ["c_out"])], "condition",
+        [info("c_i", TensorProto.INT32, ()), info("c_v")], [info("c_out", TensorProto.BOOL, ())],
+        [numpy_helper.from_array(np.asarray(5, np.int32), "c_five")])
+    body = helper.make_graph(
+        [helper.make_node("Add", ["b_i", "b_one"], ["b_next"]),
+         helper.make_node("Cast", ["b_i"], ["b_f"], to=TensorProto.FLOAT),
+         # The runtime broadcasts operands of the output's rank.
+         helper.make_node("Reshape", ["b_f", "b_one_by_one"], ["b_f2"]),
+         helper.make_node("Mul", ["b_v", "b_rate"], ["b_scaled"]),
+         helper.make_node("Add", ["b_scaled", "b_f2"], ["b_out"])], "body",
+        [info("b_i", TensorProto.INT32, ()), info("b_v")],
+        [info("b_next", TensorProto.INT32, ()), info("b_out")],
+        [numpy_helper.from_array(np.asarray(1, np.int32), "b_one"),
+         numpy_helper.from_array(np.asarray([1, 1], np.int64), "b_one_by_one"),
+         numpy_helper.from_array(np.asarray(1.5, np.float32), "b_rate")])
+    compile_graph = helper.make_graph(
+        [helper.make_node("While", ["zero", "x"], ["count", "y"], domain="tigris",
+                          cond_branch=condition, body_branch=body)],
+        "while_counter", [info("x")], [info("y")],
+        [numpy_helper.from_array(np.asarray(0, np.int32), "zero")],
+        value_info=[info("count", TensorProto.INT32, ()), info("y")])
+    compile_model = helper.make_model(compile_graph, opset_imports=[
+        helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    compile_model.ir_version = 9
+    nodes, value = [], "x"
+    for step in range(5):
+        nodes += [helper.make_node("Mul", [value, "rate"], [f"scaled{step}"]),
+                  helper.make_node("Add", [f"scaled{step}", f"i{step}"],
+                                   ["y" if step == 4 else f"v{step}"])]
+        value = f"v{step}"
+    reference = _model(
+        "while_counter_reference", nodes, [info("x")], [info("y")],
+        [numpy_helper.from_array(np.asarray(1.5, np.float32), "rate"),
+         *(numpy_helper.from_array(np.asarray(float(i), np.float32), f"i{i}") for i in range(5))])
+    return ContractCase(name="while_counter", compile_model=compile_model, reference_model=reference,
+                        inputs={"x": x},
+                        expected_operators=("While", "Less", "Mul", "Cast", "Reshape", "Add", "Add"))
+
+
 def _while_case() -> ContractCase:
     """A While growing x until its sum reaches 40, against ONNX's Loop, which
     tests the first condition outside its body and each later one inside."""
@@ -7445,6 +7493,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _if_case(True),
         _if_case(False),
         _while_case(),
+        _while_counter_case(),
         _if_tiled_case(True),
         _if_tiled_case(False),
         _nested_if_case(),

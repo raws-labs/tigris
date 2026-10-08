@@ -3472,6 +3472,10 @@ def _extract_resize_scales(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+_INT32_OPERATORS = {"Add", "Sub", "Mul", "Cast", "Equal", "Less", "LessOrEqual", "Greater",
+                    "GreaterOrEqual"}
+
+
 def _mark_untileable_broadcasts(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Mark a binary operator a tile cannot carry.
 
@@ -3481,6 +3485,11 @@ def _mark_untileable_broadcasts(ag: AnalyzedGraph) -> AnalyzedGraph:
     per channel as the second operand.
     """
     for op in ag.ops:
+        # int32 arithmetic, comparisons and casts run untiled.
+        if any(name in ag.tensors and ag.tensors[name].dtype == 6
+               for name in (*op.inputs, *op.outputs)) and op.op_type in _INT32_OPERATORS:
+            op.attrs["broadcast_untileable"] = True
+            continue
         operands = stored_operands(ag, op)
         if operands is None:
             continue

@@ -156,7 +156,8 @@
     {
       "constraints": [
         "each operand has the output's shape or broadcasts to it, a tensor operand at the output's rank; tiled only when every operand is dense, a repeating constant, or one value per channel as the second operand; a constant operand, on either side, float or per-tensor int8; one per element runs untiled",
-        "standalone rank-3 pointwise length tiling on serialized axis 1"
+        "standalone rank-3 pointwise length tiling on serialized axis 1",
+        "int32 operands and result together, wrapping on overflow, untiled and without an activation"
       ],
       "opcode": 7,
       "operator": "Add",
@@ -174,7 +175,8 @@
       },
       "constraints": [
         "each operand has the output's shape or broadcasts to it, a tensor operand at the output's rank; tiled only when every operand is dense, a repeating constant, or one value per channel as the second operand; a constant operand, on either side, float or per-tensor int8; one per element runs untiled",
-        "standalone rank-3 pointwise length tiling on serialized axis 1"
+        "standalone rank-3 pointwise length tiling on serialized axis 1",
+        "int32 operands and result together, wrapping on overflow, untiled and without an activation"
       ],
       "opcode": 8,
       "operator": "Mul",
@@ -295,7 +297,8 @@
     },
     {
       "constraints": [
-        "each operand has the output's shape or broadcasts to it, a tensor operand at the output's rank; tiled only when every operand is dense, a repeating constant, or one value per channel as the second operand; a constant operand, on either side, float or per-tensor int8; one per element runs untiled"
+        "each operand has the output's shape or broadcasts to it, a tensor operand at the output's rank; tiled only when every operand is dense, a repeating constant, or one value per channel as the second operand; a constant operand, on either side, float or per-tensor int8; one per element runs untiled",
+        "int32 operands and result together, wrapping on overflow, untiled and without an activation"
       ],
       "opcode": 18,
       "operator": "Sub",
@@ -958,7 +961,7 @@
     },
     {
       "constraints": [
-        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+        "data or int32 inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
       ],
       "opcode": 73,
       "operator": "Equal",
@@ -971,7 +974,7 @@
     },
     {
       "constraints": [
-        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+        "data or int32 inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
       ],
       "opcode": 74,
       "operator": "Less",
@@ -984,7 +987,7 @@
     },
     {
       "constraints": [
-        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+        "data or int32 inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
       ],
       "opcode": 75,
       "operator": "LessOrEqual",
@@ -997,7 +1000,7 @@
     },
     {
       "constraints": [
-        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+        "data or int32 inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
       ],
       "opcode": 76,
       "operator": "Greater",
@@ -1010,7 +1013,7 @@
     },
     {
       "constraints": [
-        "data inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
+        "data or int32 inputs, bool output; broadcasting and one constant operand; int8 input scales strictly between 0 and 1"
       ],
       "opcode": 77,
       "operator": "GreaterOrEqual",
@@ -1075,7 +1078,7 @@
     },
     {
       "constraints": [
-        "dynamic bool to float32, or to int8 quantizing 0 and 1 into the output encoding"
+        "dynamic bool to float32, or to int8 quantizing 0 and 1 into the output encoding; int32 to float32"
       ],
       "opcode": 82,
       "operator": "Cast",
@@ -1140,7 +1143,7 @@
     },
     {
       "constraints": [
-        "one bool condition; branches run as their own stages; float32 operands; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
+        "one bool condition; branches run as their own stages; float32 or int32 operands; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
       ],
       "opcode": 87,
       "operator": "If",
@@ -1153,7 +1156,7 @@
     },
     {
       "constraints": [
-        "a condition giving one bool and a body, each run as its own stages; float32 loop variables; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
+        "a condition giving one bool and a body, each run as its own stages; float32 or int32 loop variables, each from an input or a constant (uncompressed plans); nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
       ],
       "opcode": 88,
       "operator": "While",
