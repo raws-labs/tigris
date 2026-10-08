@@ -1109,6 +1109,18 @@ def test_auxiliary_dtype_placement_and_operator_slots(monkeypatch):
     assert check_dtype_signatures([("p", 9, False, True)], [], ["p"], ["p"])[1]
 
 
+def test_int32_operands_of_an_operator_go_together():
+    from tigris.dtypes import check_dtype_signatures
+    tensors = [("i", 6, False, False), ("one", 6, True, False), ("j", 6, False, False),
+               ("x", 1, False, False), ("y", 1, False, False)]
+    data, issues = check_dtype_signatures(tensors, [("Add", ["i", "one"], ["j"])], ["i"], ["j"])
+    assert not issues and data == {1: ["x", "y"]}
+    _, issues = check_dtype_signatures(tensors, [("Add", ["i", "x"], ["y"])], ["i", "x"], ["y"])
+    assert any("mixes int32" in issue for issue in issues)
+    _, issues = check_dtype_signatures(tensors, [("Relu", ["i"], ["j"])], ["i"], ["j"])
+    assert issues
+
+
 def test_float32_results_stand_apart_from_int8_data():
     """Detections are float32 in an int8 plan, and no operator reads them."""
     from tigris.dtypes import check_dtype_signatures

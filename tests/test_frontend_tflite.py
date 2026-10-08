@@ -418,12 +418,36 @@ def test_state_inside_an_if_branch_is_refused(monkeypatch):
     assert any("state inside a subgraph" in r for r in tflite.unsupported(data))
 
 
-def test_a_while_counting_in_int32_is_refused(monkeypatch):
-    """A loop counter needs int32 arithmetic, which the runtime does not have."""
-    def count(tensors, operators):
-        tensors[operators[0].inputs[0]].type = "INT32"
-    reasons = _read_edited(monkeypatch, "float_while", count)
-    assert any("int32 loop variables" in r for r in reasons)
+def _counter_reasons(monkeypatch, edit):
+    """float_while_counter's reasons after `edit(graphs)`; graph 2 is its body."""
+    data = (FIXTURES / "ops" / "float_while_counter.tflite").read_bytes()
+    model, graphs = tflite._read(data)
+    edit(graphs)
+    monkeypatch.setattr(tflite, "_read", lambda _: (model, graphs))
+    return tflite.unsupported(data)
+
+
+def _body_op(graphs, kind):
+    return next(op for op in graphs[2][4] if op.kind == kind and graphs[2][1][op.inputs[0]].type == "INT32")
+
+
+@pytest.mark.parametrize(("edit", "reason"), [
+    (lambda g: setattr(g[2][1][_body_op(g, "ADD").inputs[1]], "type", "FLOAT32"),
+     "int32 mixed with other operands"),
+    (lambda g: setattr(g[2][1][_body_op(g, "CAST").outputs[0]], "type", "INT8"),
+     "int32 cast to other than float32"),
+    (lambda g: setattr(g[0][1][g[0][4][0].inputs[0]], "type", "INT16"),
+     "loop variables other than float32 or int32"),
+])
+def test_int32_computation_tflite_micro_runs_differently_is_refused(monkeypatch, edit, reason):
+    assert any(reason in r for r in _counter_reasons(monkeypatch, edit))
+
+
+def test_a_loop_starting_from_a_constant_does_not_compress(tmp_path):
+    result = CliRunner().invoke(cli, ["compile", str(FIXTURES / "ops" / "float_while_counter.tflite"),
+                                      "-m", "256K", "-c", "lz4", "-o", str(tmp_path / "m.tgrs")])
+    assert result.exit_code != 0
+    assert "a loop starting from a constant does not compress" in result.output
 
 
 def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():

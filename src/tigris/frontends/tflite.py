@@ -267,7 +267,8 @@ def unsupported(data: bytes) -> list[str]:
                 reasons.append(f"model boundary {tensors[index].name!r} is {tensors[index].type}")
         for index in sorted(indices | index_inputs):
             uses = [op for op in operators if index in op.inputs]
-            if any(op.kind not in _INDEX_SLOTS or op.inputs[_INDEX_SLOTS[op.kind]] != index
+            if any((op.kind not in _INDEX_SLOTS or op.inputs[_INDEX_SLOTS[op.kind]] != index)
+                   and not (index in index_inputs and _integer_use(op))
                    for op in uses):
                 reasons.append(f"index {tensors[index].name!r} feeds an operand other than indices")
         held = {op.inputs[slot] for op in operators if op.kind in _STATEFUL
@@ -336,9 +337,12 @@ def _branch_reasons(graph, role: str = "branch") -> list[str]:
             reasons.append("a condition other than one bool")
         outputs = []
     for index in [*inputs, *outputs]:
-        if tensors[index].type != "FLOAT32" and not _is_constant(tensors[index]):
-            reasons.append(f"subgraph boundary {tensors[index].name!r} other than float32")
+        if tensors[index].type not in ("FLOAT32", "INT32") and not _is_constant(tensors[index]):
+            reasons.append(f"subgraph boundary {tensors[index].name!r} other than float32 or int32")
     return reasons
+
+
+_BOUNDARY_TYPES = {"FLOAT32": TensorProto.FLOAT, "BOOL": TensorProto.BOOL, "INT32": TensorProto.INT32}
 
 
 def _branch_graph(graphs, position: int, name: str) -> onnx.GraphProto:
@@ -355,7 +359,7 @@ def _branch_graph(graphs, position: int, name: str) -> onnx.GraphProto:
             continue
         input_name = b.unique(f"{name}_in{position}")
         graph_inputs.append(helper.make_tensor_value_info(
-            input_name, TensorProto.FLOAT, _onnx_shape(tensors[index].shape)))
+            input_name, _BOUNDARY_TYPES[tensors[index].type], _onnx_shape(tensors[index].shape)))
         converter.values[index] = input_name
     for op in operators:
         converter.convert(op)
@@ -363,8 +367,7 @@ def _branch_graph(graphs, position: int, name: str) -> onnx.GraphProto:
     for position, index in enumerate(outputs):
         result = b.node("Identity", [converter.value(index)], f"{name}_out{position}")
         graph_outputs.append(helper.make_tensor_value_info(
-            result, TensorProto.BOOL if tensors[index].type == "BOOL" else TensorProto.FLOAT,
-            _onnx_shape(tensors[index].shape)))
+            result, _BOUNDARY_TYPES[tensors[index].type], _onnx_shape(tensors[index].shape)))
     return helper.make_graph(b.nodes, name, graph_inputs, graph_outputs, b.initializers,
                              value_info=converter.value_info)
 
@@ -500,16 +503,18 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     if op.kind == "IF":
         if ins[0].type != "BOOL" or int(np.prod(ins[0].shape)) != 1:
             return "a condition other than one bool"
-        if any(t.type != "FLOAT32" for t in [*(t for t in ins[1:] if not _is_constant(t)), *outs]):
-            return "operands other than float32"
+        if any(t.type not in ("FLOAT32", "INT32")
+               for t in [*(t for t in ins[1:] if not _is_constant(t)), *outs]):
+            return "operands other than float32 or int32"
         return ""
     if op.kind == "WHILE":
-        if any(t.type == "INT32" for t in ins):
-            # A loop counter needs int32 arithmetic the runtime does not have.
-            return "int32 loop variables"
-        if any(t.type != "FLOAT32" for t in [*ins, *outs]):
-            return "loop variables other than float32"
+        if any(t.type not in ("FLOAT32", "INT32") for t in [*ins, *outs]):
+            return "loop variables other than float32 or int32"
         return ""
+    if any(t is not None and t.type == "INT32" for t in [*ins, *outs]):
+        reason = _int32_reason(op, ins, outs)
+        if reason is not None:
+            return reason
     if op.kind == "SVDF":
         return _svdf_reason(op, ins, outs)
     if op.kind == "UNIDIRECTIONAL_SEQUENCE_LSTM":
@@ -594,6 +599,31 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         if align and half_pixel:
             return "align_corners and half_pixel_centers together"
     return ""
+
+
+def _integer_use(op: _Operator) -> bool:
+    """Operators that take an int32 model input as a value."""
+    return op.kind in ("ADD", "SUB", "MUL", "CAST", "IF", "WHILE", *_COMPARISONS)
+
+
+def _int32_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    """Why an int32 computation does not convert, "" when it does, None when
+    the operator takes int32 only as indices or axes."""
+    if op.kind in ("ADD", "SUB", "MUL"):
+        if any(t.type != "INT32" for t in [*ins, *outs]):
+            return "int32 mixed with other operands"
+        if _activation(op.option(_FUSED_SLOT[op.kind], "b")) != "none":
+            return "a fused activation on int32"
+        if all(_is_constant(t) for t in ins):
+            return "only constant operands"
+        return ""
+    if op.kind in _COMPARISONS:
+        if any(t.type != "INT32" for t in ins):
+            return "int32 compared with another dtype"
+        return ""
+    if op.kind == "CAST":
+        return "" if outs[0].type == "FLOAT32" else "int32 cast to other than float32"
+    return None
 
 
 def _same_quantization(tensors) -> bool:
@@ -876,7 +906,7 @@ class _Converter:
         # A scalar has no axis to quantize along.
         axis = _onnx_axis(tensor.quantized_dimension + rank - len(tensor.shape), rank) if rank else 0
         array = array.transpose(_to_first(rank))
-        if tensor.type in ("FLOAT32", "BOOL"):
+        if tensor.type in ("FLOAT32", "BOOL", "INT32"):
             return self.b.constant(array, tensor.name)
         return self.b.dequantized_constant(array, tensor.scale, tensor.zero_point, tensor.name,
                                            axis=axis)
@@ -932,7 +962,7 @@ class _Converter:
         """`source` requantized as tensor `index` is, so a data-movement step
         between two operators stays in int8."""
         tensor = self.tensors[index]
-        if tensor.type in ("FLOAT32", "BOOL"):
+        if tensor.type in ("FLOAT32", "BOOL", "INT32"):
             return source
         return self.b.requantized(source, float(tensor.scale[0]), int(tensor.zero_point[0]), name)
 
@@ -946,7 +976,7 @@ class _Converter:
             self.values[index] = (b.node("DequantizeLinear", [quantized, scale, zero],
                                          tensor.name + "_float")
                                   if index in self.consumed else quantized)
-        elif tensor.type in ("FLOAT32", "BOOL"):
+        elif tensor.type in ("FLOAT32", "BOOL", "INT32"):
             self.values[index] = self.b.node("Identity", [source], tensor.name)
         else:
             self.values[index] = self.b.requantized(source, float(tensor.scale[0]),
@@ -1481,7 +1511,7 @@ class _Converter:
             kind, [self.value(i) for i in operands], results, domain="tigris", **graphs))
         for index, name in zip(op.outputs, results):
             self.value_info.append(helper.make_tensor_value_info(
-                name, TensorProto.FLOAT, _onnx_shape(self.tensors[index].shape)))
+                name, _BOUNDARY_TYPES[self.tensors[index].type], _onnx_shape(self.tensors[index].shape)))
             self.finish(name, index)
 
     def _lstm(self, op: _Operator, tag: str) -> str:

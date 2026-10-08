@@ -9,6 +9,10 @@ DATA = 0
 DATA_OR_BOOL = 255
 # Data, or int16 on a tensor that holds state between runs.
 STATE = 254
+# Data, or int32 counters and indices; an operator's int32 slots go together.
+DATA_OR_INT32 = 253
+# Bool, or int32 a CAST turns into data.
+BOOL_OR_INT32 = 252
 
 
 @dataclass(frozen=True)
@@ -34,25 +38,24 @@ OP_DTYPE_SIGNATURES.update({
     "DynamicUpdateSlice": DTypeSignature(inputs=(DATA, DATA, 6)),
     "ArgMax": DTypeSignature(outputs=(6,)),
     "ArgMin": DTypeSignature(outputs=(6,)),
-    "Equal": DTypeSignature(outputs=(9,)),
-    "Less": DTypeSignature(outputs=(9,)),
-    "LessOrEqual": DTypeSignature(outputs=(9,)),
-    "Greater": DTypeSignature(outputs=(9,)),
-    "GreaterOrEqual": DTypeSignature(outputs=(9,)),
+    **{kind: DTypeSignature(inputs=(DATA_OR_INT32,) * 3, outputs=(9,))
+       for kind in ("Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual")},
+    **{kind: DTypeSignature(inputs=(DATA_OR_INT32,) * 3, outputs=(DATA_OR_INT32,))
+       for kind in ("Add", "Sub", "Mul")},
     "And": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
     "Or": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
     "Not": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
     "Where": DTypeSignature(inputs=(9, DATA, DATA)),
-    "Cast": DTypeSignature(inputs=(9, 9, 9)),
+    "Cast": DTypeSignature(inputs=(BOOL_OR_INT32,) * 3),
     "ReduceAll": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
     # Constant operands sit between the input and the state; slots skip them.
     # The output role admits int16 only on the next state, a state tensor.
     "Svdf": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     "Lstm": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
-    "If": DTypeSignature(inputs=(9, DATA, DATA)),
+    "If": DTypeSignature(inputs=(9, DATA_OR_INT32, DATA_OR_INT32), outputs=(DATA_OR_INT32,)),
     # Float32 results in a float32 or an int8 plan, which no operator reads.
     "DetectionPostProcess": DTypeSignature(outputs=(1,)),
-    "While": DTypeSignature(),
+    "While": DTypeSignature(inputs=(DATA_OR_INT32,) * 3, outputs=(DATA_OR_INT32,)),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
 })
@@ -110,6 +113,16 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
                         issues.append(f"{kind} {direction} {position} ({name}) requires data "
                                       f"or int16 state, got ONNX dtype {dtype}")
                     continue
+                if expected == DATA_OR_INT32:
+                    if dtype not in {1, 3, 6}:
+                        issues.append(f"{kind} {direction} {position} ({name}) requires data or "
+                                      f"int32, got ONNX dtype {dtype}")
+                    continue
+                if expected == BOOL_OR_INT32:
+                    if dtype not in {6, 9}:
+                        issues.append(f"{kind} {direction} {position} ({name}) requires bool or "
+                                      f"int32, got ONNX dtype {dtype}")
+                    continue
                 if expected == DATA_OR_BOOL:
                     if dtype not in {1, 3, 9} or dtype != by_name[inputs[0]][0]:
                         issues.append(f"{kind} must preserve its data or bool dtype")
@@ -117,4 +130,10 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
                 if (expected == DATA and dtype not in {1, 3}) or (expected != DATA and dtype != expected):
                     label = "data (float32 or int8)" if expected == DATA else f"ONNX dtype {expected}"
                     issues.append(f"{kind} {direction} {position} ({name}) requires {label}, got ONNX dtype {dtype}")
+        # An operator computing on int32 does so on all its operands.
+        if kind in ("Add", "Sub", "Mul", "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"):
+            slots = [n for n in (*inputs, *(outputs if kind in ("Add", "Sub", "Mul") else ()))
+                     if n in by_name and not by_name[n][1]]
+            if len({by_name[n][0] == 6 for n in slots}) > 1:
+                issues.append(f"{kind} mixes int32 with other operands")
     return data, tuple(issues)

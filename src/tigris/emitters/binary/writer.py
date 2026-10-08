@@ -564,6 +564,10 @@ def _build_weights_compressed(
 
     if not ag.weight_data:
         return b"", b"", {}
+    if any(op.op_type == "While" and any(name in ag.weight_data for name in op.inputs)
+           for op in ag.ops):
+        # A control-flow stage reads its constants as stored.
+        raise ValueError("a loop starting from a constant does not compress")
 
     weight_op_map = _build_weight_op_map(ag)
     fc_layout_shapes = _build_fc_layout_permutations(ag)
@@ -910,7 +914,7 @@ def _constant_operand_payload(
         if name not in quant_idx_map:
             raise ValueError(f"constant operand {name!r} of {op.name!r} has no quantization")
         index = quant_idx_map[name]
-    elif op.op_type in ("Add", "Mul") and position == 1 and by_length:
+    elif op.op_type in ("Add", "Mul") and position == 1 and by_length and output.dtype == 1:
         return None
     else:
         index = NO_QUANT_PARAM
@@ -986,6 +990,12 @@ def _build_op_attributes(
         if op.op_type in _MANY_CONSTANTS:
             indices = [(weight_idx or {}).get(name, NO_WEIGHT) for name in op.inputs
                        if name not in tensor_idx]
+            records.append((op_index, OP_ATTR_CONSTANTS, struct.pack(f"<{len(indices)}H", *indices)))
+        elif op.op_type == "While" and any(name not in tensor_idx for name in op.inputs):
+            # Per loop variable, the constant it starts from, or none where
+            # the next input supplies it.
+            indices = [(weight_idx or {}).get(name, NO_WEIGHT) if name not in tensor_idx
+                       else NO_WEIGHT for name in op.inputs]
             records.append((op_index, OP_ATTR_CONSTANTS, struct.pack(f"<{len(indices)}H", *indices)))
         if op.op_type == "Svdf":
             records.append((op_index, OP_ATTR_SVDF, _svdf_payload(ag, op)))
@@ -1212,7 +1222,7 @@ def _build_ops(
         spatial = _pack_spatial_attrs(op, ag.weight_data)
 
         # Resolve weight/bias indices from op's constant inputs
-        w_idx, b_idx = ((NO_WEIGHT, NO_WEIGHT) if op.op_type in _MANY_CONSTANTS
+        w_idx, b_idx = ((NO_WEIGHT, NO_WEIGHT) if op.op_type in _MANY_CONSTANTS | {"While"}
                         else _resolve_weight_bias(op, weight_idx))
 
         # Determine fused activation

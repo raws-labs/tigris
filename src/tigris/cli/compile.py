@@ -49,7 +49,10 @@ def _run_compressed_pipeline(
             input_shapes=input_shapes,
             report_bindings=False,
         )
-        required = compressed_weight_reserve_bytes(ag)
+        try:
+            required = compressed_weight_reserve_bytes(ag)
+        except ValueError as exc:
+            raise click.ClickException(f"Cannot compress the plan: {exc}") from exc
         if required <= reserve:
             # ``mem_budget`` is already the reduced activation capacity.  The
             # writer uses this marker to avoid subtracting the same reserve a
@@ -134,7 +137,10 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
 
     out = Path(output) if output else Path(model).with_suffix(".tgrs")
     with console.status("Writing binary plan..."):
-        plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip)
+        try:
+            plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip)
+        except ValueError as exc:
+            raise click.ClickException(f"Cannot write the plan: {exc}") from exc
         if ag.budget.flash > 0 and len(plan_data) > ag.budget.flash:
             raise click.ClickException(
                 f"Cannot compile a plan that exceeds the flash budget: "
