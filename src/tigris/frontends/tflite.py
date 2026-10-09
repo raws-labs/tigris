@@ -261,6 +261,9 @@ def unsupported(data: bytes) -> list[str]:
         indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
         slots = {op.inputs[_INDEX_SLOTS[op.kind]] for op in operators if op.kind in _INDEX_SLOTS}
         index_inputs = {i for i in inputs if tensors[i].type == "INT32"}
+        # int32 arithmetic results are values a run computes, usable as indices.
+        computed = {op.outputs[0] for op in operators
+                    if op.kind in ("ADD", "SUB", "MUL") and tensors[op.outputs[0]].type == "INT32"}
         for index in list(inputs) + list(outputs):
             if (tensors[index].type not in ("INT8", "FLOAT32", "BOOL") and index not in indices
                     and index not in index_inputs):
@@ -268,7 +271,7 @@ def unsupported(data: bytes) -> list[str]:
         for index in sorted(indices | index_inputs):
             uses = [op for op in operators if index in op.inputs]
             if any((op.kind not in _INDEX_SLOTS or op.inputs[_INDEX_SLOTS[op.kind]] != index)
-                   and not (index in index_inputs and _integer_use(op))
+                   and not _integer_use(op)
                    for op in uses):
                 reasons.append(f"index {tensors[index].name!r} feeds an operand other than indices")
         held = {op.inputs[slot] for op in operators if op.kind in _STATEFUL
@@ -284,10 +287,10 @@ def unsupported(data: bytes) -> list[str]:
         for index in sorted(held):
             if not tensors[index].variable:
                 reasons.append(f"state {tensors[index].name!r} is not a variable tensor")
-        for index in sorted(slots - indices - index_inputs):
+        for index in sorted(slots - indices - index_inputs - computed):
             if not _is_constant(tensors[index]):
                 reasons.append(f"indices {tensors[index].name!r} are computed by an operator "
-                               "other than ARG_MAX or ARG_MIN")
+                               "other than ARG_MAX, ARG_MIN or int32 arithmetic")
         grouped: dict[str, list[_Operator]] = {}
         for op in operators:
             reason = _operator_reason(op, tensors)

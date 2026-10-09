@@ -1041,12 +1041,15 @@ def _build_op_attributes(
                 struct.pack("<f", float(op.attrs.get("epsilon", 1e-6 if op.op_type == "L2Normalization" else 1e-5))),
             ))
             continue
-        if op.op_type in {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"} and ag.is_quantized:
+        # int32 operands compare and add as integers, without requantization.
+        integer = any(ag.tensors[n].dtype == 6 for n in op.inputs if n in ag.tensors)
+        if (op.op_type in {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"}
+                and ag.is_quantized and not integer):
             pairs = [_compute_multiplier_shift(float(ag.tensors[n].quant.scale[0])) for n in op.inputs]
             pairs = [(0, 0) if shift < -31 else (value, shift) for value, shift in pairs]
             records.append((op_index, OP_ATTR_COMPARISON_REQUANT,
                             struct.pack("<5i", 8, *(v for pair in pairs for v in pair))))
-        if op.op_type in ("Add", "Sub"):
+        if op.op_type in ("Add", "Sub") and not integer:
             payload = _binary_requant_payload(ag, op)
             if payload is not None:
                 records.append((op_index, OP_ATTR_BINARY_REQUANT, payload))

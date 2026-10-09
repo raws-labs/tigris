@@ -301,7 +301,7 @@ def test_run_time_indices_come_from_a_model_input_or_an_arg_max(monkeypatch):
         gather.inputs = [gather.inputs[1], gather.inputs[0]]
     reasons = _read_edited(monkeypatch, "float_arg_max_gather", swap)
     assert any("feeds an operand other than indices" in r for r in reasons)
-    assert any("other than ARG_MAX or ARG_MIN" in r for r in reasons)
+    assert any("other than ARG_MAX, ARG_MIN or int32 arithmetic" in r for r in reasons)
 
 
 def test_int64_run_time_indices_are_refused(monkeypatch):

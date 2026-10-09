@@ -383,6 +383,14 @@ _LSTM = tf.keras.layers.LSTM(4, return_sequences=True, unroll=True,
                              bias_initializer="ones")
 _LSTM.build((1, 3, 2))
 INDEXING["lstm_unrolled"] = _unary(_LSTM, (1, 3, 2))
+# int32 arithmetic beside int8 data: indices offset at run time, and an int32
+# comparison choosing between two int8 tensors.
+INDEXING.update({
+    "gather_index_arithmetic": ([(6, 4), (3,)], lambda x, i: tf.gather(x, i * 2 - 1)),
+    "select_int32_condition": ([_MAP, (1, 1, 1, 1)], lambda x, k: tf.where(
+        k > 2, x, tf.reverse(x, [2]))),
+})
+INDEX_INPUTS.update({"gather_index_arithmetic": {1: (1, 4)}, "select_int32_condition": {1: (0, 6)}})
 # Weighted operators with a non-zero bias, which TFLite adds after the sum.
 INDEXING.update({
     "conv_bias": _unary(lambda x: tf.nn.conv2d(x, _weights(5, 3, 3, 4, 6), 1, "SAME")
