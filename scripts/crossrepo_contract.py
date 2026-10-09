@@ -89,6 +89,7 @@ class ContractCase:
     # whose result depends on the host CPU.
     reference_unoptimized: bool = False
     exact_untiled: bool = False
+    tiled_operators: tuple[str, ...] = ()
 
 
 def _model(
@@ -1456,8 +1457,8 @@ def _while_case() -> ContractCase:
 
 
 def _runtime_index_case(kind: str, quantized: bool, variant: int = 0, arg: str | None = None,
-                        cast: bool = False) -> ContractCase:
-    case = _movement_case(kind, quantized, variant)
+                        cast: bool = False, tiled: bool = False) -> ContractCase:
+    case = _movement_case(kind, quantized, variant, tiled=tiled)
     name = "starts" if kind == "DynamicUpdateSlice" else "indices"
     original = next(t for t in case.compile_model.graph.initializer if t.name == name)
     values = numpy_helper.to_array(original).copy()
@@ -1491,8 +1492,13 @@ def _runtime_index_case(kind: str, quantized: bool, variant: int = 0, arg: str |
             # ScatterND positions are computed from the same run-time starts.
             positions = next(t for t in graph.initializer if t.name == "positions")
             graph.initializer.remove(positions)
-            for key, value in (("start_min", [0, 0, 0]), ("start_max", [1, 1, 2]),
-                               ("update_coords", list(np.ndindex((1, 2, 2))))):
+            update = case.inputs.get("update")
+            if update is None:
+                update = numpy_helper.to_array(next(t for t in graph.initializer if t.name == "update"))
+            update_shape = update.shape
+            limits = np.array(case.inputs["input"].shape) - update_shape
+            for key, value in (("start_min", [0, 0, 0]), ("start_max", limits),
+                               ("update_coords", list(np.ndindex(update_shape)))):
                 graph.initializer.append(numpy_helper.from_array(np.array(value, np.int64), key))
             prefix = [helper.make_node("Max", [name, "start_min"], ["positive_starts"]),
                       helper.make_node("Min", ["positive_starts", "start_max"], ["clamped_starts"]),
@@ -7051,8 +7057,9 @@ def _run_case(
         actual_outputs, reference_outputs, _output_scales(plan)
     )
     if case.exact_untiled:
-        assert plan["version"] == 9
-        banded_types = {OP_TYPE_MAP[k] for k in case.expected_operators if k != "Transpose"}
+        expected_schema = 10 if any(k in {"Svdf", "Lstm"} for k in case.expected_operators) else 9
+        assert plan["version"] == expected_schema
+        banded_types = {OP_TYPE_MAP[k] for k in (case.tiled_operators or case.expected_operators) if k != "Transpose"}
         banded_stages = [stage for stage in plan["stages"] if any(
             plan["ops"][i]["op_type"] in banded_types for i in stage["ops"])]
         assert banded_stages and all(stage["tile_plan_idx"] != 65535 and
@@ -7061,7 +7068,7 @@ def _run_case(
         untiled = _compile_plan(compile_path, untiled_path, mem_budget="64K", slow_budget="16K",
                                 compression=None, xip=False)
         assert not any(tile["tileable"] for tile in untiled["tile_plans"])
-        assert untiled["version"] == 9
+        assert untiled["version"] == expected_schema
         untiled_outputs = case_dir / "untiled.bin"
         _run([str(runner), str(untiled_path), str(inputs_path), str(untiled_outputs),
               str(untiled["_compiler_scheduled_peak"])], f"{case.name} untiled execution")
@@ -7576,6 +7583,26 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases.append(_reduce_all_case(2, True, tiled=True, leading=True))
     cases.extend(_leading_index_case(kind, q)
                  for q in (False, True) for kind in ("GatherND", "EmbeddingLookup"))
+    tight_cases = [
+        _svdf_case(), _lstm_case(),
+        _channel_split_case(quantized=True),
+        _inner_axis_concat_case(axis=2, quantized=True),
+        _inner_axis_concat_case(axis=3, quantized=True),
+        _standalone_pad_case(quantized=True),
+        _broadcast_case(op_type="Add", quantized=True, other_shape=[1, 4, 12, 1], first=False),
+        _broadcast_case(op_type="Sub", quantized=True, other_shape=[1, 4, 1, 12], first=True),
+        _broadcast_case(op_type="Add", quantized=True, other_shape=[1, 4, 12, 12], first=False, constant=True),
+    ]
+    cases.extend(replace(case, name=case.name + "_bands", mem_budget="256",
+                         slow_budget="64K", expect_tiled=True, exact_untiled=True,
+                         tiled_operators=tuple(k for k in case.expected_operators if k not in {"Conv", "Mul", "Transpose"}))
+                 for case in tight_cases)
+    cases.extend(_arg_case(kind, 2, q, False, tiled=True, leading=True)
+                 for q in (False, True) for kind in ("ArgMax", "ArgMin"))
+    cases.extend(replace(_runtime_index_case(kind, q, variant=2 if kind == "Gather" else 0,
+                                            tiled=True), exact_untiled=True,
+                         tiled_operators=(kind,))
+                 for q in (False, True) for kind in ("Gather", "GatherND", "DynamicUpdateSlice"))
     covered_operators = {
         operator for case in cases for operator in case.expected_operators
     }

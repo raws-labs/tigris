@@ -808,8 +808,8 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
 
     The plan holds the constant as the operator's weight, aligned to the
     output's rank in its layout, and names its side, its quantization for
-    int8, and its shape where the length alone does not say it. One per
-    element carries no row offset, so it runs only untiled.
+    int8, and its shape where the length alone does not say it. Dense constants
+    need an independent band with a global origin to run tiled.
     """
     constants = [name for name in op.inputs if _is_constant_operand(ag, name)]
     dynamic = [ag.tensors.get(name) for name in op.inputs
@@ -850,7 +850,9 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
         if stage is not None and (
                 stage.chain_id != 0xFFFF
                 or (stage.tile_plan is not None and stage.tile_plan.tileable)):
-            reasons.append(f"constant operand {name!r} cannot be offset for tiled execution")
+            from .partition_spatial import _independent_mode
+            if len(stage.op_indices) != 1 or stage.chain_id != 0xFFFF or not _independent_mode(ag, op):
+                reasons.append(f"constant operand {name!r} cannot be offset for tiled execution")
     return reasons
 
 
