@@ -212,6 +212,11 @@ def _constant_result(op: "_Operator", tensors) -> "np.ndarray | None":
         return None
     if op.kind == "TRANSPOSE":
         return ins[0].array().transpose(ins[1].array().reshape(-1))
+    if op.kind == "QUANTIZE" and ins[0].type == "FLOAT32" and out.type == "INT8" and len(out.scale) == 1:
+        # TFLite Micro's QUANTIZE: a float32 division, rounded half away from zero.
+        ratio = (ins[0].array() / np.float32(out.scale[0])).astype(np.float32).astype(np.float64)
+        rounded = np.sign(ratio) * np.floor(np.abs(ratio) + 0.5)
+        return np.clip(rounded + int(out.zero_point[0]), -128, 127).astype(np.int8)
     if op.kind == "FILL":
         return np.full(ins[0].array().reshape(-1), ins[1].array().reshape(-1)[0], _NUMPY[out.type])
     if op.kind == "BROADCAST_ARGS":
@@ -348,6 +353,12 @@ def _branch_reasons(graph, role: str = "branch") -> list[str]:
 _BOUNDARY_TYPES = {"FLOAT32": TensorProto.FLOAT, "BOOL": TensorProto.BOOL, "INT32": TensorProto.INT32}
 
 
+def _control_flow_tensors(operators) -> set[int]:
+    """The operands and results of IF and WHILE operators."""
+    return {i for op in operators if op.kind in ("IF", "WHILE") for i in (*op.inputs, *op.outputs)
+            if i >= 0}
+
+
 def _branch_graph(graphs, position: int, name: str) -> onnx.GraphProto:
     """One subgraph as an ONNX graph whose inputs are the operands it receives
     and whose outputs are its results, each held by an operator of it."""
@@ -355,6 +366,7 @@ def _branch_graph(graphs, position: int, name: str) -> onnx.GraphProto:
     consumed = {i for op in operators for i in op.inputs}
     converter = _Converter(tensors, (), consumed)
     converter.graphs = graphs
+    converter.float_boundary = {*inputs, *outputs, *_control_flow_tensors(operators)}
     b = converter.b
     graph_inputs = []
     for position, index in enumerate(inputs):
@@ -534,7 +546,10 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
             if bias is not None and bias.type != "FLOAT32":
                 return "bias of a float32 operator must be float32"
         else:
-            if weights.type != "INT8" or np.any(weights.zero_point != 0) or not _is_constant(weights):
+            # TFLite's int8 convolutions ignore the filter zero point, which the
+            # converter's own QUANTIZE of a weight can leave nonzero.
+            symmetric = op.kind in ("CONV_2D", "DEPTHWISE_CONV_2D") or not np.any(weights.zero_point != 0)
+            if weights.type != "INT8" or not symmetric or not _is_constant(weights):
                 return "weights must be constant symmetric int8"
             if bias is not None and bias.type != "INT32":
                 return "bias must be int32"
@@ -897,6 +912,10 @@ class _Converter:
         # Per variable tensor, its state input and the value written for the next run.
         self.held_state: dict[int, dict] = {}
         self.detection_operands: set[int] = set()
+        # Tensors crossing a control-flow boundary, which an int8 model keeps in
+        # float32: control-flow operands and results, a subgraph's own inputs
+        # and outputs. A QUANTIZE or DEQUANTIZE there stays an operator.
+        self.float_boundary: set[int] = set()
 
     def value(self, index: int, rank: int | None = None) -> str:
         """The ONNX value of a tensor; a constant is broadcast-aligned to `rank`."""
@@ -1027,6 +1046,13 @@ class _Converter:
             return
         if kind in ("IF", "WHILE"):
             self._control_flow(op, tag)
+            return
+        if kind in ("QUANTIZE", "DEQUANTIZE") and (
+                (ins[0] if kind == "QUANTIZE" else outs[0]) in self.float_boundary
+                and self.tensors[ins[0] if kind == "DEQUANTIZE" else outs[0]].type == "INT8"):
+            y = self.custom("Quantize" if kind == "QUANTIZE" else "Dequantize", [self.value(ins[0])],
+                            tag, _onnx_shape(out.shape))
+            self.finish(y, outs[0])
             return
         if kind == "DEQUANTIZE" and outs[0] in self.detection_operands:
             # The detection operator reads the int8 tensor through its quantization.
@@ -1733,6 +1759,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     consumed = {i for op in operators for i in op.inputs}
     converter = _Converter(tensors, outputs, consumed)
     converter.graphs = graphs
+    converter.float_boundary = _control_flow_tensors(operators)
     # Dequantized tensors only a detection operator reads.
     readers = {}
     for op in operators:

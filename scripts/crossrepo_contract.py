@@ -1291,6 +1291,66 @@ def _nested_if_case() -> ContractCase:
                                             "Mul", "Add", "Add"))
 
 
+def _int8_if_case(take_then: bool) -> ContractCase:
+    """An int8 If whose operand and result cross the boundary in float32, as
+    the TFLite converter writes it: Dequantize before, Quantize after, each
+    branch requantizing its input in its own encoding."""
+    rng = np.random.default_rng(90)
+    data = rng.integers(-128, 128, (1, 4, 4, 2)).astype(np.int8)
+    shape = [1, 2, 4, 4]
+
+    def info(name, kind=TensorProto.FLOAT, dims=shape):
+        return helper.make_tensor_value_info(name, kind, dims)
+
+    def branch(name, scale, zero, relu, tigris):
+        entering = (helper.make_node("Quantize", [f"{name}_x"], [f"{name}_q"], domain="tigris") if tigris
+                    else helper.make_node("Identity", [f"{name}_x"], [f"{name}_q"]))
+        nodes = [entering, *_qdq(f"{name}_q", f"{name}_s", f"{name}_z", f"{name}_v")]
+        last = f"{name}_v"
+        if relu:
+            nodes += [helper.make_node("Relu", [last], [f"{name}_r"]),
+                      *_qdq(f"{name}_r", f"{name}_s", f"{name}_z", f"{name}_rq")]
+            last = f"{name}_rq"
+        nodes.append(helper.make_node("Dequantize", [last], [f"{name}_y"], domain="tigris") if tigris
+                     else helper.make_node("Identity", [last], [f"{name}_y"]))
+        return helper.make_graph(nodes, name, [info(f"{name}_x")], [info(f"{name}_y")],
+                                 _scalars(**{name: (scale, zero)}),
+                                 value_info=[info(f"{name}_q"), info(f"{name}_y")] if tigris else [])
+
+    def model(tigris):
+        domain = {"domain": "tigris"} if tigris else {}
+        nodes = [helper.make_node("DequantizeLinear", ["image", "in_s", "in_z"], ["x"]),
+                 helper.make_node("Dequantize" if tigris else "Identity", ["x"], ["xf"], **domain),
+                 helper.make_node("If", ["take", "xf"] if tigris else ["take"], ["yf"],
+                                  then_branch=branch("then", 0.03, -5, True, tigris),
+                                  else_branch=branch("else", 0.05, 3, False, tigris), **domain),
+                 helper.make_node("Quantize" if tigris else "Identity", ["yf"], ["yq"], **domain),
+                 helper.make_node("QuantizeLinear", ["yq", "out_s", "out_z"], ["out"])]
+        if not tigris:
+            # ONNX's If reads the outer value; the branch input is renamed onto it.
+            for graph in (nodes[2].attribute[0].g, nodes[2].attribute[1].g):
+                prefix = graph.name
+                del graph.input[:]
+                graph.node.insert(0, helper.make_node("Identity", ["xf"], [f"{prefix}_x"]))
+        graph = helper.make_graph(
+            nodes, "int8_if", [helper.make_tensor_value_info("image", TensorProto.INT8, shape),
+                               helper.make_tensor_value_info("take", TensorProto.BOOL, [1])],
+            [helper.make_tensor_value_info("out", TensorProto.INT8, shape)],
+            _scalars(**{"in": (0.04, -2), "out": (0.035, -10)}),
+            value_info=[info("xf"), info("yf"), info("yq")] if tigris else [])
+        built = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)] + (
+            [helper.make_opsetid("tigris", 1)] if tigris else []))
+        built.ir_version = 9
+        return built
+
+    return ContractCase(name=f"int8_if_{'then' if take_then else 'else'}", compile_model=model(True),
+                        reference_model=model(False),
+                        inputs={"image": data.transpose(0, 3, 1, 2).copy(),
+                                "take": np.asarray([take_then])},
+                        expected_operators=("Dequantize", "If", "Quantize", "Quantize", "Relu",
+                                            "Dequantize", "Quantize", "Dequantize"))
+
+
 def _while_counter_case() -> ContractCase:
     """A While counting i from a constant 0 to 5 in int32, adding i as a float
     to v * 1.5 each step, against the loop unrolled."""
@@ -7494,6 +7554,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _if_case(False),
         _while_case(),
         _while_counter_case(),
+        _int8_if_case(True),
+        _int8_if_case(False),
         _if_tiled_case(True),
         _if_tiled_case(False),
         _nested_if_case(),

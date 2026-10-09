@@ -61,6 +61,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _adopt_if(ag)
     ag = _adopt_while(ag)
     ag = _adopt_detection(ag)
+    ag = _adopt_quantize(ag)
     ag = _normalize_arg_outputs(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
@@ -2967,6 +2968,18 @@ def _adopt_svdf(ag: AnalyzedGraph) -> AnalyzedGraph:
             raise ValueError(f"Svdf activation {activation!r} is not supported")
         if activation != "none":
             op.attrs["fused_activation"] = {"relu": "Relu", "relu6": "Relu6"}[activation]
+    return ag
+
+
+def _adopt_quantize(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """The compiler's own Quantize and Dequantize: float32 to the int8 encoding
+    of the output, and int8 to float32, where an int8 model keeps a
+    control-flow boundary in float32."""
+    for op in ag.ops:
+        if op.op_type in ("tigris::Quantize", "tigris::Dequantize"):
+            op.op_type = op.op_type.removeprefix("tigris::")
+            if len(op.inputs) != 1 or len(op.outputs) != 1:
+                raise ValueError(f"{op.op_type} requires one input and one output")
     return ag
 
 
