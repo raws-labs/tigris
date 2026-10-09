@@ -673,7 +673,7 @@ def _row_view(info) -> tuple[int, int, int] | None:
 
 
 def _whole_band_operands(stage_ops: list[OpNode]) -> set[str]:
-    """Tensors a row band never cuts because a matrix product reads them whole.
+    """Matrix operands and runtime indices that every band reads whole.
 
     A matrix product reads every row of its second operand to produce one row
     of its output. Which tensors the band cuts is a property of the role each
@@ -682,6 +682,10 @@ def _whole_band_operands(stage_ops: list[OpNode]) -> set[str]:
     """
     whole: set[str] = set()
     for op in stage_ops:
+        if op.op_type in {"Gather", "GatherND", "EmbeddingLookup"}:
+            whole.update(op.inputs[1:])
+        if op.op_type == "DynamicUpdateSlice" and len(op.inputs) == 3:
+            whole.add(op.inputs[2])
         if op.op_type not in _ROW_TILING_WHOLE_OPERAND_OPS:
             continue
         for name in op.inputs[1:]:
@@ -694,7 +698,10 @@ def _whole_band_operands(stage_ops: list[OpNode]) -> set[str]:
 _ROW_REDUCTIONS = frozenset({"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",
                              "CumSum", "ArgMax", "ArgMin"})
 _ROW_MOVEMENT = frozenset({"Gather", "GatherND", "EmbeddingLookup", "StridedSlice",
-                          "MirrorPad", "ReverseV2", "DynamicUpdateSlice"})
+                          "MirrorPad", "ReverseV2", "DynamicUpdateSlice", "Split", "Concat", "Pad", "Transpose"})
+_BAND_BINARY = frozenset({"Add", "Sub", "Mul", "Div", "Max", "Min", "SquaredDifference",
+                          "FloorDiv", "FloorMod", "PRelu", "Equal", "Less", "LessOrEqual",
+                          "Greater", "GreaterOrEqual", "And", "Or", "Where"})
 
 
 
@@ -753,42 +760,113 @@ def _reshape_tile_for_bytes(mapping, budget: int, alignment: int, element: int) 
                     tiled_peak_bytes=_align_up(blocks * band * width * element, alignment))
 
 
-def _leading_view(info) -> tuple[int, int, int] | None:
+def _leading_view(info, trailing=False, axis=None) -> tuple[int, int, int] | None:
     shape = serialized_shape(info.shape, info.layout)
     if not 2 <= len(shape) <= 6 or min(shape) <= 0:
         return None
-    axis = next((i for i, extent in enumerate(shape) if extent != 1), 0)
-    return 1, shape[axis], math.prod(shape[axis + 1:])
+    if axis is None:
+        axis = len(shape) - 1 if trailing else next((i for i, extent in enumerate(shape) if extent != 1), 0)
+    if axis >= len(shape):
+        return None
+    return math.prod(shape[:axis]), shape[axis], math.prod(shape[axis + 1:])
+
+
+def _batch_view(info, time_major=False):
+    shape = serialized_shape(info.shape, info.layout)
+    if len(shape) not in (2, 3) or min(shape) <= 0:
+        return None
+    axis = int(time_major and len(shape) == 3)
+    return math.prod(shape[:axis]), shape[axis], math.prod(shape[axis + 1:])
 
 
 def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True,
-                      leading: bool = False) -> bool:
+                      leading: int = 0) -> bool:
     """The selected stored band axis survives the operation unchanged."""
-    if op.op_type not in _ROW_REDUCTIONS | _ROW_MOVEMENT or not op.inputs or len(op.outputs) != 1:
+    if op.op_type in _BAND_BINARY:
+        if leading < 3 or len(op.outputs) != 1 or not op.attrs.get("broadcast_untileable", False):
+            return False
+        target = ag.tensors[op.outputs[0]]
+        shape = serialized_shape(target.shape, target.layout)
+        axis = leading - 3
+        if not 2 <= len(shape) <= 5 or axis >= len(shape) or shape[axis] <= 1:
+            return False
+        for name in op.inputs:
+            info = ag.tensors[name]
+            other = serialized_shape(info.shape, info.layout)
+            if info.dtype == 6 or len(other) > len(shape):
+                return False
+            if not info.is_constant and len(other) != len(shape):
+                return False
+            other = (1,) * (len(shape) - len(other)) + tuple(other)
+            if any(a not in (1, b) for a, b in zip(other, shape)):
+                return False
+        return True
+    if op.op_type in {"Svdf", "Lstm"}:
+        views = [_batch_view(ag.tensors[n], op.attrs.get("time_major", False))
+                 for n in [*op.inputs, *op.outputs] if not ag.tensors[n].is_constant]
+        return (leading and bool(views) and all(v is not None for v in views)
+                and views[0][1] > 1 and all(v[1] == views[0][1] for v in views))
+    unary = op.op_type in _ROW_TILING_OPS - {
+        "Softmax", "LogSoftmax", "L2Normalization", "LayerNormalization",
+        "Gemm", "MatMul", "Reshape", "Flatten",
+    } and len(op.inputs) == 1
+    if unary and (not leading or len(ag.tensors[op.inputs[0]].shape) != 2):
+        return False
+    if ((not unary and op.op_type not in _ROW_REDUCTIONS | _ROW_MOVEMENT) or
+            not op.inputs or not op.outputs or (len(op.outputs) != 1 and op.op_type != "Split")):
+        return False
+    if op.op_type in {"Split", "Concat", "Pad"} and not leading:
+        return False
+    if (op.op_type == "Concat" and op.attrs.get("concat_last_axis", True)
+            and ag.tensors[op.inputs[0]].layout is not Layout.LINEAR):
+        return False
+    if op.op_type == "Transpose" and leading < 3:
         return False
     source, target = ag.tensors[op.inputs[0]], ag.tensors[op.outputs[0]]
-    view = _leading_view if leading else _row_view if row_tiled else _height_view
+    whole = _whole_band_operands([op])
+    if not leading and any(not ag.tensors[n].is_constant for n in whole):
+        return False
+    trailing = leading == 2
+    explicit = leading >= 3
+    view = (lambda info: _leading_view(info, trailing, leading - 3 if explicit else None)) if leading else _row_view if row_tiled else _height_view
     first, last = view(source), view(target)
-    if first is None or last is None or first[:2] != last[:2]:
+    if first is None or last is None or first[1] != last[1] or (not (trailing or explicit) and first[0] != last[0]):
         return False
     rank = len(source.shape)
     row = rank - 2 if row_tiled else 1
     if leading:
         shape = serialized_shape(source.shape, source.layout)
-        row = next((i for i, extent in enumerate(shape) if extent != 1), 0)
+        row = leading - 3 if explicit else rank - 1 if trailing else next((i for i, extent in enumerate(shape) if extent != 1), 0)
         for name in [*op.inputs, *op.outputs]:
             info = ag.tensors[name]
-            if info.is_constant:
+            if info.is_constant or name in whole:
                 continue
             other = serialized_shape(info.shape, info.layout)
-            if (len(other) != rank or math.prod(other[:row]) != 1 or
-                    other[row] != shape[row] or shape[row] <= 1):
+            axis = len(other) - 1 if trailing else row
+            dropped_after = (op.op_type in {"ArgMax", "ArgMin"} and len(other) == rank - 1
+                             and op.attrs["axes"][0] > row)
+            if ((not trailing and ((len(other) != rank and not dropped_after) or (not explicit and math.prod(other[:row]) != 1))) or
+                    other[axis] != shape[row] or shape[row] <= 1):
                 return False
     if not leading and not row_tiled and (len(target.shape) != rank or first[1] <= 1):
         return False
-    if any(not ag.tensors[name].is_constant and (view(ag.tensors[name]) is None or
-           view(ag.tensors[name])[:2] != first[:2]) for name in op.inputs[1:]):
+    if any(name not in whole and not ag.tensors[name].is_constant and (view(ag.tensors[name]) is None or
+           view(ag.tensors[name])[1] != first[1] or
+           (not (trailing or explicit) and view(ag.tensors[name])[0] != first[0])) for name in op.inputs[1:]):
         return False
+    if unary:
+        return source.shape == target.shape and source.dtype != 6
+    if op.op_type == "Transpose":
+        perm = serialized_transpose_perm(op.attrs["perm"], source.layout, target.layout)
+        return _transpose_band_groups(perm) is None and perm[row] == row
+    if op.op_type in {"Split", "Concat"}:
+        if op.op_type == "Concat" and any(ag.tensors[n].is_constant for n in op.inputs):
+            return False
+        return op.attrs["kernel_shape"][0] != row
+    if op.op_type == "Pad":
+        pads = op.attrs.get("pad_amounts", [])
+        axis = serialized_axis_map(rank, source.layout).index(row)
+        return len(pads) == 2 * rank and pads[axis] == 0 and pads[rank + axis] == 0
     if op.op_type in _ROW_REDUCTIONS:
         axes = op.attrs.get("axes", [])
         return len(axes) == 1 and serialized_axis_map(rank, source.layout)[axes[0]] != row
@@ -796,7 +874,7 @@ def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True,
     if not metadata:
         return False
     if op.op_type in {"Gather", "GatherND", "EmbeddingLookup"}:
-        if len(op.inputs) != 2 or not ag.tensors[op.inputs[1]].is_constant:
+        if len(op.inputs) != 2:
             return False
         if op.op_type == "GatherND":
             return metadata[metadata[0]] <= row
@@ -808,9 +886,36 @@ def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True,
         return metadata[1 + 2 * row:3 + 2 * row] == [0, 0]
     if op.op_type == "ReverseV2":
         return not metadata[0] & (1 << row)
+    if op.op_type == "DynamicUpdateSlice" and len(op.inputs) == 3 and len(metadata) == rank:
+        return metadata[row] == serialized_shape(source.shape, source.layout)[row]
     return (len(op.inputs) == 2 and not ag.tensors[op.inputs[1]].is_constant
             and len(metadata) == 2 * rank and metadata[row] == 0
             and metadata[rank + row] == serialized_shape(source.shape, source.layout)[row])
+
+
+def _independent_mode(ag: AnalyzedGraph, op: OpNode) -> int:
+    if any(name not in ag.tensors for name in [*op.inputs, *op.outputs]):
+        return 0
+    dynamic_metadata = any(not ag.tensors[n].is_constant for n in _whole_band_operands([op]))
+    if op.op_type in {"Split", "Concat", "Pad", "Transpose"} | _BAND_BINARY or dynamic_metadata:
+        info = ag.tensors[op.outputs[0] if op.op_type in _BAND_BINARY else op.inputs[0]]
+        shape = serialized_shape(info.shape, info.layout)
+        def cost(axis):
+            if op.op_type not in _BAND_BINARY:
+                return 0, -shape[axis], axis
+            total = 0
+            for name in dict.fromkeys([*op.inputs, *op.outputs]):
+                tensor = ag.tensors[name]
+                if tensor.is_constant:
+                    continue
+                stored = serialized_shape(tensor.shape, tensor.layout)
+                extent = stored[axis] if len(stored) == len(shape) else 1
+                total += _align_up(tensor.size_bytes // extent, _CONSERVATIVE_TENSOR_ALIGN)
+            return total, -shape[axis], axis
+        for axis in sorted(range(len(shape)), key=cost):
+            if _independent_band(ag, op, leading=axis + 3):
+                return axis + 3
+    return next((mode for mode in (1, 2) if _independent_band(ag, op, leading=mode)), 0)
 
 
 def _stage_is_row_tiled(
@@ -883,7 +988,8 @@ def _stage_is_row_tiled(
 
 
 def _solve_row_tile(
-    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int, view_of=_row_view
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int, view_of=_row_view,
+    independent: bool = False,
 ) -> TilePlan:
     """Size the band of rows a matrix pipeline takes at a time.
 
@@ -912,8 +1018,8 @@ def _solve_row_tile(
         info = ag.tensors[name]
         view = view_of(info)
         if (name not in whole_operands and view is not None
-                and (view[0], view[1]) == (batch, rows)):
-            per_row.append(batch * view[2] * info.elem_size)
+                and view[1] == rows and (independent or view[0] == batch)):
+            per_row.append(view[0] * view[2] * info.elem_size)
         else:
             whole += _align_up(info.size_bytes, align)
 
@@ -1611,8 +1717,13 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         if (len(stage_ops) == 1 and not stage.chain_len and
-                _independent_band(ag, stage_ops[0], leading=True)):
-            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, _leading_view)
+                _independent_mode(ag, stage_ops[0])):
+            op = stage_ops[0]
+            mode = _independent_mode(ag, op)
+            view = (lambda info: _batch_view(info, op.attrs.get("time_major", False))) \
+                if op.op_type in {"Svdf", "Lstm"} else \
+                (lambda info: _leading_view(info, mode == 2, mode - 3 if mode >= 3 else None))
+            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, view, independent=True)
             continue
 
         # A global reduction has no output axis to tile, so the runtime walks

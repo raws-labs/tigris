@@ -1369,6 +1369,15 @@ class _Converter:
         if rank in (3, 4) and axis > 0:
             return b.node("Concat", [value for value, _, _ in parts], tag,
                           axis=_onnx_axis(axis, rank))
+        if axis == 0 and rank > 1:
+            # Preserve the trailing run as an independent axis.
+            width = int(np.prod(shape[1:]))
+            flat = [self.held(self.reshape(value, part_shape, [1, part_shape[0], width],
+                                           f"{tag}_run{step}", part), part, f"{tag}_run{step}_q")
+                    for step, (value, part_shape, part) in enumerate(parts)]
+            joined = self.held(b.node("Concat", flat, tag + "_runs", axis=_onnx_axis(1, 3)),
+                               index, tag + "_runs_q")
+            return self.reshape(joined, [1, shape[0], width], shape, tag, index)
         outer = int(np.prod(shape[:axis]))
         flat = []
         for step, (value, part_shape, part) in enumerate(parts):
