@@ -1,5 +1,6 @@
 """TFLite models reach the compiler through their QDQ ONNX expression."""
 
+import json
 import os
 import struct
 from pathlib import Path
@@ -327,6 +328,39 @@ def test_int64_run_time_indices_are_refused(monkeypatch):
         tensors[operators[0].inputs[1]].type = "INT64"
     reasons = _read_edited(monkeypatch, "float_gather_runtime", widen)
     assert any("INT64 run-time indices; the runtime takes int32" in r for r in reasons)
+
+
+@pytest.mark.parametrize(("name", "arena"), [
+    # TFLite Micro's own "Arena allocation head" (tflite-micro 0.dev20260925222358) for
+    # models whose kernels request no scratch buffer.
+    ("vww_96_int8.tflite", 73728), ("pretrainedResnet_quant.tflite", 49152),
+    ("ops/conv_bias.tflite", 512),
+])
+def test_tflm_tensor_arena_reproduces_its_planner(name, arena):
+    assert tflite.tflm_tensor_arena((FIXTURES / name).read_bytes()) == arena
+
+
+def test_tflm_tensor_arena_declines_several_subgraphs():
+    assert tflite.tflm_tensor_arena((FIXTURES / "ops" / "while_conv.tflite").read_bytes()) is None
+
+
+def test_analyze_reports_json_with_tflite_micro_arena_and_exact_plan_size(tmp_path):
+    model = FIXTURES / "ops" / "while_conv.tflite"
+    result = CliRunner().invoke(cli, ["analyze", str(model), "-m", "256K", "--json"])
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    assert (report["report"], report["version"]) == ("tigris-analysis", 1)
+    assert report["model"]["format"] == "tflite" and report["model"]["dtype"] == "int8"
+    assert report["model"]["inputs"] == [{"name": "x", "shape": [1, 6, 6, 4]}]
+    # Several subgraphs: TFLite Micro's figure is not modelled.
+    assert report["tflite_micro"] is None
+    plan = tmp_path / "m.tgrs"
+    assert CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(plan)]).exit_code == 0
+    # Subgraph weights and sections count: the size is the serialized plan's.
+    assert report["flash"]["plan_bytes"] == plan.stat().st_size
+    single = json.loads(CliRunner().invoke(
+        cli, ["analyze", str(FIXTURES / "ops" / "conv_bias.tflite"), "-m", "256K", "--json"]).output)
+    assert single["tflite_micro"]["tensor_arena_bytes"] == 512
 
 
 def test_flexbuffer_map_reads_scalar_options():

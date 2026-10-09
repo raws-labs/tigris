@@ -1878,3 +1878,72 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     onnx.helper.set_model_props(model, props)
     onnx.checker.check_model(model)
     return model
+
+
+_ELEMENT_BYTES = {"FLOAT32": 4, "INT32": 4, "UINT32": 4, "INT8": 1, "UINT8": 1, "BOOL": 1,
+                  "INT16": 2, "UINT16": 2, "FLOAT16": 2, "INT64": 8, "UINT64": 8, "FLOAT64": 8}
+
+
+def tflm_tensor_arena(data: bytes) -> int | None:
+    """The bytes TFLite Micro's greedy memory planner places for the model's
+    tensors: every tensor that is neither a constant nor a variable, each
+    aligned to 16 bytes and live from the operator that writes it (inputs from
+    the start) to the last that reads it (outputs to the end). Kernel scratch
+    buffers and TFLite Micro's persistent allocations come on top. None for a
+    model with more than one subgraph or a tensor of another storage type."""
+    model = _Model(data)
+    if len(model.subgraphs) != 1:
+        return None
+    subgraph = model.subgraphs[0]
+    tensors = [_Tensor(model, t) for t in subgraph.tables(_SG_TENSORS)]
+    operators = [_Operator(model, op, i) for i, op in enumerate(subgraph.tables(_SG_OPERATORS))]
+    first = [-1] * len(tensors)
+    last = [-1] * len(tensors)
+
+    def created(index, scope):
+        if first[index] == -1:
+            first[index] = scope
+
+    for index in subgraph.scalars(_SG_INPUTS, "i"):
+        created(index, 0)
+        last[index] = 0
+    for scope, op in enumerate(operators, start=1):
+        for index in op.outputs:
+            created(index, scope)
+        for index in [*op.inputs, *op.outputs]:
+            if index >= 0:
+                last[index] = scope
+    for index in subgraph.scalars(_SG_OUTPUTS, "i"):
+        created(index, len(operators))
+        last[index] = len(operators)
+    # Requests in tensor order: (size, first, last).
+    requests = []
+    for index, tensor in enumerate(tensors):
+        if tensor.type not in _ELEMENT_BYTES:
+            return None
+        size = int(np.prod(tensor.shape)) * _ELEMENT_BYTES[tensor.type] if len(tensor.shape) else (
+            _ELEMENT_BYTES[tensor.type])
+        if tensor.data or tensor.variable or size == 0:
+            continue
+        requests.append(((size + 15) // 16 * 16, first[index], last[index]))
+    if not requests:
+        return 0
+    # GreedyMemoryPlanner: requests listed in reverse, a stable sort by
+    # decreasing size, then each placed at the lowest offset clear of every
+    # placed buffer whose lifetime overlaps its own.
+    order = sorted(reversed(range(len(requests))), key=lambda i: -requests[i][0])
+    placed: list[tuple[int, int]] = []  # (offset, request), ascending offset, insertion-stable
+    for position, i in enumerate(order):
+        size, start, end = requests[i]
+        offset = 0
+        if position:
+            for other_offset, j in placed:
+                _, other_start, other_end = requests[j]
+                if other_start > end or start > other_end:
+                    continue
+                if other_offset - offset >= size:
+                    break
+                offset = max(offset, other_offset + requests[j][0])
+        at = next((k for k, (o, _) in enumerate(placed) if o > offset), len(placed))
+        placed.insert(at, (offset, i))
+    return max(offset + requests[i][0] for offset, i in placed)

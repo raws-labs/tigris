@@ -18,7 +18,7 @@ from tigris.utils import fmt_bytes
               help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
 def simulate(model: str, mem: tuple[str, ...],
              input_shape: dict[str, tuple[int, ...]]):
-    """Print a step-by-step execution trace for an ONNX model."""
+    """Print a step-by-step execution trace for an ONNX or TFLite model."""
     ag, budget = _run_pipeline(model, mem, input_shapes=input_shape)
     _print_simulate(ag, budget)
 

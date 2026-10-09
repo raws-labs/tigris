@@ -82,7 +82,7 @@ def _run_compressed_pipeline(
               help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
 def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None,
             compress: str, xip: bool, input_shape: dict[str, tuple[int, ...]]):
-    """Compile an ONNX model to binary deployment format."""
+    """Compile an ONNX or TFLite model to a binary .tgrs plan."""
     from tigris.analysis.validation import (
         validate_budget,
         validate_execution_dtype,
