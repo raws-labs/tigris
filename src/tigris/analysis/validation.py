@@ -1175,7 +1175,7 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
             return ["int8 operands require valid per-tensor quantization"]
     if not ag.is_quantized:
         return []
-    if kind in _COMPARISONS and any(not 0 < float(t.quant.scale[0]) < 1 for t in inputs):
+    if kind in _COMPARISONS and not integer and any(not 0 < float(t.quant.scale[0]) < 1 for t in inputs):
         return ["int8 comparison input scales must be strictly between 0 and 1"]
     data = inputs[1:] + [output] if kind == "Where" else inputs if kind == "Sum" else []
     if data and any(float(t.quant.scale[0]) != float(data[0].quant.scale[0])
