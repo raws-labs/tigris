@@ -1,6 +1,8 @@
 """``tigris analyze`` command."""
 
+import json
 from dataclasses import replace
+from pathlib import Path
 
 import click
 from rich.panel import Panel
@@ -15,7 +17,78 @@ from tigris.cli import (
     _parse_size,
     _run_pipeline,
 )
-from tigris.utils import describe_interface, fmt_bytes
+from tigris.utils import describe_interface, fmt_bytes, source_shape
+
+
+def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, source: str,
+            tflm_arena: int | None) -> dict:
+    """The analysis as versioned JSON; byte counts are integers."""
+    f = findings
+    return {
+        "report": "tigris-analysis",
+        "version": 1,
+        "model": {
+            "name": ag.model_name,
+            "format": source,
+            "dtype": "int8" if f.is_quantized else "float32" if f.is_float32 else None,
+            "operators": len(ag.ops),
+            "tensors": len(ag.tensors),
+            "activations": len(ag.lifetimes),
+            "unscheduled_peak_bytes": ag.peak_memory_bytes,
+            "largest_tensor": {"shape": f.largest_tensor_shape, "bytes": f.largest_tensor_bytes},
+            # Shapes in the caller's axis order, as the interface takes them.
+            "inputs": [{"name": n, "shape": list(source_shape(ag, ag.tensors[n].shape))}
+                       for n in ag.model_inputs],
+            "outputs": [{"name": n, "shape": list(source_shape(ag, ag.tensors[n].shape))}
+                        for n in ag.model_outputs],
+            "unsupported_operators": list(f.unsupported_operators),
+            "dtype_errors": list(f.dtype_errors),
+        },
+        "tflite_micro": None if tflm_arena is None else {
+            "tensor_arena_bytes": tflm_arena,
+            "excludes": ["kernel scratch buffers", "persistent allocations"],
+        },
+        "fast": {
+            "budget_bytes": budget,
+            "verdict": f.verdict or None,
+            "scheduled_peak_bytes": f.scheduled_peak_bytes,
+            "stages": f.total_stages,
+            "stages_needing_tiling": f.stages_needing_tiling,
+            "stages_tileable": f.stages_tileable,
+            "stages_untileable": f.stages_untileable,
+            "untileable_operators": list(f.untileable_op_types),
+            "minimum_for_partition_bytes": f.min_fast_for_partition,
+            "blocking_stages": [{"stage": b.stage_id, "required_bytes": b.required_bytes,
+                                 "reason": b.reason} for b in f.blocking_stages],
+            "infeasible": list(f.feasibility_errors),
+        },
+        "slow": {
+            "budget_bytes": slow_budget,
+            "peak_bytes": f.slow_peak_bytes,
+            "fits": f.slow_fits,
+            "overflow_stages": list(f.slow_overflow_stages),
+        },
+        "flash": {
+            "budget_bytes": flash_budget,
+            "weight_bytes": f.total_weight_bytes,
+            "plan_bytes": f.plan_size_bytes or None,
+            "plan_fits": f.plan_fits_flash if flash_budget and f.plan_size_bytes else None,
+            "estimates": {"int8_plan_bytes": f.int8_plan_size_bytes or None,
+                          "lz4_plan_bytes": f.lz4_plan_size_bytes or None},
+        },
+        "stages": [{
+            "stage": s.stage_id,
+            "operators": len(s.op_indices),
+            "peak_bytes": s.peak_bytes,
+            "inputs": len(s.input_tensors),
+            "outputs": len(s.output_tensors),
+            "needs_tiling": bool(s.warnings),
+            "tiles": (None if s.tile_plan is None or not s.tile_plan.tileable else {
+                "axis": s.tile_plan.axis, "tile": s.tile_plan.tile_height,
+                "count": s.tile_plan.num_tiles, "halo": s.tile_plan.halo,
+                "tiled_peak_bytes": s.tile_plan.tiled_peak_bytes}),
+        } for s in ag.stages],
+    }
 
 
 def _side_by_side(*panels):
@@ -48,10 +121,12 @@ def _side_by_side(*panels):
 @click.option("--input-shape", "input_shape", multiple=True,
               callback=_parse_input_shape,
               help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
+@click.option("--json", "as_json", is_flag=True, help="Emit the analysis as versioned JSON.")
 def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
-            input_shape: dict[str, tuple[int, ...]]):
-    """Analyze an ONNX model for memory-constrained deployment."""
+            input_shape: dict[str, tuple[int, ...]], as_json: bool):
+    """Analyze an ONNX or TFLite model for memory-constrained deployment."""
     from tigris.analysis.findings import compute_findings
+    from tigris.frontends.tflite import is_tflite, tflm_tensor_arena
 
     mem_pools = [_parse_size(m) for m in mem]
     flash_budget = _parse_size(flash) if flash else 0
@@ -59,11 +134,18 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     # Only forward the fast tier to _run_pipeline: analyze interprets the slow
     # tier itself below and stays display-only, so a non-positive slow tier
     # must be reported as unconstrained rather than raised.
-    ag, budget = _run_pipeline(model, mem[:1], input_shapes=input_shape)
+    ag, budget = _run_pipeline(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json)
     ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
+    data = Path(model).read_bytes()
+    tflite = is_tflite(data)
+    tflm_arena = tflm_tensor_arena(data) if tflite else None
 
-    with console.status("Computing findings..."):
-        findings = compute_findings(ag, flash_budget=flash_budget)
+    findings = compute_findings(ag, flash_budget=flash_budget)
+    if as_json:
+        click.echo(json.dumps(_report(ag, findings, budget, slow_budget, flash_budget,
+                                      "tflite" if tflite else "onnx", tflm_arena),
+                              indent=2, ensure_ascii=True, allow_nan=False))
+        return
 
     # Model
     model_grid = Table.grid(padding=(0, 2))
@@ -75,9 +157,12 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     if findings.largest_tensor_shape:
         model_grid.add_row("Largest tensor", f"{findings.largest_tensor_shape} ({fmt_bytes(findings.largest_tensor_bytes)})")
     if findings.is_quantized:
-        model_grid.add_row("Quantization", "INT8 (QDQ)")
+        model_grid.add_row("Dtype", "int8" if tflite else "int8 (QDQ)")
     elif findings.is_float32:
         model_grid.add_row("Dtype", "float32")
+    if tflm_arena is not None:
+        model_grid.add_row("TFLite Micro tensors",
+                           f"{fmt_bytes(tflm_arena)} (its planner; kernel scratch not included)")
     for label, text in describe_interface(ag):
         model_grid.add_row(label, text)
     if findings.unsupported_operators:
@@ -227,7 +312,8 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
 
         fl.add_row("Weight data", fmt_bytes(findings.total_weight_bytes, unit_ref=_ur))
         fl.add_row("Plan overhead", fmt_bytes(findings.plan_overhead_bytes, unit_ref=_ur))
-        fl.add_row("Plan (est.)", _flash_row(findings.plan_size_bytes))
+        fl.add_row("Plan", _flash_row(findings.plan_size_bytes) if findings.plan_size_bytes
+                   else "not serializable")
         if findings.lz4_plan_size_bytes > 0 and findings.lz4_plan_size_bytes < findings.plan_size_bytes * 95 // 100:
             fl.add_row("Plan LZ4 (est.)", _flash_row(findings.lz4_plan_size_bytes))
         if findings.is_float32 and not findings.is_quantized:

@@ -236,7 +236,7 @@ def _render(report, verbose):
 @click.option("-v", "--verbose", is_flag=True, help="Show operators, tensors, and execution-plan details.")
 @click.option("--json", "as_json", is_flag=True, help="Emit complete, versioned metadata as JSON.")
 def inspect(model: Path, verbose: bool, as_json: bool):
-    """Inspect an ONNX graph or .tgrs plan without compiling or executing it.
+    """Inspect an ONNX, TFLite or .tgrs file without compiling or executing it.
 
     Format is detected from file contents. Inspection is offline and does not
     load external ONNX tensor data. Memory values are compiler records.
