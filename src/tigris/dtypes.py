@@ -13,6 +13,9 @@ STATE = 254
 DATA_OR_INT32 = 253
 # Bool, or int32 a CAST turns into data.
 BOOL_OR_INT32 = 252
+# Data, int32, or float32 that control flow carries across an int8 plan's
+# subgraph boundary.
+CONTROL_FLOW_VALUE = 251
 
 
 @dataclass(frozen=True)
@@ -52,13 +55,19 @@ OP_DTYPE_SIGNATURES.update({
     # The output role admits int16 only on the next state, a state tensor.
     "Svdf": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
     "Lstm": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
-    "If": DTypeSignature(inputs=(9, DATA_OR_INT32, DATA_OR_INT32), outputs=(DATA_OR_INT32,)),
+    "If": DTypeSignature(inputs=(9, CONTROL_FLOW_VALUE, CONTROL_FLOW_VALUE), outputs=(CONTROL_FLOW_VALUE,)),
     # Float32 results in a float32 or an int8 plan, which no operator reads.
     "DetectionPostProcess": DTypeSignature(outputs=(1,)),
-    "While": DTypeSignature(inputs=(DATA_OR_INT32,) * 3, outputs=(DATA_OR_INT32,)),
+    "While": DTypeSignature(inputs=(CONTROL_FLOW_VALUE,) * 3, outputs=(CONTROL_FLOW_VALUE,)),
+    "Quantize": DTypeSignature(inputs=(1, 1, 1)),
+    "Dequantize": DTypeSignature(outputs=(1,)),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
 })
+
+
+_FLOAT_WRITERS = {"Dequantize", "If", "While"}
+_FLOAT_READERS = {"Quantize", "If", "While"}
 
 
 def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, state=()):
@@ -74,8 +83,20 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
               if OP_DTYPE_SIGNATURES.get(kind, DTypeSignature()).outputs == (1,)
               for name in outputs}
     for name in stated:
-        if any(name in inputs for _, inputs, _ in operators):
+        if any(name in inputs and kind not in _FLOAT_READERS for kind, inputs, _ in operators):
             issues.append(f"float32 result {name} must not be read by another operator")
+    # In an int8 plan, float32 crosses a control-flow boundary: written by a
+    # Dequantize, control flow or as a graph input, read by a Quantize,
+    # control flow or as a graph output.
+    if any(dtype == 3 and not constant for dtype, constant, _ in by_name.values()):
+        for name, (dtype, constant, _) in by_name.items():
+            if dtype != 1 or constant or name in stated:
+                continue
+            producers = {kind for kind, _, outputs in operators if name in outputs}
+            readers = {kind for kind, inputs, _ in operators if name in inputs}
+            if ((producers <= _FLOAT_WRITERS and (producers or name in model_inputs))
+                    and readers <= _FLOAT_READERS):
+                stated.add(name)
     for name, (dtype, constant, quantized) in by_name.items():
         if constant or (name in stated and dtype == 1):
             continue
@@ -113,7 +134,7 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
                         issues.append(f"{kind} {direction} {position} ({name}) requires data "
                                       f"or int16 state, got ONNX dtype {dtype}")
                     continue
-                if expected == DATA_OR_INT32:
+                if expected in (DATA_OR_INT32, CONTROL_FLOW_VALUE):
                     if dtype not in {1, 3, 6}:
                         issues.append(f"{kind} {direction} {position} ({name}) requires data or "
                                       f"int32, got ONNX dtype {dtype}")

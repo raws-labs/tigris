@@ -804,6 +804,18 @@ FLOAT_MODELS["float_while_countdown"] = _unary(
 FLOAT_MODELS["float_if_int32"] = ([(1, 4), (1,)], lambda x, k: tf.cond(
     tf.reduce_sum(x) > 0.0, lambda: x * tf.cast(k + 1, tf.float32),
     lambda: x - tf.cast(k, tf.float32)))
+# int8 control flow: the converter keeps each subgraph boundary in float32, with
+# QUANTIZE and DEQUANTIZE on either side; loops count in int32 so they end.
+_CF_FILTER = _weights(93, 3, 3, 4, 4)
+CASES["if_conv"] = _unary(
+    lambda x: tf.cond(tf.reduce_sum(x) > 0.0, lambda: tf.nn.relu(tf.nn.conv2d(x, _CF_FILTER, 1, "SAME")),
+                      lambda: x * 0.5),
+    _MAP)
+CASES["while_conv"] = _unary(
+    lambda x: tf.while_loop(lambda i, v: i < 3,
+                            lambda i, v: [i + 1, tf.nn.relu(tf.nn.conv2d(v, _CF_FILTER, 1, "SAME"))],
+                            [0, x])[1],
+    _MAP)
 FLOAT_MODELS["float_variable_window"] = _unary(lambda x: _WINDOW(x), (1, 2))
 for _name in _FLOAT_TIER1:
     FLOAT_MODELS[f"float_{_name}"] = CASES[_name]

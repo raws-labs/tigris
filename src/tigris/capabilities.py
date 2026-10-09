@@ -117,14 +117,14 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "If",
     "While",
     "DetectionPostProcess",
+    "Quantize",
+    "Dequantize",
 })
 
 # Operators the executor runs itself rather than a kernel dispatcher.
 EXECUTOR_OPERATORS = frozenset({"If", "While"})
 
 _S8_REFERENCE_OPERATORS = _FLOAT_REFERENCE_OPERATORS - frozenset({
-    "If",
-    "While",
     "L2Pool",
     "Neg",
     "Exp",
@@ -261,9 +261,11 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "ReduceMax": ("one axis of a rank-3 tensor; independent height or row bands; rank-4 spatial max with keepdims uses GlobalMaxPool; int8 quantization must match",),
     "ReduceMin": ("one axis of a rank-3 tensor; independent height or row bands; int8 quantization must match",),
     "ReduceAll": ("one axis of a rank-3 bool tensor; independent height or row bands",),
-    "If": ("one bool condition; branches run as their own stages; float32 or int32 operands; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS",),
-    "While": ("a condition giving one bool and a body, each run as its own stages; float32 or int32 loop variables, each from an input or a constant (uncompressed plans); nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS",),
+    "If": ("one bool condition; branches run as their own stages; float32 or int32 operands, also in int8 plans, where the boundary stays float32 between a Dequantize and a Quantize; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS",),
+    "While": ("a condition giving one bool and a body, each run as its own stages; float32 or int32 loop variables, also in int8 plans, where the boundary stays float32 between a Dequantize and a Quantize, each from an input or a constant (uncompressed plans); nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS",),
     "Svdf": ("state kept between runs; int8 with int16 state and time weights; untiled",),
+    "Quantize": ("float32 to a per-tensor int8 encoding as TFLite Micro's QUANTIZE; only where an int8 plan keeps a control-flow boundary in float32; untiled",),
+    "Dequantize": ("a per-tensor int8 encoding to float32 as TFLite Micro's DEQUANTIZE; only where an int8 plan keeps a control-flow boundary in float32; untiled",),
     "DetectionPostProcess": ("SSD center-size box decoding and fast or regular non-max suppression as TFLite Micro runs them; float32 anchors; int8 or float32 encodings and scores; float32 results no operator reads; one class per detection in the fast form; untiled",),
     "Lstm": ("hidden and cell state kept between runs; every gate, no peepholes, projection or layer normalization; tanh cell activation; int8 with an int16 cell state; untiled",),
     "ReduceSum": ("one axis of a rank-3 tensor; independent height or row bands; int8 rejects reference arithmetic overflow",),

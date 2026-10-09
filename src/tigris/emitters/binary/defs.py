@@ -206,6 +206,8 @@ OP_TYPE_MAP: dict[str, int] = {
     "If": 87,
     "While": 88,
     "DetectionPostProcess": 89,
+    "Quantize": 90,
+    "Dequantize": 91,
 }
 OP_TYPE_UNKNOWN = 255
 

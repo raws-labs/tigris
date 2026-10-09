@@ -1143,28 +1143,28 @@
     },
     {
       "constraints": [
-        "one bool condition; branches run as their own stages; float32 or int32 operands; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
+        "one bool condition; branches run as their own stages; float32 or int32 operands, also in int8 plans, where the boundary stays float32 between a Dequantize and a Quantize; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
       ],
       "opcode": 87,
       "operator": "If",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
         "reference": "native",
-        "s8_ref": "unsupported"
+        "s8_ref": "native"
       }
     },
     {
       "constraints": [
-        "a condition giving one bool and a body, each run as its own stages; float32 or int32 loop variables, each from an input or a constant (uncompressed plans); nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
+        "a condition giving one bool and a body, each run as its own stages; float32 or int32 loop variables, also in int8 plans, where the boundary stays float32 between a Dequantize and a Quantize, each from an input or a constant (uncompressed plans); nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
       ],
       "opcode": 88,
       "operator": "While",
       "routes": {
-        "cmsis-nn": "unsupported",
-        "esp-nn": "unsupported",
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
         "reference": "native",
-        "s8_ref": "unsupported"
+        "s8_ref": "native"
       }
     },
     {
@@ -1173,6 +1173,32 @@
       ],
       "opcode": 89,
       "operator": "DetectionPostProcess",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "float32 to a per-tensor int8 encoding as TFLite Micro's QUANTIZE; only where an int8 plan keeps a control-flow boundary in float32; untiled"
+      ],
+      "opcode": 90,
+      "operator": "Quantize",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
+    },
+    {
+      "constraints": [
+        "a per-tensor int8 encoding to float32 as TFLite Micro's DEQUANTIZE; only where an int8 plan keeps a control-flow boundary in float32; untiled"
+      ],
+      "opcode": 91,
+      "operator": "Dequantize",
       "routes": {
         "cmsis-nn": "fallback:s8_ref",
         "esp-nn": "fallback:s8_ref",
