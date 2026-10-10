@@ -16,7 +16,7 @@ _BUDGETS_TRIED = 3
 
 
 def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, source: str,
-            tflm_arena: int | None, tried: list) -> dict:
+            tflm_arena: int | None, tried: list, traffic) -> dict:
     """The analysis as versioned JSON; byte counts are integers."""
     f = findings
     return {
@@ -62,6 +62,8 @@ def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, sour
             "peak_bytes": f.slow_peak_bytes,
             "fits": f.slow_fits,
             "overflow_stages": list(f.slow_overflow_stages),
+            # Measured on the host runtime; null when not measured.
+            "traffic": traffic if isinstance(traffic, dict) else None,
         },
         "flash": {
             "budget_bytes": flash_budget,
@@ -174,8 +176,9 @@ def verdict_lines(findings, budget: int, slow_budget: int, stages=()) -> list[st
 
 
 def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budget: int,
-            tflm_arena: int | None, tried: list | None = None) -> None:
-    """The header, verdict, memory and flash, shared by analyze and compile."""
+            tflm_arena: int | None, tried: list | None = None, traffic=None) -> None:
+    """The header, verdict, memory and flash, shared by analyze and compile.
+    `traffic` is what trace.traffic measured; None leaves the row out."""
     f = findings
     dtype = "int8" if f.is_quantized else "float32" if f.is_float32 else "mixed"
     graphs = len(getattr(ag, "subgraphs", []) or [])
@@ -203,6 +206,12 @@ def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budge
     if f.slow_peak_bytes > 0:
         memory.append(["slow memory", fmt_bytes(f.slow_peak_bytes),
                        text.dim(f"budget {fmt_bytes(slow_budget)}") if slow_budget else ""])
+    if isinstance(traffic, dict):
+        memory.append(["slow traffic", fmt_bytes(traffic["written"] + traffic["read"]),
+                       text.dim(f"per inference: {fmt_bytes(traffic['written'])} written, "
+                                f"{fmt_bytes(traffic['read'])} read")])
+    elif traffic is not None:
+        memory.append(["slow traffic", "", text.dim(f"not measured: {traffic}")])
     fits_here = not f.blocking_stages
     for b, fits, stages, tiled in tried or []:
         label = ("also fits at" if fits_here else "fits at") if fits else "does not fit at"
@@ -292,11 +301,13 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     supported = not (findings.unsupported_operators or findings.dtype_errors)
     tried = (_tried(model, budget, not findings.blocking_stages, input_shape)
              if budget > 0 and supported else [])
+    from tigris.cli.trace import traffic as measure_traffic
+    traffic = measure_traffic(ag) if supported else None
     if as_json:
         click.echo(json.dumps(_report(ag, findings, budget, slow_budget, flash_budget,
-                                      "tflite" if tflite else "onnx", tflm_arena, tried),
+                                      "tflite" if tflite else "onnx", tflm_arena, tried, traffic),
                               indent=2, ensure_ascii=True, allow_nan=False))
         return
-    summary(model, ag, findings, budget, slow_budget, flash_budget, tflm_arena, tried)
+    summary(model, ag, findings, budget, slow_budget, flash_budget, tflm_arena, tried, traffic)
     if verbose and ag.stages:
         _stages(ag)

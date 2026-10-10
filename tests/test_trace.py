@@ -1,5 +1,7 @@
 """The execution trace groups and checks runtime events without a host library."""
 
+import json
+
 from click.testing import CliRunner
 
 from tigris.cli import cli
@@ -89,3 +91,17 @@ def test_input_is_only_for_trace(conv_relu_chain_path, tmp_path):
                                       "--input", str(tmp_path / "x.bin")])
     assert result.exit_code != 0
     assert "--input is for --trace" in result.output
+
+
+def test_analyze_says_when_traffic_is_not_measured(conv_relu_chain_path, monkeypatch):
+    import tigris.runtime
+
+    def unavailable():
+        raise tigris.runtime.RuntimeError("Bundled host runtime is unavailable")
+
+    monkeypatch.setattr(tigris.runtime, "runtime_info", unavailable)
+    result = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "8K"])
+    assert result.exit_code == 0, result.output
+    assert "not measured: no host runtime in this install" in result.output
+    result = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "8K", "--json"])
+    assert json.loads(result.output)["slow"]["traffic"] is None
