@@ -19,6 +19,9 @@ from packaging.tags import sys_tags
 
 ROOT = Path(__file__).resolve().parents[1]
 DESTINATION = ROOT / "src" / "tigris" / "native"
+# Read from the package source, so staging and loading cannot disagree.
+HOST_ABI = int(re.search(r"^HOST_ABI = (\d+)$", (ROOT / "src" / "tigris" / "runtime.py").read_text(),
+                         re.M)[1])
 
 
 def build_source(source: Path):
@@ -64,7 +67,7 @@ def stage(data: bytes, checksum: str, destination: Path, *, release=None, platfo
             raise ValueError("Unsafe runtime archive member")
         contents = {member.name: archive.extractfile(member).read() for member in members}
     manifest = json.loads(contents["manifest.json"])
-    if manifest.get("abi") != 1 or manifest.get("library") not in libraries:
+    if manifest.get("abi") != HOST_ABI or manifest.get("library") not in libraries:
         raise ValueError("Unsupported runtime archive ABI or library")
     if hashlib.sha256(contents[manifest["library"]]).hexdigest() != manifest.get("sha256"):
         raise ValueError("Runtime library checksum mismatch")

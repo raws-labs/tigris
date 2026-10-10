@@ -294,3 +294,25 @@ def test_inspect_fast_arena_matches_the_runtime(conv_relu_chain_path, tmp_path, 
     assert needs["fast_arena_bytes"] >= required
     if platform.machine() == "x86_64":
         assert needs["fast_arena_bytes"] == required
+
+
+def test_analyze_trace_runs_the_plan_and_matches_the_counters(conv_relu_chain_path):
+    result = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "8K", "--trace", "-v"])
+    assert result.exit_code == 0, result.output
+    assert "traced on runtime" in result.output
+    assert "their bytes equal the runtime's own counters" in result.output
+    assert "mismatch" not in result.output
+    assert "tile 0" in result.output
+
+
+def test_session_trace_reports_events_in_order(linear_plan):
+    with Session(linear_plan) as session:
+        outputs, events, counters = session.trace({"input": np.ones((1, 64), np.float32)})
+    assert outputs["output"].sum() == 64
+    # The input is placed in slow memory before the stage and the fast pool is reset after it.
+    kinds = [event["kind"] for event in events]
+    assert (kinds[0], events[0]["pool"], events[0]["stage"]) == ("alloc", "slow", None)
+    assert kinds.count("stage_begin") == kinds.count("stage_end") == 1
+    assert kinds.index("stage_begin") < kinds.index("stage_end") == len(kinds) - 2
+    assert [event["op"] for event in events if event["kind"] == "op"] == [0, 1, 2]
+    assert sum(event["bytes"] for event in events if event["kind"] == "load") == counters["load_bytes"]

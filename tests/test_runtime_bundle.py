@@ -16,7 +16,7 @@ from scripts import runtime_bundle
 
 def archive(*, library_hash=None, extra=None, link=False, platform=None):
     library = b"test library payload"
-    manifest = {"version": "1.2.3", "abi": 1, "library": "libtigris_host.so",
+    manifest = {"version": "1.2.3", "abi": runtime_bundle.HOST_ABI, "library": "libtigris_host.so",
                 "platform": platform or next(sys_tags()).platform,
                 "sha256": library_hash or hashlib.sha256(library).hexdigest()}
     files = {"manifest.json": json.dumps(manifest).encode(), "LICENSE": b"license",

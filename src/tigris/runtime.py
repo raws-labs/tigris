@@ -16,6 +16,27 @@ class RuntimeError(ValueError):
     """A host runtime or model execution error."""
 
 
+# The host library interface this package speaks; the bundled manifest records it.
+HOST_ABI = 2
+
+
+class TraceEvent(ct.Structure):
+    """One runtime execution event, as include/tigris_trace.h lays it out."""
+
+    _fields_ = [("kind", ct.c_uint8), ("pool", ct.c_uint8), ("path", ct.c_uint8), ("_pad", ct.c_uint8),
+                ("stage", ct.c_uint16), ("tensor", ct.c_uint16), ("op", ct.c_uint16), ("_pad2", ct.c_uint16),
+                ("offset", ct.c_uint32), ("src_offset", ct.c_uint32), ("bytes", ct.c_uint32),
+                ("row0", ct.c_int32), ("row1", ct.c_int32), ("col0", ct.c_int32), ("col1", ct.c_int32),
+                ("fast_used", ct.c_uint32), ("slow_used", ct.c_uint32)]
+
+
+TRACE_KINDS = {1: "stage_begin", 2: "stage_end", 3: "tile_begin", 4: "load", 5: "spill", 6: "alloc",
+               7: "reset", 8: "move", 9: "weights", 10: "op", 11: "copy"}
+TRACE_PATHS = {0: "normal", 1: "tiled", 2: "tiled_2d", 3: "by_input", 4: "transpose", 5: "rows",
+               6: "reshape", 7: "chain", 8: "control"}
+_NONE_U16 = 0xFFFF
+
+
 def _library():
     override = os.environ.get("TIGRIS_HOST_LIBRARY")
     manifest = None
@@ -57,11 +78,13 @@ def _library():
                               ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint32), ct.c_uint32]),
         "metric": (ct.c_uint64, [ct.c_void_p, ct.c_uint32]),
         "reset_state": (ct.c_char_p, [ct.c_void_p]),
+        "trace_buffer": (None, [ct.c_void_p, ct.c_void_p, ct.c_uint32]),
+        "trace_count": (ct.c_uint32, [ct.c_void_p]),
     }
     try:
         lib.tigris_host_abi.restype = ct.c_uint32
         lib.tigris_host_abi.argtypes = []
-        if lib.tigris_host_abi() != 1 or (manifest is not None and manifest["abi"] != 1):
+        if lib.tigris_host_abi() != HOST_ABI or (manifest is not None and manifest["abi"] != HOST_ABI):
             raise RuntimeError(f"Unsupported host library ABI ({source})")
         for name, (result, arguments) in signatures.items():
             function = getattr(lib, f"tigris_host_{name}")
@@ -184,6 +207,53 @@ class Session:
             self._check(self._lib.tigris_host_run(self._handle, pointers(arrays), sizes(arrays), len(arrays),
                                                  pointers(outputs), sizes(outputs), len(outputs)))
             return {info["name"]: value for info, value in zip(self.outputs, outputs)}
+
+    def trace(self, inputs: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], list[dict], dict[str, int]]:
+        """Run once and return the outputs, every execution event the runtime
+        reported in order, and the run's counters. A buffer too small for the
+        events is enlarged and the run repeated from the same state."""
+        with self._lock:
+            if not self._handle:
+                raise RuntimeError("Session is closed")
+            capacity = 1 << 14
+            while True:
+                buffer = (TraceEvent * capacity)()
+                self._lib.tigris_host_trace_buffer(self._handle, buffer, capacity)
+                try:
+                    outputs = self.run(inputs)
+                finally:
+                    count = self._lib.tigris_host_trace_count(self._handle)
+                    self._lib.tigris_host_trace_buffer(self._handle, None, 0)
+                if count <= capacity:
+                    break
+                capacity = count
+                self.reset_state()
+            events = []
+            for event in buffer[:count]:
+                item = {"kind": TRACE_KINDS.get(event.kind, f"unknown({event.kind})")}
+                for name in ("stage", "tensor", "op"):
+                    value = getattr(event, name)
+                    item[name] = None if value == _NONE_U16 else value
+                item["pool"] = {0: "fast", 1: "slow"}.get(event.pool)
+                if item["kind"] == "stage_begin":
+                    item["path"] = TRACE_PATHS.get(event.path, f"unknown({event.path})")
+                for name in ("offset", "src_offset", "bytes", "fast_used", "slow_used"):
+                    item[name] = getattr(event, name)
+                for name in ("row0", "row1", "col0", "col1"):
+                    value = getattr(event, name)
+                    item[name] = None if value < 0 else value
+                events.append(item)
+            return outputs, events, self.counters
+
+    @property
+    def counters(self) -> dict[str, int]:
+        """The last run's data movement as the runtime counted it."""
+        with self._lock:
+            if not self._handle:
+                raise RuntimeError("Session is closed")
+            names = {"load_bytes": 5, "spill_bytes": 6, "weight_bytes": 7, "copy_bytes": 8,
+                     "compactions": 9, "tiles": 10, "tensor_align": 11}
+            return {name: self._lib.tigris_host_metric(self._handle, index) for name, index in names.items()}
 
     def reset_state(self):
         """Return every variable the plan keeps across runs to its initial
