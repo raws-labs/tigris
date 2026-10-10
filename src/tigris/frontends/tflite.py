@@ -222,13 +222,76 @@ def _constant_result(op: "_Operator", tensors) -> "np.ndarray | None":
     if op.kind == "BROADCAST_ARGS":
         return np.asarray(np.broadcast_shapes(*(tuple(t.array().reshape(-1)) for t in ins)),
                           _NUMPY[out.type])
+    if op.kind in _CONSTANT_MOVES and _same_quantization([ins[0], out]):
+        return _constant_move(op, ins)
+    if (op.kind in _CONSTANT_MATH and all(t.type in ("INT32", "INT64") and not len(t.scale)
+                                          for t in (*ins, out))
+            and not op.option(_FUSED_SLOT.get(op.kind, 0), "b")):
+        a, b = (t.array().astype(np.int64) for t in ins)
+        value = _CONSTANT_MATH[op.kind](a, b)
+        info = np.iinfo(_NUMPY[out.type])
+        return value if np.all((value >= info.min) & (value <= info.max)) else None
     return None
+
+
+# Data movement the frontend computes on constants of any dtype, and the integer
+# arithmetic of shape computations (a Keras Reshape that keeps the batch axis
+# exports SHAPE, STRIDED_SLICE and PACK ahead of the RESHAPE).
+_CONSTANT_MOVES = ("STRIDED_SLICE", "SLICE", "PACK", "CONCATENATION", "RESHAPE", "SQUEEZE",
+                   "EXPAND_DIMS")
+_CONSTANT_MATH = {"ADD": np.add, "SUB": np.subtract, "MUL": np.multiply}
+
+
+def _constant_move(op: "_Operator", ins) -> "np.ndarray | None":
+    x = ins[0].array()
+    if op.kind in ("RESHAPE", "SQUEEZE", "EXPAND_DIMS"):
+        return x  # _fold_constants gives it the output's static shape
+    if op.kind == "PACK":
+        return np.stack([t.array() for t in ins], axis=op.option(1, "i"))
+    if op.kind == "CONCATENATION":
+        if op.option(1, "b") or not _same_quantization(ins):
+            return None
+        return np.concatenate([t.array() for t in ins], axis=op.option(0, "i"))
+    if op.kind == "SLICE":
+        begin = [int(v) for v in ins[1].array().reshape(-1)]
+        size = [int(v) for v in ins[2].array().reshape(-1)]
+        ends = [extent if s == -1 else b + s for b, s, extent in zip(begin, size, x.shape)]
+        if any(not 0 <= b <= e <= extent for b, e, extent in zip(begin, ends, x.shape)):
+            return None
+        return x[tuple(slice(b, e) for b, e in zip(begin, ends))]
+    # STRIDED_SLICE with TensorFlow's clamping; ellipsis and new axes are not folded.
+    if op.option(2, "i") or op.option(3, "i"):
+        return None
+    begins, ends, strides = ([int(v) for v in ins[i].array().reshape(-1)] for i in (1, 2, 3))
+    begin_mask, end_mask, shrink_mask = op.option(0, "i"), op.option(1, "i"), op.option(4, "i")
+    offset = op.option(5, "?", False)
+    for axis in range(len(begins)):
+        extent, stride = x.shape[axis], strides[axis]
+        if stride == 0:
+            return None
+        begin, end = begins[axis], ends[axis] + (begins[axis] if offset else 0)
+        if shrink_mask >> axis & 1:
+            begin = begin + extent if begin < 0 else begin
+            if not 0 <= begin < extent:
+                return None
+            index = [begin]
+        else:
+            low, high = (0, extent) if stride > 0 else (-1, extent - 1)
+            begin = (low if stride > 0 else high) if begin_mask >> axis & 1 else \
+                min(max(begin + extent if begin < 0 else begin, low), high)
+            end = (high if stride > 0 else low) if end_mask >> axis & 1 else \
+                min(max(end + extent if end < 0 else end, low), high)
+            index = list(range(begin, end, stride))
+        x = np.take(x, index, axis=axis)
+    return x.reshape([n for axis, n in enumerate(x.shape)
+                      if not (axis < len(begins) and shrink_mask >> axis & 1)])
 
 
 def _fold_constants(graph):
     """Operators computed from static shapes and constants become constants:
-    the shape and fill operators the converter folds in a static model, and a
-    transpose of a weight it passed into a branch."""
+    the shape and fill operators the converter folds in a static model, the
+    shape arithmetic it leaves in, and a transpose of a weight it passed into
+    a branch."""
     name, tensors, inputs, outputs, operators = graph
     kept = []
     for op in operators:
@@ -236,9 +299,10 @@ def _fold_constants(graph):
         value = (_constant_result(op, tensors)
                  if result is not None and op.outputs[0] not in outputs and result.type in _NUMPY
                  else None)
-        if value is None:
+        if value is None or value.size != int(np.prod(result.shape)):
             kept.append(op)
             continue
+        value = value.reshape(result.shape)
         result.folded = np.ascontiguousarray(value.astype(_NUMPY[result.type])).tobytes()
         result.buffer = 1 << 30
     return name, tensors, inputs, outputs, kept

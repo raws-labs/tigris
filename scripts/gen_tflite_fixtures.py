@@ -670,6 +670,51 @@ def _shape_ops(case):
         tensors = [act((1, 4)), act((2,), T.INT32), act((1, 4)), act((1, 4))]
         ops = [(B.SHAPE, schema.BuiltinOptions.ShapeOptions, options, [0], [1]),
                (B.RESHAPE, schema.BuiltinOptions.NONE, None, [0, 1], [2]), (*add, [0, 2], [3])]
+    elif case in ("pack_reshape", "pack_reshape_int8"):
+        # What Keras exports for a Reshape that keeps the batch axis.
+        x = ((1, 1, 1, 4), T.INT8, None, 0.05, 3, False) if case.endswith("int8") else act((1, 1, 1, 4))
+        tensors = [x, act((4,), T.INT32), *(const(np.asarray([v], np.int32), T.INT32) for v in (0, 1, 1)),
+                   act((), T.INT32), const(np.asarray(4, np.int32), T.INT32), act((2,), T.INT32),
+                   ((1, 4), *x[1:])]
+        shape, slices, pack = (schema.ShapeOptionsT(), schema.StridedSliceOptionsT(),
+                               schema.PackOptionsT())
+        shape.outType, slices.shrinkAxisMask, pack.valuesCount = T.INT32, 1, 2
+        ops = [(B.SHAPE, schema.BuiltinOptions.ShapeOptions, shape, [0], [1]),
+               (B.STRIDED_SLICE, schema.BuiltinOptions.StridedSliceOptions, slices, [1, 2, 3, 4], [5]),
+               (B.PACK, schema.BuiltinOptions.PackOptions, pack, [5, 6], [7]),
+               (B.RESHAPE, schema.BuiltinOptions.NONE, None, [0, 7], [8])]
+    elif case == "shape_arithmetic":
+        # [1, 2, 3, 4] -> [2 * n, h * w * c - 12] from SLICE, STRIDED_SLICE, MUL,
+        # SUB and CONCATENATION on its shape.
+        def ints(*values):
+            return const(np.asarray(values, np.int32), T.INT32)
+
+        one = act((1,), T.INT32)
+        tensors = [act((1, 2, 3, 4)), act((4,), T.INT32), ints(1), one, ints(2), one, ints(3),
+                   ints(1), one, one, one, ints(0), ints(1), ints(1), one, ints(2), one, ints(12), one,
+                   act((2,), T.INT32), act((2, 12)), act((2, 12))]
+        shape, concat = schema.ShapeOptionsT(), schema.ConcatenationOptionsT()
+        shape.outType = T.INT32
+        none = schema.BuiltinOptions.NONE
+        ops = [(B.SHAPE, schema.BuiltinOptions.ShapeOptions, shape, [0], [1]),
+               (B.SLICE, none, None, [1, 2, 7], [3]), (B.SLICE, none, None, [1, 4, 7], [5]),
+               (B.SLICE, none, None, [1, 6, 7], [8]),
+               (B.MUL, none, None, [3, 5], [9]), (B.MUL, none, None, [9, 8], [10]),
+               (B.STRIDED_SLICE, schema.BuiltinOptions.StridedSliceOptions,
+                schema.StridedSliceOptionsT(), [1, 11, 12, 13], [14]),
+               (B.MUL, none, None, [14, 15], [16]), (B.SUB, none, None, [10, 17], [18]),
+               (B.CONCATENATION, schema.BuiltinOptions.ConcatenationOptions, concat, [16, 18], [19]),
+               (B.RESHAPE, none, None, [0, 19], [20]), (*add, [20, 20], [21])]
+    elif case == "reverse_reshape":
+        # [1, 2, 3, 4] reshaped to its reversed shape by a stride -1 STRIDED_SLICE.
+        tensors = [act((1, 2, 3, 4)), act((4,), T.INT32),
+                   *(const(np.asarray([v], np.int32), T.INT32) for v in (0, 0, -1)),
+                   act((4,), T.INT32), act((4, 3, 2, 1)), act((4, 3, 2, 1))]
+        shape, slices = schema.ShapeOptionsT(), schema.StridedSliceOptionsT()
+        shape.outType, slices.beginMask, slices.endMask = T.INT32, 1, 1
+        ops = [(B.SHAPE, schema.BuiltinOptions.ShapeOptions, shape, [0], [1]),
+               (B.STRIDED_SLICE, schema.BuiltinOptions.StridedSliceOptions, slices, [1, 2, 3, 4], [5]),
+               (B.RESHAPE, schema.BuiltinOptions.NONE, None, [0, 5], [6]), (*add, [6, 6], [7])]
     else:  # broadcast_args
         tensors = [act((4,)), const(np.asarray([1, 4], np.int32), T.INT32),
                    const(np.asarray([4], np.int32), T.INT32), act((2,), T.INT32), act((1, 4))]
@@ -733,6 +778,10 @@ HANDMADE = {
     "detection_regular": lambda: _detection(True, quantized=True),
     "float_shape_reshape": lambda: _shape_ops("shape_reshape"),
     "float_broadcast_args": lambda: _shape_ops("broadcast_args"),
+    "float_shape_pack_reshape": lambda: _shape_ops("pack_reshape"),
+    "shape_pack_reshape": lambda: _shape_ops("pack_reshape_int8"),
+    "float_shape_arithmetic": lambda: _shape_ops("shape_arithmetic"),
+    "float_shape_reverse_reshape": lambda: _shape_ops("reverse_reshape"),
     "lstm_time_major_clip": lambda: _lstm(True, 2, 3, 3, 4, cell_clip=0.8, quantized=True),
 }
 # TFLite's float SVDF and LSTM compute in another order than TFLite Micro, so
