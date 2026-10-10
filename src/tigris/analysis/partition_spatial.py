@@ -1249,9 +1249,11 @@ def _solve_layout_conversion(
     other = rows if band_on_columns else cols
 
     align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+    # A transposed position includes the unchanged trailing dimensions.
+    position_bytes = source.size_bytes // (batch * rows * cols)
 
     def working_set(band: int) -> int:
-        return 2 * _align_up(batch * other * band * source.elem_size, align)
+        return 2 * _align_up(batch * other * band * position_bytes, align)
 
     if working_set(1) > budget:
         return TilePlan(
