@@ -5,9 +5,6 @@ import os
 from pathlib import Path
 
 import click
-from rich.console import Console
-
-console = Console()
 
 
 def _parse_size(s: str) -> int:
@@ -69,7 +66,8 @@ def _report_shape_bindings(ag) -> None:
     needs no warning, and the rows already report it.
     """
     for binding in ag.shape_bindings:
-        console.print(f"[yellow]warning:[/] {binding}")
+        from tigris.cli import text
+        text.echo(text.warn("warning: ") + str(binding), err=True)
 
 
 def _run_pipeline(
@@ -103,10 +101,9 @@ def _run_pipeline(
         raise click.ClickException("Fast-memory reservation must not be negative")
 
     try:
-        with console.status("Loading model..."):
-            ag = load_model(model_path, input_shapes)
-            ag = compute_lifetimes(ag)
-            ag = compute_memory_timeline(ag, capture_live_tensors=False)
+        ag = load_model(model_path, input_shapes)
+        ag = compute_lifetimes(ag)
+        ag = compute_memory_timeline(ag, capture_live_tensors=False)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -124,20 +121,19 @@ def _run_pipeline(
             "Fast-memory budget exceeds the uint32 plan-format limit"
         )
     if total_budget >= 0 and fast_reserve_bytes > total_budget:
+        # Only compressed plans reserve fast memory, for decompressed weights.
+        from tigris.utils import fmt_bytes
         raise click.ClickException(
-            "Fast-memory reservation "
-            f"({fast_reserve_bytes:,} bytes) exceeds the total budget "
-            f"({total_budget:,} bytes)"
+            f"no plan written: decompressed weights need {fmt_bytes(fast_reserve_bytes)} "
+            f"of fast memory, the budget is {fmt_bytes(total_budget)}"
         )
     budget = total_budget - fast_reserve_bytes
 
     def planned(graph):
         if budget > 0:
-            with console.status("Partitioning..."):
-                graph = partition_temporal(graph, budget)
-            with console.status("Computing spatial partitioning..."):
-                graph = partition_spatial(graph)
-                graph = detect_and_solve_chains(graph)
+            graph = partition_temporal(graph, budget)
+            graph = partition_spatial(graph)
+            graph = detect_and_solve_chains(graph)
         graph.budget = replace(graph.budget, fast_reserve=fast_reserve_bytes)
         return graph
 
@@ -180,7 +176,12 @@ def _show_version(ctx, param, value):
 @click.option("--version", is_flag=True, is_eager=True, expose_value=False,
               callback=_show_version, help="Show compiler and host runtime versions and runtime origin.")
 def cli():
-    """TiGrIS - Tiled Graph Inference Scheduler"""
+    """TiGrIS - Tiled Graph Inference Scheduler
+
+    Fits ONNX and TFLite models into the memory of embedded devices: analyze a
+    model against a budget, compile it into a tiled execution plan, generate
+    the C code that runs it.
+    """
 
 
 def main():

@@ -203,6 +203,78 @@ def _finite(value):
     return value
 
 
+def _model_analysis(report: dict) -> tuple[dict, dict | None]:
+    """Weights and multiply-accumulates per operator type, the largest
+    activations, and for TFLite how the model is quantized."""
+    from tigris.inspection_stats import model_costs, quantization
+
+    graph = report["graph"]
+    tensors = {}
+    for item in graph.get("activations", []) + graph.get("value_info", []) + graph["inputs"] + graph["outputs"]:
+        shape = item.get("shape")
+        if isinstance(shape, list) and not all(isinstance(dim, int) for dim in shape):
+            shape = None
+        tensors[item["name"]] = {"shape": shape, "dtype": item.get("dtype"), "constant": False}
+    for item in graph["initializers"]:
+        tensors[item["name"]] = {"shape": item["shape"], "dtype": item["dtype"], "constant": True,
+                                 "size_bytes": item["size_bytes"]}
+    costs = model_costs(graph["operators"], tensors, [item["name"] for item in graph["inputs"]])
+    folded = set(costs.pop("constants"))
+    quant = None
+    if report["format"] == "tflite":
+        activations = [item for item in graph["activations"] if item["name"] not in folded]
+        quant = quantization(activations, graph["initializers"], graph["operators"],
+                             [item["name"] for item in graph["outputs"]], folded)
+    return costs, quant
+
+
+def _plan_requirements(plan: dict) -> dict:
+    """What a runtime needs to run the plan: the fast arena, the state it
+    keeps between runs, and the build limits the plan asks for. The fast arena
+    adds the decompression buffer, sized as the runtime sizes it at the
+    largest tensor alignment, so it is an upper bound across targets."""
+    from tigris.emitters.binary.writer import (
+        RUNTIME_MAX_CHAIN_STAGES, RUNTIME_MAX_STAGE_INPUTS, RUNTIME_MAX_STAGE_OUTPUTS,
+        RUNTIME_MAX_TENSORS)
+    from tigris.emitters.codegen import _executor_workspace_limits
+
+    def aligned(size):
+        return -(-size // _MAX_TENSOR_ALIGN) * _MAX_TENSOR_ALIGN
+
+    blocks = [block for block in plan["weight_blocks"] if block["compressed_size"]]
+    decompression = max((aligned(block["uncompressed_size"]) for block in blocks), default=0)
+    for index, stage in enumerate(plan["stages"]):
+        if stage["chain_len"] < 2 or stage["chain_id"] != index:
+            continue
+        # A chain head decompresses each member's first block before any tile.
+        firsts = {}
+        for block in blocks:
+            if index <= block["stage_idx"] < index + stage["chain_len"]:
+                firsts.setdefault(block["stage_idx"], block)
+        decompression = max(decompression, sum(aligned(b["uncompressed_size"]) for b in firsts.values()))
+    tensors, inputs, outputs, chain, spatial = _executor_workspace_limits(
+        {**plan, "num_tensors": len(plan["tensors"])})
+    defaults = {"TIGRIS_MAX_TENSORS": RUNTIME_MAX_TENSORS,
+                "TIGRIS_MAX_STAGE_INPUTS": RUNTIME_MAX_STAGE_INPUTS,
+                "TIGRIS_MAX_STAGE_OUTPUTS": RUNTIME_MAX_STAGE_OUTPUTS,
+                "TIGRIS_MAX_CHAIN_STAGES": RUNTIME_MAX_CHAIN_STAGES,
+                "TIGRIS_MAX_SPATIAL_OPS_PER_STAGE": _RUNTIME_MAX_SPATIAL_OPS}
+    needed = dict(zip(defaults, (tensors, inputs, outputs, chain, spatial)))
+    return {
+        "fast_arena_bytes": plan["budget"] + decompression,
+        "decompression_bytes": decompression,
+        "state_bytes": plan["state"]["bytes"],
+        "build_limits": [{"name": name, "needed": needed[name], "default": default}
+                         for name, default in defaults.items()],
+    }
+
+
+# The runtime's largest TIGRIS_TENSOR_ALIGN and its default spatial-operator
+# limit; tigris_config.h holds both.
+_MAX_TENSOR_ALIGN = 32
+_RUNTIME_MAX_SPATIAL_OPS = 8
+
+
 def inspect_file(path: str | Path) -> dict:
     """Return JSON-safe metadata; never load external ONNX tensor data."""
     data = Path(path).read_bytes()
@@ -240,6 +312,10 @@ def inspect_file(path: str | Path) -> dict:
                        for fn in model.functions],
         )
         operators = graph["operators"]
+    if report["format"] == "tgrs":
+        report["requirements"] = _plan_requirements(report["plan"])
+    else:
+        report["costs"], report["quantization"] = _model_analysis(report)
     report["operator_counts"] = dict(sorted(Counter(
         f"{op['domain']}::{op['type']}" if op.get("domain") else op["type"]
         for op in operators

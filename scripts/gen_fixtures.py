@@ -16,7 +16,6 @@ import click
 import numpy as np
 import onnx
 import onnxruntime as ort
-from rich.console import Console
 
 from tigris.cli import _run_pipeline
 from tigris.emitters.binary.writer import emit_binary
@@ -28,7 +27,6 @@ from tigris.fixtures import (
     build_tcn,
 )
 
-console = Console()
 
 _INLINE = [
     ("linear_3op",      build_linear_3op,      "4K",   False),
@@ -50,7 +48,7 @@ def _gen_reference(onnx_path: str, out_path: Path) -> None:
     results = sess.run(None, {inp_meta.name: inp_data})
     ref_data = b"".join(r.astype(np.float32).tobytes() for r in results)
     out_path.write_bytes(ref_data)
-    console.print(f"  {out_path} ({len(ref_data)} bytes, {len(ref_data)//4} floats)")
+    print(f"  {out_path} ({len(ref_data)} bytes, {len(ref_data)//4} floats)")
 
 
 @click.command()
@@ -64,7 +62,7 @@ def main(model: str, output_dir: str, mem: str, compress: bool):
     out.mkdir(parents=True, exist_ok=True)
 
     for name, builder, budget, gen_ref in _INLINE:
-        console.print(f"[bold]Generating {name} fixture...[/]")
+        print(f"Generating {name} fixture...")
         onnx_model = builder()
         with tempfile.TemporaryDirectory() as tmp:
             onnx_path = Path(tmp) / f"{name}.onnx"
@@ -72,26 +70,26 @@ def main(model: str, output_dir: str, mem: str, compress: bool):
             ag, _ = _run_pipeline(str(onnx_path), (budget,))
             plan_path = out / f"{name}.tgrs"
             emit_binary(ag, plan_path)
-            console.print(f"  {plan_path} ({plan_path.stat().st_size} bytes)")
+            print(f"  {plan_path} ({plan_path.stat().st_size} bytes)")
             if compress and ag.weight_data:
                 lz4_path = out / f"{name}.lz4.tgrs"
                 emit_binary(ag, lz4_path, compress="lz4")
-                console.print(f"  {lz4_path} ({lz4_path.stat().st_size} bytes, LZ4)")
+                print(f"  {lz4_path} ({lz4_path.stat().st_size} bytes, LZ4)")
             if gen_ref:
                 _gen_reference(str(onnx_path), out / f"{name}.reference.bin")
 
-    console.print(f"[bold]Compiling MobileNetV2: {model}...[/]")
+    print(f"Compiling MobileNetV2: {model}...")
     ag, _ = _run_pipeline(model, (mem,))
     plan_path = out / "mobilenetv2.tgrs"
     emit_binary(ag, plan_path)
-    console.print(f"  Plan: {plan_path} ({plan_path.stat().st_size} bytes)")
+    print(f"  Plan: {plan_path} ({plan_path.stat().st_size} bytes)")
     if compress:
         lz4_path = out / "mobilenetv2.lz4.tgrs"
         emit_binary(ag, lz4_path, compress="lz4")
-        console.print(f"  LZ4 plan: {lz4_path} ({lz4_path.stat().st_size} bytes)")
+        print(f"  LZ4 plan: {lz4_path} ({lz4_path.stat().st_size} bytes)")
     _gen_reference(model, out / "mobilenetv2.reference.bin")
 
-    console.print(f"\n[bold green]All fixtures written to {out}/[/]")
+    print(f"\nAll fixtures written to {out}/")
 
 
 if __name__ == "__main__":

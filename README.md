@@ -44,34 +44,27 @@ tigris analyze mobilenetv2.onnx -m 256K -f 16M
 
 ```text
 warning: input axis 0 (batch_size) is unset; using 1 (--input-shape overrides)
-╭──────────────────────── TiGrIS - mobilenetv2 ────────────────────────╮
-│ Operators            65                                              │
-│ Tensors              244 (66 activations)                            │
-│ Peak memory (naive)  5.74 MiB                                        │
-│ Largest tensor       1x96x112x112 (4.59 MiB)                         │
-│ Dtype                float32                                         │
-│ Input                input 1x3x224x224 float32                       │
-│ Output               output 1x1000 float32                           │
-╰──────────────────────────────────────────────────────────────────────╯
-╭──────────────────────────────── SRAM ────────────────────────────────╮
-│ Budget              256.00 KiB                                       │
-│ Scheduled peak      252.00 KiB (4.3% of naive peak)                  │
-│ Stages              58                                               │
-│ Spill / reload I/O  26.21 MiB / 27.55 MiB                            │
-│                                                                      │
-│ Need tiling         47 of 58 stages                                  │
-│   tileable          11 (138 tiles, max halo 2)                       │
-╰────────────────  PASS - tiling resolves all stages  ─────────────────╯
-╭─────────────────────────────── Flash ────────────────────────────────╮
-│ Budget            16.00 MiB                                          │
-│ Weight data       13.30 MiB                                          │
-│ Plan overhead      0.01 MiB                                          │
-│ Plan (est.)       13.31 MiB                                          │
-│ Plan INT8 (est.)   3.34 MiB                                          │
-╰─────────────────────────  PASS - plan fits  ─────────────────────────╯
+mobilenetv2.onnx   float32, 65 operators
+  input    input    1x3x224x224 float32
+  output   output   1x1000 float32
+fits 256.00 KiB fast memory, 58 stages, 53 tiled
+
+memory
+  unscheduled         5.74 MiB
+  largest tensor      4.59 MiB   1x96x112x112
+  this plan         252.00 KiB   4.00 KiB headroom
+  slow memory         5.17 MiB
+  also fits at      128.00 KiB   64 stages, 62 tiled
+  also fits at       64.00 KiB   64 stages, 63 tiled
+  does not fit at    32.00 KiB
+
+flash
+  plan           13.31 MiB   weights 13.30 MiB, overhead 9.41 KiB
+  as int8         3.34 MiB   estimate
+  flash budget   16.00 MiB   fits
 ```
 
-The naive peak is 5.74 MiB. TiGrIS schedules it into 256 KiB through temporal partitioning and spatial tiling. `analyze` runs on your laptop; no hardware required.
+Unscheduled, the model peaks at 5.74 MiB. TiGrIS schedules it into 256 KiB through temporal partitioning and spatial tiling. `analyze` runs on your laptop; no hardware required.
 
 That model is a stock export with a free batch dimension. TiGrIS binds a dimension the model leaves open to 1 and says so; pass `--input-shape input:4x3x224x224` to compile for a different one.
 

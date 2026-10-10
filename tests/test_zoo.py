@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import re
 
 import pytest
 from click.testing import CliRunner
@@ -82,7 +83,7 @@ def test_unknown_upper_bound_does_not_filter_out_untested_releases(tmp_path):
     result = CliRunner().invoke(cli, ["zoo", "--catalog", str(catalog), "list", "--runtime", "0.10.0", "--verbose"])
     assert result.exit_code == 0, result.output
     assert "no known upper bound" in result.output
-    assert "tested runtimes: 0.9.1" in result.output
+    assert re.search(r"tested +0\.9\.1", result.output)
 
 
 def test_download_uses_current_compatibility_without_rewriting_manifest(tmp_path):
@@ -237,7 +238,7 @@ def test_cli_filtering_and_download(tmp_path):
     prefix = ["zoo", "--catalog", str(catalog)]
     result = runner.invoke(cli, prefix + ["list"])
     assert result.exit_code == 0, result.output
-    assert "Model zoo" in result.output and "Classification" in result.output
+    assert result.output.startswith("model") and "Classification" in result.output
     assert "1.00 KiB" in result.output
     assert "example-a" not in result.output and "published=" not in result.output
     result = runner.invoke(cli, prefix + ["list", "--runtime", "0.9.1", "-m", "1K+0", "--json"])
@@ -246,8 +247,8 @@ def test_cli_filtering_and_download(tmp_path):
     output = tmp_path / "download"
     result = runner.invoke(cli, prefix + ["fetch", "--artifact", "example-b", "-o", str(output)])
     assert result.exit_code == 0, result.output
-    assert "WARNING: withdrawn: bad output" in result.output
-    assert "runtime >= 0.9.1, <= 0.9.3" in result.output
+    assert "warning: withdrawn: bad output" in result.output
+    assert re.search(r"runtime +>= 0\.9\.1, <= 0\.9\.3", result.output)
     assert (output / "model.tgrs").read_bytes() == b"plan"
     for args in (["fetch"], ["fetch", "example", "--artifact", "example-a"],
                  ["fetch", "example", "--runtime", "0.10.0"],

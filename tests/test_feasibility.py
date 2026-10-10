@@ -135,7 +135,7 @@ def test_minimum_tile_that_exceeds_budget_is_infeasible(conv_relu_chain_path):
 
     assert not validation.feasible
     assert validation.scheduled_peak_bytes > graph.mem_budget
-    assert any(issue.reason == "minimum 2D tile" for issue in validation.issues)
+    assert any(issue.reason == "smallest 2D tile" for issue in validation.issues)
 
 
 def test_findings_never_pass_when_scheduled_peak_exceeds_budget(conv_relu_chain_path):
@@ -161,8 +161,8 @@ def test_compile_refuses_infeasible_plan_without_creating_output(
     )
 
     assert result.exit_code != 0
-    assert "Cannot compile an infeasible memory plan" in result.output
-    assert "requires" in result.output
+    assert "does not fit" in result.output and "no plan written" in result.output
+    assert "smallest 2D tile" in result.output
     assert not output.exists()
 
 
@@ -239,8 +239,31 @@ def test_analyze_displays_failing_verdict(conv_relu_chain_path):
     )
 
     assert result.exit_code == 0
-    assert "FAIL" in result.output
-    assert "Infeasible" in result.output
+    assert "does not fit 300 B fast memory" in result.output
+    # The blocking stage is named once, with what it needs.
+    assert result.output.count("smallest 2D tile") == 1
+    assert "none at this budget" in result.output
+
+
+def test_analyze_prints_the_trace(conv_relu_chain_path):
+    trace = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "64K", "--trace"])
+    assert trace.exit_code == 0 and "conv0" in trace.output and "1 stage," in trace.output
+    assert CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "--json",
+                                    "--trace"]).exit_code != 0
+
+
+@pytest.mark.parametrize(("command", "replacement"), [
+    (["plan", "-o"], "inspect PLAN --json"), (["simulate"], "--trace"),
+])
+def test_plan_and_simulate_are_deprecated_aliases(conv_relu_chain_path, tmp_path, command,
+                                                  replacement):
+    args = [command[0], str(conv_relu_chain_path), "-m", "64K"]
+    if command[0] == "plan":
+        args += ["-o", str(tmp_path / "plan.yaml")]
+    result = CliRunner().invoke(cli, args)
+    assert result.exit_code == 0, result.output
+    assert "deprecated" in result.stderr and replacement in result.stderr
+    assert "removed in the next release" in result.stderr.lower()
 
 
 def test_run_pipeline_records_slow_tier(conv_relu_chain_path):
@@ -276,7 +299,7 @@ def test_compile_refuses_slow_overflow_without_output(conv_relu_chain_path, tmp_
         cli, ["compile", str(conv_relu_chain_path), "-m", "16K", "-m", "1K",
                "-o", str(output)])
     assert result.exit_code != 0
-    assert "overflow slow memory" in result.output
+    assert "slow memory" in result.output and "needed" in result.output and "given" in result.output
     assert not output.exists()
 
 
@@ -300,7 +323,7 @@ def test_compile_refuses_flash_overflow_without_output(conv_relu_chain_path, tmp
         cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
                "-f", "1", "-o", str(output)])
     assert result.exit_code != 0
-    assert "exceeds the flash budget" in result.output
+    assert "exceeds it by" in result.output and "no plan written" in result.output
     assert not output.exists()
 
 
@@ -312,7 +335,7 @@ def test_compile_refuses_flash_overflow_compressed(conv_relu_chain_path, tmp_pat
         cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
                "--compress", "lz4", "-f", "1", "-o", str(output)])
     assert result.exit_code != 0
-    assert "exceeds the flash budget" in result.output
+    assert "exceeds it by" in result.output and "no plan written" in result.output
     assert not output.exists()
 
 

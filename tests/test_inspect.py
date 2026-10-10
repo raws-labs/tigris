@@ -1,6 +1,7 @@
 """Inspection preserves source metadata and never executes model code."""
 
 import json
+import re
 import struct
 from pathlib import Path
 
@@ -67,7 +68,7 @@ def test_supported_schemas_and_json(path):
     assert json.loads(result.output) == report
     verbose = CliRunner().invoke(cli, ["inspect", str(path), "-v"])
     assert verbose.exit_code == 0, verbose.output
-    assert "Stored tensors" in verbose.output
+    assert "stored tensors" in verbose.output
 
 
 def test_plan_detected_by_content(tmp_path):
@@ -214,3 +215,71 @@ def test_pool_and_weight_bounds(tmp_path, kind, field, value):
     path.write_bytes(data)
     with pytest.raises(ValueError, match="Data exceeds section"):
         inspect_file(path)
+
+
+TFLITE = Path(__file__).parent / "fixtures" / "tflite"
+
+
+def test_tflite_costs_quantization_and_activations():
+    report = inspect_file(TFLITE / "ops" / "conv_bias.tflite")
+    # 7x7x6 outputs, each a 3x3x4 dot product.
+    assert report["costs"]["operators"] == [
+        {"type": "CONV_2D", "count": 1, "weight_bytes": 240, "macs": 7 * 7 * 6 * 3 * 3 * 4}]
+    assert report["quantization"] == {"activation_dtypes": ["int8"], "int8_weights": 1,
+                                      "per_channel": 1, "asymmetric": 0, "float_islands": 0}
+    report = inspect_file(TFLITE / "vww_96_int8.tflite")
+    costs = report["costs"]
+    assert costs["weight_bytes"] == sum(item["size_bytes"] for item in report["graph"]["initializers"])
+    assert costs["macs"] == sum(kind["macs"] for kind in costs["operators"])
+    largest = costs["largest_activations"][0]
+    assert (largest["shape"], largest["bytes"], largest["step"]) == ([1, 48, 48, 16], 36864, 2)
+    assert any(item["step"] is None for item in costs["largest_activations"])
+    result = CliRunner().invoke(cli, ["inspect", str(TFLITE / "vww_96_int8.tflite")])
+    assert result.exit_code == 0, result.output
+    assert "largest activations" in result.output
+    assert "int8 weights 27 of 28 per channel, symmetric" in result.output
+
+
+def test_onnx_costs_mark_undeclared_shapes(conv_relu_chain_path):
+    report = inspect_file(conv_relu_chain_path)
+    assert report["quantization"] is None
+    conv = next(kind for kind in report["costs"]["operators"] if kind["type"] == "Conv")
+    # The intermediate shapes are not declared, so the multiply-accumulates are unknown.
+    assert conv["macs"] is None and report["costs"]["macs"] is None
+    assert conv["weight_bytes"] > 0
+    result = CliRunner().invoke(cli, ["inspect", str(conv_relu_chain_path)])
+    assert result.exit_code == 0, result.output
+    assert re.search(r"Conv +2 +\S+ \S+ +\S+ +\?", result.output)
+
+
+def test_plan_requirements_name_the_build_limits(tmp_path):
+    report = inspect_file(FIXTURES / "schema-v10-state.tgrs")
+    needs = report["requirements"]
+    assert needs["fast_arena_bytes"] == report["plan"]["budget"]
+    assert needs["state_bytes"] == 48
+    limits = {item["name"]: item for item in needs["build_limits"]}
+    assert limits["TIGRIS_MAX_TENSORS"]["needed"] == len(report["plan"]["tensors"])
+    result = CliRunner().invoke(cli, ["inspect", str(FIXTURES / "schema-v10-state.tgrs")])
+    assert "default limits suffice" in result.output
+    assert "kept between runs" in result.output
+
+
+def test_qdq_weights_belong_to_the_operator_that_uses_them(qdq_conv_path, tmp_path):
+    # Declare the Conv output so its multiply-accumulates are computable.
+    model = onnx.load(qdq_conv_path)
+    conv = next(node for node in model.graph.node if node.op_type == "Conv")
+    model.graph.value_info.append(helper.make_tensor_value_info(conv.output[0], TensorProto.FLOAT, [1, 2, 2, 2]))
+    path = tmp_path / "qdq.onnx"
+    onnx.save(model, path)
+    report = inspect_file(path)
+    kinds = {kind["type"]: kind for kind in report["costs"]["operators"]}
+    # The weight reaches Conv through QuantizeLinear and DequantizeLinear, and
+    # its bytes, scales and zero points count where it is used.
+    assert kinds["Conv"]["weight_bytes"] == report["costs"]["weight_bytes"] - kinds["QuantizeLinear"]["weight_bytes"] \
+        - kinds["DequantizeLinear"]["weight_bytes"]
+    assert kinds["Conv"]["weight_bytes"] >= 2 * 1 * 3 * 3 * 4
+    assert kinds["Conv"]["macs"] == 2 * 2 * 2 * 1 * 3 * 3
+    names = {item["name"] for item in report["costs"]["activations"]}
+    produced_from_constants = {node.output[0] for node in model.graph.node
+                               if node.input[0] in {init.name for init in model.graph.initializer}}
+    assert not names & produced_from_constants

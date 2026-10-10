@@ -1,7 +1,7 @@
 """Tests for tigris.analysis.partition_spatial - op classification, receptive field, tile solver."""
 
 import pytest
-import yaml
+import json
 import numpy as np
 from onnx import TensorProto, helper, numpy_helper
 
@@ -18,7 +18,7 @@ from tigris.analysis.partition_spatial import (
     _stage_tile_axis,
 )
 from tigris.analysis.validation import validate_memory_plan
-from tigris.emitters.yaml import emit_yaml_str
+from tigris.emitters.plan_json import plan_json_str
 from tigris.fixtures import build_tcn
 
 
@@ -420,15 +420,15 @@ class TestTilingIntegration:
         assert validation.scheduled_peak_bytes <= 16 * 1024
 
 
-# YAML includes tile_plan
+# The JSON plan includes tile_plan
 
 
 class TestTilingYaml:
     def test_yaml_includes_tile_plan(self, conv_relu_chain_path):
         """YAML output should include tile_plan for oversized stages."""
         ag = _full_pipeline(conv_relu_chain_path, budget=1024)
-        text = emit_yaml_str(ag)
-        plan = yaml.safe_load(text)
+        text = plan_json_str(ag)
+        plan = json.loads(text)
 
         if "stages" in plan:
             stages_with_tp = [s for s in plan["stages"] if "tile_plan" in s]

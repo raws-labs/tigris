@@ -859,7 +859,14 @@ def describe(data: bytes) -> dict:
                            "inputs": [tensors[i].name for i in op.inputs if i >= 0],
                            "outputs": [tensors[i].name for i in op.outputs]} for op in operators],
             "initializers": [{"name": t.name, "dtype": _dtype_name(t), "shape": list(t.shape),
-                              "size_bytes": len(t.data), "storage": "embedded"} for t in constants],
+                              "size_bytes": len(t.data), "storage": "embedded",
+                              "scales": len(t.scale),
+                              "symmetric": bool(len(t.zero_point)) and not np.any(t.zero_point != 0)}
+                             for t in constants],
+            # Every tensor the operators produce or read that is not a constant.
+            "activations": [{"name": t.name, "dtype": _dtype_name(t), "shape": list(t.shape),
+                             "variable": t.variable}
+                            for t in tensors if not (t.buffer > 0 and t.data)],
             "sparse_initializers": [],
         },
         "unsupported": unsupported(data),
