@@ -12,6 +12,37 @@ from tigris.runtime import Session
 from tigris.utils import fmt_bytes
 
 
+def read_inputs(session, input_files) -> dict:
+    """Input arrays from .bin or .npy files, one per model input; a single
+    input may omit its NAME=."""
+    paths = {}
+    for item in input_files:
+        if "=" in item:
+            name, filename = item.split("=", 1)
+        elif len(session.inputs) == 1:
+            name, filename = session.inputs[0]["name"], item
+        else:
+            raise ValueError("Multiple-input models require NAME=FILE for each input")
+        if name in paths:
+            raise ValueError(f"Duplicate input: {name}")
+        paths[name] = Path(filename)
+    if set(paths) != {info["name"] for info in session.inputs}:
+        raise ValueError("Input names must match the complete model interface")
+    inputs = {}
+    for info in session.inputs:
+        path = paths[info["name"]]
+        if path.suffix == ".npy":
+            value = np.load(path, allow_pickle=False)
+        elif path.suffix == ".bin":
+            if path.stat().st_size != info["size_bytes"]:
+                raise ValueError(f"Input {info['name']!r} requires {info['size_bytes']} bytes")
+            value = np.fromfile(path, dtype=info["dtype"].newbyteorder("<")).reshape(info["shape"])
+        else:
+            raise ValueError("Inputs must end in .bin or .npy")
+        inputs[info["name"]] = value
+    return inputs
+
+
 @cli.command("run")
 @click.argument("model", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--input", "input_files", multiple=True, required=True,
@@ -33,33 +64,9 @@ def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
         if output.suffix not in {".bin", ".npy", ".npz"}:
             raise ValueError("Output must end in .bin, .npy, or .npz")
         with Session(model) as session:
-            paths = {}
-            for item in input_files:
-                if "=" in item:
-                    name, filename = item.split("=", 1)
-                elif len(session.inputs) == 1:
-                    name, filename = session.inputs[0]["name"], item
-                else:
-                    raise ValueError("Multiple-input models require NAME=FILE for each input")
-                if name in paths:
-                    raise ValueError(f"Duplicate input: {name}")
-                paths[name] = Path(filename)
-            if set(paths) != {info["name"] for info in session.inputs}:
-                raise ValueError("Input names must match the complete model interface")
+            inputs = read_inputs(session, input_files)
             if len(session.outputs) > 1 and output.suffix != ".npz":
                 raise ValueError("Multiple-output models require an .npz output")
-            inputs = {}
-            for info in session.inputs:
-                path = paths[info["name"]]
-                if path.suffix == ".npy":
-                    value = np.load(path, allow_pickle=False)
-                elif path.suffix == ".bin":
-                    if path.stat().st_size != info["size_bytes"]:
-                        raise ValueError(f"Input {info['name']!r} requires {info['size_bytes']} bytes")
-                    value = np.fromfile(path, dtype=info["dtype"].newbyteorder("<")).reshape(info["shape"])
-                else:
-                    raise ValueError("Inputs must end in .bin or .npy")
-                inputs[info["name"]] = value
             outputs = session.run(inputs)
             with output.open("xb") as stream:
                 if output.suffix == ".npz":

@@ -257,15 +257,21 @@ def _stages(ag) -> None:
               callback=_parse_input_shape,
               help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
 @click.option("--json", "as_json", is_flag=True, help="Emit the analysis as versioned JSON")
-@click.option("--trace", is_flag=True, help="Print the step-by-step execution trace instead")
+@click.option("--trace", is_flag=True,
+              help="Run the plan on the host runtime and print what it did instead")
+@click.option("--input", "input_files", multiple=True,
+              help="Input for --trace as .bin or .npy; NAME=FILE for several (default: zeros)")
 def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
-            input_shape: dict[str, tuple[int, ...]], as_json: bool, trace: bool):
+            input_shape: dict[str, tuple[int, ...]], as_json: bool, trace: bool,
+            input_files: tuple[str, ...]):
     """Check whether a model fits a memory budget, and why not."""
     from tigris.analysis.findings import compute_findings
     from tigris.frontends.tflite import is_tflite, tflm_tensor_arena
 
     if as_json and trace:
         raise click.UsageError("--json and --trace are two different outputs; choose one")
+    if input_files and not trace:
+        raise click.UsageError("--input is for --trace")
     mem_pools = [_parse_size(m) for m in mem]
     flash_budget = _parse_size(flash) if flash else 0
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
@@ -275,8 +281,8 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     ag, budget = _run_pipeline(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json)
     ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
     if trace:
-        from tigris.cli.simulate import print_trace
-        print_trace(ag, budget)
+        from tigris.cli.trace import trace_model
+        trace_model(model, ag, input_files, verbose)
         return
 
     data = Path(model).read_bytes()

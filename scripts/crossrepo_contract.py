@@ -13,6 +13,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -44,6 +45,9 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
 from tigris.fixtures import build_tcn
 from tigris.frontends.tflite import STATE_KEY
+from tigris.runtime import Session
+from tigris.cli.trace import check as check_trace
+from tigris.cli.trace import units as trace_units
 from tigris.graph.ir import Stage
 
 # The byte-level line-buffer flag decoder already exists in the compiler's
@@ -7116,6 +7120,7 @@ def _run_case(
             _decode_outputs(plan, outputs_path.read_bytes(), reference_outputs),
             reference_outputs, _output_scales(plan),
         )
+    _assert_trace(case.name, plan_path, inputs_path.read_bytes(), outputs_path.read_bytes())
     if case.exact_untiled:
         expected_schema = 10 if any(k in {"Svdf", "Lstm"} for k in case.expected_operators) else 9
         assert plan["version"] == expected_schema
@@ -7135,6 +7140,66 @@ def _run_case(
         assert outputs_path.read_bytes() == untiled_outputs.read_bytes()
     print(f"PASS {case.name} memory-contract")
     return plan_path
+
+
+def _build_host_library(runtime: Path, build_dir: Path) -> Path:
+    """Build the host library, which compiles the runtime with execution tracing."""
+    _run(["cmake", "-S", str(runtime), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release",
+          "-DTIGRIS_BUILD_HOST=ON"], "host library configure")
+    _run(["cmake", "--build", str(build_dir), "--target", "tigris_host", "--parallel", "4"],
+         "host library build")
+    for name in ("libtigris_host.so", "libtigris_host.dylib", "tigris_host.dll"):
+        matches = sorted(build_dir.rglob(name))
+        if matches:
+            return matches[0]
+    raise AssertionError(f"host library not found in {build_dir}")
+
+
+def _assert_trace(case_name: str, plan_path: Path, inputs: bytes, outputs: bytes) -> None:
+    """Run the plan once more with tracing on. The traced run produces the same
+    bytes, its events add up to the runtime's counters and peaks, and the tiles
+    of every spatially tiled stage spill each output cell at least once."""
+    with Session(plan_path) as session:
+        arrays, offset = {}, 0
+        for item in session.inputs:
+            count = item["size_bytes"] // item["dtype"].itemsize
+            arrays[item["name"]] = np.frombuffer(
+                inputs, item["dtype"], count, offset).reshape(item["shape"])
+            offset += item["size_bytes"]
+        results, events, counters = session.trace(arrays)
+        memory = session.memory
+        produced = b"".join(results[item["name"]].tobytes() for item in session.outputs)
+    if produced != outputs:
+        raise AssertionError(f"{case_name}: traced run produced different outputs")
+    problems = check_trace(events, counters)
+    if problems:
+        raise AssertionError(f"{case_name}: " + "; ".join(problems))
+    for pool in ("fast", "slow"):
+        peak = max((event[f"{pool}_used"] for event in events), default=0)
+        if peak != memory[f"{pool}_peak_bytes"]:
+            raise AssertionError(f"{case_name}: {pool} events peak at {peak}, the runtime "
+                                 f"counted {memory[f'{pool}_peak_bytes']}")
+    plan = read_binary_plan(plan_path.read_bytes(), decompress_weights=False)
+    for unit in trace_units(plan, events):
+        if unit["path"] not in {"tiled", "tiled_2d", "chain"}:
+            continue
+        spills: dict[int, list[dict]] = {}
+        for event in unit["events"]:
+            if event["kind"] == "spill" and event["row0"] is not None:
+                spills.setdefault(event["tensor"], []).append(event)
+        for tensor, tiles in spills.items():
+            shape = plan["tensors"][tensor]["shape"]
+            written = np.zeros((shape[1], shape[2] if len(shape) == 4 else 1), np.int32)
+            for event in tiles:
+                columns = slice(event["col0"], event["col1"]) if event["col0"] is not None else slice(None)
+                written[event["row0"]:event["row1"], columns] += 1
+            name = plan["tensors"][tensor]["name"]
+            if (written == 0).any():
+                raise AssertionError(f"{case_name}: stage {unit['stage']} never spills "
+                                     f"{int((written == 0).sum())} cells of {name}")
+            if (written > 1).any():
+                print(f"NOTE {case_name}: stage {unit['stage']} spills {int((written > 1).sum())} "
+                      f"of {written.size} cells of {name} more than once")
 
 
 def _output_scales(plan: dict) -> list[float]:
@@ -7680,6 +7745,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
 
     runner, rows_runner = _build_runner(runtime, work_dir / "runtime-build")
     runner_a16, _ = _build_runner(runtime, work_dir / "runtime-build-a16", alignment=16)
+    os.environ["TIGRIS_HOST_LIBRARY"] = str(_build_host_library(runtime, work_dir / "host-build"))
     _run_peak_fixtures((runner, runner_a16), work_dir)
     first_plan: Path | None = None
     for case in cases:

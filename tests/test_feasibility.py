@@ -247,7 +247,8 @@ def test_analyze_displays_failing_verdict(conv_relu_chain_path):
 
 def test_analyze_prints_the_trace(conv_relu_chain_path):
     trace = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "64K", "--trace"])
-    assert trace.exit_code == 0 and "conv0" in trace.output and "1 stage," in trace.output
+    assert trace.exit_code == 0, trace.output
+    assert "traced on runtime" in trace.output and "their bytes equal the runtime's own counters" in trace.output
     assert CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "--json",
                                     "--trace"]).exit_code != 0
 
