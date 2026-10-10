@@ -91,9 +91,10 @@ jobs:
           MKL_NUM_THREADS: "2"
         run: |
           python -m pip install dist/*.whl pytest onnxruntime
-          mkdir -p "$RUNNER_TEMP/wheel-tests/schema_compat"
+          mkdir -p "$RUNNER_TEMP/wheel-tests/schema_compat" "$RUNNER_TEMP/wheel-tests/fixtures"
           cp tests/conftest.py tests/test_host_runtime.py tests/test_inspect.py "$RUNNER_TEMP/wheel-tests/"
           cp tests/schema_compat/*.tgrs "$RUNNER_TEMP/wheel-tests/schema_compat/"
+          cp -r tests/fixtures/tflite "$RUNNER_TEMP/wheel-tests/fixtures/"
           cd "$RUNNER_TEMP/wheel-tests"
           python -c 'import tigris; from pathlib import Path; assert "site-packages" in str(Path(tigris.__file__).resolve())'
           tigris --version
