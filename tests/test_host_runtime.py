@@ -305,6 +305,19 @@ def test_analyze_trace_runs_the_plan_and_matches_the_counters(conv_relu_chain_pa
     assert "tile 0" in result.output
 
 
+def test_analyze_reports_measured_slow_traffic(conv_relu_chain_path):
+    result = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "8K", "--trace"])
+    moved = next(line for line in result.output.splitlines() if line.strip().startswith("moved"))
+    result = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "8K"])
+    assert result.exit_code == 0, result.output
+    row = next(line for line in result.output.splitlines() if "slow traffic" in line)
+    written, read = moved.split(None, 1)[1].replace(" written", "").replace(" read", "").split(", ")
+    assert f"per inference: {written} written, {read} read" in row
+    report = json.loads(CliRunner().invoke(
+        cli, ["analyze", str(conv_relu_chain_path), "-m", "8K", "--json"]).output)
+    assert report["slow"]["traffic"]["written"] > 0 and report["slow"]["traffic"]["read"] > 0
+
+
 def test_session_trace_reports_events_in_order(linear_plan):
     with Session(linear_plan) as session:
         outputs, events, counters = session.trace({"input": np.ones((1, 64), np.float32)})

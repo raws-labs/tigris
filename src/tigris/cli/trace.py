@@ -159,50 +159,95 @@ def render(model: str, plan: dict, events: list[dict], counters: dict[str, int],
                            "these bytes."))
 
 
-def trace_model(model: str, ag, input_files: tuple[str, ...], verbose: bool) -> None:
-    """Compile the analyzed graph in memory, run it once on the host runtime
-    and print what the runtime did."""
-    import tempfile
-    from pathlib import Path
-
-    import click
-    import numpy as np
-
+def _plan_bytes(ag) -> bytes | None:
+    """The plan analyze would compile at this budget, or None when there is none."""
     from tigris.analysis.validation import (
         validate_budget, validate_execution_dtype, validate_operator_support)
-    from tigris.emitters.binary.reader import read_binary_plan
     from tigris.emitters.binary.writer import emit_binary_bytes
-    from tigris.runtime import RuntimeError as HostError
-    from tigris.runtime import Session
 
     if ag.mem_budget <= 0:
-        raise click.UsageError("--trace runs the plan, so it needs a fast-memory budget (-m)")
+        return None
     usable = validate_execution_dtype(ag).supported and validate_operator_support(ag).supported
     result = validate_budget(ag) if usable else None
     if result is None or not result.fast.feasible:
-        raise click.ClickException("no plan to trace: run analyze without --trace to see why")
+        return None
     try:
-        data = emit_binary_bytes(ag)
-    except ValueError as exc:
-        raise click.ClickException(f"no plan to trace: {exc}") from exc
-    plan = read_binary_plan(data, decompress_weights=False)
+        return emit_binary_bytes(ag)
+    except ValueError:
+        return None
+
+
+def _run(data: bytes, input_files: tuple[str, ...], traced: bool):
+    """Run a plan once on the host runtime with zeros or the given inputs.
+    Returns the events (empty unless traced), counters, memory and run facts."""
+    import tempfile
+    from pathlib import Path
+
+    import numpy as np
+
+    from tigris.runtime import Session
+
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "plan.tgrs"
         path.write_bytes(data)
-        try:
-            with Session(path) as session:
-                if input_files:
-                    from tigris.cli.run import read_inputs
-                    inputs = read_inputs(session, input_files)
-                    described = "given input"
-                else:
-                    inputs = {info["name"]: np.zeros(info["shape"], dtype=info["dtype"])
-                              for info in session.inputs}
-                    described = "zero input"
+        with Session(path) as session:
+            if input_files:
+                from tigris.cli.run import read_inputs
+                inputs = read_inputs(session, input_files)
+                described = "given input"
+            else:
+                inputs = {info["name"]: np.zeros(info["shape"], dtype=info["dtype"])
+                          for info in session.inputs}
+                described = "zero input"
+            if traced:
                 _, events, counters = session.trace(inputs)
-                memory = session.memory
-                info = {"version": session.runtime_version, "input": described,
-                        "align": counters.pop("tensor_align")}
-        except (HostError, OSError, ValueError) as exc:
-            raise click.ClickException(f"cannot trace: {exc}") from exc
+            else:
+                session.run(inputs)
+                events, counters = [], session.counters
+            info = {"version": session.runtime_version, "input": described,
+                    "align": counters.pop("tensor_align")}
+            return events, counters, session.memory, info
+
+
+def traffic(ag) -> dict[str, int] | str | None:
+    """Bytes one inference writes to and reads from slow memory, measured on
+    the host runtime: {"written", "read"}, a reason it was not measured, or
+    None when there is no plan at this budget."""
+    from tigris.runtime import RuntimeError as HostError
+    from tigris.runtime import runtime_info
+
+    data = _plan_bytes(ag)
+    if data is None:
+        return None
+    try:
+        runtime_info()
+    except HostError:
+        return "no host runtime in this install"
+    try:
+        _, counters, _, _ = _run(data, (), traced=False)
+    except (HostError, OSError, ValueError) as exc:
+        return str(exc)
+    return {"written": counters["spill_bytes"], "read": counters["load_bytes"]}
+
+
+def trace_model(model: str, ag, input_files: tuple[str, ...], verbose: bool) -> None:
+    """Compile the analyzed graph in memory, run it once on the host runtime
+    and print what the runtime did."""
+    from pathlib import Path
+
+    import click
+
+    from tigris.emitters.binary.reader import read_binary_plan
+    from tigris.runtime import RuntimeError as HostError
+
+    if ag.mem_budget <= 0:
+        raise click.UsageError("--trace runs the plan, so it needs a fast-memory budget (-m)")
+    data = _plan_bytes(ag)
+    if data is None:
+        raise click.ClickException("no plan to trace: run analyze without --trace to see why")
+    plan = read_binary_plan(data, decompress_weights=False)
+    try:
+        events, counters, memory, info = _run(data, input_files, traced=True)
+    except (HostError, OSError, ValueError) as exc:
+        raise click.ClickException(f"cannot trace: {exc}") from exc
     render(Path(model).name, plan, events, counters, memory, info, verbose)
