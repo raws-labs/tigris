@@ -1,6 +1,7 @@
 """TFLite models reach the compiler through their QDQ ONNX expression."""
 
 import json
+import re
 import os
 import struct
 from pathlib import Path
@@ -67,8 +68,10 @@ def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_pat
     Session = _session()
     plan_path = tmp_path / "model.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", budget, "-o", str(plan_path)])
-    if tight and result.exit_code != 0 and "fast-memory budget" in result.output:
-        pytest.skip("does not fit the tight budget: " + result.output.strip().splitlines()[-1])
+    if tight and result.exit_code != 0 and "does not fit" in result.output:
+        lines = result.output.splitlines()
+        verdict = next(k for k, line in enumerate(lines) if line.startswith("does not fit"))
+        pytest.skip(" ".join(line.strip() for line in lines[verdict:verdict + 2]))
     assert result.exit_code == 0, result.output
     _, graphs = tflite._read(model.read_bytes())
     _, tensors, inputs, outputs, _ = graphs[0]
@@ -261,7 +264,7 @@ def test_an_int8_operator_tflite_micro_runs_in_float_only_is_refused():
 def test_analyze_reports_shapes_in_the_files_axis_order():
     result = CliRunner().invoke(cli, ["analyze", str(KWS), "-m", "16K"])
     assert result.exit_code == 0, result.output
-    assert "input_1 1x49x10x1" in result.output
+    assert re.search(r"input_1 +1x49x10x1", result.output)
     assert "1x25x5x64" in result.output
 
 

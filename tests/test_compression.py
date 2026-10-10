@@ -214,7 +214,7 @@ def test_compile_compressed_uses_total_arena_budget(
     # The compiler uses 32-byte tensor alignment, an intentional conservative
     # upper bound over the runtime's target-specific alignment.
     assert plan["budget"] + reserve <= 32 * 1024
-    assert "total fast memory" in result.output
+    assert "holds decompressed weights" in result.output
 
 
 # Weightless graph produces no blocks

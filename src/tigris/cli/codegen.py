@@ -5,7 +5,8 @@ from pathlib import Path
 import click
 
 from tigris.capabilities import CODEGEN_BACKENDS
-from tigris.cli import cli, console
+from tigris.cli import cli, text
+from tigris.utils import fmt_bytes
 
 
 @cli.command()
@@ -23,7 +24,7 @@ from tigris.cli import cli, console
               help="C symbol prefix for --format core (default: tigris_codegen)")
 def codegen(plan: str, backend: str, output: str | None,
             output_format: str, header: str | None, core_name: str):
-    """Generate C deployment code from a compiled .tgrs plan."""
+    """Generate C deployment code for a plan."""
     from tigris.emitters.codegen import generate_c
 
     plan_path = Path(plan)
@@ -38,11 +39,7 @@ def codegen(plan: str, backend: str, output: str | None,
     out = Path(output) if output else plan_path.with_suffix(".c")
     header_path = Path(header) if header else out.with_suffix(".h")
     try:
-        with console.status("Generating C source..."):
-            c_source = generate_c(
-                plan_data, backend, output_format,
-                header_path.name, core_name,
-            )
+        c_source = generate_c(plan_data, backend, output_format, header_path.name, core_name)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -51,10 +48,7 @@ def codegen(plan: str, backend: str, output: str | None,
         from tigris.emitters.codegen import generate_core_header
         header_path.write_text(generate_core_header(plan_data, core_name))
 
-    console.print(f"[bold green]C source written to {out}[/]")
-    console.print(f"  backend: {backend}", style="dim")
-    console.print(f"  format: {output_format}", style="dim")
+    details = f"{output_format}, {backend} backend, {fmt_bytes(len(c_source))}"
     if output_format == "core":
-        console.print(f"  header: {header_path}", style="dim")
-        console.print(f"  name: {core_name}", style="dim")
-    console.print(f"  size: {len(c_source)} bytes", style="dim")
+        details += f", header {header_path}, symbols {core_name}_*"
+    text.echo(f"wrote {out}   {details}")

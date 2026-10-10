@@ -1,5 +1,7 @@
 """Resolution of unresolved ONNX deployment shapes."""
 
+import re
+
 import numpy as np
 import onnx
 import pytest
@@ -203,7 +205,7 @@ def test_cli_reports_an_input_shape_override_without_warning(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert "input 4x64 float32" in result.output
+    assert re.search(r"input +input +4x64 float32", result.output)
     assert "warning" not in result.output
     assert "--input-shape" not in result.output
 
@@ -216,7 +218,7 @@ def test_cli_does_not_warn_when_an_override_pins_a_concrete_shape(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert "input 8x64 float32" in result.output
+    assert re.search(r"input +input +8x64 float32", result.output)
     assert "is unset" not in result.output
 
 

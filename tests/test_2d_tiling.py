@@ -13,6 +13,7 @@ from tigris.analysis.partition_spatial import (
     partition_spatial,
 )
 from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, Stage, TensorInfo
+from tigris.analysis.validation import validate_memory_plan
 
 
 def make_conv_op(kernel, stride, dilation):
@@ -113,6 +114,16 @@ def test_strided_2d_tile_infeasible_is_marked(tmp_path):
     tp = ag.stages[0].tile_plan
     assert tp.axis != TILE_AXIS_HW
     assert tp.min_2d_tile_infeasible
+
+
+def test_infeasible_2d_stage_reports_the_smallest_2d_tile(tmp_path):
+    # What the stage needs is the 1x1 output tile, not the single-row band of
+    # the height-only solve, which is larger.
+    ag = _strided_depthwise_stages(tmp_path, 2 * 1024)
+    issue = next(issue for issue in validate_memory_plan(ag).issues if issue.stage_id == 0)
+    assert issue.reason == "smallest 2D tile"
+    assert issue.required_bytes == _runtime_2d_bytes(1, 1)
+    assert issue.required_bytes < ag.stages[0].tile_plan.tiled_peak_bytes
 
 
 # Op eligibility for the HW axis. Conv1D shares the CONV category with Conv

@@ -1818,6 +1818,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         # both axes together before falling back to the 1D infeasible
         # warning below.
         min_2d_tile_infeasible = False
+        min_2d_bytes = 0
         if (
             tile_h == 1
             and tiled_peak > budget
@@ -1832,8 +1833,9 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
                 # Even a 1x1 output tile does not fit the budget. Mark this
                 # stage distinctly so the surfaced diagnostic names the 2D
                 # tile instead of falling back to the generic 1D minimum-tile
-                # message below.
+                # message below. The 1x1 tile is what the stage needs.
                 min_2d_tile_infeasible = True
+                min_2d_bytes = plan_2d.min_tile_bytes
 
         # Overhead: extra halo reads per tile boundary
         # Each internal tile boundary reads halo rows extra from the input
@@ -1864,6 +1866,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             overhead_bytes=overhead,
             warnings=warnings,
             min_2d_tile_infeasible=min_2d_tile_infeasible,
+            min_tile_bytes=min_2d_bytes,
         )
 
     return ag

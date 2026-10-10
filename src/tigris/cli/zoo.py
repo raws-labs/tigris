@@ -4,10 +4,8 @@ import json
 from pathlib import Path
 
 import click
-from rich.table import Table
-from rich.text import Text
 
-from tigris.cli import _expand_mem, _parse_size, cli, console
+from tigris.cli import _expand_mem, _parse_size, cli, text
 from tigris.utils import fmt_bytes
 from tigris.zoo import REPOSITORY, Zoo, select, version
 
@@ -56,7 +54,7 @@ def _matches(config, *, mem, flash, **filters):
 @click.option("--cache-dir", type=click.Path(file_okay=False, path_type=Path))
 @click.pass_context
 def zoo(ctx, **config):
-    """Find and download precompiled .tgrs models without an account."""
+    """Find and download precompiled plans."""
     ctx.obj = config
 
 
@@ -75,40 +73,42 @@ def list_models(config, as_json, verbose, **filters):
     if as_json:
         click.echo(json.dumps(matches, indent=2))
     elif not matches:
-        click.echo("No matching artifacts.")
+        text.echo("no matching artifacts")
     elif verbose:
         for item in matches:
             _report(item)
     else:
-        table = Table(title="Model zoo", border_style="dim", box=None, pad_edge=False)
-        table.add_column("Model", style="cyan")
-        table.add_column("Category")
-        table.add_column("Precision")
-        for label in ("Fast RAM", "Slow RAM", "Plan"):
-            table.add_column(label, justify="right", no_wrap=True)
+        rows = [[text.dim(cell) for cell in
+                 ("model", "category", "precision", "fast RAM", "slow RAM", "plan")]]
         for item in matches:
             memory = item["memory"]
-            category = item["category"].removeprefix("time-series-").replace("-", " ").capitalize()
-            table.add_row(
-                Text(item["model"]), Text(category), Text(item["quantization"]),
-                *(fmt_bytes(memory[key]) for key in ("fast_bytes", "slow_bytes", "flash_bytes")),
-            )
-        console.print(table)
+            rows.append([item["model"], _category(item), item["quantization"],
+                         *(fmt_bytes(memory[key]) for key in ("fast_bytes", "slow_bytes", "flash_bytes"))])
+        for line in text.columns(rows, "<<<>>>", indent=0):
+            text.echo(line)
+
+
+def _category(item):
+    return item["category"].removeprefix("time-series-").replace("-", " ").capitalize()
 
 
 def _report(item):
+    """One artifact: its ID and model, then runtime range, tested runtimes and memory."""
     memory = item["memory"]
     maximum = item["runtime"]["max"]
-    upper = f", <= {maximum}" if maximum is not None else " (no known upper bound)"
-    click.echo(f"{item['id']}  model={item['model']}  category={item['category']}")
-    click.echo(f"  runtime >= {item['runtime']['min']}{upper}"
-               f"  schema={item['schema']}  backends={','.join(item['backends'])}")
-    click.echo(f"  tested runtimes: {', '.join(item['tested_runtime_versions']) or 'none recorded'}")
-    click.echo(f"  quantization={item['quantization']}  fast={memory['fast_bytes']} B"
-               f"  slow={memory['slow_bytes']} B  plan={memory['flash_bytes']} B"
-               f"  published={item['published_at']}")
+    runtime = f">= {item['runtime']['min']}, " + (f"<= {maximum}" if maximum is not None else "no known upper bound")
+    text.gap()
+    text.echo(text.bold(item["id"]) + f"   {item['model']}, {_category(item)}, {item['quantization']}")
+    for line in text.columns([
+            ["runtime", runtime],
+            ["tested", ", ".join(item["tested_runtime_versions"]) or "none recorded"],
+            ["schema", f"{item['schema']}, backends " + ", ".join(item["backends"])],
+            ["memory", f"fast {fmt_bytes(memory['fast_bytes'])}, slow {fmt_bytes(memory['slow_bytes'])}, "
+                       f"plan {fmt_bytes(memory['flash_bytes'])}"],
+            ["published", item["published_at"]]]):
+        text.echo(line)
     if item.get("withdrawn"):
-        click.echo(f"  WARNING: withdrawn: {item['withdrawn']}", err=True)
+        text.echo(text.warn("warning: ") + f"withdrawn: {item['withdrawn']}", err=True)
 
 
 @zoo.command()
@@ -127,9 +127,10 @@ def fetch(config, model, artifact_id, output, **filters):
         if not matches:
             raise ValueError("No compatible artifact matches the supplied filters")
         chosen = matches[0]
-        plan = source.fetch(chosen, output or Path(chosen["id"]))
+        destination = output or Path(chosen["id"])
+        plan = source.fetch(chosen, destination)
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
     _report(chosen)
-    click.echo(f"Plan: {plan}")
-    click.echo(f"Runtime requirements: {plan.parent / 'download.json'}")
+    text.gap()
+    text.echo(f"wrote {destination}   plan {plan.name}, runtime requirements download.json")

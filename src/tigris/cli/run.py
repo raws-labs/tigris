@@ -6,10 +6,8 @@ from pathlib import Path
 
 import click
 import numpy as np
-from rich.text import Text
 
-from tigris.cli import cli, console
-from tigris.cli.inspect import _panel
+from tigris.cli import cli, text
 from tigris.runtime import Session
 from tigris.utils import fmt_bytes
 
@@ -22,13 +20,12 @@ from tigris.utils import fmt_bytes
               help="Output .bin/.npy for one tensor, or .npz for named outputs.")
 @click.option("--json", "as_json", is_flag=True, help="Print execution metadata as JSON.")
 def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
-    """Execute MODEL using the selected host reference runtime.
+    """Run a model or plan on the host reference runtime.
 
-    Set TIGRIS_HOST_LIBRARY to select a library instead of the bundled runtime.
-    Inputs use the stored axis order and declared interface dtype shown by
-    inspect. Binary files contain little-endian, contiguous tensor elements.
-    Execution checks the portable float32/int8 reference path, not ESP-NN or
-    CMSIS-NN numerics or on-device latency. No image/CSV preprocessing is performed.
+    Inputs take the axis order and dtype inspect shows; .bin files hold
+    little-endian, contiguous elements. This checks the portable reference
+    kernels, not ESP-NN or CMSIS-NN numerics or device latency. Set
+    TIGRIS_HOST_LIBRARY to use another runtime library.
     """
     try:
         if output.exists():
@@ -85,9 +82,15 @@ def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
     if as_json:
         click.echo(json.dumps(report, indent=2))
     else:
-        _panel("TiGrIS Run", [("Runtime", report["runtime_version"]), ("Source", report["runtime_source"]),
-                              ("Backend", "Host reference"),
-                              ("Output", output),
-                              ("Fast arena peak", fmt_bytes(report["memory"]["fast_peak_bytes"])),
-                              ("Slow arena peak", fmt_bytes(report["memory"]["slow_peak_bytes"]))])
-        console.print(Text("Arena peaks exclude the plan, executor workspace, and Python process memory.", style="dim"))
+        memory = report["memory"]
+        text.echo(text.bold(model.name) + f"   runtime {report['runtime_version']}, "
+                  f"{report['runtime_source']}, host reference backend")
+        for line in text.columns([
+                ["fast arena peak", fmt_bytes(memory["fast_peak_bytes"]),
+                 text.dim("measured; plan and workspace excluded")],
+                ["slow arena peak", fmt_bytes(memory["slow_peak_bytes"]), ""]], "<>"):
+            text.echo(line)
+        text.gap()
+        shapes = ", ".join(f"{'x'.join(map(str, item['shape'])) or 'scalar'} {item['dtype']}"
+                           for item in report["tensors"])
+        text.echo(f"wrote {output}   {shapes}")

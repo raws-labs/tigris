@@ -271,3 +271,26 @@ def test_bool_passthrough_boundary_selects_data_dispatcher(tmp_path):
         assert result["flag"].dtype == np.dtype("bool")
         np.testing.assert_array_equal(result["flag"], flags)
         np.testing.assert_array_equal(result["output"], [0, 2, 0, 4])
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_inspect_fast_arena_matches_the_runtime(conv_relu_chain_path, tmp_path, compressed):
+    import platform
+
+    from tigris.inspection import inspect_file
+
+    if compressed:
+        graph, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("64K",))
+    else:
+        graph, _ = _run_pipeline(str(conv_relu_chain_path), ("16K",))
+    path = tmp_path / "conv.tgrs"
+    path.write_bytes(emit_binary_bytes(graph, compress="lz4" if compressed else None))
+    needs = inspect_file(path)["requirements"]
+    assert (needs["decompression_bytes"] > 0) == compressed
+    with Session(path) as session:
+        required = session.memory["fast_capacity_bytes"]
+    # inspect sizes the decompression buffer at the largest tensor alignment,
+    # which is the host's own on x86_64.
+    assert needs["fast_arena_bytes"] >= required
+    if platform.machine() == "x86_64":
+        assert needs["fast_arena_bytes"] == required

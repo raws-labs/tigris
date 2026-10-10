@@ -1,27 +1,22 @@
-"""``tigris analyze`` command."""
+"""``tigris analyze``: does a model fit a budget, and if not, why."""
 
 import json
 from dataclasses import replace
 from pathlib import Path
 
 import click
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
 
-from tigris.cli import (
-    cli,
-    console,
-    _expand_mem,
-    _parse_input_shape,
-    _parse_size,
-    _run_pipeline,
-)
+from tigris.cli import _expand_mem, _parse_input_shape, _parse_size, _run_pipeline, cli, text
 from tigris.utils import describe_interface, fmt_bytes, source_shape
+
+# Causes listed under a verdict; --json lists all.
+_CAUSES_SHOWN = 5
+# Budgets tried beyond the one given, halving below a fit or doubling above a failure.
+_BUDGETS_TRIED = 3
 
 
 def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, source: str,
-            tflm_arena: int | None) -> dict:
+            tflm_arena: int | None, tried: list) -> dict:
     """The analysis as versioned JSON; byte counts are integers."""
     f = findings
     return {
@@ -76,6 +71,8 @@ def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, sour
             "estimates": {"int8_plan_bytes": f.int8_plan_size_bytes or None,
                           "lz4_plan_bytes": f.lz4_plan_size_bytes or None},
         },
+        "budgets_tried": [{"budget_bytes": b, "fits": fits, "stages": stages, "tiled": tiled}
+                          for b, fits, stages, tiled in tried],
         "stages": [{
             "stage": s.stage_id,
             "operators": len(s.op_indices),
@@ -91,25 +88,163 @@ def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, sour
     }
 
 
-def _side_by_side(*panels):
-    """Render panels side by side if the terminal is wide enough, else stack."""
-    panels = [p for p in panels if p is not None]
-    if not panels:
-        return
-    if len(panels) == 1:
-        console.print(panels[0])
-        return
 
-    # Need roughly 40 chars per panel + 1 gap
-    if console.width >= 40 * len(panels) + len(panels) - 1:
-        grid = Table.grid(padding=(0, 1), expand=True)
-        for _ in panels:
-            grid.add_column(ratio=1)
-        grid.add_row(*panels)
-        console.print(grid)
-    else:
-        for p in panels:
-            console.print(p)
+
+def _tried(model: str, budget: int, fits: bool, input_shape) -> list[tuple[int, bool, int, int]]:
+    """Other budgets compiled for comparison, as (budget, fits, stages,
+    tiled stages): halving from a budget that fits, doubling from one that
+    does not, until the answer changes. Only budgets actually compiled are
+    reported; a budget that fits does not imply every larger one does."""
+    from tigris.analysis.validation import validate_memory_plan
+
+    tried = []
+    candidate = budget
+    for _ in range(_BUDGETS_TRIED):
+        candidate = candidate // 2 if fits else candidate * 2
+        if candidate <= 0 or candidate > 0xFFFFFFFF:
+            break
+        try:
+            graph, _ = _run_pipeline(model, (str(candidate),), input_shapes=input_shape,
+                                     report_bindings=False)
+        except click.ClickException:
+            break
+        ok = validate_memory_plan(graph).feasible
+        tiled = sum(runs_tiled(s) for s in graph.stages)
+        tried.append((candidate, ok, len(graph.stages), tiled))
+        if ok != fits:
+            break
+    return tried
+
+
+def interface_rows(ag) -> list[list[str]]:
+    """One row per input and output: label, name, then shape and dtype."""
+    rows = []
+    for label, value in describe_interface(ag):
+        name, _, rest = value.partition(" ")
+        rows.append([label.lower(), name, rest] if label != "State" else [label.lower(), value, ""])
+    return rows
+
+
+def runs_tiled(stage) -> bool:
+    """A stage that executes in tiles: over the budget with a usable tile
+    plan, or a place in a chain."""
+    return ((bool(stage.warnings) and stage.tile_plan is not None and stage.tile_plan.tileable)
+            or stage.chain_id != 0xFFFF)
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _stage_count(n: int) -> str:
+    return _count(n, "stage")
+
+
+def verdict_lines(findings, budget: int, slow_budget: int, stages=()) -> list[str]:
+    """The verdict, then one line per cause, worst first."""
+    f = findings
+    if f.unsupported_operators:
+        count = len(f.unsupported_operators)
+        lines = [text.bad("cannot compile") +
+                 f": {count} unsupported operator{'s' if count != 1 else ''}"]
+        return lines + text.columns([[issue] for issue in f.unsupported_operators[:_CAUSES_SHOWN]])
+    if f.dtype_errors:
+        return [text.bad("cannot compile") + f": {f.dtype_errors[0]}"]
+    if budget <= 0:
+        return [text.dim("no budget given; memory figures only")]
+    tiled = sum(runs_tiled(s) for s in stages)
+    if f.blocking_stages:
+        count = len(f.blocking_stages)
+        lines = [text.bad("does not fit") + f" {fmt_bytes(budget)} fast memory: "
+                 f"{_stage_count(count)} exceed{'s' if count == 1 else ''} it"]
+        causes = sorted(f.blocking_stages, key=lambda b: (-b.required_bytes, b.stage_id))
+        rows = [[f"stage {b.stage_id}", text.bad(fmt_bytes(b.required_bytes)), b.reason]
+                for b in causes[:_CAUSES_SHOWN]]
+        lines += text.columns(rows, "<>")
+        if count > _CAUSES_SHOWN:
+            lines.append(text.dim(f"  and {count - _CAUSES_SHOWN} more; --json lists all"))
+        return lines
+    fit = f" {fmt_bytes(budget)} fast memory, {_stage_count(f.total_stages)}"
+    if tiled:
+        fit += f", {tiled} tiled"
+    if not f.slow_fits:
+        return [text.warn(f"fits{fit}; slow memory {fmt_bytes(f.slow_peak_bytes)} needed, "
+                          f"{fmt_bytes(slow_budget)} given")]
+    return [text.good("fits") + fit]
+
+
+def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budget: int,
+            tflm_arena: int | None, tried: list | None = None) -> None:
+    """The header, verdict, memory and flash, shared by analyze and compile."""
+    f = findings
+    dtype = "int8" if f.is_quantized else "float32" if f.is_float32 else "mixed"
+    graphs = len(getattr(ag, "subgraphs", []) or [])
+    title = f"{dtype}, {_count(len(ag.ops), 'operator')}" + (
+        f", {_count(graphs, 'subgraph')}" if graphs else "")
+    text.gap()
+    text.echo(text.bold(Path(model).name) + "   " + title)
+    for line in text.columns(interface_rows(ag)):
+        text.echo(line)
+    for line in verdict_lines(f, budget, slow_budget, ag.stages):
+        text.echo(line)
+
+    memory = []
+    if tflm_arena is not None:
+        memory.append(["TFLite Micro tensors", fmt_bytes(tflm_arena),
+                       text.dim("its planner; kernel scratch excluded")])
+    memory.append(["unscheduled", fmt_bytes(ag.peak_memory_bytes), ""])
+    if f.largest_tensor_bytes:
+        memory.append(["largest tensor", fmt_bytes(f.largest_tensor_bytes),
+                       text.dim(f.largest_tensor_shape)])
+    supported = not (f.unsupported_operators or f.dtype_errors)
+    if budget > 0 and supported and f.scheduled_peak_bytes > 0 and not f.blocking_stages:
+        memory.append(["this plan", fmt_bytes(f.scheduled_peak_bytes),
+                       text.dim(f"{fmt_bytes(budget - f.scheduled_peak_bytes)} headroom")])
+    if f.slow_peak_bytes > 0:
+        memory.append(["slow memory", fmt_bytes(f.slow_peak_bytes),
+                       text.dim(f"budget {fmt_bytes(slow_budget)}") if slow_budget else ""])
+    fits_here = not f.blocking_stages
+    for b, fits, stages, tiled in tried or []:
+        label = ("also fits at" if fits_here else "fits at") if fits else "does not fit at"
+        detail = _stage_count(stages) + (f", {tiled} tiled" if tiled else "") if fits else ""
+        memory.append([label, fmt_bytes(b), text.dim(detail)])
+    text.section("memory", memory, "<>")
+
+    if f.total_weight_bytes > 0 or f.plan_size_bytes > 0:
+        flash = []
+        if not f.plan_size_bytes:
+            flash.append(["plan", "", text.dim("none at this budget")])
+        else:
+            flash.append(["plan", fmt_bytes(f.plan_size_bytes),
+                          text.dim(f"weights {fmt_bytes(f.total_weight_bytes)}, "
+                                   f"overhead {fmt_bytes(f.plan_overhead_bytes)}")])
+            if 0 < f.lz4_plan_size_bytes < f.plan_size_bytes * 95 // 100:
+                flash.append(["with -c lz4", fmt_bytes(f.lz4_plan_size_bytes), text.dim("estimate")])
+            if f.is_float32 and not f.is_quantized:
+                flash.append(["as int8", fmt_bytes(f.int8_plan_size_bytes), text.dim("estimate")])
+            if flash_budget > 0:
+                over = f.plan_size_bytes - flash_budget
+                flash.append(["flash budget", fmt_bytes(flash_budget),
+                              text.good("fits") if over <= 0 else
+                              text.bad(f"exceeds it by {fmt_bytes(over)}")])
+        text.section("flash", flash, "<>")
+
+
+def _stages(ag) -> None:
+    """One row per stage, as inspect prints a plan's stages."""
+    rows = [[text.dim(cell) for cell in ("stage", "ops", "untiled peak", "in", "out", "tiling")]]
+    for s in ag.stages:
+        tp = s.tile_plan
+        tiling = (f"{tp.num_tiles} tiles, axis {tp.axis}, halo {tp.halo}"
+                  if runs_tiled(s) and tp is not None and tp.tileable else "untiled")
+        if s.chain_id != 0xFFFF:
+            tiling = (f"chain of {s.chain_len}, tile height {s.chain_tile_h}"
+                      if s.chain_id == s.stage_id else f"in chain {s.chain_id}")
+        first, last = s.op_indices[0], s.op_indices[-1]
+        rows.append([str(s.stage_id), str(first) if first == last else f"{first}-{last}",
+                     fmt_bytes(s.peak_bytes), str(len(s.input_tensors)),
+                     str(len(s.output_tensors)), tiling])
+    text.section("stages", rows, ">>>>>")
 
 
 @cli.command()
@@ -117,288 +252,45 @@ def _side_by_side(*panels):
 @click.option("--mem", "-m", multiple=True, callback=_expand_mem,
               help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 @click.option("--flash", "-f", default=None, help="Flash size for plan fit check (e.g. 4M)")
-@click.option("--verbose", "-v", is_flag=True, help="Show per-stage and tiling tables")
+@click.option("--verbose", "-v", is_flag=True, help="Add the per-stage table")
 @click.option("--input-shape", "input_shape", multiple=True,
               callback=_parse_input_shape,
               help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
-@click.option("--json", "as_json", is_flag=True, help="Emit the analysis as versioned JSON.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the analysis as versioned JSON")
+@click.option("--trace", is_flag=True, help="Print the step-by-step execution trace instead")
 def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
-            input_shape: dict[str, tuple[int, ...]], as_json: bool):
-    """Analyze an ONNX or TFLite model for memory-constrained deployment."""
+            input_shape: dict[str, tuple[int, ...]], as_json: bool, trace: bool):
+    """Check whether a model fits a memory budget, and why not."""
     from tigris.analysis.findings import compute_findings
     from tigris.frontends.tflite import is_tflite, tflm_tensor_arena
 
+    if as_json and trace:
+        raise click.UsageError("--json and --trace are two different outputs; choose one")
     mem_pools = [_parse_size(m) for m in mem]
     flash_budget = _parse_size(flash) if flash else 0
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
     # Only forward the fast tier to _run_pipeline: analyze interprets the slow
-    # tier itself below and stays display-only, so a non-positive slow tier
-    # must be reported as unconstrained rather than raised.
+    # tier itself and stays display-only, so a non-positive slow tier is
+    # reported as unconstrained rather than raised.
     ag, budget = _run_pipeline(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json)
     ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
+    if trace:
+        from tigris.cli.simulate import print_trace
+        print_trace(ag, budget)
+        return
+
     data = Path(model).read_bytes()
     tflite = is_tflite(data)
     tflm_arena = tflm_tensor_arena(data) if tflite else None
-
     findings = compute_findings(ag, flash_budget=flash_budget)
+    supported = not (findings.unsupported_operators or findings.dtype_errors)
+    tried = (_tried(model, budget, not findings.blocking_stages, input_shape)
+             if budget > 0 and supported else [])
     if as_json:
         click.echo(json.dumps(_report(ag, findings, budget, slow_budget, flash_budget,
-                                      "tflite" if tflite else "onnx", tflm_arena),
+                                      "tflite" if tflite else "onnx", tflm_arena, tried),
                               indent=2, ensure_ascii=True, allow_nan=False))
         return
-
-    # Model
-    model_grid = Table.grid(padding=(0, 2))
-    model_grid.add_column(style="bold")
-    model_grid.add_column()
-    model_grid.add_row("Operators", str(len(ag.ops)))
-    model_grid.add_row("Tensors", f"{len(ag.tensors)} ({len(ag.lifetimes)} activations)")
-    model_grid.add_row("Peak memory (naive)", fmt_bytes(ag.peak_memory_bytes))
-    if findings.largest_tensor_shape:
-        model_grid.add_row("Largest tensor", f"{findings.largest_tensor_shape} ({fmt_bytes(findings.largest_tensor_bytes)})")
-    if findings.is_quantized:
-        model_grid.add_row("Dtype", "int8" if tflite else "int8 (QDQ)")
-    elif findings.is_float32:
-        model_grid.add_row("Dtype", "float32")
-    if tflm_arena is not None:
-        model_grid.add_row("TFLite Micro tensors",
-                           f"{fmt_bytes(tflm_arena)} (its planner; kernel scratch not included)")
-    for label, text in describe_interface(ag):
-        model_grid.add_row(label, text)
-    if findings.unsupported_operators:
-        model_grid.add_row(
-            "[red]Unsupported operators[/]",
-            "[red]" + ", ".join(findings.unsupported_operators) + "[/]",
-        )
-    if findings.dtype_errors:
-        model_grid.add_row(
-            "[red]Unsupported dtype[/]",
-            "[red]" + "; ".join(findings.dtype_errors) + "[/]",
-        )
-
-    model_failed = bool(findings.unsupported_operators or findings.dtype_errors)
-    model_panel = Panel(
-        model_grid,
-        title=f"[bold]TiGrIS - {ag.model_name}[/]",
-        subtitle=(
-            "[bold red] FAIL - unsupported deployment contract [/]"
-            if model_failed
-            else None
-        ),
-        border_style="red" if model_failed else "blue",
-    )
-    console.print(model_panel)
-
-    # SRAM
-    sram_panel = None
-    if budget > 0:
-        sram_style_map = {"ok": "green", "partitioned": "green", "tiled": "yellow", "needs_work": "red"}
-        sram_label_map = {"ok": "PASS", "partitioned": "PASS", "tiled": "PASS", "needs_work": "FAIL"}
-        sram_verdict_map = {
-            "ok": "fits in budget",
-            "partitioned": "partitioned, no tiling needed",
-            "tiled": "tiling resolves all stages",
-            "needs_work": "untileable stages remain",
-        }
-        vs = sram_style_map.get(findings.verdict, "dim")
-        vlabel = sram_label_map.get(findings.verdict, "?")
-        vtext = sram_verdict_map.get(findings.verdict, "")
-        if findings.unsupported_operators or findings.dtype_errors:
-            vtext = "unsupported deployment contract"
-
-        sram = Table.grid(padding=(0, 2))
-        sram.add_column(style="bold")
-        sram.add_column()
-        sram.add_row("Budget", fmt_bytes(budget))
-        if len(mem_pools) > 1:
-            for i, pool in enumerate(mem_pools[1:], 1):
-                sram.add_row(f"  pool {i+1} (slow)", fmt_bytes(pool))
-        if findings.scheduled_peak_bytes > 0 and findings.ratio > 1.0:
-            pct = findings.scheduled_peak_bytes / findings.peak_bytes * 100
-            sram.add_row(
-                "Scheduled peak",
-                f"{fmt_bytes(findings.scheduled_peak_bytes)} ({pct:.1f}% of naive peak)",
-            )
-        sram.add_row("Stages", str(findings.total_stages))
-
-        if findings.stage_transitions > 0:
-            sram.add_row("Spill / reload I/O", f"{fmt_bytes(findings.total_spill_bytes)} / {fmt_bytes(findings.total_reload_bytes)}")
-
-        # Tiling breakdown
-        if findings.stages_needing_tiling > 0:
-            sram.add_row("", "")
-            sram.add_row("Need tiling", f"{findings.stages_needing_tiling} of {findings.total_stages} stages")
-            if findings.stages_tileable > 0:
-                tile_style = "red" if findings.feasibility_errors else "green"
-                sram.add_row(
-                    "  tileable",
-                    f"[{tile_style}]{findings.stages_tileable}[/] "
-                    f"({findings.total_tiles} tiles, max halo {findings.max_halo})",
-                )
-            if findings.stages_untileable > 0:
-                ops = ", ".join(findings.untileable_op_types)
-                sram.add_row(
-                    "  untileable",
-                    f"[red]{findings.stages_untileable}[/] - blocked by: {ops}",
-                )
-            if findings.blocking_stages:
-                sram.add_row(
-                    "  min SRAM (this partition)",
-                    fmt_bytes(findings.min_fast_for_partition),
-                )
-                for blocking in findings.blocking_stages[:3]:
-                    sram.add_row(
-                        f"    stage {blocking.stage_id}",
-                        f"{fmt_bytes(blocking.required_bytes)} ({blocking.reason})",
-                    )
-
-        if findings.feasibility_errors:
-            sram.add_row("", "")
-            for i, error in enumerate(findings.feasibility_errors[:3]):
-                sram.add_row("Infeasible" if i == 0 else "", f"[red]{error}[/]")
-            if len(findings.feasibility_errors) > 3:
-                sram.add_row("", f"... and {len(findings.feasibility_errors) - 3} more")
-            vtext = "minimum execution unit exceeds budget"
-
-        # Slow memory (PSRAM) overflow warning
-        if slow_budget > 0 and not findings.slow_fits:
-            sram.add_row("", "")
-            sram.add_row(
-                "[red]Slow memory overflow[/]",
-                f"{len(findings.slow_overflow_stages)} stage(s)",
-            )
-            sram.add_row(
-                "  peak (in+out)",
-                f"[red]{fmt_bytes(findings.slow_peak_bytes)}[/] > {fmt_bytes(slow_budget)}",
-            )
-            for sid in findings.slow_overflow_stages[:3]:
-                sram.add_row(f"    stage {sid}", "[red]overflow[/]")
-            if len(findings.slow_overflow_stages) > 3:
-                sram.add_row("", f"... and {len(findings.slow_overflow_stages) - 3} more")
-            vs = "red"
-            vlabel = "FAIL"
-            vtext = "slow memory overflow"
-
-        subtitle = f"[bold {vs}] {vlabel} - {vtext} [/]" if findings.verdict else None
-        sram_panel = Panel(sram, title="[bold]SRAM[/]", subtitle=subtitle, border_style=vs)
-
-    # Flash
-    flash_panel = None
-    if findings.total_weight_bytes > 0:
-        fl = Table.grid(padding=(0, 2))
-        fl.add_column(style="bold")
-        fl.add_column(justify="right")
-
-        # Use plan size as unit reference so all flash values share the same unit
-        _ur = findings.plan_size_bytes
-
-        # Format a plan size row, colored by flash fit
-        def _flash_row(b: int) -> str:
-            v = fmt_bytes(b, unit_ref=_ur)
-            if flash_budget <= 0:
-                return v
-            return f"[green]{v}[/]" if b <= flash_budget else f"[red]{v}[/]"
-
-        fs = "magenta"
-        flash_subtitle = None
-        if flash_budget > 0:
-            fl.add_row("Budget", fmt_bytes(flash_budget, unit_ref=_ur))
-            if findings.plan_fits_flash:
-                fs = "green"
-                flash_subtitle = "[bold green] PASS - plan fits [/]"
-            else:
-                fs = "red"
-                flash_subtitle = "[bold red] FAIL - plan does not fit [/]"
-
-        fl.add_row("Weight data", fmt_bytes(findings.total_weight_bytes, unit_ref=_ur))
-        fl.add_row("Plan overhead", fmt_bytes(findings.plan_overhead_bytes, unit_ref=_ur))
-        fl.add_row("Plan", _flash_row(findings.plan_size_bytes) if findings.plan_size_bytes
-                   else "not serializable")
-        if findings.lz4_plan_size_bytes > 0 and findings.lz4_plan_size_bytes < findings.plan_size_bytes * 95 // 100:
-            fl.add_row("Plan LZ4 (est.)", _flash_row(findings.lz4_plan_size_bytes))
-        if findings.is_float32 and not findings.is_quantized:
-            fl.add_row("Plan INT8 (est.)", _flash_row(findings.int8_plan_size_bytes))
-
-        flash_panel = Panel(fl, title="[bold]Flash[/]", subtitle=flash_subtitle, border_style=fs)
-
-    _side_by_side(sram_panel, flash_panel)
-
-    # Budget Sweep
-    if verbose and findings.budget_sweep:
-        table = Table(title="Budget Comparison", border_style="dim")
-        table.add_column("Budget", justify="right")
-        table.add_column("Stages", justify="right")
-        table.add_column("Need Tiling", justify="right")
-        table.add_column("Status")
-
-        for row in findings.budget_sweep:
-            is_current = row.budget == budget
-            status = Text("OK", style="green") if row.ok else Text(
-                f"{row.need_tiling} need tiling", style="red"
-            )
-            style = "bold" if is_current else ""
-            marker = " <--" if is_current else ""
-            table.add_row(
-                row.budget_str + marker,
-                str(row.stages),
-                str(row.need_tiling),
-                status,
-                style=style,
-            )
-
-        console.print(table)
-
-    # Stages
+    summary(model, ag, findings, budget, slow_budget, flash_budget, tflm_arena, tried)
     if verbose and ag.stages:
-        table = Table(title=f"Stages ({len(ag.stages)})", border_style="dim")
-        table.add_column("#", justify="right")
-        table.add_column("Ops", justify="right")
-        table.add_column("Peak", justify="right")
-        table.add_column("In", justify="right")
-        table.add_column("Out", justify="right")
-        table.add_column("Note")
-
-        for s in ag.stages:
-            note = Text("NEEDS TILING", style="red") if s.warnings else Text("")
-            table.add_row(
-                str(s.stage_id),
-                str(len(s.op_indices)),
-                fmt_bytes(s.peak_bytes),
-                str(len(s.input_tensors)),
-                str(len(s.output_tensors)),
-                note,
-            )
-
-        console.print(table)
-
-    # Tiling Analysis
-    tiled_stages = [s for s in ag.stages if s.tile_plan is not None]
-    if verbose and tiled_stages:
-        table = Table(title="Tiling Analysis", border_style="dim")
-        table.add_column("Stage", justify="right")
-        table.add_column("Tileable?")
-        table.add_column("Axis", justify="right")
-        table.add_column("Tile", justify="right")
-        table.add_column("Tiles", justify="right")
-        table.add_column("Halo", justify="right")
-        table.add_column("RF", justify="right")
-        table.add_column("Tiled Peak", justify="right")
-
-        for s in tiled_stages:
-            tp = s.tile_plan
-            if tp is None:
-                continue
-            tileable = Text("Yes", style="green") if tp.tileable else Text("No", style="red")
-            tile_h = str(tp.tile_height) if tp.tileable else "-"
-            axis = str(tp.axis) if tp.tileable else "-"
-            tiles = str(tp.num_tiles) if tp.tileable else "-"
-            halo_str = str(tp.halo) if tp.tileable else "-"
-            rf_str = str(tp.receptive_field) if tp.tileable else "-"
-            tiled_peak = fmt_bytes(tp.tiled_peak_bytes) if tp.tileable else "-"
-
-            table.add_row(
-                str(s.stage_id), tileable, axis, tile_h, tiles,
-                halo_str, rf_str, tiled_peak,
-            )
-
-        console.print(table)
+        _stages(ag)

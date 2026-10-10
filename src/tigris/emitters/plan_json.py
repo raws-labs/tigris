@@ -1,9 +1,12 @@
-"""YAML plan emitter - human-readable execution plan."""
+"""Plan emitter for the deprecated ``tigris plan``.
 
+It writes JSON, which every YAML parser reads, so the command keeps working
+without a YAML dependency until it is removed.
+"""
+
+import json
 from datetime import datetime, timezone
 from pathlib import Path
-
-import yaml
 
 from tigris import SCHEMA_VERSION
 from tigris.graph.ir import AnalyzedGraph
@@ -24,61 +27,28 @@ DTYPE_NAMES = {
 }
 
 
-# Custom YAML formatting
-# Short lists (shapes, tensor names, op indices) render inline:
-#   shape: [1, 3, 224, 224]
-# Everything else stays block style for readability.
-
-
-class _Inline(list):
-    """Marker: serialize this list in YAML flow style."""
-
-
-class _PlanDumper(yaml.SafeDumper):
-    def increase_indent(self, flow=False, indentless=False):
-        return super().increase_indent(flow, False)
-
-
-_PlanDumper.add_representer(
-    _Inline,
-    lambda dumper, data: dumper.represent_sequence(
-        "tag:yaml.org,2002:seq", data, flow_style=True
-    ),
-)
-
-
-def _inline(seq) -> _Inline:
-    return _Inline(seq)
-
-
-# Public API
+def _inline(seq) -> list:
+    return list(seq)
 
 
 def _dtype_name(dtype: int) -> str:
     return DTYPE_NAMES.get(dtype, f"unknown({dtype})")
 
 
-def emit_yaml(ag: AnalyzedGraph, path: Path) -> None:
-    """Write an execution plan as YAML to *path*."""
+def emit_plan_json(ag: AnalyzedGraph, path: Path) -> None:
+    """Write an execution plan to *path*."""
     with open(path, "w") as f:
         f.write(_to_str(ag))
 
 
-def emit_yaml_str(ag: AnalyzedGraph) -> str:
-    """Return the execution plan as a YAML string."""
+def plan_json_str(ag: AnalyzedGraph) -> str:
+    """Return the execution plan as JSON text."""
     return _to_str(ag)
 
 
 def _to_str(ag: AnalyzedGraph) -> str:
-    plan = _build_plan(ag)
-    header = (
-        f"# TiGrIS Execution Plan v{SCHEMA_VERSION}\n"
-        f"# Model: {ag.model_name}\n"
-        f"# Generated: {datetime.now(timezone.utc).isoformat()}\n\n"
-    )
-    return header + yaml.dump(
-        plan, Dumper=_PlanDumper, default_flow_style=False, sort_keys=False
-    )
+    plan = {"generated": datetime.now(timezone.utc).isoformat(), **_build_plan(ag)}
+    return json.dumps(plan, indent=2) + "\n"
 
 
 def _build_plan(ag: AnalyzedGraph) -> dict:

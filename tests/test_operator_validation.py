@@ -123,7 +123,7 @@ def test_analyze_lists_unsupported_operator_as_failure(acos_model_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert "FAIL" in result.output
+    assert "cannot compile" in result.output
     assert "unsupported_acos (Acos)" in result.output
 
 
@@ -138,7 +138,7 @@ def test_compile_rejects_unsupported_operator_without_output(
     )
 
     assert result.exit_code != 0
-    assert "Cannot compile a plan with unsupported operators" in result.output
+    assert "cannot compile" in result.output
     assert "unsupported_acos (Acos)" in result.output
     assert not output.exists()
 
@@ -183,7 +183,7 @@ def test_compile_preserves_existing_output_on_dtype_rejection(
     )
 
     assert result.exit_code != 0
-    assert "Cannot compile a plan with unsupported tensor dtypes" in result.output
+    assert "cannot compile" in result.output
     assert output.read_bytes() == b"sentinel"
 
 

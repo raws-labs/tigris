@@ -20,6 +20,7 @@ from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.graph.ir import state_tensor_names
 from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.dtypes import check_dtype_signatures
+from tigris.utils import fmt_bytes
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
@@ -659,8 +660,8 @@ class MemoryPlanIssue:
 
     def describe(self) -> str:
         return (
-            f"stage {self.stage_id} requires {self.required_bytes:,} bytes "
-            f"but the fast-memory budget is {self.budget:,} bytes ({self.reason})"
+            f"stage {self.stage_id} needs {fmt_bytes(self.required_bytes)} of fast memory, "
+            f"the budget is {fmt_bytes(self.budget)} ({self.reason})"
         )
 
 
@@ -704,7 +705,7 @@ def validate_memory_plan(
         required = activation_required + fast_reserve_bytes
         scheduled_peak = max(scheduled_peak, required)
         if fast_reserve_bytes:
-            reason = f"{reason}; {fast_reserve_bytes:,} bytes reserved"
+            reason = f"{reason}; {fmt_bytes(fast_reserve_bytes)} reserved for weights"
         if invalid or required > budget:
             issues.append(
                 MemoryPlanIssue(
@@ -729,7 +730,7 @@ def validate_memory_plan(
     for position, sub in enumerate(ag.subgraphs, start=1):
         nested = validate_memory_plan(sub, fast_reserve_bytes=fast_reserve_bytes)
         scheduled_peak = max(scheduled_peak, nested.scheduled_peak_bytes)
-        issues.extend(replace(issue, reason=f"subgraph {position}: {issue.reason}")
+        issues.extend(replace(issue, reason=f"{issue.reason} (subgraph {position})")
                       for issue in nested.issues)
 
     return MemoryPlanValidation(
@@ -756,28 +757,29 @@ def _execution_unit_requirement(
             or stage.chain_tile_h <= 0
             or len(chain_stages) != stage.chain_len
         ):
-            return stage.peak_bytes, "invalid chain metadata", True
+            return stage.peak_bytes, "internal error: invalid chain metadata", True
 
         params = [_get_stage_spatial_params(ag, candidate) for candidate in chain_stages]
         heights = _back_propagate_tile_heights(params, stage.chain_tile_h)
         required = _chain_fast_bytes(ag, chain_stages, heights)
-        return required, f"chain of {len(chain_stages)} stages", False
+        return required, f"smallest tile of a chain of {len(chain_stages)} stages", False
 
     tile_plan = stage.tile_plan
     if tile_plan is not None:
         if not tile_plan.tileable:
             if tile_plan.min_tile_bytes > 0 and not tile_plan.untileable_ops:
                 return tile_plan.min_tile_bytes, "smallest tile", False
-            detail = ", ".join(tile_plan.untileable_ops)
-            reason = f"untileable operators: {detail}" if detail else "stage is not tileable"
+            # Untileable operators are recorded as "name (type)".
+            names = ", ".join(op.split(" (")[0] for op in tile_plan.untileable_ops)
+            reason = f"runs untiled: {names}" if names else "runs untiled"
             return stage.peak_bytes, reason, True
         if tile_plan.tiled_peak_bytes <= 0:
-            return stage.peak_bytes, "tile solver produced no positive working set", True
+            return stage.peak_bytes, "internal error: the tile solver produced no working set", True
         if tile_plan.min_2d_tile_infeasible:
-            return tile_plan.tiled_peak_bytes, "minimum 2D tile", False
-        return tile_plan.tiled_peak_bytes, "minimum spatial tile", False
+            return tile_plan.min_tile_bytes, "smallest 2D tile", False
+        return tile_plan.tiled_peak_bytes, "smallest tile", False
 
-    return stage.peak_bytes, "untiled stage", False
+    return stage.peak_bytes, "runs untiled", False
 
 
 @dataclass(frozen=True)

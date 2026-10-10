@@ -13,14 +13,15 @@ Ahead-of-time compiler that tiles ONNX models to fit a memory budget and emits `
 - `python scripts/gen_fixtures.py model.onnx -o <dir> [--compress]`: writes `.tgrs` and `.reference.bin` fixtures for the runtime's C tests. There is no `tigris gen-fixtures` subcommand.
 
 ## CLI
-- Subcommands: `analyze` (feasibility report, no hardware), `plan` (YAML plan), `simulate` (step-by-step execution trace), `compile` (binary `.tgrs`), `codegen` (C from a `.tgrs`).
+- Subcommands: `analyze` (fit against a budget, `--json` report, `--trace` step-by-step execution), `compile` (binary `.tgrs`, prints the same summary), `codegen` (C from a `.tgrs`), `inspect` (file contents and costs, no compilation), `run`, `zoo`. `plan` and `simulate` are hidden, deprecated aliases removed in the next release.
+- Output is plain text through `cli/text.py`: click styles, `NO_COLOR` honored, no color off a terminal. One blank line between sections, none before the first.
 - Budgets: first `-m` is the fast pool, a second `-m` the slow pool; `-m 256K+4M` is sugar for `-m 256K -m 4M`. `-f/--flash` makes `compile` fail when the plan exceeds it. `--xip` reads weights in place from flash. `-c lz4` compresses weight blocks.
 - `codegen --backend reference|esp-nn|cmsis-nn --format app|core`; `--header` and `--name` are valid only with `core`. Accelerated backends are int8 only; a float32 plan on them gets the reference dispatcher explicitly.
 
 ## Layout
 - `src/tigris/loaders/onnx/`: ONNX import; `normalize.py` holds the pass pipeline.
 - `src/tigris/analysis/`: lifetime, memory model, temporal partition (stages), spatial partition (tiles, chains, 2D tiling), validation.
-- `src/tigris/emitters/binary/`: wire format; `defs.py` is the schema source, `writer.py` and `reader.py` the codecs. `emitters/codegen.py` generates C, `emitters/yaml.py` the plan YAML.
+- `src/tigris/emitters/binary/`: wire format; `defs.py` is the schema source, `writer.py` and `reader.py` the codecs. `emitters/codegen.py` generates C, `emitters/plan_json.py` the JSON plan of the deprecated `plan` command.
 - `src/tigris/capabilities.py`: per-operator backend routes, constraints and conditional fallbacks; the public matrix JSON is generated from it.
 - `src/tigris/__init__.py`: `SCHEMA_VERSION` and `SUPPORTED_SCHEMA_VERSIONS` live here. `compatibility.json` records compiler and runtime releases with the schemas each emits or accepts, and entries record each component separately. Paired releases share a version; release ordering and version checks are in `CONTRIBUTING.md`. `tests/schema_compat/` holds a frozen plan for every supported schema version.
 

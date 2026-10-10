@@ -9,14 +9,14 @@ from tigris.emitters.binary.writer import RUNTIME_MAX_TENSORS
 
 from tigris.cli import (
     cli,
-    console,
+    text,
     _expand_mem,
     _parse_input_shape,
     _parse_size,
     _report_shape_bindings,
     _run_pipeline,
 )
-from tigris.utils import describe_interface, fmt_bytes
+from tigris.utils import fmt_bytes
 
 
 def _run_compressed_pipeline(
@@ -82,7 +82,7 @@ def _run_compressed_pipeline(
               help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
 def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None,
             compress: str, xip: bool, input_shape: dict[str, tuple[int, ...]]):
-    """Compile an ONNX or TFLite model to a binary .tgrs plan."""
+    """Compile a model into an execution plan."""
     from tigris.analysis.validation import (
         validate_budget,
         validate_execution_dtype,
@@ -92,13 +92,10 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
 
     compress_arg = compress if compress != "none" else None
     if compress_arg:
-        ag, budget, reserved_budget, weight_reserve = _run_compressed_pipeline(
-            model, mem, input_shape
-        )
+        ag, budget, _, weight_reserve = _run_compressed_pipeline(model, mem, input_shape)
         _report_shape_bindings(ag)
     else:
         ag, budget = _run_pipeline(model, mem, input_shapes=input_shape)
-        reserved_budget = 0
         weight_reserve = 0
 
     ag.budget = replace(ag.budget, flash=_parse_size(flash) if flash else 0)
@@ -110,46 +107,31 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
             "Fast-memory budget exceeds the uint32 plan-format limit"
         )
 
-    dtype_validation = validate_execution_dtype(ag)
-    if not dtype_validation.supported:
-        raise click.ClickException(
-            "Cannot compile a plan with unsupported tensor dtypes: "
-            + dtype_validation.describe()
-        )
+    from tigris.analysis.findings import compute_findings
+    from tigris.cli.analyze import summary
+    from tigris.frontends.tflite import is_tflite, tflm_tensor_arena
 
-    operator_validation = validate_operator_support(ag)
-    if not operator_validation.supported:
-        raise click.ClickException(
-            "Cannot compile a plan with unsupported operators: "
-            + operator_validation.describe()
-        )
-
-    result = validate_budget(ag)
-    if not result.fast.feasible:
-        details = "; ".join(issue.describe() for issue in result.fast.issues)
-        raise click.ClickException(
-            f"Cannot compile an infeasible memory plan: {details}"
-        )
-    if not result.slow.fits:
-        raise click.ClickException(
-            f"Cannot compile this plan: {result.slow.describe()}"
-        )
+    # The same summary analyze prints: what was decided, and why not when it
+    # was not. A plan is written only when everything holds.
+    data = Path(model).read_bytes()
+    findings = compute_findings(ag, flash_budget=ag.budget.flash)
+    summary(model, ag, findings, budget, ag.budget.slow, ag.budget.flash,
+            tflm_tensor_arena(data) if is_tflite(data) else None)
+    usable = (validate_execution_dtype(ag).supported and validate_operator_support(ag).supported)
+    result = validate_budget(ag) if usable else None
+    if result is None or not result.fast.feasible or not result.slow.fits:
+        raise click.ClickException("no plan written")
 
     out = Path(output) if output else Path(model).with_suffix(".tgrs")
-    with console.status("Writing binary plan..."):
-        try:
-            plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip)
-        except ValueError as exc:
-            raise click.ClickException(f"Cannot write the plan: {exc}") from exc
-        if ag.budget.flash > 0 and len(plan_data) > ag.budget.flash:
-            raise click.ClickException(
-                f"Cannot compile a plan that exceeds the flash budget: "
-                f"plan is {fmt_bytes(len(plan_data))} but the flash budget is "
-                f"{fmt_bytes(ag.budget.flash)}"
-            )
-        out.write_bytes(plan_data)
-
-    plan_bytes = len(plan_data)
+    try:
+        plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip)
+    except ValueError as exc:
+        raise click.ClickException(f"no plan written: {exc}") from exc
+    if ag.budget.flash > 0 and len(plan_data) > ag.budget.flash:
+        raise click.ClickException(
+            f"no plan written: the plan is {fmt_bytes(len(plan_data))}, "
+            f"the flash budget is {fmt_bytes(ag.budget.flash)}")
+    out.write_bytes(plan_data)
 
     # The count follows from the model, so it is not something to set; what it
     # decides is how the target has to be built. A target built for fewer
@@ -157,34 +139,14 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     # failure.
     runtime_tensors = sum(
         1 for info in ag.tensors.values() if not info.is_constant)
+    text.echo()
     if runtime_tensors > RUNTIME_MAX_TENSORS:
-        console.print(
-            f"[yellow]This plan holds {runtime_tensors} tensors, more than the "
-            f"{RUNTIME_MAX_TENSORS} a runtime carries by default. Build the "
-            f"runtime with -DTIGRIS_MAX_TENSORS={runtime_tensors} or it will "
-            f"refuse the plan.[/]"
-        )
-
+        text.echo(text.warn("warning: ") +
+                  f"the plan holds {runtime_tensors} tensors, more than the "
+                  f"{RUNTIME_MAX_TENSORS} a runtime carries by default; build the "
+                  f"runtime with -DTIGRIS_MAX_TENSORS={runtime_tensors}")
+    note = ""
     if compress_arg:
-        uncompressed_size = len(emit_binary_bytes(ag))
-        ratio = plan_bytes / uncompressed_size if uncompressed_size > 0 else 1.0
-        console.print(f"[bold green]Binary plan written to {out}[/] (LZ4 compressed)")
-        console.print(
-            f"  {len(ag.ops)} ops, {len(ag.stages)} stages @ "
-            f"{fmt_bytes(budget)} total fast memory "
-            f"({fmt_bytes(ag.mem_budget)} activations + "
-            f"{fmt_bytes(weight_reserve)} compressed weights)",
-            style="dim",
-        )
-        if reserved_budget != weight_reserve:
-            console.print(
-                f"  conservative planning reserve: {fmt_bytes(reserved_budget)}",
-                style="dim",
-            )
-        console.print(f"  plan size: {fmt_bytes(plan_bytes)} (uncompressed: {fmt_bytes(uncompressed_size)}, ratio: {ratio:.2f}x)", style="dim")
-    else:
-        console.print(f"[bold green]Binary plan written to {out}[/]")
-        console.print(f"  {len(ag.ops)} ops, {len(ag.stages)} stages @ {fmt_bytes(budget)} budget", style="dim")
-        console.print(f"  plan size: {fmt_bytes(plan_bytes)}", style="dim")
-    for label, text in describe_interface(ag):
-        console.print(f"  {label.lower()}: {text}", style="dim")
+        note = (f", LZ4, {fmt_bytes(weight_reserve)} of the {fmt_bytes(budget)} fast memory "
+                f"holds decompressed weights")
+    text.echo(f"wrote {out}   {fmt_bytes(len(plan_data))}{note}")

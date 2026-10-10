@@ -4,52 +4,42 @@ import json
 from pathlib import Path
 
 import click
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
-
-from tigris.cli import cli, console
+from tigris.cli import cli, text
 from tigris.emitters.binary.defs import FLAG_XIP, STAGE_FLAG_LINE_BUFFERED
 from tigris.inspection import inspect_file
 from tigris.utils import fmt_bytes
 
 
 def _panel(title, rows):
-    grid = Table.grid(padding=(0, 2))
-    grid.add_column(style="bold", no_wrap=True)
-    grid.add_column()
-    for label, value in rows:
-        grid.add_row(Text(label), Text(str(value)))
-    console.print(Panel(grid, title=Text(title, style="bold"), border_style="blue"))
+    text.section(title, [[label[:1].lower() + label[1:], str(value)] for label, value in rows])
 
 
 def _shape(shape):
-    return "unknown shape" if shape is None else "[" + ", ".join(
-        "?" if dim is None else str(dim) for dim in shape) + "]"
+    if shape is None:
+        return "unknown shape"
+    return "x".join("?" if dim is None else str(dim) for dim in shape) or "scalar"
 
 
 def _interface(tensor, *, plan=False):
+    """Name, then shape and dtype, then a dim note on storage."""
     dtype = tensor.get("interface_dtype", tensor.get("dtype", tensor.get("kind", "unknown")))
-    value = f"{tensor['name']}  {dtype}"
+    note = ""
     if plan:
-        value += f"  (stored: {tensor['dtype']} {_shape(tensor['shape'])}, {tensor['layout']})"
-    else:
-        value += f" {_shape(tensor.get('shape'))}"
-        if tensor.get("initializer_default"):
-            value += "  (initializer default)"
-    return value
+        note = f"stored {tensor['dtype']}, {tensor['layout']}"
+    elif tensor.get("initializer_default"):
+        note = "initializer default"
+    return [tensor["name"], f"{_shape(tensor.get('shape'))} {dtype}", text.dim(note)]
 
 
 def _names(indices, tensors):
     return ", ".join(tensors[index]["name"] for index in indices) or "none"
 
 
-def _operators(ops, tensors=None):
-    table = Table(box=None, padding=(0, 1), expand=True)
-    for name in ("Step", "Operator", "Type", "Inputs", "Outputs"):
-        table.add_column(name, overflow="fold")
+def _operators(ops, tensors=None, title="steps"):
+    header = ["step", "operator", "type", "inputs", "outputs"]
     if tensors is not None:
-        table.add_column("Fused activation")
+        header.append("fused activation")
+    rows = [[text.dim(cell) for cell in header]]
     for index, op in ops:
         op_type = f"{op['domain']}::{op['type']}" if op.get("domain") else op["type"]
         values = [str(index), op["name"] or "(unnamed)", op_type,
@@ -57,9 +47,8 @@ def _operators(ops, tensors=None):
                   _names(op["outputs"], tensors) if tensors is not None else ", ".join(op["outputs"])]
         if tensors is not None:
             values.append(op["fused_activation"])
-        table.add_row(*(Text(value, style="cyan" if column == 1 else "")
-                        for column, value in enumerate(values)))
-    console.print(table)
+        rows.append(values)
+    text.section(title, rows, ">")
 
 
 def _value(value):
@@ -81,11 +70,9 @@ def _details(title, value):
 
 
 def _tensors(title, tensors, *, plan=False):
-    table = Table(box=None, padding=(0, 1), expand=True)
-    columns = ["ID", "Tensor", "Type", "Stored shape" if plan else "Declared shape"]
-    columns += ["Bytes", "Layout", "Quant"] if plan else ["Bytes", "Storage"]
-    for label in columns:
-        table.add_column(label, overflow="fold")
+    columns = ["id", "tensor", "type", "stored shape" if plan else "declared shape"]
+    columns += ["bytes", "layout", "quant"] if plan else ["bytes", "storage"]
+    rows = [[text.dim(cell) for cell in columns]]
     for index, tensor in enumerate(tensors):
         values = [str(index), tensor["name"], tensor.get("dtype", tensor.get("kind", "unknown")),
                   _shape(tensor.get("shape")),
@@ -94,23 +81,26 @@ def _tensors(title, tensors, *, plan=False):
             values += [tensor["layout"], str(tensor["quant_param_idx"]) if tensor["quant_param_idx"] is not None else "none"]
         else:
             values.append(tensor.get("storage", "not declared"))
-        table.add_row(*(Text(value, style="cyan" if column == 1 else "")
-                        for column, value in enumerate(values)))
-    console.print(Panel(table, title=Text(title, style="bold"), border_style="blue"))
+        rows.append(values)
+    text.section(title, rows, ">   >")
 
 
-_FORMATS = {"tgrs": "TiGrIS execution plan", "onnx": "ONNX graph", "tflite": "TFLite model"}
+_FORMATS = {"tgrs": "plan", "onnx": "ONNX", "tflite": "TFLite"}
 
 
-def _render(report, verbose):
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _render(report, verbose, path: Path):
     is_plan = report["format"] == "tgrs"
     is_tflite = report["format"] == "tflite"
-    rows = [("Format", _FORMATS[report["format"]]),
-            ("File size", fmt_bytes(report["file_size_bytes"]))]
+    counts = report["operator_counts"]
+    summary = [_FORMATS[report["format"]]]
     if is_plan:
         plan = report["plan"]
         tensors = plan["tensors"]
-        rows.append(("Schema", plan["version"]))
+        summary.append(f"schema {plan['version']}")
         inputs = [tensors[index] for index in plan["model_inputs"]]
         outputs = [tensors[index] for index in plan["model_outputs"]]
     else:
@@ -119,97 +109,200 @@ def _render(report, verbose):
         inputs = [{**item, "initializer_default": item["name"] in defaults} for item in graph["inputs"]]
         outputs = graph["outputs"]
         if is_tflite:
-            rows.extend([("Schema version", report["tflite_version"]),
-                         ("Subgraphs", report["subgraphs"])])
+            summary.append(f"schema {report['tflite_version']}")
         else:
-            rows.extend([("IR version", report["ir_version"]),
-                         ("Opsets", ", ".join(f"{item['domain'] or 'ai.onnx'}: {item['version']}"
-                                              for item in report["opsets"]))])
-    for label, items in (("Input", inputs), ("Output", outputs)):
-        for item in items:
-            rows.append((label, _interface(item, plan=is_plan)))
-    counts = report["operator_counts"]
-    rows.append(("Operators", f"{sum(counts.values())}: " + ", ".join(
-        f"{name} x {count}" if count > 1 else name for name, count in counts.items())))
+            summary.append(f"IR {report['ir_version']}, opsets " + ", ".join(
+                f"{item['domain'] or 'ai.onnx'} {item['version']}" for item in report["opsets"]))
+    summary.append(_count(sum(counts.values()), "operator"))
+    if is_tflite and report["subgraphs"] > 1:
+        summary.append(_count(report["subgraphs"], "subgraph"))
     if is_plan:
-        tiled = sum(stage["tile_plan_idx"] is not None and
-                    plan["tile_plans"][stage["tile_plan_idx"]]["tileable"] for stage in plan["stages"])
-        chains = sum(stage["chain_len"] >= 2 and stage["chain_id"] == index
-                     for index, stage in enumerate(plan["stages"]))
-        count = len(plan["stages"])
-        rows.append(("Schedule", f"{count} {'stage' if count == 1 else 'stages'}, {tiled} tiled, {chains} chains"))
-    elif is_tflite:
-        constants = graph["initializers"]
-        rows.append(("Constants", f"{len(constants)}, "
-                     f"{fmt_bytes(sum(item['size_bytes'] for item in constants))}"))
-        reasons = report["unsupported"]
-        rows.append(("Converts to a plan", "yes" if not reasons else f"no, {len(reasons)} reason(s)"))
-        for reason in reasons[:5]:
-            rows.append(("", reason))
-        if len(reasons) > 5:
-            rows.append(("", f"... and {len(reasons) - 5} more (--json lists all)"))
-    else:
-        initializers = graph["initializers"]
-        external = sum(item["storage"] == "external" for item in initializers)
-        rows.append(("Initializers", f"{len(initializers)} dense, {len(graph['sparse_initializers'])} sparse"
-                     f", {external} external dense"))
-    _panel(f"TiGrIS Inspect - {report['name'] or '(unnamed)'}", rows)
+        stages = plan["stages"]
+        # A stage runs tiled when it has a tile plan or belongs to a chain.
+        tiled = sum((stage["tile_plan_idx"] is not None and
+                     plan["tile_plans"][stage["tile_plan_idx"]]["tileable"]) or
+                    (stage["chain_id"] is not None and stage["chain_len"] >= 2) for stage in stages)
+        summary.append(_count(len(stages), "stage") + (f", {tiled} tiled" if tiled else ""))
+    summary.append(fmt_bytes(report["file_size_bytes"]))
+    # The name stored inside the file, where it is not the file's own.
+    if report.get("name") and report["name"] != path.stem:
+        summary.insert(1, f"model {report['name']}")
+    text.echo(text.bold(path.name) + "   " + ", ".join(summary))
+    rows = [[label, *_interface(item, plan=is_plan)]
+            for label, items in (("input", inputs), ("output", outputs)) for item in items]
+    for line in text.columns(rows):
+        text.echo(line)
+
     if is_plan:
-        compression = "LZ4" if plan["weight_blocks_compression"] == 1 else "uncompressed"
-        storage = "Read in place (XIP)" if plan["flags"] & FLAG_XIP else "Loaded by stage"
-        _panel("Memory", [
-            ("Fast budget", fmt_bytes(plan["budget"])),
-            ("Recorded graph peak", fmt_bytes(plan["peak"])),
-            ("Weights (including bias)", fmt_bytes(sum(weight["size_bytes"] for weight in plan["weights"]))),
-            ("Weight storage", f"{storage}, {compression}"),
-        ])
-        console.print(Text("Memory values are compiler records, not measured runtime peak or total RAM.", style="dim"))
-    elif is_tflite:
-        console.print(Text("Model metadata as stored in the file.", style="dim"))
+        _plan_summary(plan, report["requirements"])
     else:
-        console.print(Text("Declared graph metadata. Shapes are not inferred; external tensor data is not loaded.", style="dim"))
+        _model_summary(report, is_tflite)
     if not verbose:
         return
+    if is_plan:
+        _plan_details(plan)
+        return
+    _steps(graph, report["costs"])
+    if graph["initializers"]:
+        _tensors("constants", graph["initializers"])
     if is_tflite:
-        _operators(enumerate(graph["operators"]))
-        if graph["initializers"]:
-            _tensors("Constants", graph["initializers"])
         return
-    if not is_plan:
-        _operators(enumerate(graph["operators"]))
-        for index, op in enumerate(graph["operators"]):
-            if op["attributes"]:
-                _details(f"Operator {index} attributes", op["attributes"])
-        for label, key in (("Declared intermediate tensors", "value_info"), ("Initializers", "initializers")):
-            if graph[key]:
-                _tensors(label, graph[key])
-        for tensor in graph["initializers"]:
-            if tensor["external_data"]:
-                _details(f"External data - {tensor['name']}", tensor["external_data"])
-        if graph["sparse_initializers"]:
-            _details("Sparse initializers", graph["sparse_initializers"])
-        if report["functions"]:
-            _details("Local functions", report["functions"])
-        return
+    for index, op in enumerate(graph["operators"]):
+        if op["attributes"]:
+            _details(f"operator {index} attributes", op["attributes"])
+    if graph["value_info"]:
+        _tensors("declared intermediate tensors", graph["value_info"])
+    for tensor in graph["initializers"]:
+        if tensor["external_data"]:
+            _details(f"external data {tensor['name']}", tensor["external_data"])
+    if graph["sparse_initializers"]:
+        _details("sparse initializers", graph["sparse_initializers"])
+    if report["functions"]:
+        _details("local functions", report["functions"])
+
+
+def _macs(n):
+    if n is None:
+        return "?"
+    for limit, unit in ((1e9, "G"), (1e6, "M"), (1e3, "K")):
+        if n >= limit:
+            return f"{n / limit:.2f} {unit}"
+    return str(n)
+
+
+def _share(part, whole):
+    if not part or not whole:
+        return ""
+    share = 100 * part / whole
+    return "<1%" if share < 0.5 else f"{share:.0f}%"
+
+
+def _cost_rows(kinds, weight_total, macs_total, *, with_macs):
+    """One row per operator type, heaviest first, and a total."""
+    header = ["", "count", "weights", ""] + (["MACs", ""] if with_macs else [])
+    rows = [[text.dim(cell) for cell in header]]
+    for kind in kinds:
+        row = [kind["type"], str(kind["count"]),
+               fmt_bytes(kind["weight_bytes"]) if kind["weight_bytes"] else "",
+               _share(kind["weight_bytes"], weight_total)]
+        if with_macs:
+            row += [_macs(kind["macs"]) if kind["macs"] != 0 else "", _share(kind["macs"], macs_total)]
+        rows.append(row)
+    total = [text.dim("total"), str(sum(kind["count"] for kind in kinds)),
+             fmt_bytes(weight_total), ""]
+    if with_macs:
+        total += [_macs(macs_total), ""]
+    rows.append(total)
+    return rows
+
+
+def _model_summary(report, is_tflite):
+    costs = report["costs"]
+    text.section("operators", _cost_rows(costs["operators"], costs["weight_bytes"], costs["macs"],
+                                         with_macs=True), "<>>>>>")
+    largest = costs["largest_activations"]
+    if largest:
+        text.section("largest activations", [
+            [f"{_shape(item['shape'])} {item['dtype']}", fmt_bytes(item["bytes"]),
+             "model input" if item["step"] is None else f"step {item['step']}, {item['type']}"]
+            for item in largest], "<>")
+    rows = []
+    if is_tflite:
+        rows.append(["quantization", _quantization(report["quantization"])])
+        reasons = report["unsupported"]
+        rows.append(["converts", "yes" if not reasons else
+                     text.bad("no") + f", {_count(len(reasons), 'reason')}"])
+        rows += [["", reason] for reason in reasons[:5]]
+        if len(reasons) > 5:
+            rows.append(["", text.dim(f"and {len(reasons) - 5} more; --json lists all")])
+    else:
+        graph = report["graph"]
+        external = sum(item["storage"] == "external" for item in graph["initializers"])
+        rows.append(["initializers", f"{len(graph['initializers'])} dense, "
+                     f"{len(graph['sparse_initializers'])} sparse, {external} external"])
+    text.block(rows)
+    if not is_tflite:
+        text.gap()
+        text.echo(text.dim("Declared metadata: shapes are not inferred, external data is not loaded; "
+                           "? marks a figure an undeclared shape hides."))
+
+
+def _quantization(quant):
+    parts = [", ".join(quant["activation_dtypes"]) + " activations"]
+    weights = quant["int8_weights"]
+    if weights:
+        per_channel = quant["per_channel"]
+        if per_channel == weights:
+            layout = "per channel"
+        elif per_channel == 0:
+            layout = "per tensor"
+        else:
+            layout = f"{per_channel} of {weights} per channel"
+        symmetry = ("symmetric" if not quant["asymmetric"]
+                    else f"{quant['asymmetric']} asymmetric")
+        parts.append(f"int8 weights {layout}, {symmetry}")
+    if quant["float_islands"]:
+        parts.append(_count(quant["float_islands"], "float32 region"))
+    return "; ".join(parts)
+
+
+def _plan_kinds(plan):
+    kinds = {}
+    for op in plan["ops"]:
+        entry = kinds.setdefault(op["type"], {"type": op["type"], "count": 0, "weight_bytes": 0})
+        entry["count"] += 1
+        entry["weight_bytes"] += sum(plan["weights"][op[key]]["size_bytes"]
+                                     for key in ("weight_idx", "bias_idx") if op[key] is not None)
+    return sorted(kinds.values(), key=lambda item: (-item["weight_bytes"], -item["count"], item["type"]))
+
+
+def _plan_summary(plan, needs):
+    weights = sum(weight["size_bytes"] for weight in plan["weights"])
+    text.section("operators", _cost_rows(_plan_kinds(plan), weights, None, with_macs=False), "<>>>")
+    compression = "LZ4" if plan["weight_blocks_compression"] == 1 else "uncompressed"
+    storage = "read in place (XIP)" if plan["flags"] & FLAG_XIP else "loaded by stage"
+    arena_note = ""
+    if needs["decompression_bytes"]:
+        arena_note = (f"{fmt_bytes(plan['budget'])} activations, "
+                      f"{fmt_bytes(needs['decompression_bytes'])} decompressed weights")
+    rows = [["fast arena", fmt_bytes(needs["fast_arena_bytes"]), text.dim(arena_note)],
+            ["unscheduled", fmt_bytes(plan["peak"]), ""],
+            ["weights", fmt_bytes(weights), text.dim(f"{storage}, {compression}")]]
+    if needs["state_bytes"]:
+        rows.append(["state", fmt_bytes(needs["state_bytes"]), text.dim("kept between runs")])
+    text.section("memory", rows, "<>")
+    over = [limit for limit in needs["build_limits"] if limit["needed"] > limit["default"]]
+    text.block([["runtime build", "default limits suffice" if not over else
+                 ", ".join(f"-D{limit['name']}={limit['needed']}" for limit in over)]])
+
+
+def _tiling(plan, index, stage):
+    if stage["chain_id"] is not None and stage["chain_len"] >= 2:
+        head = plan["stages"][stage["chain_id"]]
+        if stage["chain_id"] != index:
+            return f"in chain {stage['chain_id']}"
+        mode = "line buffered" if head["flags"] & STAGE_FLAG_LINE_BUFFERED else "tile buffered"
+        return f"chain of {stage['chain_len']}, tile height {head['chain_tile_h']}, {mode}"
+    if stage["tile_plan_idx"] is not None:
+        tile = plan["tile_plans"][stage["tile_plan_idx"]]
+        if tile["tileable"]:
+            return f"{tile['num_tiles']} tiles, axis {tile['axis']}, halo {tile['halo']}"
+    return "untiled"
+
+
+def _plan_details(plan):
+    tensors = plan["tensors"]
+    rows = [[text.dim(cell) for cell in ("stage", "ops", "untiled peak", "weights", "tiling")]]
     for index, stage in enumerate(plan["stages"]):
-        rows = [("Inputs", _names(stage["inputs"], tensors)),
-                ("Outputs", _names(stage["outputs"], tensors)),
-                ("Recorded peak", fmt_bytes(stage["peak_bytes"]))]
-        tile_index = stage["tile_plan_idx"]
-        if tile_index is not None:
-            tile = plan["tile_plans"][tile_index]
-            if tile["tileable"]:
-                rows.append(("Tiling", f"{tile['num_tiles']} tiles; axis {tile['axis']}; "
-                             f"height {tile['tile_height']}, width {tile['tile_width']}; halo {tile['halo']}"))
-        if stage["chain_id"] is not None and stage["chain_len"] >= 2:
-            head = plan["stages"][stage["chain_id"]]
-            mode = "line buffered" if head["flags"] & STAGE_FLAG_LINE_BUFFERED else "tile buffered"
-            rows.append(("Chain", f"head {stage['chain_id']}, {stage['chain_len']} stages, "
-                         f"{mode}, tile height {head['chain_tile_h']}"))
-        _panel(f"Stage {index}", rows)
-        _operators(((op_index, plan["ops"][op_index]) for op_index in stage["ops"]), tensors)
-    if not plan["stages"]:
-        _operators(enumerate(plan["ops"]), tensors)
+        weights = sum(plan["weights"][op[key]]["size_bytes"] for op in (plan["ops"][i] for i in stage["ops"])
+                      for key in ("weight_idx", "bias_idx") if op[key] is not None)
+        first, last = stage["ops"][0], stage["ops"][-1]
+        rows.append([str(index), str(first) if first == last else f"{first}-{last}",
+                     fmt_bytes(stage["peak_bytes"]), fmt_bytes(weights) if weights else "",
+                     _tiling(plan, index, stage)])
+    if plan["stages"]:
+        text.section("stages", rows, ">>>>")
+    _operators(enumerate(plan["ops"]), tensors)
     for index, op in enumerate(plan["ops"]):
         details = {}
         if op["spatial"]["kernel_h"]:
@@ -222,13 +315,28 @@ def _render(report, verbose):
             if op[key] is not None:
                 details[key.removesuffix("_idx")] = plan["weights"][op[key]]["name"]
         if details:
-            _details(f"Operator {index} parameters", details)
-    _tensors("Stored tensors", tensors, plan=True)
-    for label, key in (("Weights", "weights"),
-                       ("Quantization", "quant_params"), ("Tile plans", "tile_plans"),
-                       ("Weight blocks", "weight_blocks")):
+            _details(f"operator {index} parameters", details)
+    _tensors("stored tensors", tensors, plan=True)
+    for label, key in (("weights", "weights"), ("quantization", "quant_params"),
+                       ("tile plans", "tile_plans"), ("weight blocks", "weight_blocks")):
         if plan[key]:
             _details(label, plan[key])
+
+
+def _steps(graph, costs):
+    """Every operator with its output, the weights it reads first, and its MACs."""
+    shapes = {item["name"]: item for item in graph.get("activations", []) + graph.get("value_info", [])
+              + graph["inputs"] + graph["outputs"]}
+    rows = [[text.dim(cell) for cell in ("step", "type", "output", "bytes", "weights", "MACs", "name")]]
+    for op, step in zip(graph["operators"], costs["steps"]):
+        out = shapes.get(op["outputs"][0]) if op["outputs"] else None
+        shape = f"{_shape(out.get('shape'))} {out.get('dtype', '')}".strip() if out else "?"
+        size = (text.dim("constant") if step["constant"] else
+                fmt_bytes(step["output_bytes"]) if step["output_bytes"] is not None else "?")
+        rows.append([str(step["step"]), op["type"], shape, size,
+                     fmt_bytes(step["weight_bytes"]) if step["weight_bytes"] else "",
+                     _macs(step["macs"]) if step["macs"] != 0 else "", op["name"] or ""])
+    text.section("steps", rows, "><<>>>")
 
 
 @cli.command("inspect")
@@ -236,13 +344,10 @@ def _render(report, verbose):
 @click.option("-v", "--verbose", is_flag=True, help="Show operators, tensors, and execution-plan details.")
 @click.option("--json", "as_json", is_flag=True, help="Emit complete, versioned metadata as JSON.")
 def inspect(model: Path, verbose: bool, as_json: bool):
-    """Inspect an ONNX, TFLite or .tgrs file without compiling or executing it.
+    """Show what a model or plan contains.
 
-    Format is detected from file contents. Inspection is offline and does not
-    load external ONNX tensor data. Memory values are compiler records.
-    Inspection does not execute kernels; run checks the portable reference
-    path, not ESP-NN or CMSIS-NN
-    numerics or on-device latency.
+    Offline: external ONNX tensor data is not loaded. Memory values are the
+    compiler's records, not measurements.
     """
     try:
         report = inspect_file(model)
@@ -251,4 +356,4 @@ def inspect(model: Path, verbose: bool, as_json: bool):
     if as_json:
         click.echo(json.dumps(report, indent=2, ensure_ascii=True, allow_nan=False))
     else:
-        _render(report, verbose)
+        _render(report, verbose, model)
