@@ -6796,11 +6796,11 @@ _MEMORY_REPORT = re.compile(
 
 
 def _assert_memory_contract(
-    case: ContractCase, plan: dict, runtime_stdout: str
+    case_name: str, plan: dict, runtime_stdout: str, *, full_budget: bool = False
 ) -> None:
     match = _MEMORY_REPORT.search(runtime_stdout)
     if match is None:
-        raise AssertionError(f"{case.name}: runtime emitted no memory report")
+        raise AssertionError(f"{case_name}: runtime emitted no memory report")
 
     (
         budget,
@@ -6814,32 +6814,33 @@ def _assert_memory_contract(
     scheduled_peak = int(plan["_compiler_scheduled_peak"])
     if budget != plan["budget"]:
         raise AssertionError(
-            f"{case.name}: runtime budget {budget} != plan budget {plan['budget']}"
+            f"{case_name}: runtime budget {budget} != plan budget {plan['budget']}"
         )
     if required != budget + reserve:
         raise AssertionError(
-            f"{case.name}: required arena {required} != budget + reserve "
+            f"{case_name}: required arena {required} != budget + reserve "
             f"({budget} + {reserve})"
         )
-    if activation_limit != scheduled_peak:
+    expected_limit = budget if full_budget else scheduled_peak
+    if activation_limit != expected_limit:
         raise AssertionError(
-            f"{case.name}: runner activation limit {activation_limit} != "
-            f"compiler scheduled peak {scheduled_peak}"
+            f"{case_name}: runner activation limit {activation_limit} != "
+            f"requested activation limit {expected_limit}"
         )
     if scheduled_peak > budget:
         raise AssertionError(
-            f"{case.name}: compiler scheduled peak {scheduled_peak} exceeds "
+            f"{case_name}: compiler scheduled peak {scheduled_peak} exceeds "
             f"activation budget {budget}"
         )
-    if allocated != scheduled_peak + reserve:
+    if allocated != expected_limit + reserve:
         raise AssertionError(
-            f"{case.name}: allocated arena {allocated} != compiler core "
-            f"estimate {scheduled_peak + reserve}"
+            f"{case_name}: allocated arena {allocated} != compiler core "
+            f"allocation {expected_limit + reserve}"
         )
-    if measured_peak > allocated:
+    if measured_peak > scheduled_peak + reserve:
         raise AssertionError(
-            f"{case.name}: runtime peak {measured_peak} exceeds compiler "
-            f"core estimate {allocated} "
+            f"{case_name}: runtime peak {measured_peak} exceeds compiler "
+            f"core estimate {scheduled_peak + reserve} "
             f"({scheduled_peak} activations + {reserve} reserve)"
         )
     # The slow pool is sized by the compiler and filled by the runtime, and
@@ -6848,18 +6849,62 @@ def _assert_memory_contract(
     predicted = int(plan["_compiler_slow_peak"])
     if slow_peak > predicted:
         raise AssertionError(
-            f"{case.name}: runtime slow peak {slow_peak} exceeds the compiler's "
+            f"{case_name}: runtime slow peak {slow_peak} exceeds the compiler's "
             f"slow requirement {predicted}"
         )
     slow_budget = int(plan["_compiler_slow_budget"])
     if slow_budget > 0 and slow_peak > slow_budget:
         raise AssertionError(
-            f"{case.name}: runtime slow peak {slow_peak} exceeds the slow "
+            f"{case_name}: runtime slow peak {slow_peak} exceeds the slow "
             f"budget {slow_budget} the compiler accepted"
         )
 
 
-def _build_runner(runtime: Path, build_dir: Path) -> tuple[Path, Path]:
+def _run_peak_fixtures(runners: tuple[Path, ...], work_dir: Path) -> None:
+    fixtures = Path(__file__).resolve().parents[1] / "tests/fixtures/tflite/ops"
+    for name, minimum in (("concat_rows", 96), ("select_v2_broadcast", 128),
+                          ("select_v2_rank", 128), ("float_space_to_depth", 192)):
+        model_path = fixtures / f"{name}.tflite"
+        graph, _ = _run_pipeline(str(model_path), (str(minimum - 1),))
+        assert not validate_memory_plan(graph).feasible, name
+        with np.load(fixtures / f"{name}.npz") as samples:
+            for budget in (minimum, 256):
+                case_name = f"{name}_peak_{budget}"
+                case_dir = work_dir / case_name
+                case_dir.mkdir()
+                plan_path = case_dir / "model.tgrs"
+                plan = _compile_plan(
+                    model_path, plan_path, mem_budget=str(budget),
+                    slow_budget=None, compression=None, xip=False,
+                )
+                input_path = case_dir / "inputs.bin"
+                output_path = case_dir / "outputs.bin"
+                for sample in range(len(samples["input_0"])):
+                    input_path.write_bytes(b"".join(
+                        samples[f"input_{i}"][sample].tobytes()
+                        for i in range(len(plan["model_inputs"]))
+                    ))
+                    expected = b"".join(
+                        samples[f"output_{i}"][sample].tobytes()
+                        for i in range(len(plan["model_outputs"]))
+                    )
+                    for runner in runners:
+                        for full_budget in (False, True):
+                            limit = budget if full_budget else plan["_compiler_scheduled_peak"]
+                            completed = _run(
+                                [str(runner), str(plan_path), str(input_path),
+                                 str(output_path), str(limit)], case_name,
+                            )
+                            _assert_memory_contract(
+                                case_name, plan, completed.stdout, full_budget=full_budget,
+                            )
+                            assert output_path.read_bytes() == expected, case_name
+                print(f"PASS {case_name}")
+
+
+def _build_runner(
+    runtime: Path, build_dir: Path, *, alignment: int | None = None
+) -> tuple[Path, Path]:
     """Build the default and rows-instrumented contract runners.
 
     The rows-instrumented runner compiles the runtime sources with
@@ -6874,6 +6919,8 @@ def _build_runner(runtime: Path, build_dir: Path) -> tuple[Path, Path]:
             "-B",
             str(build_dir),
             "-DCMAKE_BUILD_TYPE=Release",
+            *([f"-DCMAKE_C_FLAGS=-DTIGRIS_TENSOR_ALIGN={alignment}"]
+              if alignment is not None else []),
         ],
         "runtime configure",
     )
@@ -6885,7 +6932,7 @@ def _build_runner(runtime: Path, build_dir: Path) -> tuple[Path, Path]:
             "--target",
             "tigris_contract_runner",
             "tigris_contract_runner_rows",
-            "--parallel",
+            "--parallel", "4",
         ],
         "runtime contract-runner build",
     )
@@ -6952,7 +6999,7 @@ def _run_metric_case(
             f"{case.name} rows-runner ({label})",
         )
         if label == "linebuffered":
-            _assert_memory_contract(case, plan, completed.stdout)
+            _assert_memory_contract(case.name, plan, completed.stdout)
         actual_outputs = _decode_outputs(
             plan, outputs_path.read_bytes(), reference_outputs
         )
@@ -7011,7 +7058,7 @@ def _reference_session(case: ContractCase, path: Path) -> ort.InferenceSession:
 
 
 def _run_case(
-    case: ContractCase, runner: Path, work_dir: Path
+    case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Path | None = None
 ) -> Path:
     case_dir = work_dir / case.name
     case_dir.mkdir()
@@ -7049,13 +7096,26 @@ def _run_case(
         ],
         f"{case.name} runtime execution",
     )
-    _assert_memory_contract(case, plan, completed.stdout)
+    _assert_memory_contract(case.name, plan, completed.stdout)
     actual_outputs = _decode_outputs(
         plan, outputs_path.read_bytes(), reference_outputs
     )
     _assert_output_parity(
         actual_outputs, reference_outputs, _output_scales(plan)
     )
+    # Extra caller capacity must not change the scheduled memory bound.
+    for full_runner in (runner, roomy_runner):
+        if full_runner is None:
+            continue
+        completed = _run(
+            [str(full_runner), str(plan_path), str(inputs_path), str(outputs_path)],
+            f"{case.name} full-budget execution",
+        )
+        _assert_memory_contract(case.name, plan, completed.stdout, full_budget=True)
+        _assert_output_parity(
+            _decode_outputs(plan, outputs_path.read_bytes(), reference_outputs),
+            reference_outputs, _output_scales(plan),
+        )
     if case.exact_untiled:
         expected_schema = 10 if any(k in {"Svdf", "Lstm"} for k in case.expected_operators) else 9
         assert plan["version"] == expected_schema
@@ -7619,12 +7679,14 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
     )
 
     runner, rows_runner = _build_runner(runtime, work_dir / "runtime-build")
+    runner_a16, _ = _build_runner(runtime, work_dir / "runtime-build-a16", alignment=16)
+    _run_peak_fixtures((runner, runner_a16), work_dir)
     first_plan: Path | None = None
     for case in cases:
         if case.recompute_metric:
             _run_metric_case(case, rows_runner, work_dir)
         else:
-            plan_path = _run_case(case, runner, work_dir)
+            plan_path = _run_case(case, runner, work_dir, runner_a16)
             if first_plan is None:
                 first_plan = plan_path
     assert first_plan is not None, "gate needs at least one non-metric case"
