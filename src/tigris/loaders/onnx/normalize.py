@@ -68,6 +68,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_constant_ops(ag)
     ag = _fold_static_subgraphs(ag)
     ag = _fold_elementwise_patterns(ag)
+    ag = _quantize_inputs_first(ag)
     ag = _fold_qdq(ag)
     ag = _fold_float_square(ag)
     ag = _fold_gemm_scalars(ag)
@@ -1573,6 +1574,74 @@ def _fold_float_square(ag: AnalyzedGraph) -> AnalyzedGraph:
             tensor = ag.tensors.get(op.inputs[0])
             if tensor is not None and tensor.dtype == 1:
                 op.op_type, op.inputs = "Square", op.inputs[:1]
+    return ag
+
+
+_LAYOUT_OPS = frozenset({"Transpose", "Reshape", "Flatten", "Squeeze", "Unsqueeze"})
+
+
+def _quantize_inputs_first(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Quantize a float model input before the layout steps that lead to its
+    first QuantizeLinear.
+
+    Exporters put a Transpose or Reshape on the float input and quantize its
+    result, so the layout step reads float32 and writes int8. Per-tensor
+    quantization commutes with moving elements, so a QuantizeLinear and
+    DequantizeLinear with the same parameters on the input and after each
+    intermediate step give the same values, and the fold turns the input into
+    an int8 boundary and every step into an int8 one.
+    """
+    consumers: dict[str, list[OpNode]] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            if name:
+                consumers.setdefault(name, []).append(op)
+
+    inserted: dict[int, list[OpNode]] = {}
+    for name in ag.model_inputs:
+        info = ag.tensors.get(name)
+        if info is None or info.dtype != 1 or name in ag.model_outputs:
+            continue
+        held = [name]
+        op = None
+        while len(consumers.get(held[-1], [])) == 1:
+            op = consumers[held[-1]][0]
+            if op.op_type not in _LAYOUT_OPS or op.inputs[0] != held[-1]:
+                break
+            if op.outputs[0] in ag.model_outputs:
+                op = None
+                break
+            held.append(op.outputs[0])
+        if (op is None or op.op_type != "QuantizeLinear" or len(held) < 2
+                or op.inputs[1] not in ag.weight_data
+                or ag.weight_data[op.inputs[1]].size != 1):
+            continue
+        params = op.inputs[1:]
+        quantized = ag.tensors.get(op.outputs[0])
+        dtype = quantized.dtype if quantized is not None else 3
+        for tensor in held[:-1]:
+            first = consumers[tensor][0]
+            shape = ag.tensors[tensor].shape
+            q, dq = f"{tensor}_input_q", f"{tensor}_input_dq"
+            ag.tensors[q] = TensorInfo(name=q, shape=shape, dtype=dtype)
+            ag.tensors[dq] = TensorInfo(name=dq, shape=shape, dtype=1)
+            inserted.setdefault(id(first), []).extend([
+                OpNode(name=q, op_type="QuantizeLinear", inputs=[tensor, *params],
+                       outputs=[q]),
+                OpNode(name=dq, op_type="DequantizeLinear", inputs=[q, *params],
+                       outputs=[dq]),
+            ])
+            first.inputs[0] = dq
+
+    if not inserted:
+        return ag
+    ops: list[OpNode] = []
+    for op in ag.ops:
+        ops.extend(inserted.get(id(op), []))
+        ops.append(op)
+    for step, op in enumerate(ops):
+        op.step = step
+    ag.ops = ops
     return ag
 
 

@@ -650,3 +650,53 @@ def test_a_batch_normalization_no_convolution_absorbs_matches_onnx_runtime(tmp_p
     with Session(plan) as session:
         actual = session.run({"a": a.transpose(0, 2, 3, 1), "b": b.transpose(0, 2, 3, 1)})["output"]
     np.testing.assert_allclose(actual.transpose(0, 3, 1, 2), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("steps", [["Reshape"], ["Transpose"], ["Reshape", "Transpose"]])
+def test_a_layout_step_before_the_first_quantize_matches_onnx_runtime(tmp_path, steps):
+    """Exporters move a float input into NCHW and quantize the result."""
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    rng = np.random.default_rng(14)
+    shape = [1, 60] if steps[0] == "Reshape" else [1, 4, 5, 3]
+    target = [1, 4, 5, 3] if len(steps) > 1 else [1, 3, 4, 5]
+    nodes, x_name = [], "input"
+    for index, step in enumerate(steps):
+        out = f"moved{index}"
+        if step == "Reshape":
+            nodes.append(helper.make_node("Reshape", [x_name, "target"], [out]))
+        else:
+            nodes.append(helper.make_node("Transpose", [x_name], [out], perm=[0, 3, 1, 2]))
+        x_name = out
+    nodes += [
+        helper.make_node("QuantizeLinear", [x_name, "xs", "xz"], ["xq"]),
+        helper.make_node("DequantizeLinear", ["xq", "xs", "xz"], ["xd"]),
+        helper.make_node("DequantizeLinear", ["w", "ws", "wz"], ["wd"]),
+        helper.make_node("Conv", ["xd", "wd"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        helper.make_node("QuantizeLinear", ["y", "ys", "yz"], ["yq"]),
+        helper.make_node("DequantizeLinear", ["yq", "ys", "yz"], ["output"]),
+    ]
+    f = lambda name, v: numpy_helper.from_array(np.array(v, dtype=np.float32), name)  # noqa: E731
+    z = lambda name: numpy_helper.from_array(np.array(0, dtype=np.int8), name)  # noqa: E731
+    params = [f("xs", 0.03), z("xz"), f("ws", 0.02), z("wz"), f("ys", 0.1), z("yz"),
+              numpy_helper.from_array(rng.integers(-127, 128, (4, 3, 3, 3)).astype(np.int8), "w"),
+              numpy_helper.from_array(np.array(target, np.int64), "target")]
+    model = helper.make_model(helper.make_graph(
+        nodes, "layout", [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 4, 5])], params),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    source = tmp_path / "layout.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "layout.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    x = rng.uniform(-3, 3, shape).astype(np.float32)
+    expected = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"]).run(None, {"input": x})[0]
+    with Session(plan) as session:
+        feed = x if len(shape) == 2 else x.transpose(0, 2, 3, 1)
+        actual = session.run({"input": feed})["output"].transpose(0, 3, 1, 2)
+    # One output step: the int8 kernels round as TFLite does, ONNX Runtime in float.
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=0.1 + 1e-6)
