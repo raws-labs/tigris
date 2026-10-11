@@ -567,3 +567,47 @@ def test_signed_activations_are_untouched(tmp_path):
 
     assert int(ag.tensors["input"].quant.zero_point[0]) == -14
     assert ag.weight_data["weight_q"].ravel().tolist() == [72]
+
+
+def _int_weight_conv(path, weight_type):
+    """Q/DQ input, a constant integer weight dequantized per channel, Conv, Q/DQ output."""
+    weights = np.array([-8, -3, 0, 2, 7, 1, -1, 5, -6] * 2, dtype=np.int8).reshape(2, 1, 3, 3)
+    initializers = [
+        helper.make_tensor("w", weight_type, weights.shape, weights.flatten().tolist()),
+        numpy_helper.from_array(np.array([0.02, 0.03], dtype=np.float32), "w_scale"),
+        helper.make_tensor("w_zp", weight_type, [2], [0, 0]),
+        numpy_helper.from_array(np.array(0.05, dtype=np.float32), "x_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "x_zp"),
+        numpy_helper.from_array(np.array(0.1, dtype=np.float32), "y_scale"),
+        numpy_helper.from_array(np.array(0, dtype=np.int8), "y_zp"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "x_scale", "x_zp"], ["x_q"]),
+        helper.make_node("DequantizeLinear", ["x_q", "x_scale", "x_zp"], ["x_dq"]),
+        helper.make_node("DequantizeLinear", ["w", "w_scale", "w_zp"], ["w_dq"], axis=0),
+        helper.make_node("Conv", ["x_dq", "w_dq"], ["conv"], name="conv"),
+        helper.make_node("QuantizeLinear", ["conv", "y_scale", "y_zp"], ["y_q"]),
+        helper.make_node("DequantizeLinear", ["y_q", "y_scale", "y_zp"], ["output"]),
+    ]
+    graph = helper.make_graph(
+        nodes, "int_weight_conv",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 4, 4])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2, 2, 2])], initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.save(model, path)
+    return path
+
+
+def test_int4_weights_compile_as_the_same_int8_values(tmp_path):
+    """4-bit weights hold int8 values exactly; the plan is the int8 model's."""
+    plans = []
+    for weight_type in (TensorProto.INT4, TensorProto.INT8):
+        from tigris.cli import _run_pipeline
+
+        (tmp_path / str(weight_type)).mkdir()
+        graph, _ = _run_pipeline(str(_int_weight_conv(tmp_path / str(weight_type) / "conv.onnx", weight_type)),
+                                 ("64K",), report_bindings=False)
+        assert graph.weight_data["w"].dtype == np.int8
+        plans.append(emit_binary_bytes(graph))
+    assert plans[0] == plans[1]
