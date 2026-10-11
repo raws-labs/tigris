@@ -20,6 +20,7 @@ from tigris.capabilities import (
 )
 from tigris.dtypes import check_dtype_signatures
 from tigris.emitters.binary.defs import FLAG_XIP, TENSOR_FLAG_STATE
+from tigris.analysis.plan_graph import slow_arena_required
 from tigris.emitters.binary.reader import read_binary_plan
 
 
@@ -302,10 +303,13 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
     guard = f"{macro_prefix}_CORE_H"
     weight_reserve = _weight_decompression_overhead(plan, _PLAN_TENSOR_ALIGN)
     fast_arena_required = plan["budget"] + weight_reserve
+    slow_arena_bytes = slow_arena_required(plan)
     workspace_limits = _executor_workspace_limits(plan)
     workspace_limits_args = ", ".join(f"{value}u" for value in workspace_limits)
     if fast_arena_required > 0xFFFFFFFF:
         raise ValueError("Core fast-arena requirement exceeds uint32")
+    if slow_arena_bytes > 0xFFFFFFFF:
+        raise ValueError("Core slow-arena requirement exceeds uint32")
     return f"""\
 /* Auto-generated-code API.  This header is target-neutral. */
 #ifndef {guard}
@@ -328,6 +332,8 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
 #define {macro_prefix}_PLAN_BUDGET_BYTES {plan['budget']}u
 #define {macro_prefix}_WEIGHT_DECOMPRESSION_RESERVE_BYTES {weight_reserve}u
 #define {macro_prefix}_CORE_FAST_ARENA_BYTES {fast_arena_required}u
+/* Slow memory the plan needs, model inputs and outputs included. */
+#define {macro_prefix}_CORE_SLOW_ARENA_BYTES {slow_arena_bytes}u
 #define {macro_prefix}_EXECUTOR_WORKSPACE_BYTES \\
     TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS({workspace_limits_args})
 /* Variables the model keeps across runs; 0 when it keeps none. A plan with
@@ -543,6 +549,9 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
     dispatch = "tigris_dispatch_kernel_s8" if is_quantized else "tigris_dispatch_kernel"
     kernel_include = '#include "tigris_kernels_s8.h"' if is_quantized else '#include "tigris_kernels.h"'
     budget = plan["budget"] or 65536
+    slow_size = slow_arena_required(plan)
+    if slow_size > 0xFFFFFFFF:
+        raise ValueError("Slow arena exceeds the uint32 runtime size limit")
     workspace_declaration = (
         _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
     )
@@ -629,13 +638,7 @@ int main(int argc, char **argv)
         return 1;
     }}
 
-    if (plan.header->peak > UINT32_MAX / 4u) {{
-        fprintf(stderr, "Slow-memory arena requirement exceeds uint32\\n");
-        free(plan_buf);
-        return 1;
-    }}
-    uint32_t slow_size = plan.header->peak * 4u;
-    if (slow_size < 256 * 1024) slow_size = 256 * 1024;
+    uint32_t slow_size = {slow_size}u;
 
     void *fast_buf = allocate_aligned(fast_size);
     void *slow_buf = allocate_aligned(slow_size);
@@ -737,6 +740,9 @@ int main(int argc, char **argv)
 
 def _generate_esp(plan: dict, is_quantized: bool) -> str:
     budget = plan["budget"] or 65536
+    slow_size = slow_arena_required(plan)
+    if slow_size > 0xFFFFFFFF:
+        raise ValueError("Slow arena exceeds the uint32 runtime size limit")
     workspace_declaration = (
         _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
     )
@@ -834,15 +840,7 @@ void app_main(void)
         return;
     }}
 
-#if CONFIG_SPIRAM
-    uint32_t slow_size = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-    if (slow_size > 64 * 1024) slow_size -= 16 * 1024;
-#else
-    uint32_t slow_size = heap_caps_get_largest_free_block(
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (slow_size > 32 * 1024) slow_size -= 16 * 1024;
-#endif
-    if (slow_size < 64 * 1024) slow_size = 64 * 1024;
+    uint32_t slow_size = {slow_size}u;
 
     void *fast_buf = heap_caps_malloc(fast_size,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -951,7 +949,7 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
         raise ValueError(
             "CMSIS-NN static fast arena exceeds the uint32 runtime size limit"
         )
-    slow_arena_size = max(budget * 4, 256 * 1024)
+    slow_arena_size = slow_arena_required(plan)
     workspace_declaration = (
         _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
     )

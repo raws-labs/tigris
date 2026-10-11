@@ -11,6 +11,7 @@ import onnx
 import pytest
 from click.testing import CliRunner
 
+from tigris.analysis.plan_graph import slow_arena_required
 from tigris.cli import cli
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.frontends import tflite
@@ -64,7 +65,8 @@ def _session():
 def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path,
                                  tight: bool = False):
     """Runs the compiled plan on TFLite Micro's recorded inputs, in the
-    model's own dtypes, and compares the outputs bit for bit."""
+    model's own dtypes, and compares the outputs bit for bit. The slow arena
+    is exactly what generated applications reserve for the plan."""
     Session = _session()
     plan_path = tmp_path / "model.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", budget, "-o", str(plan_path)])
@@ -75,7 +77,8 @@ def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_pat
     assert result.exit_code == 0, result.output
     _, graphs = tflite._read(model.read_bytes())
     _, tensors, inputs, outputs, _ = graphs[0]
-    with Session(plan_path) as session:
+    slow = slow_arena_required(read_binary_plan(plan_path.read_bytes()))
+    with Session(plan_path, slow_capacity=slow) as session:
         assert [tuple(i["shape"]) for i in session.inputs] == [tuple(tensors[i].shape) for i in inputs]
         for sample in range(len(golden["input_0"])):
             feed = {}
