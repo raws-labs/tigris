@@ -94,6 +94,16 @@ CASES = {
 
 
 FLOAT_BOUNDARIES = {"float_boundaries": _unary(lambda x: tf.nn.relu(x) * x, (1, 6, 6, 4))}
+# int8 models whose inputs and outputs are uint8, as the converter writes them
+# for inference_input_type and inference_output_type uint8.
+UINT8_BOUNDARIES = {
+    "uint8_boundaries": _unary(lambda x: tf.nn.relu(tf.nn.conv2d(x, _weights(31, 3, 3, 4, 4), 1, "SAME")),
+                               (1, 6, 6, 4)),
+    "uint8_classifier": _unary(
+        lambda x: tf.nn.softmax(tf.matmul(tf.reduce_mean(tf.nn.relu(
+            tf.nn.conv2d(x, _weights(32, 3, 3, 3, 8), 1, "SAME")), [1, 2]), _weights(33, 8, 5))),
+        (1, 8, 8, 3)),
+}
 for _kind, _resize in (("nearest", tf.raw_ops.ResizeNearestNeighbor), ("bilinear", tf.raw_ops.ResizeBilinear)):
     for _coordinate in ("asymmetric", "half_pixel", "align_corners"):
         CASES[f"resize_{_kind}_{_coordinate}_down"] = _unary(
@@ -101,6 +111,7 @@ for _kind, _resize in (("nearest", tf.raw_ops.ResizeNearestNeighbor), ("bilinear
                 images=x, size=(7, 5), align_corners=mode == "align_corners", half_pixel_centers=mode == "half_pixel"),
             (1, 17, 9, 4))
 CASES.update(FLOAT_BOUNDARIES)
+CASES.update(UINT8_BOUNDARIES)
 
 _MAP = (1, 6, 6, 4)
 CASES.update({
@@ -894,7 +905,7 @@ REWRITES.update({"elu": _int8_island(), "cumsum": _int8_island(True),
 
 
 def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True, trackable=None,
-             index_inputs=None):
+             index_inputs=None, uint8_io=False):
     index_inputs = index_inputs or {}
     specs = [tf.TensorSpec(shape, tf.int32 if i in index_inputs else tf.float32)
              for i, shape in enumerate(shapes)]
@@ -913,8 +924,8 @@ def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True, trackable=N
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    converter.inference_input_type = tf.float32 if float_io else tf.int8
-    converter.inference_output_type = tf.float32 if float_io else tf.int8
+    io = tf.float32 if float_io else tf.uint8 if uint8_io else tf.int8
+    converter.inference_input_type = converter.inference_output_type = io
     return converter.convert()
 
 
@@ -924,11 +935,12 @@ def _inputs(details, rng, value_range=None, index_range=None):
         return rng.integers(*index_range, shape, dtype=np.int32)
     if details["dtype"] == np.float32:
         return rng.uniform(*(value_range or (-3.0, 3.0)), shape).astype(np.float32)
+    info = np.iinfo(details["dtype"])
     if value_range is None:
-        return rng.integers(-128, 128, shape, dtype=np.int8)
+        return rng.integers(info.min, info.max + 1, shape, dtype=details["dtype"])
     scale, zero_point = details["quantization"]
     values = np.round(rng.uniform(*value_range, shape) / scale) + zero_point
-    return np.clip(values, -128, 127).astype(np.int8)
+    return np.clip(values, info.min, info.max).astype(details["dtype"])
 
 
 def generate(name: str) -> bool:
@@ -941,6 +953,7 @@ def generate(name: str) -> bool:
         shapes, fn = CASES[name]
         model = _convert(fn, shapes, ranges or [(-3.0, 3.0)] * len(shapes), rng,
                          float_io=name in FLOAT_BOUNDARIES, quantize=name not in FLOAT_MODELS,
+                         uint8_io=name in UINT8_BOUNDARIES,
                          trackable=TRACKABLES.get(name.removeprefix("float_")),
                          index_inputs=INDEX_INPUTS.get(name.removeprefix("float_")))
     if name in REWRITES:
