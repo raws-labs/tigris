@@ -583,3 +583,39 @@ def test_a_requantization_tiles_and_matches_its_untiled_plan(tmp_path):
             outputs[budget] = session.run({"input": x.transpose(0, 2, 3, 1)})
     for name in ("first", "second"):
         np.testing.assert_array_equal(outputs["4K"][name], outputs["1M"][name])
+
+
+@pytest.mark.parametrize("op_type, constant", [("Div", 6.0), ("Mul", 0.5), ("Add", 3.0), ("Sub", 1.25),
+                                              ("Mul", [[[[2.0]], [[2.0]], [[2.0]]]])])
+def test_a_uniform_float_constant_of_an_int8_operator_matches_onnx_runtime(tmp_path, op_type, constant):
+    """A QDQ export can leave a scalar operand in float, as in x * relu6(x + 3) / 6."""
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    s = lambda name, v: numpy_helper.from_array(np.array(v, dtype=np.float32), name)  # noqa: E731
+    z = lambda name: numpy_helper.from_array(np.array(0, dtype=np.int8), name)  # noqa: E731
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "xs", "xz"], ["xq"]),
+        helper.make_node("DequantizeLinear", ["xq", "xs", "xz"], ["xd"]),
+        helper.make_node(op_type, ["xd", "c"], ["y"]),
+        helper.make_node("QuantizeLinear", ["y", "ys", "yz"], ["yq"]),
+        helper.make_node("DequantizeLinear", ["yq", "ys", "yz"], ["output"]),
+    ]
+    model = helper.make_model(helper.make_graph(
+        nodes, "constant", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 4, 4])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 4, 4])],
+        [s("xs", 0.04), z("xz"), s("ys", 0.05), z("yz"), s("c", constant)]),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    source = tmp_path / "constant.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "constant.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    x = np.random.default_rng(12).uniform(-3, 3, (1, 3, 4, 4)).astype(np.float32)
+    expected = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"]).run(None, {"input": x})[0]
+    with Session(plan) as session:
+        actual = session.run({"input": x.transpose(0, 2, 3, 1)})["output"].transpose(0, 3, 1, 2)
+    # One output step: the int8 kernels round as TFLite does, ONNX Runtime in float.
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=0.05 + 1e-6)

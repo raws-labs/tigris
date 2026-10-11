@@ -75,6 +75,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_bn(ag)
     ag = _fold_sub_constant_to_add(ag)
     ag = _fold_div_constant_to_mul(ag)
+    ag = _quantize_uniform_constants(ag)
     ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
@@ -189,6 +190,39 @@ def _ceil_mode_as_padding(ag: AnalyzedGraph) -> AnalyzedGraph:
         if not fits:
             continue
         op.attrs = {**op.attrs, "ceil_mode": 0, "pads": pads[:rank] + ends}
+    return ag
+
+
+def _quantize_uniform_constants(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Encode a float constant operand of an int8 Add or Mul whose elements are
+    all one value.
+
+    QDQ exporters leave such a constant in float, as in a hard-swish written out
+    as x * relu6(x + 3) / 6. One value v is exactly 127 at scale |v| / 127, so the
+    int8 operator reads the same number; a constant of differing values would
+    lose precision and stays refused.
+    """
+    if not ag.is_quantized:
+        return ag
+    for op in ag.ops:
+        if op.op_type not in ("Add", "Mul") or len(op.inputs) != 2:
+            continue
+        activations = [ag.tensors.get(n) for n in op.inputs if n not in ag.weight_data]
+        if len(activations) != 1 or activations[0] is None or activations[0].quant is None:
+            continue
+        name = next(n for n in op.inputs if n in ag.weight_data)
+        info, value = ag.tensors.get(name), np.asarray(ag.weight_data[name])
+        if info is None or info.quant is not None or value.dtype.kind != "f" or value.size == 0:
+            continue
+        first = float(value.reshape(-1)[0])
+        if not np.all(value == value.reshape(-1)[0]) or not np.isfinite(first):
+            continue
+        scale = np.float32(abs(first) / 127.0) if first != 0.0 else np.float32(1.0)
+        level = 0 if first == 0.0 else (127 if first > 0 else -127)
+        ag.weight_data[name] = np.full(value.shape, level, dtype=np.int8)
+        info.dtype = 3
+        info.quant = QuantParam(scale=np.array([scale], dtype=np.float32),
+                                zero_point=np.array([0], dtype=np.int32))
     return ag
 
 
