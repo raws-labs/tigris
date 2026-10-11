@@ -79,6 +79,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
     ag = _explicit_auto_pad(ag)
+    ag = _ceil_mode_as_padding(ag)
     ag = _fold_pad_into_conv(ag)
     ag = _relabel_depthwise(ag)
     ag = _split_grouped_convs(ag)
@@ -151,6 +152,43 @@ def _explicit_auto_pad(ag: AnalyzedGraph) -> AnalyzedGraph:
         attrs.pop("auto_pad")
         attrs["pads"] = begins + ends
         op.attrs = attrs
+    return ag
+
+
+def _ceil_mode_as_padding(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """State a pool's ceil_mode as end padding.
+
+    Rounding the output extent up instead of down adds at most one window per
+    axis, which starts inside the input and runs past its end. The same window
+    comes from padding the end by the overhang: the pool kernels skip padded
+    positions, so a max or an average excluding padding is unchanged. An
+    overhang that would cover a whole window is left to the refusal.
+    """
+    for op in ag.ops:
+        if op.op_type not in ("MaxPool", "AveragePool") or int(op.attrs.get("ceil_mode", 0)) != 1:
+            continue
+        source, result = ag.tensors.get(op.inputs[0]), ag.tensors.get(op.outputs[0])
+        if source is None or result is None or len(source.shape) < 3 or len(result.shape) != len(source.shape):
+            continue
+        rank = len(source.shape) - 2
+        kernel = [int(k) for k in op.attrs.get("kernel_shape", [])]
+        strides = [int(v) for v in op.attrs.get("strides", [1] * rank)]
+        dilations = [int(v) for v in op.attrs.get("dilations", [1] * rank)]
+        pads = [int(v) for v in op.attrs.get("pads", [0] * (2 * rank))]
+        if len(kernel) != rank:
+            continue
+        ends = list(pads[rank:])
+        fits = True
+        for axis in range(rank):
+            span = (kernel[axis] - 1) * dilations[axis] + 1
+            needed = (int(result.shape[2 + axis]) - 1) * strides[axis] + span
+            extra = needed - (int(source.shape[2 + axis]) + pads[axis] + pads[rank + axis])
+            if extra >= span:
+                fits = False
+            ends[axis] += max(extra, 0)
+        if not fits:
+            continue
+        op.attrs = {**op.attrs, "ceil_mode": 0, "pads": pads[:rank] + ends}
     return ag
 
 
