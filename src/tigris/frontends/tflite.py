@@ -1339,6 +1339,10 @@ class _Converter:
                                                      f"{tag}_part{step}", i), i,
                                         f"{tag}_part{step}_q"), expanded, i))
             y = self._concat(parts, axis, outs[0], tag)
+        elif kind == "UNPACK" and len(outs) == 1:
+            # The one part is the input without its axis.
+            source = self.tensors[ins[0]]
+            y = self.reshape(self.value(ins[0]), list(source.shape), out.shape, tag, outs[0])
         elif kind == "UNPACK":
             source = self.tensors[ins[0]]
             axis = op.option(1, "i") % len(source.shape)
