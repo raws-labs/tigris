@@ -235,10 +235,10 @@ OPERATOR_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "int32 operands and result together, wrapping on overflow, untiled and without an activation",
     ),
     "AveragePool": (
-        "explicit padding, floor output sizing, unit dilation, and count_include_pad=0 wherever padding is non-zero",
+        "explicit or auto_pad padding, floor or ceil output sizing, unit dilation, and count_include_pad=0 wherever padding is non-zero",
     ),
     "MaxPool": (
-        "explicit padding, floor output sizing, unit dilation, and no indices output",
+        "explicit or auto_pad padding, floor or ceil output sizing, unit dilation, and no indices output",
     ),
     "Concat": (
         "rank-3 and rank-4 concatenation on any stored axis but the batch "

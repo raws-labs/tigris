@@ -125,7 +125,7 @@
     },
     {
       "constraints": [
-        "explicit padding, floor output sizing, unit dilation, and no indices output"
+        "explicit or auto_pad padding, floor or ceil output sizing, unit dilation, and no indices output"
       ],
       "opcode": 5,
       "operator": "MaxPool",
@@ -142,7 +142,7 @@
         "esp-nn": "falls back when tiled or when input/output quantization differs"
       },
       "constraints": [
-        "explicit padding, floor output sizing, unit dilation, and count_include_pad=0 wherever padding is non-zero"
+        "explicit or auto_pad padding, floor or ceil output sizing, unit dilation, and count_include_pad=0 wherever padding is non-zero"
       ],
       "opcode": 6,
       "operator": "AveragePool",
