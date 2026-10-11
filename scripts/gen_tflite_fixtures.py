@@ -55,6 +55,8 @@ CASES = {
     "logistic": _unary(tf.sigmoid, (1, 6, 6, 4)),
     "tanh": _unary(tf.tanh, (1, 6, 6, 4)),
     "hard_swish": _unary(lambda x: x * tf.nn.relu6(x + 3.0) / 6.0, (1, 6, 6, 4)),
+    "hard_swish_wide": _unary(lambda x: x * tf.nn.relu6(x + 3.0) / 6.0, (1, 32, 256)),
+    "hard_swish_offset": _unary(lambda x: x * tf.nn.relu6(x + 3.0) / 6.0, (1, 32, 256)),
     "relu": _unary(tf.nn.relu, (1, 6, 6, 4)),
     "relu6": _unary(tf.nn.relu6, (1, 6, 6, 4)),
     "mean_spatial": _unary(lambda x: tf.reduce_mean(x, [1, 2], keepdims=True), (1, 6, 6, 4)),
@@ -181,6 +183,9 @@ RANGES = {
     "float_while": [(0.5, 3.0)], "float_while_two_variables": [(0.5, 3.0), (0.5, 3.0)],
     "float_while_feature_map": [(0.5, 3.0)],
     "float_if_if": [(-2.8, 2.5)],
+    # Scales where TFLite's 16-bit fixed point and a float formula part by one
+    # unit on two or three codes; 8192 inputs per sample reach every code.
+    "hard_swish_wide": [(-4.0, 16.0)], "hard_swish_offset": [(-8.0, 4.0)],
     # Past both of the float logistic's cutoffs, -9 and about 16.6.
     "float_logistic_tails": [(-24.0, 24.0)],
 }
