@@ -122,6 +122,9 @@ def _explicit_auto_pad(ag: AnalyzedGraph) -> AnalyzedGraph:
             auto_pad = auto_pad.decode()
         if op.op_type not in ("Conv", "MaxPool", "AveragePool", "LpPool") or auto_pad in ("", "NOTSET"):
             continue
+        # ONNX forbids pads next to auto_pad; such an operator stays refused.
+        if any(int(v) for v in op.attrs.get("pads", [])):
+            continue
         source = ag.tensors.get(op.inputs[0])
         if source is None or len(source.shape) < 3:
             continue
