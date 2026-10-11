@@ -361,3 +361,46 @@ def test_spatial_mean_without_kept_axes_runs_as_a_global_pool(tmp_path, axes_inp
     with Session(plan) as session:
         actual = session.run({"input": x.transpose(0, 2, 3, 1)})["output"]
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("form", ["depthwise", "dilated_depthwise", "multiplier", "no_kernel_shape"])
+def test_one_dimensional_convolutions_match_onnx_runtime(tmp_path, form):
+    """A grouped 1D convolution runs as a 2D depthwise over a height of one; a
+    1D convolution that leaves kernel_shape to its weight is still 1D."""
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    rng = np.random.default_rng(5)
+    channels, length = 6, 20
+    out_channels = 12 if form == "multiplier" else channels
+    group = 1 if form == "no_kernel_shape" else channels
+    in_per_group = channels if form == "no_kernel_shape" else 1
+    weight = rng.normal(size=(out_channels, in_per_group, 3)).astype(np.float32)
+    attrs = {"group": group, "pads": [2, 2] if form == "dilated_depthwise" else [1, 1]}
+    if form == "dilated_depthwise":
+        attrs["dilations"] = [2]
+    if form != "no_kernel_shape":
+        attrs["kernel_shape"] = [3]
+    else:
+        attrs["strides"] = [2]
+    nodes = [helper.make_node("Conv", ["input", "w", "b"], ["conv"], **attrs),
+             helper.make_node("Relu", ["conv"], ["output"])]
+    initializers = [numpy_helper.from_array(weight, "w"),
+                    numpy_helper.from_array(rng.normal(size=out_channels).astype(np.float32), "b")]
+    model = helper.make_model(helper.make_graph(
+        nodes, "conv1d", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, length])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, None)], initializers),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    model = onnx.shape_inference.infer_shapes(model)
+    source = tmp_path / "conv1d.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "conv1d.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "8K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    x = rng.uniform(-1, 1, (1, channels, length)).astype(np.float32)
+    expected = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"]).run(None, {"input": x})[0]
+    with Session(plan) as session:
+        actual = session.run({"input": x.transpose(0, 2, 1)})["output"]
+    np.testing.assert_allclose(actual.transpose(0, 2, 1), expected, rtol=1e-5, atol=1e-6)
