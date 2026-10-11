@@ -329,3 +329,35 @@ def test_session_trace_reports_events_in_order(linear_plan):
     assert kinds.index("stage_begin") < kinds.index("stage_end") == len(kinds) - 2
     assert [event["op"] for event in events if event["kind"] == "op"] == [0, 1, 2]
     assert sum(event["bytes"] for event in events if event["kind"] == "load") == counters["load_bytes"]
+
+
+@pytest.mark.parametrize("axes_input", [False, True])
+def test_spatial_mean_without_kept_axes_runs_as_a_global_pool(tmp_path, axes_input):
+    """ReduceMean over H and W with keepdims=0, as ShuffleNet and MNASNet end."""
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    weight = numpy_helper.from_array(np.random.default_rng(3).normal(size=(6, 3, 3, 3)).astype(np.float32), "w")
+    mean_inputs, opset, attrs = ["conv"], 13, {"axes": [2, 3]}
+    initializers = [weight]
+    if axes_input:
+        initializers.append(numpy_helper.from_array(np.array([2, 3], dtype=np.int64), "axes"))
+        mean_inputs, opset, attrs = ["conv", "axes"], 18, {}
+    nodes = [helper.make_node("Conv", ["input", "w"], ["conv"], pads=[1, 1, 1, 1]),
+             helper.make_node("ReduceMean", mean_inputs, ["output"], keepdims=0, **attrs)]
+    model = helper.make_model(helper.make_graph(
+        nodes, "mean", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 6])], initializers),
+        opset_imports=[helper.make_opsetid("", opset)])
+    model.ir_version = 8
+    source = tmp_path / "mean.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "mean.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "4K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    x = np.random.default_rng(4).uniform(-1, 1, (1, 3, 8, 8)).astype(np.float32)
+    expected = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"]).run(None, {"input": x})[0]
+    with Session(plan) as session:
+        actual = session.run({"input": x.transpose(0, 2, 3, 1)})["output"]
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
