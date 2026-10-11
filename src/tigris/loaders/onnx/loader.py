@@ -152,14 +152,18 @@ def _graph_to_ag(graph: onnx.GraphProto, opset_import) -> AnalyzedGraph:
     initializer_names: set[str] = set()
     for init in graph.initializer:
         shape = tuple(init.dims)
+        data, dtype = numpy_helper.to_array(init), init.data_type
+        if dtype == onnx.TensorProto.INT4:
+            # 4-bit values are int8 values; the int8 kernels run them exactly.
+            data, dtype = data.astype(np.int8), onnx.TensorProto.INT8
         ag.tensors[init.name] = TensorInfo(
             name=init.name,
             shape=shape,
-            dtype=init.data_type,
+            dtype=dtype,
             is_constant=True,
         )
         initializer_names.add(init.name)
-        ag.weight_data[init.name] = numpy_helper.to_array(init)
+        ag.weight_data[init.name] = data
 
     # --- Collect value_info (intermediate tensors with inferred shapes) ---
     for vi in list(graph.input) + list(graph.output) + list(graph.value_info):
