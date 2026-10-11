@@ -82,6 +82,8 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     # argument that admits Softmax.
     "Erf": TileCategory.POINTWISE,
     "HardSwish": TileCategory.POINTWISE,
+    "Quantize": TileCategory.POINTWISE,
+    "Dequantize": TileCategory.POINTWISE,
     "Abs": TileCategory.POINTWISE,
     "Rsqrt": TileCategory.POINTWISE,
     "Neg": TileCategory.POINTWISE,
@@ -163,7 +165,7 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "Round",
     "Sin",
     "Cos",
-    "LayerNormalization", "Not", "Cast",
+    "LayerNormalization", "Not", "Cast", "Quantize", "Dequantize",
 })
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
@@ -602,7 +604,7 @@ def _transpose_band_extents(
 # loader and the executor.
 _ROW_TILING_OPS = frozenset({
     "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
-    "And", "Or", "Not", "Where", "Cast", "Sum",
+    "And", "Or", "Not", "Where", "Cast", "Sum", "Quantize", "Dequantize",
     "Gemm",
     "MatMul",
     "Relu",
