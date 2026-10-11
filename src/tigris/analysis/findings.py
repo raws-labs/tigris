@@ -82,6 +82,9 @@ class Findings:
     int8_weight_bytes: int = 0
     plan_overhead_bytes: int = 0
     plan_size_bytes: int = 0
+    # Runtime build limits the plan needs above their defaults, as inspect
+    # reports them: {"name", "needed", "default"}.
+    build_limits: list = field(default_factory=list)
     int8_plan_size_bytes: int = 0
     lz4_weight_bytes: int = 0
     lz4_plan_size_bytes: int = 0
@@ -161,15 +164,15 @@ def _compressed_weight_block_count(ag: AnalyzedGraph) -> int:
     return len(stages_with_weights)
 
 
-def _measure_plan(ag: AnalyzedGraph, names: bool) -> int:
-    """The serialized plan's size, from the writer itself; 0 when the plan does
+def _measure_plan(ag: AnalyzedGraph, names: bool) -> bytes:
+    """The serialized plan, from the writer itself; empty when the plan does
     not serialize (an unsupported operator or dtype)."""
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     try:
-        return len(emit_binary_bytes(ag, names=names))
+        return emit_binary_bytes(ag, names=names)
     except ValueError:
-        return 0
+        return b""
 
 
 def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = False) -> Findings:
@@ -349,8 +352,13 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = Fal
     f.total_weight_bytes, f.int8_weight_bytes, f.lz4_weight_bytes = _estimate_weight_sizes(whole)
     current_blob = _aligned_weight_blob_size(_serialized_weight_sizes(whole, int8=False),
                                              PLAN_SECTION_ALIGNMENT)
-    f.plan_size_bytes = _measure_plan(ag, names)
-    if f.plan_size_bytes:
+    plan = _measure_plan(ag, names)
+    f.plan_size_bytes = len(plan)
+    if plan:
+        from tigris.inspection import _plan, _plan_requirements
+
+        f.build_limits = [limit for limit in _plan_requirements(_plan(plan))["build_limits"]
+                          if limit["needed"] > limit["default"]]
         f.plan_overhead_bytes = f.plan_size_bytes - f.total_weight_bytes
         f.int8_plan_size_bytes = f.plan_size_bytes - current_blob + _aligned_weight_blob_size(
             _serialized_weight_sizes(whole, int8=True), PLAN_SECTION_ALIGNMENT)

@@ -1278,16 +1278,8 @@ def _build_stages(
         inp_indices = [tensor_idx[n] for n in stage.input_tensors if n in tensor_idx]
         out_indices = [tensor_idx[n] for n in stage.output_tensors if n in tensor_idx]
 
-        if len(inp_indices) > RUNTIME_MAX_STAGE_INPUTS:
-            raise ValueError(
-                f"stage {stage.stage_id} has {len(inp_indices)} inputs; current runtime limit is "
-                f"{RUNTIME_MAX_STAGE_INPUTS}"
-            )
-        if len(out_indices) > RUNTIME_MAX_STAGE_OUTPUTS:
-            raise ValueError(
-                f"stage {stage.stage_id} has {len(out_indices)} outputs; current runtime limit is "
-                f"{RUNTIME_MAX_STAGE_OUTPUTS}"
-            )
+        # Stage inputs and outputs beyond the runtime's defaults are a build
+        # option (TIGRIS_MAX_STAGE_INPUTS/OUTPUTS); the plan states what it needs.
         if stage.chain_len > RUNTIME_MAX_CHAIN_STAGES:
             raise ValueError(
                 f"stage {stage.stage_id} chain length {stage.chain_len} exceeds current runtime "
