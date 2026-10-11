@@ -81,6 +81,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _explicit_auto_pad(ag)
     ag = _fold_pad_into_conv(ag)
     ag = _relabel_depthwise(ag)
+    ag = _split_grouped_convs(ag)
     ag = _relabel_conv1d(ag)
     ag = _clip_to_relu6(ag)
     ag = _normalize_reduction_axes(ag)
@@ -2768,6 +2769,69 @@ def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
                 ):
                     op.op_type = "DepthwiseConv"
 
+    return ag
+
+
+def _split_grouped_convs(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Run a grouped convolution as one convolution per group.
+
+    A Conv with 1 < group that is not depthwise reads, per group, its own run of
+    input channels and writes its own run of output channels: a Split of the
+    input along the channel axis, a Conv of group 1 on each part with that
+    part's filters, bias and per-channel quantization, and a Concat of the
+    results. Each output channel sums the same products as before.
+    """
+    rewritten: list[OpNode] = []
+    for op in ag.ops:
+        group = int(op.attrs.get("group", 1))
+        weight = ag.weight_data.get(op.inputs[1]) if op.op_type == "Conv" and len(op.inputs) > 1 else None
+        source = ag.tensors.get(op.inputs[0])
+        result = ag.tensors.get(op.outputs[0]) if op.outputs else None
+        if (op.op_type != "Conv" or group <= 1 or weight is None or source is None or result is None
+                or len(source.shape) < 3 or source.shape[1] % group or weight.shape[0] % group):
+            rewritten.append(op)
+            continue
+        inputs_per, outputs_per = source.shape[1] // group, weight.shape[0] // group
+        w_info = ag.tensors[op.inputs[1]]
+        bias = ag.weight_data.get(op.inputs[2]) if len(op.inputs) > 2 and op.inputs[2] else None
+        parts_in, parts_out = [], []
+        for g in range(group):
+            part = _fresh_name(ag, f"{op.inputs[0]}_group{g}")
+            ag.tensors[part] = replace(source, name=part, shape=(source.shape[0], inputs_per, *source.shape[2:]))
+            parts_in.append(part)
+            out = _fresh_name(ag, f"{op.outputs[0]}_group{g}")
+            ag.tensors[out] = replace(result, name=out, shape=(result.shape[0], outputs_per, *result.shape[2:]))
+            parts_out.append(out)
+        rewritten.append(OpNode(name=f"{op.name}_groups", op_type="Split", inputs=[op.inputs[0]],
+                                outputs=parts_in, attrs={"axis": 1}))
+        attrs = {**op.attrs, "group": 1}
+        for g in range(group):
+            rows = slice(g * outputs_per, (g + 1) * outputs_per)
+            w_name = _fresh_name(ag, f"{op.inputs[1]}_group{g}")
+            ag.weight_data[w_name] = np.ascontiguousarray(weight[rows])
+            quant = w_info.quant
+            if quant is not None and np.asarray(quant.scale).size > 1:
+                quant = QuantParam(scale=np.asarray(quant.scale)[rows], zero_point=np.asarray(quant.zero_point)[rows],
+                                   axis=quant.axis)
+            ag.tensors[w_name] = replace(w_info, name=w_name, shape=ag.weight_data[w_name].shape, quant=quant)
+            inputs = [parts_in[g], w_name]
+            if bias is not None:
+                b_info = ag.tensors[op.inputs[2]]
+                b_name = _fresh_name(ag, f"{op.inputs[2]}_group{g}")
+                ag.weight_data[b_name] = np.ascontiguousarray(bias[rows])
+                b_quant = b_info.quant
+                if b_quant is not None and np.asarray(b_quant.scale).size > 1:
+                    b_quant = QuantParam(scale=np.asarray(b_quant.scale)[rows],
+                                         zero_point=np.asarray(b_quant.zero_point)[rows], axis=b_quant.axis)
+                ag.tensors[b_name] = replace(b_info, name=b_name, shape=ag.weight_data[b_name].shape, quant=b_quant)
+                inputs.append(b_name)
+            rewritten.append(OpNode(name=f"{op.name}_group{g}", op_type="Conv", inputs=inputs,
+                                    outputs=[parts_out[g]], attrs=dict(attrs)))
+        rewritten.append(OpNode(name=op.name, op_type="Concat", inputs=parts_out,
+                                outputs=[op.outputs[0]], attrs={"axis": 1}))
+    ag.ops = rewritten
+    for step, op in enumerate(ag.ops):
+        op.step = step
     return ag
 
 
