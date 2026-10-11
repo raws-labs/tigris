@@ -334,7 +334,7 @@ def unsupported(data: bytes) -> list[str]:
         computed = {op.outputs[0] for op in operators
                     if op.kind in ("ADD", "SUB", "MUL") and tensors[op.outputs[0]].type == "INT32"}
         for index in list(inputs) + list(outputs):
-            if (tensors[index].type not in ("INT8", "FLOAT32", "BOOL") and index not in indices
+            if (tensors[index].type not in ("INT8", "UINT8", "FLOAT32", "BOOL") and index not in indices
                     and index not in index_inputs):
                 reasons.append(f"model boundary {tensors[index].name!r} is {tensors[index].type}")
         for index in sorted(indices | index_inputs):
@@ -636,7 +636,10 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
             return f"{outs[0].type} indices; TFLite Micro writes int32"
         outs = []
     if op.kind == "QUANTIZE":
-        if data[0].type not in ("INT8", "FLOAT32") or outs[0].type != "INT8":
+        # uint8 only enters and leaves an int8 model, as the converter writes
+        # its boundaries for inference_input_type and inference_output_type uint8.
+        if (data[0].type, outs[0].type) not in (("FLOAT32", "INT8"), ("INT8", "INT8"),
+                                                ("UINT8", "INT8"), ("INT8", "UINT8")):
             return "only float or int8 to int8 converts"
     elif op.kind == "DEQUANTIZE":
         if data[0].type != "INT8" or outs[0].type != "FLOAT32":
@@ -647,7 +650,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         return "activations must be all int8 or all float32"
     elif (op.kind in _ELEMENTWISE and op.kind not in _INT8_ELEMENTWISE) or op.kind == "L2_POOL_2D":
         return "TFLite Micro runs it in float32 only"
-    if any(len(t.scale) != 1 for t in [*data, *outs] if t.type == "INT8"):
+    if any(len(t.scale) != 1 for t in [*data, *outs] if t.type in ("INT8", "UINT8")):
         return "activations must be quantized per tensor"
     if op.kind in _FUSED_SLOT:
         fused = _activation(op.option(_FUSED_SLOT[op.kind], "b"))
@@ -971,8 +974,9 @@ class _Converter:
         self.b = GraphBuilder()
         self.tensors = tensors
         self.values: dict[int, str] = {}
-        # int8 model outputs are the QuantizeLinear itself, as TFLite hands them over.
-        self.int8_outputs = {i for i in outputs if tensors[i].type == "INT8"}
+        # int8 and uint8 model outputs are the QuantizeLinear itself, as TFLite
+        # hands them over.
+        self.int8_outputs = {i for i in outputs if tensors[i].type in ("INT8", "UINT8")}
         self.consumed = set(consumed)
         # Output shapes of the operators ONNX has no standard form for.
         self.value_info = []
@@ -1064,7 +1068,8 @@ class _Converter:
         if index in self.int8_outputs:
             b = self.b
             scale = b.constant(np.float32(tensor.scale[0]), tensor.name + "_scale")
-            zero = b.constant(np.array(int(tensor.zero_point[0]), np.int8), tensor.name + "_zero_point")
+            zero = b.constant(np.array(int(tensor.zero_point[0]), _NUMPY[tensor.type]),
+                              tensor.name + "_zero_point")
             quantized = b.node("QuantizeLinear", [source, scale, zero], tensor.name)
             self.values[index] = (b.node("DequantizeLinear", [quantized, scale, zero],
                                          tensor.name + "_float")
@@ -1854,7 +1859,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         if op.kind == "DEQUANTIZE" and readers.get(op.outputs[0]) == {_DETECTION}
         and op.outputs[0] not in outputs}
     b = converter.b
-    boundary_type = {"INT8": TensorProto.INT8, "FLOAT32": TensorProto.FLOAT,
+    boundary_type = {"INT8": TensorProto.INT8, "UINT8": TensorProto.UINT8, "FLOAT32": TensorProto.FLOAT,
                      "INT32": TensorProto.INT32, "BOOL": TensorProto.BOOL}
     indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
 
@@ -1870,7 +1875,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
             converter.values[index] = tensor.name
         else:
             scale = b.constant(np.float32(tensor.scale[0]), tensor.name + "_scale")
-            zero = b.constant(np.array(int(tensor.zero_point[0]), np.int8),
+            zero = b.constant(np.array(int(tensor.zero_point[0]), _NUMPY[tensor.type]),
                               tensor.name + "_zero_point")
             converter.values[index] = b.node("DequantizeLinear", [tensor.name, scale, zero],
                                              tensor.name + "_float")
