@@ -438,3 +438,37 @@ def test_a_flatten_into_a_product_keeps_the_model_order(tmp_path, also_output):
         actual = runtime_session.run({"x": x.transpose(0, 2, 3, 1)})
     for name, value in expected.items():
         np.testing.assert_allclose(actual[name].reshape(value.shape), value, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("op_type, auto_pad, stride, size", [
+    ("Conv", "SAME_UPPER", 2, 9), ("Conv", "SAME_UPPER", 2, 8), ("Conv", "SAME_LOWER", 2, 9),
+    ("Conv", "VALID", 1, 8), ("MaxPool", "SAME_UPPER", 2, 9), ("AveragePool", "SAME_UPPER", 2, 7),
+    ("AveragePool", "SAME_LOWER", 1, 6)])
+def test_auto_pad_matches_onnx_runtime(tmp_path, op_type, auto_pad, stride, size):
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    rng = np.random.default_rng(8)
+    inputs, initializers = ["x"], []
+    attrs = {"auto_pad": auto_pad, "strides": [stride, stride], "kernel_shape": [3, 3]}
+    if op_type == "Conv":
+        inputs.append("w")
+        initializers.append(numpy_helper.from_array(rng.normal(size=(4, 3, 3, 3)).astype(np.float32), "w"))
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node(op_type, inputs, ["y"], **attrs)], "auto_pad",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, size, size])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)], initializers),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    model = onnx.shape_inference.infer_shapes(model)
+    source = tmp_path / "auto_pad.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "auto_pad.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    x = rng.uniform(-1, 1, (1, 3, size, size)).astype(np.float32)
+    expected = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+    with Session(plan) as session:
+        actual = session.run({"x": x.transpose(0, 2, 3, 1)})["y"].transpose(0, 3, 1, 2)
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
