@@ -536,3 +536,50 @@ def test_ceil_mode_pools_match_onnx_runtime(tmp_path, op_type, size, kernel, str
     with Session(plan) as session:
         actual = session.run({"x": x.transpose(0, 2, 3, 1)})["y"].transpose(0, 3, 1, 2)
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_a_requantization_tiles_and_matches_its_untiled_plan(tmp_path):
+    """An activation in two encodings: the int8 Quantize between them tiles as a
+    pointwise operator, and the tiled plan's outputs equal the untiled plan's."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    from tigris.inspection import inspect_file
+
+    s = lambda name, v: numpy_helper.from_array(np.array(v, dtype=np.float32), name)  # noqa: E731
+    z = lambda name: numpy_helper.from_array(np.array(0, dtype=np.int8), name)  # noqa: E731
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "xs", "xz"], ["xq"]),
+        helper.make_node("DequantizeLinear", ["xq", "xs", "xz"], ["xd"]),
+        helper.make_node("Relu", ["xd"], ["r"]),
+        helper.make_node("QuantizeLinear", ["r", "as", "az"], ["rq"]),
+        helper.make_node("DequantizeLinear", ["rq", "as", "az"], ["rd"]),
+        helper.make_node("QuantizeLinear", ["rd", "as", "az"], ["first_q"]),
+        helper.make_node("DequantizeLinear", ["first_q", "as", "az"], ["first"]),
+        helper.make_node("QuantizeLinear", ["rd", "bs", "bz"], ["second_q"]),
+        helper.make_node("DequantizeLinear", ["second_q", "bs", "bz"], ["second"]),
+    ]
+    shape = [1, 8, 32, 32]
+    model = helper.make_model(helper.make_graph(
+        nodes, "two_encodings", [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info(n, TensorProto.FLOAT, shape) for n in ("first", "second")],
+        [s("xs", 0.05), z("xz"), s("as", 0.02), z("az"), s("bs", 0.07), z("bz")]),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    source = tmp_path / "two.onnx"
+    onnx.save(model, source)
+    outputs = {}
+    for budget in ("4K", "1M"):
+        plan = tmp_path / f"two_{budget}.tgrs"
+        result = CliRunner().invoke(cli, ["compile", str(source), "-m", budget, "-m", "1M", "-o", str(plan)])
+        assert result.exit_code == 0, result.output
+        report = inspect_file(plan)["plan"]
+        quantize = next(k for k, op in enumerate(report["ops"]) if op["type"] == "Quantize")
+        stage = next(st for st in report["stages"] if quantize in st["ops"])
+        tiled = stage["tile_plan_idx"] is not None or (stage["chain_len"] or 0) >= 2
+        assert tiled == (budget == "4K")
+        x = np.random.default_rng(11).uniform(-1, 6, shape).astype(np.float32)
+        with Session(plan) as session:
+            outputs[budget] = session.run({"input": x.transpose(0, 2, 3, 1)})
+    for name in ("first", "second"):
+        np.testing.assert_array_equal(outputs["4K"][name], outputs["1M"][name])
