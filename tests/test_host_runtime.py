@@ -619,3 +619,34 @@ def test_a_uniform_float_constant_of_an_int8_operator_matches_onnx_runtime(tmp_p
         actual = session.run({"input": x.transpose(0, 2, 3, 1)})["output"].transpose(0, 3, 1, 2)
     # One output step: the int8 kernels round as TFLite does, ONNX Runtime in float.
     np.testing.assert_allclose(actual, expected, rtol=0, atol=0.05 + 1e-6)
+
+
+def test_a_batch_normalization_no_convolution_absorbs_matches_onnx_runtime(tmp_path):
+    """Pre-activation networks normalize the sum of a residual Add."""
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    rng = np.random.default_rng(13)
+    channels = 6
+    params = [numpy_helper.from_array(v.astype(np.float32), n) for n, v in (
+        ("gamma", rng.uniform(0.5, 2, channels)), ("beta", rng.normal(size=channels)),
+        ("mean", rng.normal(size=channels)), ("var", rng.uniform(0.2, 3, channels)))]
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node("Add", ["a", "b"], ["sum"]),
+         helper.make_node("BatchNormalization", ["sum", "gamma", "beta", "mean", "var"], ["bn"], epsilon=1e-5),
+         helper.make_node("Relu", ["bn"], ["output"])], "preact",
+        [helper.make_tensor_value_info(n, TensorProto.FLOAT, [1, channels, 5, 7]) for n in ("a", "b")],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 5, 7])], params),
+        opset_imports=[helper.make_opsetid("", 15)])
+    model.ir_version = 8
+    source = tmp_path / "preact.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "preact.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    a, b = (rng.uniform(-2, 2, (1, channels, 5, 7)).astype(np.float32) for _ in range(2))
+    expected = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"]).run(None, {"a": a, "b": b})[0]
+    with Session(plan) as session:
+        actual = session.run({"a": a.transpose(0, 2, 3, 1), "b": b.transpose(0, 2, 3, 1)})["output"]
+    np.testing.assert_allclose(actual.transpose(0, 3, 1, 2), expected, rtol=1e-5, atol=1e-5)

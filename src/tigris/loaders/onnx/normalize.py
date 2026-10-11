@@ -73,6 +73,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_gemm_scalars(ag)
     ag = _relabel_matmul_to_gemm(ag)
     ag = _fold_bn(ag)
+    ag = _standalone_bn_as_affine(ag)
     ag = _fold_sub_constant_to_add(ag)
     ag = _fold_div_constant_to_mul(ag)
     ag = _quantize_uniform_constants(ag)
@@ -1999,6 +2000,47 @@ def _fold_bn_into_quantized_conv(ag: AnalyzedGraph, conv_op: OpNode, gamma, beta
         b_info.dtype = 6  # INT32
         b_info.quant = bias_quant
     return True
+
+
+def _standalone_bn_as_affine(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Run a float BatchNormalization no convolution absorbed as Mul then Add.
+
+    Inference-time batch normalization is y = x * a + c per channel, with
+    a = gamma / sqrt(var + eps) and c = beta - mean * a; pre-activation networks
+    place it after an Add, where no weight can take it. An int8 one would need
+    per-channel int8 constants and stays refused.
+    """
+    if ag.is_quantized:
+        return ag
+    rewritten: list[OpNode] = []
+    for op in ag.ops:
+        source = ag.tensors.get(op.inputs[0]) if op.inputs else None
+        params = [ag.weight_data.get(n) for n in op.inputs[1:5]]
+        if (op.op_type != "BatchNormalization" or len(op.inputs) < 5 or source is None
+                or source.quant is not None or any(v is None for v in params) or len(source.shape) < 2):
+            rewritten.append(op)
+            continue
+        gamma, beta, mean, var = (np.asarray(v, dtype=np.float32).reshape(-1) for v in params)
+        eps = np.float32(op.attrs.get("epsilon", 1e-5))
+        scale = (gamma / np.sqrt(var + eps)).astype(np.float32)
+        shift = (beta - mean * scale).astype(np.float32)
+        broadcast = (scale.size, *[1] * (len(source.shape) - 2))
+        names = []
+        for label, value in (("scale", scale), ("shift", shift)):
+            name = _fresh_name(ag, f"{op.name or op.outputs[0]}_{label}")
+            ag.weight_data[name] = value.reshape(broadcast)
+            ag.tensors[name] = TensorInfo(name=name, shape=broadcast, dtype=1, is_constant=True)
+            names.append(name)
+        scaled = _fresh_name(ag, f"{op.outputs[0]}_scaled")
+        ag.tensors[scaled] = replace(ag.tensors[op.outputs[0]], name=scaled)
+        rewritten.append(OpNode(name=f"{op.name}_scale", op_type="Mul", inputs=[op.inputs[0], names[0]],
+                                outputs=[scaled]))
+        rewritten.append(OpNode(name=op.name, op_type="Add", inputs=[scaled, names[1]],
+                                outputs=list(op.outputs[:1])))
+    ag.ops = rewritten
+    for step, op in enumerate(ag.ops):
+        op.step = step
+    return ag
 
 
 def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
