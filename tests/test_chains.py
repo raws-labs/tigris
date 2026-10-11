@@ -460,6 +460,32 @@ class TestSplitChains:
         assert "t0" in streamed
 
 
+def test_padded_chain_fits_two_rows_without_unused_output_rows(tmp_path):
+    shape = [1, 4, 64, 64]
+    weights = np.full((4, 4, 3, 3), 0.01, dtype=np.float32)
+    nodes, initializers = [], []
+    source = "input"
+    for index in range(4):
+        name = f"w{index}"
+        output = "output" if index == 3 else f"t{index}"
+        initializers.append(helper.make_tensor(
+            name, TensorProto.FLOAT, weights.shape, weights.ravel().tolist()))
+        nodes.append(helper.make_node(
+            "Conv", [source, name], [output], kernel_shape=[3, 3], pads=[1] * 4))
+        source = output
+    graph = helper.make_graph(
+        nodes, "padded_chain",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+        initializers)
+    path = tmp_path / "chain.onnx"
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+    ag = _full_pipeline(path, budget=32768)
+    head = ag.stages[0]
+    assert head.chain_len == 4
+    assert head.chain_tile_h == 2
+
+
 # Chain detection tests
 
 

@@ -2398,8 +2398,7 @@ def _chain_fast_bytes(
                 sh = _get_stride_h(op)
                 dh = _get_dilation_h(op)
                 ekh = dh * (kh - 1) + 1
-                pt = op.attrs.get("pads", [0])[0] if "pads" in op.attrs else 0
-                cur_h = (cur_h + pt - ekh) // sh + 1
+                cur_h = (cur_h - max(ekh - sh, 0)) // sh
             for out_name in op.outputs:
                 info = ag.tensors.get(out_name)
                 if info and len(info.shape) == 4:

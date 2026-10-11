@@ -5661,22 +5661,12 @@ def _qdq_convtranspose_per_channel_case() -> ContractCase:
 
 
 def _linebuffer_conv_chain_case() -> ContractCase:
-    """A padded Conv chain compiled tight enough to be line-buffered.
-
-    Three 3x3 stride-1 padded Conv stages each compose a halo of 2 rows, so at
-    a 32K budget the compiler forms a recomputing chain and marks the head
-    line-buffered. The runtime re-derives a tile height of 3 against that
-    budget (22 tiles over an output height of 64, with a partial last tile of
-    one row), so a single execution exercises tile 0, interior tiles, and the
-    partial last tile. The Conv nodes carry an explicit kernel_shape so the
-    compiler's halo analysis sees the real 3x3 receptive field. Drives both the
-    differential parity check and the recompute-reduction metric.
-    """
+    """Padded Conv chain with a partial last band under either buffer bound."""
     model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 3, 64, 64]
+        "input", TensorProto.FLOAT, [1, 3, 67, 64]
     )
     model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 8, 64, 64]
+        "output", TensorProto.FLOAT, [1, 8, 67, 64]
     )
     rng = np.random.default_rng(7)
     weights = [
@@ -5707,7 +5697,7 @@ def _linebuffer_conv_chain_case() -> ContractCase:
         "float_linebuffer_conv_chain",
         model,
         model,
-        {"input": np.linspace(-1.0, 1.0, 12288, dtype=np.float32).reshape(1, 3, 64, 64)},
+        {"input": np.linspace(-1.0, 1.0, 12864, dtype=np.float32).reshape(1, 3, 67, 64)},
         ("Conv", "Conv", "Conv"),
         mem_budget="32K",
         expect_tiled=True,
@@ -5718,18 +5708,9 @@ def _linebuffer_conv_chain_case() -> ContractCase:
 
 
 def _qdq_conv_chain_case() -> ContractCase:
-    """The int8 twin of the line-buffered Conv chain.
-
-    Three QDQ 3x3 stride-1 padded Conv stages, wrapped exactly as ``_qdq_case``
-    wraps a single Conv, fold to an int8 Conv chain. At an 8K budget the
-    compiler forms the recomputing chain and marks the head line-buffered; the
-    runtime re-derives a tile height of 3 (22 tiles over output height 64, a
-    partial last tile of one row). The int8 ORT reference is the quantized
-    (post-final-QuantizeLinear) tensor, matched to one LSB as ``_qdq_case``
-    does.
-    """
-    input_shape = [1, 3, 64, 64]
-    output_shape = [1, 8, 64, 64]
+    """Int8 padded chain with a partial last band and recomputation checks."""
+    input_shape = [1, 3, 67, 64]
+    output_shape = [1, 8, 67, 64]
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, input_shape
     )
@@ -5820,8 +5801,8 @@ def _qdq_conv_chain_case() -> ContractCase:
         reference_model,
         {
             "input": np.linspace(
-                -1.0, 1.0, 3 * 64 * 64, dtype=np.float32
-            ).reshape(1, 3, 64, 64)
+                -1.0, 1.0, 3 * 67 * 64, dtype=np.float32
+            ).reshape(1, 3, 67, 64)
         },
         ("Conv", "Conv", "Conv"),
         mem_budget="8K",
