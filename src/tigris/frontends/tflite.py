@@ -1832,8 +1832,11 @@ class _Converter:
                           op.inputs[0], tag + "_rows_q")
         y = self.b.node("Gemm", [x, w, bias], tag, transB=1)
         if list(out.shape) != [rows, weights_tensor.shape[0]]:
-            y = self.reshape(self.held(y, op.outputs[0], tag + "_q"), [rows, weights_tensor.shape[0]],
-                             out.shape, tag + "_shape", op.outputs[0])
+            # Held again so a fused activation after the reshape reads int8.
+            y = self.held(self.reshape(self.held(y, op.outputs[0], tag + "_q"),
+                                       [rows, weights_tensor.shape[0]], out.shape,
+                                       tag + "_shape", op.outputs[0]),
+                          op.outputs[0], tag + "_shape_q")
         return y
 
 

@@ -87,6 +87,10 @@ CASES = {
     "batch_matmul": _binary(tf.matmul, (1, 6, 8), (1, 8, 5)),
     "fully_connected_rank3": _unary(
         lambda x: tf.tensordot(x, _weights(4, 8, 5), 1), (1, 6, 8)),
+    "fully_connected_rank3_relu": _unary(
+        lambda x: tf.nn.relu(tf.tensordot(x, _weights(34, 8, 5), 1)), (1, 6, 8)),
+    "fully_connected_row_relu": _unary(
+        lambda x: tf.nn.relu(tf.tensordot(x, _weights(35, 8, 5), 1)), (1, 1, 8)),
     "pad_conv": _unary(
         lambda x: tf.nn.conv2d(tf.pad(x, [[0, 0], [1, 1], [2, 2], [0, 0]]),
                                _weights(5, 3, 3, 4, 4), 1, "VALID"), (1, 6, 6, 4)),
