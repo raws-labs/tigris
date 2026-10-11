@@ -887,6 +887,16 @@ def _binary_requant_payload(ag: AnalyzedGraph, op: OpNode) -> bytes | None:
     return struct.pack("<6i", *(value for pair in pairs for value in pair))
 
 
+def _constant_operand(ag: AnalyzedGraph, op: OpNode) -> int | None:
+    """The position of a binary operator's one constant operand."""
+    if op.op_type not in BINARY_OPS or len(op.inputs) != (3 if op.op_type == "Where" else 2):
+        return None
+    positions = [i for i, name in enumerate(op.inputs) if name in ag.weight_data]
+    if len(positions) != 1 or len(op.outputs) != 1 or op.outputs[0] not in ag.tensors:
+        return None
+    return positions[0]
+
+
 def _constant_operand_payload(
     ag: AnalyzedGraph, op: OpNode, quant_idx_map: dict[str, int]
 ) -> bytes | None:
@@ -895,13 +905,10 @@ def _constant_operand_payload(
     A float Add or Mul with its constant second is left without one: every
     runtime reads that form, older ones included.
     """
-    if op.op_type not in BINARY_OPS or len(op.inputs) != (3 if op.op_type == "Where" else 2):
+    position = _constant_operand(ag, op)
+    if position is None:
         return None
-    positions = [i for i, name in enumerate(op.inputs) if name in ag.weight_data]
-    output = ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
-    if len(positions) != 1 or output is None:
-        return None
-    position = positions[0]
+    output = ag.tensors[op.outputs[0]]
     name = op.inputs[position]
     # One value, one per channel, or one per element is known by its length;
     # any other broadcast states the constant's stored shape.
@@ -1524,6 +1531,15 @@ def _build_quant_params(
     # Pre-compute effective scales for op output tensors
     effective_scales = _compute_effective_scales(ag)
 
+    # Entries the plan refers to: an activation's own, and an int8 constant
+    # operand's. Convolution and matrix weights reach their kernels through the
+    # effective scales of the activation they produce.
+    referenced = {name for name, info in ag.tensors.items() if not info.is_constant}
+    for op in ag.ops:
+        position = _constant_operand(ag, op)
+        if position is not None:
+            referenced.add(op.inputs[position])
+
     quant_idx_map: dict[str, int] = {}
     entries_buf = bytearray()
     data_buf = bytearray()  # int32 elements
@@ -1532,7 +1548,7 @@ def _build_quant_params(
     idx = 0
 
     for name, info in ag.tensors.items():
-        if info.quant is None:
+        if info.quant is None or name not in referenced:
             continue
 
         qp = info.quant
