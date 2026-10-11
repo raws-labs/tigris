@@ -358,3 +358,28 @@ def test_flash_within_budget_compiles(conv_relu_chain_path, tmp_path):
                "-f", "16M", "-o", str(output)])
     assert result.exit_code == 0
     assert output.exists()
+
+
+def test_a_plan_beyond_the_default_build_is_written_and_names_the_build(tmp_path):
+    """Nineteen stage outputs exceed the runtime's default of 16, a build
+    option: the plan is written and every report names the -D it needs."""
+    import json
+
+    outputs = [f"part{k}" for k in range(19)]
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node("Split", ["input"], outputs, axis=1, num_outputs=19)], "parts",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 19])],
+        [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 1]) for name in outputs]),
+        opset_imports=[helper.make_opsetid("", 18)])
+    model.ir_version = 8
+    source = tmp_path / "parts.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "parts.tgrs"
+    expected = "runtime build   -DTIGRIS_MAX_STAGE_OUTPUTS=19"
+    for args in (["compile", str(source), "-m", "16K", "-o", str(plan)],
+                 ["analyze", str(source), "-m", "16K"], ["inspect", str(plan)]):
+        result = CliRunner().invoke(cli, args, env={"NO_COLOR": "1"})
+        assert result.exit_code == 0, result.output
+        assert expected in result.output
+    report = json.loads(CliRunner().invoke(cli, ["analyze", str(source), "-m", "16K", "--json"]).output)
+    assert report["runtime_build"] == [{"name": "TIGRIS_MAX_STAGE_OUTPUTS", "needed": 19, "default": 16}]

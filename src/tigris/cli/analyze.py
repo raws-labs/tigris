@@ -73,6 +73,8 @@ def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, sour
             "estimates": {"int8_plan_bytes": f.int8_plan_size_bytes or None,
                           "lz4_plan_bytes": f.lz4_plan_size_bytes or None},
         },
+        # Runtime build limits the plan needs above their defaults.
+        "runtime_build": list(f.build_limits),
         "budgets_tried": [{"budget_bytes": b, "fits": fits, "stages": stages, "tiled": tiled}
                           for b, fits, stages, tiled in tried],
         "stages": [{
@@ -253,6 +255,10 @@ def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budge
                               text.good("fits") if over <= 0 else
                               text.bad(f"exceeds it by {fmt_bytes(over)}")])
         text.section("flash", flash, "<>")
+    if f.build_limits:
+        # As inspect states it: the -D options a runtime build needs for this plan.
+        text.block([["runtime build", ", ".join(f"-D{limit['name']}={limit['needed']}"
+                                                for limit in f.build_limits)]])
 
 
 def _stages(ag) -> None:
