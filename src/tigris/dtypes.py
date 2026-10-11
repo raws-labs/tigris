@@ -16,6 +16,8 @@ BOOL_OR_INT32 = 252
 # Data, int32, or float32 that control flow carries across an int8 plan's
 # subgraph boundary.
 CONTROL_FLOW_VALUE = 251
+# Float32, or data: a Quantize reads float32, or int8 it requantizes.
+FLOAT_OR_DATA = 250
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ OP_DTYPE_SIGNATURES.update({
     # Float32 results in a float32 or an int8 plan, which no operator reads.
     "DetectionPostProcess": DTypeSignature(outputs=(1,)),
     "While": DTypeSignature(inputs=(CONTROL_FLOW_VALUE,) * 3, outputs=(CONTROL_FLOW_VALUE,)),
-    "Quantize": DTypeSignature(inputs=(1, 1, 1)),
+    "Quantize": DTypeSignature(inputs=(FLOAT_OR_DATA,) * 3),
     "Dequantize": DTypeSignature(outputs=(1,)),
     **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
        for kind in ("Transpose", "Reshape", "Flatten")},
@@ -138,6 +140,11 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
                     if dtype not in {1, 3, 6}:
                         issues.append(f"{kind} {direction} {position} ({name}) requires data or "
                                       f"int32, got ONNX dtype {dtype}")
+                    continue
+                if expected == FLOAT_OR_DATA:
+                    if dtype not in {1, 3}:
+                        issues.append(f"{kind} {direction} {position} ({name}) requires float32 or "
+                                      f"int8, got ONNX dtype {dtype}")
                     continue
                 if expected == BOOL_OR_INT32:
                     if dtype not in {6, 9}:

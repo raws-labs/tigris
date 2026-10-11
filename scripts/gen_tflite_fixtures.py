@@ -242,6 +242,11 @@ CASES.update({
     "concat_outer": _binary(lambda x, y: tf.concat([x, y], 0), (2, 3, 4), (1, 3, 4)),
     "concat_rank2": _binary(lambda x, y: tf.concat([x, y], 1), (3, 4), (3, 2)),
     "unpack": _unary(lambda x: tf.unstack(x, axis=1), (1, 3, 4, 6)),
+    # The converter requantizes the narrower operand of a concatenation with a
+    # QUANTIZE; the same tensor also feeds a second reader in its own encoding.
+    "requantize_shared": _binary(
+        lambda x, y: (lambda t: (tf.concat([t, y * 4.0], -1), tf.nn.relu(t)))(tf.tanh(x)),
+        (1, 4, 4, 3), (1, 4, 4, 3)),
     "unpack_one": _unary(lambda x: tf.unstack(x, axis=1), (1, 1, 4, 6)),
     "slice": _unary(lambda x: tf.slice(x, [0, 1, 2, 0], [1, 3, 3, 4]), _MAP),
     "strided_slice": _unary(lambda x: x[:, 1:5, :, 1:3], _MAP),

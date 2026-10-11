@@ -611,3 +611,36 @@ def test_int4_weights_compile_as_the_same_int8_values(tmp_path):
         assert graph.weight_data["w"].dtype == np.int8
         plans.append(emit_binary_bytes(graph))
     assert plans[0] == plans[1]
+
+
+def test_a_second_encoding_of_an_activation_is_a_requantization(tmp_path):
+    """Relu's output is quantized for its own readers and again, at another
+    scale, for a second one: it keeps its encoding and a Quantize makes the other."""
+    s = lambda name, v: numpy_helper.from_array(np.array(v, dtype=np.float32), name)  # noqa: E731
+    z = lambda name: numpy_helper.from_array(np.array(0, dtype=np.int8), name)  # noqa: E731
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "xs", "xz"], ["xq"]),
+        helper.make_node("DequantizeLinear", ["xq", "xs", "xz"], ["xd"]),
+        helper.make_node("Relu", ["xd"], ["r"]),
+        helper.make_node("QuantizeLinear", ["r", "as", "az"], ["rq"]),
+        helper.make_node("DequantizeLinear", ["rq", "as", "az"], ["rd"]),
+        helper.make_node("Neg", ["rd"], ["n"]),
+        helper.make_node("QuantizeLinear", ["n", "as", "az"], ["nq"]),
+        helper.make_node("DequantizeLinear", ["nq", "as", "az"], ["first"]),
+        helper.make_node("QuantizeLinear", ["rd", "bs", "bz"], ["second_q"]),
+        helper.make_node("DequantizeLinear", ["second_q", "bs", "bz"], ["second"]),
+    ]
+    graph = helper.make_graph(
+        nodes, "two_encodings", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 8])],
+        [helper.make_tensor_value_info(n, TensorProto.FLOAT, [1, 8]) for n in ("first", "second")],
+        [s("xs", 0.05), z("xz"), s("as", 0.02), z("az"), s("bs", 0.07), z("bz")])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "two.onnx"
+    onnx.save(model, path)
+    ag = _fold_qdq(load_raw(path))
+    relu = next(op for op in ag.ops if op.op_type == "Relu")
+    assert float(ag.tensors[relu.outputs[0]].quant.scale[0]) == np.float32(0.02)
+    requantize = [op for op in ag.ops if op.op_type == "Quantize"]
+    assert len(requantize) == 1 and requantize[0].inputs == relu.outputs
+    assert float(ag.tensors[requantize[0].outputs[0]].quant.scale[0]) == np.float32(0.07)

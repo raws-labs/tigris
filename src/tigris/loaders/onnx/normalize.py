@@ -1662,6 +1662,7 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     # Pass 2: Process activation Q/DQ pairs.
     # Pattern: activation -> QuantizeLinear -> int8 -> DequantizeLinear -> consumer
+    requantized: list[tuple[int, OpNode]] = []
     for i, op in enumerate(ag.ops):
         if i in removed:
             continue
@@ -1678,6 +1679,31 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         # Get quant params from this QL op
         qp, unsigned = _get_quant_param(op)
         if qp is None:
+            continue
+
+        # An activation another QuantizeLinear already encoded keeps that
+        # encoding; a different one is a requantization of its own, which
+        # writes the QuantizeLinear's output as an int8 tensor.
+        source = ag.tensors.get(ql_input)
+        if (source is not None and source.quant is not None and source.dtype == 3
+                and not _same_quant(source.quant, qp)):
+            ag.tensors[ql_output] = TensorInfo(name=ql_output, shape=source.shape, dtype=3, quant=qp)
+            requantize = OpNode(name=op.name, op_type="Quantize", inputs=[ql_input],
+                                outputs=[ql_output], step=op.step)
+            requantized.append((i, requantize))
+            for dql_idx in [c for c, _ in input_to_consumers.get(ql_output, [])
+                            if ag.ops[c].op_type == "DequantizeLinear"]:
+                dql_output = ag.ops[dql_idx].outputs[0]
+                for cons_idx, pos in input_to_consumers.get(dql_output, []):
+                    ag.ops[cons_idx].inputs[pos] = ql_output
+                if dql_output in ag.model_outputs:
+                    ag.model_outputs = [ql_output if n == dql_output else n for n in ag.model_outputs]
+                if dql_output in ag.tensors and dql_output != ql_output:
+                    del ag.tensors[dql_output]
+                removed.add(dql_idx)
+                deferred_cleanup.update(name for name in ag.ops[dql_idx].inputs[1:] if name)
+            removed.add(i)
+            deferred_cleanup.update(name for name in op.inputs[1:] if name)
             continue
 
         # Store quant param on the activation tensor and set dtype to INT8
@@ -1743,12 +1769,19 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
             del ag.tensors[name]
 
     if removed:
-        ag.ops = [op for idx, op in enumerate(ag.ops) if idx not in removed]
+        replacements = dict(requantized)
+        ag.ops = [replacements.get(idx, op) for idx, op in enumerate(ag.ops)
+                  if idx not in removed or idx in replacements]
         for step, op in enumerate(ag.ops):
             op.step = step
         ag.is_quantized = True
 
     return ag
+
+
+def _same_quant(a: QuantParam, b: QuantParam) -> bool:
+    return (np.array_equal(np.asarray(a.scale), np.asarray(b.scale))
+            and np.array_equal(np.asarray(a.zero_point), np.asarray(b.zero_point)))
 
 
 # Batch normalization
