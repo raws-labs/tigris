@@ -72,7 +72,8 @@ def _run_compressed_pipeline(
 @click.option("--mem", "-m", multiple=True, required=True, callback=_expand_mem,
               help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 @click.option("--output", "-o", default=None, help="Output path (default: <model>.tgrs)")
-@click.option("--flash", "-f", default=None, help="Flash size budget - fail if plan exceeds (e.g. 4M)")
+@click.option("--flash", "-f", default=None,
+              help="Flash size budget; no plan is written when the plan is larger (e.g. 4M)")
 @click.option("--compress", "-c", type=click.Choice(["none", "lz4"]), default="none",
               help="Weight compression (default: none)")
 @click.option("--xip", is_flag=True, default=False,

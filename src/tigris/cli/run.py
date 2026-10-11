@@ -8,6 +8,8 @@ import click
 import numpy as np
 
 from tigris.cli import cli, text
+from tigris.emitters.binary.defs import MAGIC
+from tigris.frontends import is_onnx, not_a_model, tflite
 from tigris.runtime import Session
 from tigris.utils import fmt_bytes
 
@@ -43,15 +45,25 @@ def read_inputs(session, input_files) -> dict:
     return inputs
 
 
+def _check_plan(path: Path) -> None:
+    """A model where a plan belongs gets a pointer to compile."""
+    data = path.read_bytes()
+    if data.startswith(MAGIC):
+        return
+    if tflite.is_tflite(data) or is_onnx(data):
+        raise ValueError(f"not a plan: compile {path.name} with tigris compile first")
+    raise ValueError(not_a_model(path))
+
+
 @cli.command("run")
-@click.argument("model", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("plan", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--input", "input_files", multiple=True, required=True,
               help="Input .bin or .npy tensor; use NAME=FILE for multiple inputs.")
 @click.option("--output", "output", required=True, type=click.Path(path_type=Path),
               help="Output .bin/.npy for one tensor, or .npz for named outputs.")
 @click.option("--json", "as_json", is_flag=True, help="Print execution metadata as JSON.")
-def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
-    """Run a model or plan on the host reference runtime.
+def run(plan: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
+    """Run a plan on the host reference runtime.
 
     Inputs take the axis order and dtype inspect shows; .bin files hold
     little-endian, contiguous elements. This checks the portable reference
@@ -59,11 +71,12 @@ def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
     TIGRIS_HOST_LIBRARY to use another runtime library.
     """
     try:
+        _check_plan(plan)
         if output.exists():
             raise ValueError(f"Output already exists: {output}")
         if output.suffix not in {".bin", ".npy", ".npz"}:
             raise ValueError("Output must end in .bin, .npy, or .npz")
-        with Session(model) as session:
+        with Session(plan) as session:
             inputs = read_inputs(session, input_files)
             if len(session.outputs) > 1 and output.suffix != ".npz":
                 raise ValueError("Multiple-output models require an .npz output")
@@ -90,7 +103,7 @@ def run(model: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
         click.echo(json.dumps(report, indent=2))
     else:
         memory = report["memory"]
-        text.echo(text.bold(model.name) + f"   runtime {report['runtime_version']}, "
+        text.echo(text.bold(plan.name) + f"   runtime {report['runtime_version']}, "
                   f"{report['runtime_source']}, host reference backend")
         for line in text.columns([
                 ["fast arena peak", fmt_bytes(memory["fast_peak_bytes"]),

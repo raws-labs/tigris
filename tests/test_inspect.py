@@ -108,8 +108,9 @@ def test_compressed_metadata_without_decompression(linear_3op_path, tmp_path, mo
 
 
 @pytest.mark.parametrize("data, message", [
-    (b"TGRS", "File too small"), (b"", "readable ONNX"),
-    (b"not a model", "readable ONNX"),
+    (b"TGRS", "File too small"),
+    (b"", "model is not an ONNX model, a TFLite model or a plan"),
+    (b"not a model", "model is not an ONNX model, a TFLite model or a plan"),
 ])
 def test_invalid_files_are_cli_errors(tmp_path, data, message):
     path = tmp_path / "model"
@@ -118,6 +119,26 @@ def test_invalid_files_are_cli_errors(tmp_path, data, message):
     assert result.exit_code == 1
     assert message in result.output
     assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("data", [b"", b"not a model"])
+@pytest.mark.parametrize("command", [["analyze", "-m", "32K"], ["compile", "-m", "32K"],
+                                     ["run", "--input", "x.bin", "--output", "y.bin"]])
+def test_a_file_that_is_no_model_is_a_cli_error(tmp_path, data, command):
+    path = tmp_path / "model.onnx"
+    path.write_bytes(data)
+    result = CliRunner().invoke(cli, [command[0], str(path), *command[1:]])
+    assert result.exit_code == 1
+    assert result.output.strip().endswith(
+        "Error: model.onnx is not an ONNX model, a TFLite model or a plan")
+
+
+def test_run_points_a_model_to_compile(tmp_path):
+    result = CliRunner().invoke(cli, ["run", str(TFLITE / "vww_96_int8.tflite"), "--input", "x.bin",
+                                      "--output", str(tmp_path / "y.bin")])
+    assert result.exit_code == 1
+    assert result.output.strip().endswith(
+        "Error: not a plan: compile vww_96_int8.tflite with tigris compile first")
 
 
 def test_unsupported_schema(tmp_path):

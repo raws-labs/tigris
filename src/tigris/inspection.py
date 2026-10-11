@@ -9,7 +9,7 @@ from pathlib import Path
 import onnx
 from google.protobuf.message import DecodeError
 
-from tigris.frontends import tflite
+from tigris.frontends import not_a_model, tflite
 from tigris import SCHEMA_VERSION_INTERFACE_DTYPE, SCHEMA_VERSION_TENSOR_LAYOUT
 from tigris.emitters.binary import defs
 from tigris.emitters.binary.reader import read_binary_plan
@@ -297,9 +297,9 @@ def inspect_file(path: str | Path) -> dict:
         try:
             model = onnx.load_model_from_string(data)
         except DecodeError as exc:
-            raise ValueError("Not a TiGrIS plan or a readable ONNX model") from exc
+            raise ValueError(not_a_model(path)) from exc
         if not model.HasField("graph") or model.ir_version <= 0:
-            raise ValueError("Not a TiGrIS plan or a readable ONNX model")
+            raise ValueError(not_a_model(path))
         graph = _graph(model.graph)
         report.update(
             format="onnx", name=graph["name"], ir_version=model.ir_version,
