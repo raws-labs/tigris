@@ -13,6 +13,7 @@ from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import partition_spatial
 from tigris.analysis.partition_temporal import partition_temporal
+from tigris.analysis.plan_graph import slow_arena_required
 from tigris.analysis.validation import OperatorSupportValidation
 from tigris.cli import cli
 from tigris.emitters.binary.defs import (
@@ -185,7 +186,8 @@ def test_codegen_reports_xip_and_loads_plan_at_runtime(linear_3op_path):
     assert "tigris_mem_error_t merr = tigris_mem_init(" in source
     assert "merr = tigris_mem_alloc_slow(" in source
     assert source.count("if (merr != TIGRIS_MEM_OK)") >= 2
-    assert "plan.header->peak > UINT32_MAX / 4u" in source
+    plan = read_binary_plan(data)
+    assert f"uint32_t slow_size = {slow_arena_required(plan)}u;" in source
     assert "TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES" in source
     assert (
         "uint8_t executor_workspace"
@@ -441,14 +443,27 @@ def test_codegen_rejects_plan_without_executable_stages(linear_3op_path):
 
 
 def test_cmsis_codegen_rejects_unrepresentable_static_slow_arena(
-    linear_3op_path,
+    linear_3op_path, monkeypatch,
 ):
-    ag = _full_pipeline(linear_3op_path, budget=4096)
-    data = bytearray(emit_binary_bytes(ag))
-    struct.pack_into("<I", data, 24, 0x80000000)
+    import tigris.emitters.codegen as codegen
 
+    ag = _full_pipeline(linear_3op_path, budget=4096)
+    monkeypatch.setattr(codegen, "slow_arena_required", lambda plan: 0x100000000)
     with pytest.raises(ValueError, match="static slow arena exceeds"):
-        generate_c(bytes(data), "cmsis-nn")
+        generate_c(emit_binary_bytes(ag), "cmsis-nn")
+
+
+@pytest.mark.parametrize("backend", ["reference", "cmsis-nn", "esp-nn"])
+def test_apps_size_the_slow_arena_from_the_plan(conv_relu_chain_path, backend):
+    """The slow arena is what the plan needs, not a multiple of the fast budget."""
+    data = emit_binary_bytes(_full_pipeline(conv_relu_chain_path, budget=4096))
+    required = slow_arena_required(read_binary_plan(data))
+    source = generate_c(data, backend)
+    assert 0 < required < 256 * 1024
+    if backend == "cmsis-nn":
+        assert f"static uint8_t slow_arena[{required}]" in source
+    else:
+        assert f"uint32_t slow_size = {required}u;" in source
 
 
 def test_quantized_cmsis_codegen_checks_prepare_and_memory(qdq_conv_path):

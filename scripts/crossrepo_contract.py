@@ -30,6 +30,7 @@ from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris import TILE_AXIS_HW
+from tigris.analysis.plan_graph import slow_arena_required
 from tigris.analysis.validation import slow_pool_usage, validate_memory_plan
 from tigris.capabilities import KERNEL_CAPABILITIES, OP_TYPE_BY_CODE
 from tigris.cli import _run_pipeline
@@ -6684,6 +6685,12 @@ def _compile_plan(
     plan["_compiler_scheduled_peak"] = validation.scheduled_peak_bytes
     plan["_compiler_slow_budget"] = graph.budget.slow
     plan["_compiler_slow_peak"] = slow_pool_usage(graph).slow_peak_bytes
+    # Generated applications size their slow arena from the plan alone.
+    derived = slow_arena_required(read_binary_plan(plan_bytes, decompress_weights=False))
+    if derived != plan["_compiler_slow_peak"]:
+        raise AssertionError(
+            f"slow arena derived from the plan ({derived}) differs from the "
+            f"compiler's slow requirement ({plan['_compiler_slow_peak']})")
     plan["_plan_bytes"] = plan_bytes
     return plan
 
@@ -6872,8 +6879,12 @@ def _assert_memory_contract(
 
 def _run_peak_fixtures(runners: tuple[Path, ...], work_dir: Path) -> None:
     fixtures = Path(__file__).resolve().parents[1] / "tests/fixtures/tflite/ops"
+    # concat_rank2 and lstm_unrolled hold reshape groups over a stage input
+    # and outputs nothing reads, which the runtime once kept live to the end
+    # of the stage and pushed later outputs past the compiler's slow figure.
     for name, minimum in (("concat_rows", 96), ("select_v2_broadcast", 128),
-                          ("select_v2_rank", 128), ("float_space_to_depth", 192)):
+                          ("select_v2_rank", 128), ("float_space_to_depth", 192),
+                          ("concat_rank2", 96), ("lstm_unrolled", 160)):
         model_path = fixtures / f"{name}.tflite"
         graph, _ = _run_pipeline(str(model_path), (str(minimum - 1),))
         assert not validate_memory_plan(graph).feasible, name
