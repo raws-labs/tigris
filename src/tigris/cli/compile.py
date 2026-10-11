@@ -81,8 +81,10 @@ def _run_compressed_pipeline(
 @click.option("--input-shape", "input_shape", multiple=True,
               callback=_parse_input_shape,
               help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
+@click.option("--keep-names", is_flag=True,
+              help="Keep operator and tensor names in the plan for inspect")
 def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None,
-            compress: str, xip: bool, input_shape: dict[str, tuple[int, ...]]):
+            compress: str, xip: bool, input_shape: dict[str, tuple[int, ...]], keep_names: bool):
     """Compile a model into an execution plan."""
     from tigris.analysis.validation import (
         validate_budget,
@@ -115,7 +117,7 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     # The same summary analyze prints: what was decided, and why not when it
     # was not. A plan is written only when everything holds.
     data = Path(model).read_bytes()
-    findings = compute_findings(ag, flash_budget=ag.budget.flash)
+    findings = compute_findings(ag, flash_budget=ag.budget.flash, names=keep_names)
     summary(model, ag, findings, budget, ag.budget.slow, ag.budget.flash,
             tflm_tensor_arena(data) if is_tflite(data) else None)
     usable = (validate_execution_dtype(ag).supported and validate_operator_support(ag).supported)
@@ -125,7 +127,7 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
 
     out = Path(output) if output else Path(model).with_suffix(".tgrs")
     try:
-        plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip)
+        plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip, names=keep_names)
     except ValueError as exc:
         raise click.ClickException(f"no plan written: {exc}") from exc
     if ag.budget.flash > 0 and len(plan_data) > ag.budget.flash:

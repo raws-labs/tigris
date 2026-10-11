@@ -68,7 +68,7 @@ def test_weights_in_binary(conv_relu_chain_path):
 def test_weight_entries_correct(conv_relu_chain_path):
     """Weight entries should have correct names and sizes."""
     ag = _full_pipeline(conv_relu_chain_path)
-    data = emit_binary_bytes(ag)
+    data = emit_binary_bytes(ag, names=True)
     plan = read_binary_plan(data)
 
     weight_names = set(ag.weight_data.keys())
@@ -84,7 +84,7 @@ def test_weight_entries_correct(conv_relu_chain_path):
 def test_weight_blob_data(conv_relu_chain_path):
     """Actual weight bytes in the blob should match the original arrays."""
     ag = _full_pipeline(conv_relu_chain_path)
-    data = emit_binary_bytes(ag)
+    data = emit_binary_bytes(ag, names=True)
     plan = read_binary_plan(data)
 
     for w in plan["weights"]:

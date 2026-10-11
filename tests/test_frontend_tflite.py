@@ -380,6 +380,29 @@ def test_analyze_shows_the_lz4_estimate_only_where_lz4_compiles():
         assert (report["flash"]["estimates"]["lz4_plan_bytes"] is not None) == compiles
 
 
+def test_compile_keeps_only_interface_names_unless_asked(tmp_path):
+    model = FIXTURES / "vww_96_int8.tflite"
+    plans = {}
+    for name, extra in (("stripped", []), ("named", ["--keep-names"])):
+        path = tmp_path / f"{name}.tgrs"
+        result = CliRunner().invoke(cli, ["compile", str(model), "-m", "32K", "-m", "1M", "-o", str(path),
+                                          *extra])
+        assert result.exit_code == 0, result.output
+        plans[name] = read_binary_plan(path.read_bytes())
+        plans[name]["size"] = path.stat().st_size
+    stripped, named = plans["stripped"], plans["named"]
+    interface = {named["tensors"][i]["name"] for i in (*named["model_inputs"], *named["model_outputs"])}
+    assert interface == {"input_1_int8", "Identity_int8"}
+    assert stripped["model_name"] == named["model_name"] == "vww_96_int8"
+    assert {t["name"] for t in stripped["tensors"]} == interface | {""}
+    assert {op["name"] for op in stripped["ops"]} == {""}
+    assert {w["name"] for w in stripped["weights"]} == {""}
+    assert all(op["name"] for op in named["ops"])
+    assert stripped["size"] < named["size"]
+    report = json.loads(CliRunner().invoke(cli, ["analyze", str(model), "-m", "32K", "-m", "1M", "--json"]).output)
+    assert report["flash"]["plan_bytes"] == stripped["size"]
+
+
 def test_flexbuffer_map_reads_scalar_options():
     from tigris.frontends.flatbuffer import flexbuffer_map
     data = bytes.fromhex(

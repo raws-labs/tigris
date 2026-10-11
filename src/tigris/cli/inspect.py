@@ -32,7 +32,9 @@ def _interface(tensor, *, plan=False):
 
 
 def _names(indices, tensors):
-    return ", ".join(tensors[index]["name"] for index in indices) or "none"
+    # A plan compiled without --keep-names names only its interface tensors;
+    # the others are given by their id in the tensors table.
+    return ", ".join(tensors[index]["name"] or f"tensor {index}" for index in indices) or "none"
 
 
 def _operators(ops, tensors=None, title="steps"):
@@ -74,7 +76,7 @@ def _tensors(title, tensors, *, plan=False):
     columns += ["bytes", "layout", "quant"] if plan else ["bytes", "storage"]
     rows = [[text.dim(cell) for cell in columns]]
     for index, tensor in enumerate(tensors):
-        values = [str(index), tensor["name"], tensor.get("dtype", tensor.get("kind", "unknown")),
+        values = [str(index), tensor["name"] or "(unnamed)", tensor.get("dtype", tensor.get("kind", "unknown")),
                   _shape(tensor.get("shape")),
                   fmt_bytes(tensor["size_bytes"]) if tensor.get("size_bytes") is not None else "unknown"]
         if plan:

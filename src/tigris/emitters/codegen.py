@@ -231,7 +231,7 @@ def generate_c(
         op_type = OP_TYPE_BY_CODE.get(opcode)
         if op_type is None or op_type not in supported:
             label = op_type if op_type is not None else f"opcode {opcode}"
-            unsupported.append(f"{op['name']} ({label})")
+            unsupported.append(f"{op['name']} ({label})" if op["name"] else label)
 
     if unsupported:
         route = describe_codegen_route(backend, dtype)

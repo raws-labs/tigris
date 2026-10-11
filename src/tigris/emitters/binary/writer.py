@@ -130,21 +130,18 @@ def _require_uint(value: int, bits: int, field: str) -> None:
 
 
 class _StringTable:
-    """Deduplicating null-terminated string pool."""
+    """Deduplicating null-terminated string pool. With `keep`, any other string
+    is stored as the empty string."""
 
-    def __init__(self) -> None:
+    def __init__(self, keep: set[str] | None = None) -> None:
         self._map: dict[str, int] = {}
         self._buf = bytearray()
+        self._keep = keep
 
     def add(self, s: str) -> int:
-        """Add string, return byte offset. Empty string -> offset 0."""
-        if not s:
-            # ensure we have an empty string at offset 0
-            if 0 not in self._map.values() or not self._buf:
-                if not self._buf:
-                    self._map[""] = 0
-                    self._buf.append(0)
-            return self._map.get("", 0)
+        """Add string, return byte offset."""
+        if self._keep is not None and s not in self._keep:
+            s = ""
         if s in self._map:
             return self._map[s]
         offset = len(self._buf)
@@ -1629,33 +1626,36 @@ def _patch_stage_tile_indices(stage_data: bytearray, ag: AnalyzedGraph, stage_to
 
 def emit_binary(
     ag: AnalyzedGraph, path: Path, compress: str | None = None,
-    xip: bool = False,
+    xip: bool = False, names: bool = False,
 ) -> None:
     """Write an execution plan as a binary file to *path*."""
-    data = emit_binary_bytes(ag, compress=compress, xip=xip)
+    data = emit_binary_bytes(ag, compress=compress, xip=xip, names=names)
     with open(path, "wb") as f:
         f.write(data)
 
 
 def emit_binary_bytes(
     ag: AnalyzedGraph, compress: str | None = None, xip: bool = False,
+    names: bool = False,
 ) -> bytes:
     """Build the complete binary plan and return as bytes. Each subgraph a
     control-flow operator runs is validated as a graph of its own, then
-    serialized after the main graph's stages."""
+    serialized after the main graph's stages. Without `names` the plan keeps
+    only the model's name and its interface tensors' names, which is all a
+    runtime reads."""
     if not ag.subgraphs:
-        return _emit(ag, compress, xip)
+        return _emit(ag, compress, xip, names=names)
     from tigris.graph.subgraphs import all_graphs, flatten_subgraphs
 
     for graph in all_graphs(ag):
         _emit(graph, compress, xip, serialize=False)
     merged, ranges = flatten_subgraphs(ag)
-    return _emit(merged, compress, xip, ranges=ranges, validate=False)
+    return _emit(merged, compress, xip, ranges=ranges, validate=False, names=names)
 
 
 def _emit(
     ag: AnalyzedGraph, compress: str | None = None, xip: bool = False,
-    *, serialize: bool = True, validate: bool = True, ranges=None,
+    *, serialize: bool = True, validate: bool = True, ranges=None, names: bool = False,
 ) -> bytes:
     """Validate a graph for emission and, when `serialize`, the plan bytes.
 
@@ -1744,7 +1744,8 @@ def _emit(
     _require_uint(len(ag.weight_data), 16, "weight count")
     _require_uint(len(ag.stages), 16, "stage count")
 
-    strings = _StringTable()
+    strings = _StringTable(None if names else
+                           {ag.model_name, *ag.model_inputs, *ag.model_outputs})
     shapes = _ShapePool()
     index_pool = _IndexPool()
 
