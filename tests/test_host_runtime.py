@@ -363,7 +363,8 @@ def test_spatial_mean_without_kept_axes_runs_as_a_global_pool(tmp_path, axes_inp
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("form", ["depthwise", "dilated_depthwise", "multiplier", "no_kernel_shape"])
+@pytest.mark.parametrize("form", ["depthwise", "dilated_depthwise", "multiplier", "no_kernel_shape",
+                                  "no_kernel_shape_stride_1"])
 def test_one_dimensional_convolutions_match_onnx_runtime(tmp_path, form):
     """A grouped 1D convolution runs as a 2D depthwise over a height of one; a
     1D convolution that leaves kernel_shape to its weight is still 1D."""
@@ -374,15 +375,15 @@ def test_one_dimensional_convolutions_match_onnx_runtime(tmp_path, form):
     rng = np.random.default_rng(5)
     channels, length = 6, 20
     out_channels = 12 if form == "multiplier" else channels
-    group = 1 if form == "no_kernel_shape" else channels
-    in_per_group = channels if form == "no_kernel_shape" else 1
+    group = 1 if form.startswith("no_kernel_shape") else channels
+    in_per_group = channels if form.startswith("no_kernel_shape") else 1
     weight = rng.normal(size=(out_channels, in_per_group, 3)).astype(np.float32)
     attrs = {"group": group, "pads": [2, 2] if form == "dilated_depthwise" else [1, 1]}
     if form == "dilated_depthwise":
         attrs["dilations"] = [2]
-    if form != "no_kernel_shape":
+    if not form.startswith("no_kernel_shape"):
         attrs["kernel_shape"] = [3]
-    else:
+    elif form == "no_kernel_shape":
         attrs["strides"] = [2]
     nodes = [helper.make_node("Conv", ["input", "w", "b"], ["conv"], **attrs),
              helper.make_node("Relu", ["conv"], ["output"])]

@@ -223,7 +223,6 @@ def _pack_spatial_attrs(
     di = attrs.get("dilations", [])
     gr = int(attrs.get("group", 1))
 
-    is_1d = len(ks) == 1
     is_spatial = op.op_type in {
         "Conv",
         "Conv1D",
@@ -250,6 +249,8 @@ def _pack_spatial_attrs(
             elif weights.ndim == 3:
                 ks = [int(weights.shape[-1])]
             break
+    # Decided once kernel_shape is known, from the weight when the model leaves it out.
+    is_1d = len(ks) == 1
     if is_spatial and not ks:
         raise ValueError(
             f"Cannot emit spatial operator {op.name!r} ({op.op_type}) "
