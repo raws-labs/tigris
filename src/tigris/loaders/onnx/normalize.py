@@ -78,6 +78,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
+    ag = _explicit_auto_pad(ag)
     ag = _fold_pad_into_conv(ag)
     ag = _relabel_depthwise(ag)
     ag = _relabel_conv1d(ag)
@@ -104,6 +105,48 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _lower_linear_matmul(ag)
     ag = _drop_unreferenced_weights(ag)
     ag = _restore_output_names(ag, declared_outputs)
+    return ag
+
+
+def _explicit_auto_pad(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """State a convolution's or pool's auto_pad as the pads it stands for.
+
+    VALID pads nothing. SAME_UPPER and SAME_LOWER pad so the output extent is
+    the input's divided by the stride, rounded up, the odd element at the end
+    or at the start, as ONNX defines them. ConvTranspose keeps its own
+    definition and is left as it is.
+    """
+    for op in ag.ops:
+        auto_pad = op.attrs.get("auto_pad", "NOTSET")
+        if isinstance(auto_pad, bytes):
+            auto_pad = auto_pad.decode()
+        if op.op_type not in ("Conv", "MaxPool", "AveragePool", "LpPool") or auto_pad in ("", "NOTSET"):
+            continue
+        source = ag.tensors.get(op.inputs[0])
+        if source is None or len(source.shape) < 3:
+            continue
+        spatial = [int(d) for d in source.shape[2:]]
+        kernel = op.attrs.get("kernel_shape")
+        if kernel is None and op.op_type == "Conv" and op.inputs[1] in ag.weight_data:
+            kernel = ag.weight_data[op.inputs[1]].shape[2:]
+        if kernel is None or len(kernel) != len(spatial):
+            continue
+        strides = [int(v) for v in op.attrs.get("strides", [1] * len(spatial))]
+        dilations = [int(v) for v in op.attrs.get("dilations", [1] * len(spatial))]
+        begins, ends = [], []
+        for extent, k, stride, dilation in zip(spatial, kernel, strides, dilations):
+            if auto_pad == "VALID":
+                total = 0
+            else:
+                out = -(-extent // stride)
+                total = max((out - 1) * stride + (int(k) - 1) * dilation + 1 - extent, 0)
+            small = total // 2
+            begins.append(total - small if auto_pad == "SAME_LOWER" else small)
+            ends.append(small if auto_pad == "SAME_LOWER" else total - small)
+        attrs = dict(op.attrs)
+        attrs.pop("auto_pad")
+        attrs["pads"] = begins + ends
+        op.attrs = attrs
     return ag
 
 
