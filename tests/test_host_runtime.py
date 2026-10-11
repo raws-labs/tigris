@@ -681,7 +681,9 @@ def test_a_layout_step_before_the_first_quantize_matches_onnx_runtime(tmp_path, 
     f = lambda name, v: numpy_helper.from_array(np.array(v, dtype=np.float32), name)  # noqa: E731
     z = lambda name: numpy_helper.from_array(np.array(0, dtype=np.int8), name)  # noqa: E731
     params = [f("xs", 0.03), z("xz"), f("ws", 0.02), z("wz"), f("ys", 0.1), z("yz"),
-              numpy_helper.from_array(rng.integers(-127, 128, (4, 3, 3, 3)).astype(np.int8), "w"),
+              # 7-bit weights: ONNX Runtime's u8s8 kernels on x86 without VNNI saturate
+              # int16 pair sums of full-range weights, so the reference would depend on the CPU.
+              numpy_helper.from_array(rng.integers(-63, 64, (4, 3, 3, 3)).astype(np.int8), "w"),
               numpy_helper.from_array(np.array(target, np.int64), "target")]
     model = helper.make_model(helper.make_graph(
         nodes, "layout", [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
