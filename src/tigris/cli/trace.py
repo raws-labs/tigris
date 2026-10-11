@@ -172,7 +172,8 @@ def _plan_bytes(ag) -> bytes | None:
     if result is None or not result.fast.feasible:
         return None
     try:
-        return emit_binary_bytes(ag)
+        # The trace names every operator and tensor it reports.
+        return emit_binary_bytes(ag, names=True)
     except ValueError:
         return None
 

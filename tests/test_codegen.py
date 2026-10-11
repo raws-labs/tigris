@@ -523,7 +523,8 @@ def test_unsupported_operator_codegen_fails_before_output(
 
     assert result.exit_code != 0
     assert f"Backend '{backend}' cannot execute this int8 plan" in result.output
-    assert "unsupported (InstanceNormalization)" in result.output
+    # The plan keeps no operator names, as compile writes it by default.
+    assert "Unsupported operators: InstanceNormalization" in result.output
     assert not output.exists()
 
 
