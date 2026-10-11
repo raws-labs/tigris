@@ -4630,6 +4630,31 @@ def _qdq_tiled_global_reduction_case() -> ContractCase:
     )
 
 
+def _tiled_ceil_pool_case() -> ContractCase:
+    """MaxPool -> AveragePool with ceil_mode, each rounding up to one more
+    window, tiled so the end padding that states it reaches the last band."""
+    model = _model(
+        "tiled_ceil_pool",
+        [
+            helper.make_node("MaxPool", ["input"], ["max"], kernel_shape=[3, 3],
+                             strides=[2, 2], ceil_mode=1),
+            helper.make_node("AveragePool", ["max"], ["output"], kernel_shape=[3, 3],
+                             strides=[2, 2], ceil_mode=1),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2, 64, 64])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2, 16, 16])],
+    )
+    return ContractCase(
+        "float_tiled_ceil_pool",
+        model,
+        model,
+        {"input": np.linspace(-2.0, 3.0, 8192, dtype=np.float32).reshape(1, 2, 64, 64)},
+        ("MaxPool", "AveragePool"),
+        mem_budget="4K",
+        expect_tiled=True,
+    )
+
+
 def _tiled_pool_chain_case() -> ContractCase:
     """AveragePool -> MaxPool must stream with both spatial ranges composed."""
     model_input = helper.make_tensor_value_info(
@@ -7402,6 +7427,8 @@ def _assert_compile_rejected(work_dir: Path) -> None:
             [resize_scales],
         ),
         _model(
+            # Rounding up adds a window that starts past the input, which no
+            # end padding states.
             "unsupported_pool_ceil",
             [
                 helper.make_node(
@@ -7409,18 +7436,18 @@ def _assert_compile_rejected(work_dir: Path) -> None:
                     ["input"],
                     ["output"],
                     ceil_mode=1,
-                    kernel_shape=[2, 2],
-                    strides=[2, 2],
+                    kernel_shape=[1, 1],
+                    strides=[3, 3],
                 )
             ],
             [
                 helper.make_tensor_value_info(
-                    "input", TensorProto.FLOAT, [1, 1, 3, 3]
+                    "input", TensorProto.FLOAT, [1, 1, 5, 5]
                 )
             ],
             [
                 helper.make_tensor_value_info(
-                    "output", TensorProto.FLOAT, [1, 1, 2, 2]
+                    "output", TensorProto.FLOAT, [1, 1, 3, 3]
                 )
             ],
         ),
@@ -7647,6 +7674,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _resize_concat_case(),
         _tiled_pool_case(),
         _tiled_pool_chain_case(),
+        _tiled_ceil_pool_case(),
         _tiled_global_reduction_case(),
         _qdq_tiled_global_reduction_case(),
         _tiled_chain_case(compression="lz4"),

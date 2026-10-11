@@ -188,11 +188,25 @@ def test_compile_preserves_existing_output_on_dtype_rejection(
     assert output.read_bytes() == b"sentinel"
 
 
+def test_ceil_mode_whose_last_window_lies_in_the_padding_is_rejected(tmp_path):
+    """Kernel 1, stride 3 over five rows: rounding up adds a window that starts
+    past the input, which no end padding can state."""
+    node = helper.make_node("MaxPool", ["input"], ["output"], kernel_shape=[1, 1], strides=[3, 3], ceil_mode=1)
+    model = helper.make_model(helper.make_graph(
+        [node], "ceil_past_input", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 5, 5])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 3, 3])]),
+        opset_imports=[helper.make_opsetid("", 19)])
+    model.ir_version = 9
+    path = tmp_path / "ceil_past_input.onnx"
+    onnx.save(model, path)
+    graph, _ = _run_pipeline(str(path), ("4K",))
+    assert "ceil_mode=1 is not encoded" in validate_operator_support(graph).describe()
+
+
 @pytest.mark.parametrize(
     ("attrs", "message"),
     [
         ({"count_include_pad": 1}, "count_include_pad=1 with padding is not encoded"),
-        ({"ceil_mode": 1}, "ceil_mode=1 is not encoded"),
         ({"dilations": [2, 2]}, "pooling dilation is not implemented"),
         ({"auto_pad": "SAME_UPPER"}, "requires explicit pads"),
     ],

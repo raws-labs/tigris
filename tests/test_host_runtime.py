@@ -508,3 +508,31 @@ def test_grouped_convolutions_match_onnx_runtime(tmp_path, group, out_channels, 
     with Session(plan) as session:
         actual = session.run({"x": x.transpose(order)})["y"]
     np.testing.assert_allclose(actual.transpose(np.argsort(order)), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("op_type, size, kernel, stride, pads", [
+    ("MaxPool", 7, 3, 2, 0), ("MaxPool", 8, 2, 3, 0), ("AveragePool", 7, 3, 2, 0),
+    ("AveragePool", 10, 3, 2, 1), ("MaxPool", 6, 3, 2, 1)])
+def test_ceil_mode_pools_match_onnx_runtime(tmp_path, op_type, size, kernel, stride, pads):
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper
+
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node(op_type, ["x"], ["y"], kernel_shape=[kernel, kernel], strides=[stride, stride],
+                          pads=[pads] * 4, ceil_mode=1)], "ceil",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, size, size])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    model = onnx.shape_inference.infer_shapes(model)
+    source = tmp_path / "ceil.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "ceil.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    x = np.random.default_rng(10).uniform(-1, 1, (1, 3, size, size)).astype(np.float32)
+    expected = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+    with Session(plan) as session:
+        actual = session.run({"x": x.transpose(0, 2, 3, 1)})["y"].transpose(0, 3, 1, 2)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
