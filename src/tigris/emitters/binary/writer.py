@@ -1118,6 +1118,8 @@ def _build_op_attributes(
         _require_uint(op_index, 16, "operator-attribute operator index")
         if len(payload) > 0xFF:
             raise ValueError("operator-attribute payload exceeds uint8 length")
+        # Every payload starts 4-byte aligned, as the loader requires of int32 data.
+        data.extend(b"\0" * (-len(data) % 4))
         entries.extend(OP_ATTRIBUTE_STRUCT.pack(
             op_index, attr_type, len(payload), len(data)
         ))
