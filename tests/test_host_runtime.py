@@ -404,3 +404,37 @@ def test_one_dimensional_convolutions_match_onnx_runtime(tmp_path, form):
     with Session(plan) as session:
         actual = session.run({"input": x.transpose(0, 2, 1)})["output"]
     np.testing.assert_allclose(actual.transpose(0, 2, 1), expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("also_output", [False, True])
+def test_a_flatten_into_a_product_keeps_the_model_order(tmp_path, also_output):
+    """The flatten a Gemm reads may stay in stored order, its weights permuted,
+    but not when the model also returns it."""
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    rng = np.random.default_rng(6)
+    nodes = [helper.make_node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]),
+             helper.make_node("Flatten", ["c"], ["flat"]),
+             helper.make_node("Gemm", ["flat", "fw"], ["y"], transB=1)]
+    outputs = [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3])]
+    if also_output:
+        outputs.insert(0, helper.make_tensor_value_info("flat", TensorProto.FLOAT, [1, 120]))
+    model = helper.make_model(helper.make_graph(
+        nodes, "flatten", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2, 6, 4])], outputs,
+        [numpy_helper.from_array(rng.normal(size=(5, 2, 3, 3)).astype(np.float32), "w"),
+         numpy_helper.from_array(rng.normal(size=(3, 120)).astype(np.float32), "fw")]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    source = tmp_path / "flatten.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "flatten.tgrs"
+    assert CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)]).exit_code == 0
+    x = rng.uniform(-1, 1, (1, 2, 6, 4)).astype(np.float32)
+    session = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"])
+    expected = dict(zip([o.name for o in outputs], session.run(None, {"x": x})))
+    with Session(plan) as runtime_session:
+        actual = runtime_session.run({"x": x.transpose(0, 2, 3, 1)})
+    for name, value in expected.items():
+        np.testing.assert_allclose(actual[name].reshape(value.shape), value, rtol=1e-5, atol=1e-5)

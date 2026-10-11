@@ -342,6 +342,9 @@ def _flattened_into_a_product(ag: AnalyzedGraph, op: OpNode) -> bool:
     # axis; a reshape that also regroups rows is not a flatten it can absorb.
     if len(source.shape) not in (3, 4) or vector.shape[0] != source.shape[0]:
         return False
+    # A model output is read in the model's order, which no weight absorbs.
+    if op.outputs[0] in ag.model_outputs:
+        return False
     readers = [
         other for other in ag.ops
         if op.outputs[0] in other.inputs and other is not op
@@ -408,6 +411,24 @@ def _reshape_keeps_its_order(ag: AnalyzedGraph, op: OpNode) -> bool:
     second = serialized_shape(tuple(dst.shape), dst.layout)
     return (bool(first) and bool(second)
             and first[0] == second[0] and first[-1] == second[-1])
+
+
+def _transposes_to_storage_order(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """A rank-3 or rank-4 Transpose whose permutation is its spatial operand's
+    channels-last storage order."""
+    if op.op_type != "Transpose" or len(op.inputs) != 1 or len(op.outputs) != 1:
+        return False
+    source = ag.tensors.get(op.inputs[0])
+    if source is None or source.is_constant or source.layout is not Layout.SPATIAL:
+        return False
+    rank = len(source.shape)
+    if rank not in (3, 4):
+        return False
+    stored = serialized_axis_map(rank, Layout.SPATIAL)
+    order = [0] * rank
+    for raw_axis, stored_axis in enumerate(stored):
+        order[stored_axis] = raw_axis
+    return [int(axis) for axis in op.attrs.get("perm", [])] == order
 
 
 def _required_layout(ag: AnalyzedGraph, op: OpNode) -> Layout | None:
@@ -515,6 +536,10 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
     converted: dict[tuple[str, Layout], str] = {}
     rewritten: list[OpNode] = []
     counter = 0
+    readers: dict[str, list[OpNode]] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            readers.setdefault(name, []).append(op)
 
     for op in ag.ops:
         required = _required_layout(ag, op)
@@ -563,6 +588,15 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
                 if info is not None and not info.is_constant:
                     produced = info.layout
                     break
+        if (produced is Layout.SPATIAL and _transposes_to_storage_order(ag, op)
+                and op.outputs[0] not in ag.model_outputs
+                and all(_required_layout(ag, reader) is not Layout.SPATIAL
+                        for reader in readers.get(op.outputs[0], []))):
+            # A Transpose to channels-last order writes the input's own stored
+            # order, so held as stated it is a copy, and what reads it, such
+            # as a flatten into a matrix product, sees the elements in the
+            # order the model sums them.
+            produced = Layout.LINEAR
         for name in op.outputs:
             info = ag.tensors.get(name)
             if info is not None:
