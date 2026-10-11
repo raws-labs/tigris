@@ -12,6 +12,7 @@ from tigris.analysis.validation import (
     validate_execution_dtype,
     validate_operator_support,
 )
+from tigris.inspection import inspect_file
 from tigris.cli import _run_pipeline, cli
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, Stage, TensorInfo, TilePlan
@@ -795,8 +796,9 @@ def test_operator_from_another_domain_is_not_the_standard_one(tmp_path):
     assert not output.exists()
 
 
-def test_grouped_convolution_is_rejected_at_compile_time(tmp_path):
-    """group=2 over four channels is neither ordinary nor depthwise; the runtime has no kernel."""
+def test_grouped_convolution_compiles_as_one_convolution_per_group(tmp_path):
+    """group=2 over four channels is neither ordinary nor depthwise: a Split,
+    one convolution per group and a Concat."""
     weight = np.ones((4, 2, 1, 1), dtype=np.float32)
     graph = helper.make_graph(
         [helper.make_node("Conv", ["input", "weight"], ["output"], name="grouped", group=2)],
@@ -809,13 +811,13 @@ def test_grouped_convolution_is_rejected_at_compile_time(tmp_path):
     onnx.checker.check_model(model)
     path = tmp_path / "grouped_conv.onnx"
     onnx.save(model, path)
-    output = tmp_path / "should-not-exist.tgrs"
+    output = tmp_path / "grouped_conv.tgrs"
 
     result = CliRunner().invoke(cli, ["compile", str(path), "-m", "4K", "-o", str(output)])
 
-    assert result.exit_code != 0
-    assert "group=2 is not implemented" in result.output
-    assert not output.exists()
+    assert result.exit_code == 0, result.output
+    plan = inspect_file(output)["plan"]
+    assert [op["type"] for op in plan["ops"]] == ["Split", "Conv", "Conv", "Concat"]
 
 
 @pytest.mark.parametrize("pools", [["-m", "16K", "-m", "1M", "-m", "1"], ["-m", "16K+1M+1"]])

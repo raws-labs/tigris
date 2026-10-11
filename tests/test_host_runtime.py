@@ -473,3 +473,38 @@ def test_auto_pad_matches_onnx_runtime(tmp_path, op_type, auto_pad, stride, size
     with Session(plan) as session:
         actual = session.run({"x": x.transpose(0, 2, 3, 1)})["y"].transpose(0, 3, 1, 2)
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("group, out_channels, rank", [(2, 4, 4), (4, 8, 4), (2, 6, 3)])
+def test_grouped_convolutions_match_onnx_runtime(tmp_path, group, out_channels, rank):
+    """A grouped convolution that is not depthwise runs as one per group."""
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper, numpy_helper
+
+    rng = np.random.default_rng(9)
+    channels = 8
+    spatial = [7, 6] if rank == 4 else [11]
+    kernel = [3] * (rank - 2)
+    weight = rng.normal(size=(out_channels, channels // group, *kernel)).astype(np.float32)
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node("Conv", ["x", "w", "b"], ["y"], group=group, pads=[1] * (2 * (rank - 2)),
+                          strides=[2] * (rank - 2))], "grouped",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, channels, *spatial])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
+        [numpy_helper.from_array(weight, "w"),
+         numpy_helper.from_array(rng.normal(size=out_channels).astype(np.float32), "b")]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    model = onnx.shape_inference.infer_shapes(model)
+    source = tmp_path / "grouped.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / "grouped.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    x = rng.uniform(-1, 1, (1, channels, *spatial)).astype(np.float32)
+    expected = ort.InferenceSession(str(source), providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+    order = (0, *range(2, rank), 1)
+    with Session(plan) as session:
+        actual = session.run({"x": x.transpose(order)})["y"]
+    np.testing.assert_allclose(actual.transpose(np.argsort(order)), expected, rtol=1e-5, atol=1e-5)
