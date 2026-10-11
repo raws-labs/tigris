@@ -804,3 +804,20 @@ def test_a_float_whole_map_average_pool_carries_no_rounding(tmp_path):
 
 def test_an_int8_global_average_pool_stays_a_mean(tmp_path):
     assert _pool_rounding_records(tmp_path, "GlobalAveragePool", quantized=True) == []
+
+
+@pytest.mark.parametrize("name, constants", [("vww_96_int8.tflite", 0),
+                                             ("ops/add_constant_channels.tflite", 1)])
+def test_quantization_entries_are_only_those_the_plan_reads(name, constants):
+    """Convolution weights and biases need no entry: their scales are folded
+    into the effective scale of the activation they produce."""
+    from tigris.cli import _run_pipeline
+    from tigris.emitters.binary.writer import _build_quant_params
+
+    graph, _ = _run_pipeline(str(Path(__file__).parent / "fixtures" / "tflite" / name), ("256K",),
+                             report_bindings=False)
+    _, index = _build_quant_params(graph)
+    activations = {n for n, t in graph.tensors.items() if t.quant is not None and not t.is_constant}
+    assert activations <= set(index)
+    assert len(set(index) - activations) == constants
+    assert all(graph.tensors[n].quant is not None for n in index)
