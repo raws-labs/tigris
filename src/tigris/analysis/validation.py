@@ -902,6 +902,11 @@ def untiled_stage_spill(
             return 0
         return (info.size_bytes + align - 1) & ~(align - 1)
 
+    def root(name: str) -> str:
+        while name in alias:
+            name = alias[name]
+        return name
+
     ops = [ag.ops[i] for i in stage.op_indices]
     outputs = set(stage.output_tensors)
     last_use: dict[str, int] = {}
@@ -909,6 +914,24 @@ def untiled_stage_spill(
         for name in op.inputs:
             if name in ag.tensors and not ag.tensors[name].is_constant:
                 last_use[name] = position
+    # An output nothing in the stage reads dies where it is written.
+    for position, op in enumerate(ops):
+        for name in op.outputs:
+            if name in ag.tensors and name not in last_use:
+                last_use[name] = position
+    # A reshape that moves no byte shares its source's buffer, so the group
+    # dies at its last read, and survives the stage with any member that does.
+    group_last: dict[str, int] = {}
+    for name, position in last_use.items():
+        group_last[root(name)] = max(group_last.get(root(name), position), position)
+    kept = {root(name) for name in outputs}
+
+    # The runtime keeps a stage within its serialized working set even when
+    # the arena is larger.
+    peak = stage.peak_bytes
+    if stage.tile_plan is not None and stage.tile_plan.tileable:
+        peak = stage.tile_plan.tiled_peak_bytes
+    capacity = peak if 0 < peak < fast_total else fast_total
 
     live: dict[str, int] = {}
     for name in dict.fromkeys(stage.input_tensors):
@@ -924,7 +947,7 @@ def untiled_stage_spill(
                 placed.add(name)
                 continue
             size = sized(name)
-            if sum(live.values()) + size <= fast_total:
+            if sum(live.values()) + size <= capacity:
                 live[name] = size
             elif name not in outputs:
                 # A stage output that lands in slow is already counted as a
@@ -932,9 +955,10 @@ def untiled_stage_spill(
                 # stage leaves behind are extra.
                 spilled += size
             placed.add(name)
-        for name in op.inputs:
-            if last_use.get(name) == position and name not in outputs:
-                live.pop(name, None)
+        for name in [*op.inputs, *op.outputs]:
+            group = root(name)
+            if group_last.get(group) == position and group not in kept:
+                live.pop(group, None)
     return spilled
 
 
