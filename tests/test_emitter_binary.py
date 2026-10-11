@@ -821,3 +821,32 @@ def test_quantization_entries_are_only_those_the_plan_reads(name, constants):
     assert activations <= set(index)
     assert len(set(index) - activations) == constants
     assert all(graph.tensors[n].quant is not None for n in index)
+
+
+def test_attribute_payloads_start_four_byte_aligned(tmp_path):
+    """A three-byte transpose permutation ahead of a Pad's int32 pads must not
+    leave the pads at an offset the loader refuses."""
+    from tigris.cli import _run_pipeline
+    from tigris.emitters.binary.defs import (OP_ATTR_PADS, OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
+                                             OP_ATTRIBUTE_STRUCT)
+    from tigris.emitters.binary.writer import _build_op_attributes
+
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node("Transpose", ["input"], ["moved"], perm=[0, 2, 1]),
+         helper.make_node("Pad", ["moved", "pads"], ["output"])],
+        "aligned", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 5])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 7, 3])],
+        [numpy_helper.from_array(np.array([0, 1, 0, 0, 1, 0], dtype=np.int64), "pads")]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    path = tmp_path / "aligned.onnx"
+    onnx.save(model, path)
+    graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
+    tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
+    section = _build_op_attributes(graph, tensor_idx)
+    count, _ = OP_ATTRIBUTE_SECTION_HEADER_STRUCT.unpack_from(section)
+    entries = [OP_ATTRIBUTE_STRUCT.unpack_from(section, OP_ATTRIBUTE_SECTION_HEADER_STRUCT.size
+                                               + k * OP_ATTRIBUTE_STRUCT.size) for k in range(count)]
+    assert any(entry[1] == OP_ATTR_PADS for entry in entries)
+    assert any(entry[2] % 4 for entry in entries), "the case needs a payload of odd length"
+    assert all(entry[3] % 4 == 0 for entry in entries)
