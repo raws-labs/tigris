@@ -3183,7 +3183,9 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
     """
     reductions = {"ReduceMean": "GlobalAveragePool", "ReduceMax": "GlobalMaxPool"}
 
+    ops: list[OpNode] = []
     for op in ag.ops:
+        ops.append(op)
         if op.op_type not in reductions:
             continue
 
@@ -3215,10 +3217,22 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
         if rank != 4 or axes_norm not in ({2, 3}, {1, 2}):
             continue
 
-        if op.op_type == "ReduceMax" and (axes_norm != {2, 3} or int(op.attrs.get("keepdims", 1)) != 1):
+        kept = int(op.attrs.get("keepdims", 1)) == 1
+        if op.op_type == "ReduceMax" and (axes_norm != {2, 3} or not kept):
             continue
         op.op_type = reductions[op.op_type]
         op.attrs = {}
+        if not kept:
+            # The pool keeps rank 4; with both reduced axes at 1, a Flatten
+            # from axis 1 gives the [N, C] the reduction produced.
+            result = ag.tensors[op.outputs[0]]
+            pooled = _fresh_name(ag, f"{op.outputs[0]}_pooled")
+            shape = tuple(1 if axis in axes_norm else dim for axis, dim in enumerate(source.shape))
+            ag.tensors[pooled] = TensorInfo(name=pooled, shape=shape, dtype=result.dtype,
+                                            quant=result.quant)
+            ops.append(OpNode(name=f"{op.name}_flatten", op_type="Flatten", inputs=[pooled],
+                              outputs=[op.outputs[0]], attrs={"axis": 1}))
+            op.outputs = [pooled]
 
         # Remove axes input and clean up axes tensor
         if len(op.inputs) >= 2:
@@ -3229,6 +3243,7 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
             if axes_name in ag.tensors:
                 del ag.tensors[axes_name]
 
+    ag.ops = ops
     return ag
 
 
