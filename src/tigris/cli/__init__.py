@@ -176,7 +176,7 @@ def _show_version(ctx, param, value):
 @click.option("--version", is_flag=True, is_eager=True, expose_value=False,
               callback=_show_version, help="Show compiler and host runtime versions and runtime origin.")
 def cli():
-    """TiGrIS - Tiled Graph Inference Scheduler
+    """TiGrIS: Tiled Graph Inference Scheduler
 
     Fits ONNX and TFLite models into the memory of embedded devices: analyze a
     model against a budget, compile it into a tiled execution plan, generate

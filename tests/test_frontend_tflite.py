@@ -366,6 +366,20 @@ def test_analyze_reports_json_with_tflite_micro_arena_and_exact_plan_size(tmp_pa
     assert single["tflite_micro"]["tensor_arena_bytes"] == 512
 
 
+def test_analyze_shows_the_lz4_estimate_only_where_lz4_compiles():
+    # VWW's weights decompress to about 211 KiB for one stage, more than 32K holds.
+    model = FIXTURES / "vww_96_int8.tflite"
+    for budget, compiles in (("32K", False), ("256K", True)):
+        written = CliRunner().invoke(cli, ["compile", str(model), "-m", budget, "-m", "1M", "-c", "lz4",
+                                           "-o", os.devnull])
+        assert (written.exit_code == 0) == compiles, written.output
+        result = CliRunner().invoke(cli, ["analyze", str(model), "-m", budget, "-m", "1M"])
+        assert ("with -c lz4" in result.output) == compiles, result.output
+        report = json.loads(CliRunner().invoke(
+            cli, ["analyze", str(model), "-m", budget, "-m", "1M", "--json"]).output)
+        assert (report["flash"]["estimates"]["lz4_plan_bytes"] is not None) == compiles
+
+
 def test_flexbuffer_map_reads_scalar_options():
     from tigris.frontends.flatbuffer import flexbuffer_map
     data = bytes.fromhex(

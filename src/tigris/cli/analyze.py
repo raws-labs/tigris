@@ -118,6 +118,20 @@ def _tried(model: str, budget: int, fits: bool, input_shape) -> list[tuple[int, 
     return tried
 
 
+def _lz4_compiles(model: str, mem: tuple[str, ...], input_shape) -> bool:
+    """Whether compile -c lz4 writes a plan at these budgets: the fast arena
+    also holds each stage's decompressed weights, which can leave too little."""
+    from tigris.analysis.validation import validate_budget
+    from tigris.cli.compile import _run_compressed_pipeline
+
+    try:
+        graph, _, _, _ = _run_compressed_pipeline(model, mem, input_shape)
+    except click.ClickException:
+        return False
+    result = validate_budget(graph)
+    return result.fast.feasible and result.slow.fits
+
+
 def interface_rows(ag) -> list[list[str]]:
     """One row per input and output: label, name, then shape and dtype."""
     rows = []
@@ -176,9 +190,11 @@ def verdict_lines(findings, budget: int, slow_budget: int, stages=()) -> list[st
 
 
 def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budget: int,
-            tflm_arena: int | None, tried: list | None = None, traffic=None) -> None:
+            tflm_arena: int | None, tried: list | None = None, traffic=None,
+            lz4_tried: bool = False) -> None:
     """The header, verdict, memory and flash, shared by analyze and compile.
-    `traffic` is what trace.traffic measured; None leaves the row out."""
+    `traffic` is what trace.traffic measured; None leaves the row out. The LZ4
+    row needs `lz4_tried`: the estimate stands only where -c lz4 compiles."""
     f = findings
     dtype = "int8" if f.is_quantized else "float32" if f.is_float32 else "mixed"
     graphs = len(getattr(ag, "subgraphs", []) or [])
@@ -227,7 +243,7 @@ def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budge
             flash.append(["plan", fmt_bytes(f.plan_size_bytes),
                           text.dim(f"weights {fmt_bytes(f.total_weight_bytes)}, "
                                    f"overhead {fmt_bytes(f.plan_overhead_bytes)}")])
-            if 0 < f.lz4_plan_size_bytes < f.plan_size_bytes * 95 // 100:
+            if lz4_tried and 0 < f.lz4_plan_size_bytes < f.plan_size_bytes * 95 // 100:
                 flash.append(["with -c lz4", fmt_bytes(f.lz4_plan_size_bytes), text.dim("estimate")])
             if f.is_float32 and not f.is_quantized:
                 flash.append(["as int8", fmt_bytes(f.int8_plan_size_bytes), text.dim("estimate")])
@@ -301,6 +317,9 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     supported = not (findings.unsupported_operators or findings.dtype_errors)
     tried = (_tried(model, budget, not findings.blocking_stages, input_shape)
              if budget > 0 and supported else [])
+    if findings.lz4_plan_size_bytes and not (
+            supported and not findings.blocking_stages and _lz4_compiles(model, mem, input_shape)):
+        findings.lz4_plan_size_bytes = 0
     from tigris.cli.trace import traffic as measure_traffic
     traffic = measure_traffic(ag) if supported else None
     if as_json:
@@ -308,6 +327,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
                                       "tflite" if tflite else "onnx", tflm_arena, tried, traffic),
                               indent=2, ensure_ascii=True, allow_nan=False))
         return
-    summary(model, ag, findings, budget, slow_budget, flash_budget, tflm_arena, tried, traffic)
+    summary(model, ag, findings, budget, slow_budget, flash_budget, tflm_arena, tried, traffic,
+            lz4_tried=True)
     if verbose and ag.stages:
         _stages(ag)
