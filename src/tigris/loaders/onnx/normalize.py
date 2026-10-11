@@ -2659,18 +2659,54 @@ def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _relabel_conv1d(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Relabel Conv ops with 1D kernel_shape as Conv1D.
+    """Relabel 1D Conv ops as Conv1D, and run a 1D depthwise one as 2D.
+
+    A convolution is 1D by its kernel_shape or, when the export leaves that
+    out, by its weight's rank. Conv1D has no groups, so a 1D DepthwiseConv runs
+    as a 2D one over a height of one: [N, C, L] and [N, C, 1, L] are the same
+    bytes in channels-last storage, and two Reshapes carry the tensor across.
 
     Must run after BN fold (which only matches Conv->BN, not Conv1D->BN)
     and after depthwise relabeling (which already changed group==C_in convs).
     """
+    rewritten: list[OpNode] = []
     for op in ag.ops:
-        if op.op_type != "Conv":
+        rewritten.append(op)
+        if op.op_type not in ("Conv", "DepthwiseConv"):
             continue
-        ks = op.attrs.get("kernel_shape", [])
-        if len(ks) == 1:
+        weight = ag.weight_data.get(op.inputs[1]) if len(op.inputs) > 1 else None
+        kernel = op.attrs.get("kernel_shape")
+        one_dimensional = len(kernel) == 1 if kernel is not None else weight is not None and weight.ndim == 3
+        if not one_dimensional:
+            continue
+        if op.op_type == "Conv":
             op.op_type = "Conv1D"
-
+            continue
+        source, result = ag.tensors[op.inputs[0]], ag.tensors[op.outputs[0]]
+        if len(source.shape) != 3 or len(result.shape) != 3 or weight is None:
+            continue
+        flat = _fresh_name(ag, f"{op.inputs[1]}_2d")
+        ag.weight_data[flat] = weight.reshape(weight.shape[0], weight.shape[1], 1, weight.shape[2])
+        ag.tensors[flat] = replace(ag.tensors[op.inputs[1]], name=flat, shape=ag.weight_data[flat].shape)
+        wide_in = _fresh_name(ag, f"{op.inputs[0]}_2d")
+        wide_out = _fresh_name(ag, f"{op.outputs[0]}_2d")
+        ag.tensors[wide_in] = replace(source, name=wide_in, shape=(*source.shape[:2], 1, source.shape[2]))
+        ag.tensors[wide_out] = replace(result, name=wide_out, shape=(*result.shape[:2], 1, result.shape[2]))
+        pads = [int(p) for p in op.attrs.get("pads", [0, 0])]
+        op.attrs = {**op.attrs,
+                    "kernel_shape": [1, int(weight.shape[2])],
+                    "strides": [1, *[int(v) for v in op.attrs.get("strides", [1])]],
+                    "dilations": [1, *[int(v) for v in op.attrs.get("dilations", [1])]],
+                    "pads": [0, pads[0], 0, pads[1]]}
+        rewritten[-1:] = [
+            OpNode(name=f"{op.name}_to_2d", op_type="Reshape", inputs=[op.inputs[0]], outputs=[wide_in]),
+            op,
+            OpNode(name=f"{op.name}_to_1d", op_type="Reshape", inputs=[wide_out], outputs=[op.outputs[0]])]
+        op.inputs = [wide_in, flat, *op.inputs[2:]]
+        op.outputs = [wide_out]
+    ag.ops = rewritten
+    for step, op in enumerate(ag.ops):
+        op.step = step
     return ag
 
 
