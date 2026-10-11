@@ -1182,7 +1182,7 @@
     },
     {
       "constraints": [
-        "float32 to a per-tensor int8 encoding as TFLite Micro's QUANTIZE; only where an int8 plan keeps a control-flow boundary in float32; untiled"
+        "float32, or int8 in another encoding, to a per-tensor int8 encoding as TFLite Micro's QUANTIZE; float32 only where an int8 plan keeps a control-flow boundary in float32; untiled"
       ],
       "opcode": 90,
       "operator": "Quantize",
