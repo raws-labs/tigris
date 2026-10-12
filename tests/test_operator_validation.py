@@ -751,7 +751,21 @@ def test_elementwise_without_int8_kernel_rejects_quantized_plans(kind):
         tensors={name: TensorInfo(name, (1, 4), 3, quant=quant) for name in ("a", "b", "y")},
         is_quantized=True,
     )
-    assert "no s8_ref runtime kernel" in validate_operator_support(ag).describe()
+    assert f"{kind} has no int8 kernel in the runtime" in validate_operator_support(ag).describe()
+
+
+def test_an_operator_without_a_float32_kernel_names_the_dtype(monkeypatch):
+    # Every operator has a float32 kernel today; take Relu's away.
+    from tigris.analysis import validation
+    from tigris.capabilities import effective_operators
+    monkeypatch.setattr(validation, "effective_operators", lambda backend: (
+        effective_operators(backend) - {"Relu"} if backend == "reference"
+        else effective_operators(backend)))
+    ag = AnalyzedGraph(
+        ops=[OpNode(name="op", op_type="Relu", inputs=["a"], outputs=["y"])],
+        tensors={name: TensorInfo(name, (1, 4), 1) for name in ("a", "y")},
+    )
+    assert "Relu has no float32 kernel in the runtime" in validate_operator_support(ag).describe()
 
 
 @pytest.mark.parametrize("kind", ["Abs", "Rsqrt", "SquaredDifference", "Max", "Min", "Div"])
@@ -1123,6 +1137,84 @@ def test_auxiliary_dtype_placement_and_operator_slots(monkeypatch):
     assert check_dtype_signatures(tensors, [("Relu", ["p"], ["y"])], ["p"], ["y"])[1]
     assert check_dtype_signatures(tensors, [("choose", ["x", "p", "x"], ["y"])], ["x"], ["y"])[1]
     assert check_dtype_signatures([("p", 9, False, True)], [], ["p"], ["p"])[1]
+
+
+def test_a_layout_step_that_changes_the_dtype_names_both():
+    from tigris.dtypes import check_dtype_signatures
+    tensors = [("x", 3, False, True), ("y", 1, False, False), ("i", 6, False, False),
+               ("j", 6, False, False)]
+    _, issues = check_dtype_signatures(tensors, [("Reshape", ["x"], ["y"])], ["x"], ["y"])
+    assert "Reshape reads int8 and writes float32; it has to keep the dtype" in issues
+    _, issues = check_dtype_signatures(tensors, [("Reshape", ["i"], ["j"])], ["i"], ["j"])
+    assert ("Reshape input 0 (i) requires float32, int8 or bool, got ONNX dtype 6"
+            in issues)
+
+
+def test_add_operands_and_output_are_named_by_the_operator():
+    two = AnalyzedGraph(
+        ops=[OpNode(name="add", op_type="Add", inputs=["a", "b", "c"], outputs=["y"])],
+        tensors={name: TensorInfo(name, (1, 4), 1) for name in ("a", "b", "c", "y")},
+    )
+    assert "Add takes exactly two operands" in validate_operator_support(two).describe()
+    unknown = AnalyzedGraph(
+        ops=[OpNode(name="add", op_type="Add", inputs=["a", "b"], outputs=["y"])],
+        tensors={name: TensorInfo(name, (1, 4), 1) for name in ("a", "b")},
+    )
+    assert ("Add needs one output with a known shape"
+            in validate_operator_support(unknown).describe())
+
+
+def _refusal(ops, tensors, weights=None):
+    ag = AnalyzedGraph(ops=ops, tensors=tensors, weight_data=weights or {})
+    return validate_operator_support(ag).describe()
+
+
+def _floats(*names, shape=(1, 4, 3)):
+    return {name: TensorInfo(name, shape, 1) for name in names}
+
+
+@pytest.mark.parametrize("kind, inputs, message", [
+    ("Abs", ["a", "b"], "Abs takes one operand that is not a constant and gives one output"),
+    ("Div", ["a"], "Div takes two operands that are not constants and gives one output"),
+])
+def test_elementwise_operand_count_is_named_by_the_operator(kind, inputs, message):
+    op = OpNode(name="op", op_type=kind, inputs=inputs, outputs=["y"])
+    assert message in _refusal([op], _floats("a", "b", "y"))
+
+
+def test_axis_reductions_name_the_operator():
+    arg = OpNode(name="op", op_type="ArgMax", inputs=["a"], outputs=["y"], attrs={"axes": [0, 1]})
+    assert "ArgMax needs one input of rank 1 to 6 and one constant axis" in _refusal(
+        [arg], _floats("a", "y"))
+    reduce = OpNode(name="op", op_type="ReduceMax", inputs=["a"], outputs=["y"], attrs={"axes": [1]})
+    assert "ReduceMax needs one rank-3 input and one constant axis" in _refusal(
+        [reduce], _floats("a", "y", shape=(1, 4)))
+
+
+def test_softmax_of_a_scalar_names_the_operator():
+    op = OpNode(name="op", op_type="Softmax", inputs=["a"], outputs=["y"])
+    assert "Softmax needs one input with a known shape that is not a scalar" in _refusal(
+        [op], _floats("a", "y", shape=()))
+
+
+def test_layer_normalization_without_a_scale_is_refused_by_name():
+    op = OpNode(name="op", op_type="LayerNormalization", inputs=["a"], outputs=["y"])
+    assert "LayerNormalization needs a constant scale and an optional constant bias" in _refusal(
+        [op], _floats("a", "y"))
+
+
+def test_a_constant_operand_without_a_tensor_operand_is_refused_by_name():
+    op = OpNode(name="op", op_type="Div", inputs=["a", "w"], outputs=["y"])
+    tensors = {"w": TensorInfo("w", (1,), 1, is_constant=True), **_floats("y")}
+    assert ("Div takes one operand that is not a constant and at most one constant"
+            in _refusal([op], tensors, {"w": np.ones(1, np.float32)}))
+
+
+def test_sum_of_unequal_shapes_is_refused_by_name():
+    op = OpNode(name="op", op_type="Sum", inputs=["a", "b"], outputs=["y"])
+    tensors = {**_floats("a", "y"), **_floats("b", shape=(1, 4, 1))}
+    assert "Sum needs inputs and an output of one shape, none of them constant" in _refusal(
+        [op], tensors)
 
 
 def test_int32_operands_of_an_operator_go_together():

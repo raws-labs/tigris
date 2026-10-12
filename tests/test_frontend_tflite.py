@@ -318,6 +318,16 @@ def _read_edited(monkeypatch, name, edit):
     return tflite.unsupported(data)
 
 
+@pytest.mark.parametrize("weights, advice", [("INT8", True), ("INT16", False)])
+def test_dynamic_range_weights_name_the_conversion(monkeypatch, weights, advice):
+    def quantize_weights(tensors, operators):
+        tensors[operators[0].inputs[1]].type = weights
+    reasons = _read_edited(monkeypatch, "float_conv_bias", quantize_weights)
+    refusal = next(r for r in reasons if "must be constant float32" in r)
+    hint = "; convert to full int8 or to float32 without dynamic-range quantization"
+    assert refusal.endswith(hint) is advice
+
+
 def test_run_time_indices_come_from_a_model_input_or_an_arg_max(monkeypatch):
     """Indices stay positions: an index tensor feeds only index operands, and
     indices computed at run time come from ARG_MAX or ARG_MIN."""
