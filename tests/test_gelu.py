@@ -36,9 +36,13 @@ def gelu_model(shape, approximate, form):
                       helper.make_node("Add", ["input", "term"], ["polynomial"]),
                       helper.make_node("Mul", ["polynomial", "root_two_pi"], ["scaled"]),
                       helper.make_node("Tanh", ["scaled"], ["activation"])]
-        nodes += [helper.make_node("Add", ["activation", "one"], ["gate"]),
-                  helper.make_node("Mul", ["input", "half"], ["halved"]),
-                  helper.make_node("Mul", ["gate", "halved"], ["output"])]
+        nodes.append(helper.make_node("Add", ["activation", "one"], ["gate"]))
+        if form == "erf_last_half":
+            nodes += [helper.make_node("Mul", ["input", "gate"], ["gated"]),
+                      helper.make_node("Mul", ["gated", "half"], ["output"])]
+        else:
+            nodes += [helper.make_node("Mul", ["input", "half"], ["halved"]),
+                      helper.make_node("Mul", ["gate", "halved"], ["output"])]
     graph = helper.make_graph(nodes, "gelu", [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
                               [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
                               [numpy_helper.from_array(np.array(value, np.float32), name)
@@ -50,7 +54,8 @@ def gelu_model(shape, approximate, form):
 
 @pytest.mark.parametrize("shape", [(7, 31), (1, 4, 33), (2, 3, 5, 7)])
 @pytest.mark.parametrize("approximate,form", [("none", "native"), ("tanh", "native"),
-                                             ("none", "erf"), ("tanh", "pow"), ("tanh", "mul")])
+                                             ("none", "erf"), ("none", "erf_last_half"),
+                                             ("tanh", "pow"), ("tanh", "mul")])
 def test_onnx_gelu_forms_match_tiled_and_untiled(shape, approximate, form, tmp_path):
     model = gelu_model(shape, approximate, form)
     source = tmp_path / "model.onnx"
