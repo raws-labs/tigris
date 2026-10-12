@@ -2464,6 +2464,26 @@ def _reduce_mean_case(*, quantized: bool, keepdims: bool) -> ContractCase:
     )
 
 
+def _nonadjacent_mean_case(suffix: str) -> ContractCase:
+    from tigris.frontends import tflite
+
+    path = Path(__file__).resolve().parents[1] / "tests/fixtures/tflite/ops" / f"float_mean_nonadjacent_{suffix}.tflite"
+    model = tflite.to_onnx(path.read_bytes(), path.stem)
+    samples = np.load(path.with_suffix(".npz"))
+    x = samples["input_0"][0]
+    native = x.transpose(0, x.ndim - 1, *range(1, x.ndim - 1))
+    axes = [0, 1] if x.ndim == 3 else [1, 2]
+    keep = suffix in {"keep", "negative"}
+    reference = _model(path.stem + "_reference", [helper.make_node(
+        "ReduceMean", [model.graph.input[0].name], [model.graph.output[0].name],
+        axes=axes, keepdims=int(keep))], list(model.graph.input), list(model.graph.output))
+    budget = "2K" if suffix == "keep" else "512" if suffix == "tokens" else "1536"
+    transposes = 2 if suffix == "tokens" else 4 + int(keep)
+    expected = ("Transpose",) * transposes + ("Reshape", "ReduceMean", "Reshape")
+    return ContractCase(path.stem, model, reference, {model.graph.input[0].name: native},
+                        expected, mem_budget=budget, expect_tiled=True)
+
+
 def _head_permutation_case() -> ContractCase:
     """The permutation that moves an attention block into its head layout.
 
@@ -7519,6 +7539,7 @@ def _assert_runtime_rejects_incompatible_plan(
 
 def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
+        *[_nonadjacent_mean_case(s) for s in ("tokens", "keep", "image", "negative")],
         _linear_spatial_max_case(quantized=False),
         _linear_spatial_max_case(quantized=True),
         *[_movement_case(kind, q, variant, tiled=True)
