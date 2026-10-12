@@ -39,6 +39,7 @@ from .defs import (
     NO_QUANT_PARAM,
     NO_WEIGHT,
     OP_ATTR_AXES,
+    OP_ATTR_GELU_APPROXIMATE,
     OP_ATTR_CUMSUM_OPTIONS,
     OP_ATTR_MOVEMENT,
     OP_ATTR_COMPARISON_REQUANT,
@@ -1059,6 +1060,12 @@ def _build_op_attributes(
             if payload is not None:
                 records.append((op_index, OP_ATTR_BINARY_REQUANT, payload))
             continue
+        if op.op_type == "Gelu":
+            mode = op.attrs.get("approximate", "none")
+            if isinstance(mode, bytes):
+                mode = mode.decode("ascii")
+            records.append((op_index, OP_ATTR_GELU_APPROXIMATE,
+                            bytes([("none", "tanh").index(mode)])))
         if op.op_type == "GlobalAveragePool":
             if op.attrs.get("pool_rounding") == "average":
                 records.append((

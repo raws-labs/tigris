@@ -1053,12 +1053,60 @@ def generate_model(name: str) -> None:
     print(f"{name}: {len(model)} bytes")
 
 
+GELU_REFERENCE = {
+    "gelu": _unary(lambda x: tf.nn.gelu(x), (1, 6, 6, 4)),
+    "gelu_approximate": _unary(lambda x: tf.nn.gelu(x, approximate=True), (1, 6, 6, 4)),
+    "gelu_wide": _unary(lambda x: tf.nn.gelu(x), (1, 32, 256)),
+    "gelu_approximate_offset": _unary(lambda x: tf.nn.gelu(x, approximate=True), (1, 32, 256)),
+    "float_gelu": _unary(lambda x: tf.nn.gelu(x), (1, 6, 6, 4)),
+    "float_gelu_approximate": _unary(lambda x: tf.nn.gelu(x, approximate=True), (1, 6, 6, 4)),
+    "float_gelu_wide": _unary(lambda x: tf.nn.gelu(x), (1, 32, 256)),
+    "float_gelu_approximate_wide": _unary(lambda x: tf.nn.gelu(x, approximate=True), (1, 32, 256)),
+}
+CASES.update(GELU_REFERENCE)
+FLOAT_MODELS.update({name: case for name, case in GELU_REFERENCE.items() if name.startswith("float_")})
+RANGES.update({"gelu_wide": [(-4.0, 16.0)], "gelu_approximate_offset": [(-8.0, 4.0)]})
+
+
+def generate_gelu(name: str) -> None:
+    """Record GELU with BUILTIN_REF, since TFLite Micro does not register it."""
+    rng = np.random.default_rng(sum(name.encode()))
+    shapes, fn = GELU_REFERENCE[name]
+    ranges = RANGES.get(name, [(-3.0, 3.0)])
+    model = _convert(fn, shapes, ranges, rng, quantize=name not in FLOAT_MODELS)
+    interpreter = tf.lite.Interpreter(
+        model_content=model,
+        experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
+    interpreter.allocate_tensors()
+    details = interpreter.get_input_details()[0]
+    if name in FLOAT_MODELS:
+        inputs = _inputs(details, rng)
+    else:
+        # Every code is exercised, including the rounding transitions and tails.
+        inputs = np.resize(np.arange(-128, 128, dtype=np.int8), (SAMPLES, *details["shape"]))
+    outputs = []
+    for value in inputs:
+        interpreter.set_tensor(details["index"], value)
+        interpreter.invoke()
+        outputs.append(interpreter.get_tensor(interpreter.get_output_details()[0]["index"]).copy())
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / f"{name}.tflite").write_bytes(model)
+    np.savez_compressed(OUT / f"{name}.npz", input_0=inputs, output_0=np.stack(outputs),
+                        reference=np.array("TFLite BUILTIN_REF"))
+    print(f"{name}: {len(model)} bytes, TFLite BUILTIN_REF")
+
+
 def main(names: list[str]) -> None:
     if names == ["--models"]:
         for name in REFERENCE_MODELS:
             generate_model(name)
         return
-    deviations = [name for name in names or sorted({*CASES, *HANDMADE}) if generate(name)]
+    deviations = []
+    for name in names or sorted({*CASES, *HANDMADE}):
+        if name in GELU_REFERENCE:
+            generate_gelu(name)
+        elif generate(name):
+            deviations.append(name)
     if deviations:
         print("recorded from the reference kernels: " + ", ".join(deviations))
     print(f"tensorflow {tf.__version__}, tflite-micro {version('tflite-micro')}")

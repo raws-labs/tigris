@@ -90,8 +90,15 @@ def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_pat
                 got = produced[session.outputs[position]["name"]]
                 assert got.shape == tuple(tensor.shape)
                 assert got.dtype == golden[f"output_{position}"].dtype
-                np.testing.assert_array_equal(got, golden[f"output_{position}"][sample],
-                                              err_msg=f"sample {sample}, output {position}")
+                expected = golden[f"output_{position}"][sample]
+                if ("reference" in golden and golden["reference"].item() == "TFLite BUILTIN_REF"
+                        and expected.dtype == np.float32):
+                    tolerance = 4 * np.finfo(np.float32).eps * float(np.max(np.abs(expected)))
+                    np.testing.assert_allclose(got, expected, rtol=0, atol=tolerance,
+                                               err_msg=f"sample {sample}, output {position}")
+                else:
+                    np.testing.assert_array_equal(got, expected,
+                                                  err_msg=f"sample {sample}, output {position}")
 
 
 def test_plan_reproduces_tflite_micro_outputs(tmp_path):

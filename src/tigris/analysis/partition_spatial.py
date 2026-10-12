@@ -81,6 +81,7 @@ _OP_CATEGORY: dict[str, TileCategory] = {
     # normalization rows and needs nothing from its neighbours: the same
     # argument that admits Softmax.
     "Erf": TileCategory.POINTWISE,
+    "Gelu": TileCategory.POINTWISE,
     "HardSwish": TileCategory.POINTWISE,
     "Quantize": TileCategory.POINTWISE,
     "Dequantize": TileCategory.POINTWISE,
@@ -152,6 +153,7 @@ _RANK3_AXIS1_UNARY_OPS = frozenset({
     "LogSoftmax",
     "L2Normalization",
     "Erf",
+    "Gelu",
     "HardSwish",
     "Abs",
     "Rsqrt",
@@ -612,6 +614,7 @@ _ROW_TILING_OPS = frozenset({
     "Sigmoid",
     "Tanh",
     "Erf",
+    "Gelu",
     "HardSwish",
     "Abs",
     "Rsqrt",
