@@ -674,7 +674,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         return f"fused {_activation(op.option(0, 'b'))}"
     if op.kind in _REDUCTIONS or op.kind == "MEAN":
         axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
-        if not axes or axes != list(range(axes[0], axes[-1] + 1)):
+        if not axes or (op.kind != "MEAN" and axes != list(range(axes[0], axes[-1] + 1))):
             return "axes that are not adjacent"
     if op.kind == "SOFTMAX" and op.option(0, "f", 1.0) != 1.0:
         return "beta other than 1"
@@ -1491,17 +1491,31 @@ class _Converter:
         return b.node("Div", [x, norm], tag)
 
     def _reduction(self, op: _Operator, tag: str) -> str:
-        """A reduction or prefix sum over adjacent axes, run on the three axes
-        [before, reduced, after] of the TFLite shape and reshaped back."""
+        """Group mean axes without reordering a sum, then reduce the three
+        axes [before, reduced, after] and restore the TFLite output shape."""
         b = self.b
         ins, source = op.inputs, self.tensors[op.inputs[0]]
         out = self.tensors[op.outputs[0]]
         shape = list(source.shape)
         axes = sorted({a % len(shape) for a in self.ints(ins[1])})
+        x = self.value(ins[0])
+        if axes != list(range(axes[0], axes[-1] + 1)):
+            # Keep both sets in their original order so each sum visits the
+            # same elements in the same sequence as TFLite.
+            kept_axes = [a for a in range(len(shape)) if a not in axes]
+            perm = kept_axes + axes
+            x = self.last_to_last(x, len(shape), tag + "_last", ins[0], True)
+            x = self.held(b.node("Transpose", [x], tag + "_grouped", perm=perm),
+                          ins[0], tag + "_grouped_q")
+            grouped = [shape[a] for a in perm]
+            if not _layout_free(grouped):
+                x = self.held(b.node("Transpose", [x], tag + "_first",
+                                    perm=_to_first(len(shape))), ins[0], tag + "_first_q")
+            axes = list(range(len(kept_axes), len(shape)))
+            shape = grouped
         first, last = axes[0], axes[-1] + 1
         rows = [int(np.prod(shape[:first])), int(np.prod(shape[first:last])),
                 int(np.prod(shape[last:]))]
-        x = self.value(ins[0])
         if rows != shape:
             x = self.held(self.reshape(x, shape, rows, tag + "_rows", ins[0]), ins[0],
                           tag + "_rows_q")
