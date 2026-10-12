@@ -606,7 +606,12 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         data = [ins[source]]
         if data[0].type == "FLOAT32":
             if weights.type != "FLOAT32" or not _is_constant(weights):
-                return "weights of a float32 operator must be constant float32"
+                reason = "weights of a float32 operator must be constant float32"
+                if weights.type == "INT8" and _is_constant(weights):
+                    # Dynamic-range quantization: int8 weights, float activations.
+                    reason += ("; convert to full int8 or to float32 without dynamic-range "
+                               "quantization")
+                return reason
             if bias is not None and bias.type != "FLOAT32":
                 return "bias of a float32 operator must be float32"
         else:

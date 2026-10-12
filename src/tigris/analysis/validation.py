@@ -220,9 +220,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 UnsupportedOperatorIssue(
                     op_name=op.name,
                     op_type=op.op_type,
-                    reason=(
-                        f"{op.op_type} is wire-encodable but has no runtime kernel"
-                    ),
+                    reason=f"{op.op_type} has no kernel in the runtime",
                 )
             )
             continue
@@ -240,7 +238,8 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         reasons.extend(_bool_and_sum_reasons(ag, op))
         backend = "s8_ref" if ag.is_quantized else "reference"
         if op.op_type not in effective_operators(backend):
-            reasons.append(f"{op.op_type} has no {backend} runtime kernel")
+            dtype = "int8" if ag.is_quantized else "float32"
+            reasons.append(f"{op.op_type} has no {dtype} kernel in the runtime")
         elementwise_unary = {
             "Abs", "Rsqrt", "Neg", "Exp", "Log", "Sqrt", "Square",
             "Floor", "Ceil", "Round", "Sin", "Cos",
@@ -259,7 +258,10 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             tensors = [ag.tensors.get(name) for name in op.inputs + op.outputs]
             if (len(op.inputs) != count or len(op.outputs) != 1
                     or any(t is None or t.is_constant for t in tensors)):
-                reasons.append(f"runtime requires {count} dynamic operands and one output")
+                reasons.append(
+                    f"{op.op_type} takes one operand that is not a constant and gives one output"
+                    if count == 1 else
+                    f"{op.op_type} takes two operands that are not constants and gives one output")
             elif (count == 1 and tensors[0].shape != tensors[1].shape) or (
                     count == 2 and any(how is None for *_, how in stored_operands(ag, op) or [(None,)])):
                 reasons.append("each operand must broadcast to the output, a tensor "
@@ -310,9 +312,9 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if (len(op.inputs) != 1 or len(op.outputs) != 1 or source is None or output is None
                     or source.is_constant or output.is_constant or rank not in ranks
                     or len(axes) != 1 or int(axes[0]) not in range(rank)):
-                reasons.append("runtime requires one tensor of rank 1 to 6 and one constant axis"
+                reasons.append(f"{op.op_type} needs one input of rank 1 to 6 and one constant axis"
                                if op.op_type in {"ArgMax", "ArgMin"} else
-                               "runtime requires one rank-3 tensor and one constant reduction axis")
+                               f"{op.op_type} needs one rank-3 input and one constant axis")
             else:
                 axis = int(axes[0])
                 shape = list(source.shape)
@@ -408,7 +410,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 ag.tensors.get(op.inputs[0]) if op.inputs else None
             )
             if input_tensor is None or not input_tensor.shape:
-                reasons.append("runtime requires one concrete, non-scalar input")
+                reasons.append(f"{op.op_type} needs one input with a known shape that is not a scalar")
             else:
                 rank = len(input_tensor.shape)
                 axis = int(op.attrs.get("axis", -1))
@@ -434,8 +436,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             # activation the plan would have to route.
             if not 2 <= len(op.inputs) <= 3:
                 reasons.append(
-                    "runtime requires a scale and an optional bias, both "
-                    "constant"
+                    "LayerNormalization needs a constant scale and an optional constant bias"
                 )
             elif any(name not in ag.weight_data for name in op.inputs[1:]):
                 reasons.append("scale and bias must be constants")
@@ -596,9 +597,9 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if len(dynamic_inputs) not in {1, 2} or (
                 len(dynamic_inputs) + len(constant_names) != 2
             ):
-                reasons.append("runtime requires exactly two tensor operands")
+                reasons.append(f"{op.op_type} takes exactly two operands")
             elif len(op.outputs) != 1 or output is None:
-                reasons.append("runtime requires one concrete output tensor")
+                reasons.append(f"{op.op_type} needs one output with a known shape")
             else:
                 operands = stored_operands(ag, op)
                 per_channel = operands is not None and len(dynamic_inputs) == 2 and \
@@ -817,12 +818,12 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     dynamic = [ag.tensors.get(name) for name in op.inputs
                if not _is_constant_operand(ag, name)]
     if len(constants) != 1 or len(dynamic) != 1 or dynamic[0] is None:
-        return ["runtime requires one tensor operand and at most one constant"]
+        return [f"{op.op_type} takes one operand that is not a constant and at most one constant"]
     name = constants[0]
     output = ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
     constant = ag.weight_data.get(name)
     if output is None:
-        return ["runtime requires one concrete output tensor"]
+        return [f"{op.op_type} needs one output with a known shape"]
     if constant is None:
         return [f"constant operand {name!r} has no data"]
     reasons = []
@@ -1183,7 +1184,7 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     constants = [t for t in inputs if t.is_constant]
     if kind in {"Sum", "Cast", "Not"}:
         if constants or any(t.shape != output.shape for t in inputs):
-            return ["runtime requires equal-shaped dynamic inputs and output"]
+            return [f"{kind} needs inputs and an output of one shape, none of them constant"]
     else:
         operands = stored_operands(ag, op)
         if len(output.shape) > 8:

@@ -105,7 +105,7 @@ def test_encodable_op_without_route_rejected():
 
     assert not result.supported
     assert any(
-        "no runtime kernel" in issue.reason.lower()
+        issue.reason == f"{unrouted[0]} has no kernel in the runtime"
         or "unsupported" in issue.reason.lower()
         for issue in result.issues
     )
