@@ -55,9 +55,7 @@ from tigris.graph.ir import (
 def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
     declared_outputs = list(ag.model_outputs)
-    for op in ag.ops:
-        if op.op_type == "tigris::Gelu":
-            op.op_type = "Gelu"
+    ag = _adopt_tflite_gelu(ag)
     ag = _adopt_tflite_cumsum(ag)
     ag = _adopt_svdf(ag)
     ag = _adopt_lstm(ag)
@@ -2904,8 +2902,14 @@ def _fold_gelu(ag: AnalyzedGraph) -> AnalyzedGraph:
                     scalar(value, 1.0) for value in gate.inputs):
                 continue
             gate_name = gate.outputs[0]
-            for index, final in enumerate(ag.ops):
-                if final.op_type != "Mul" or len(final.outputs) != 1:
+            # 0.5 * x * gate takes at most two Muls, so the last one sits
+            # within two consumer hops of the gate.
+            first = {i for i in consumers.get(gate_name, set()) if ag.ops[i].op_type == "Mul"}
+            second = {j for i in first for j in consumers.get(ag.ops[i].outputs[0], set())
+                      if ag.ops[j].op_type == "Mul"}
+            for index in sorted(first | second):
+                final = ag.ops[index]
+                if len(final.outputs) != 1:
                     continue
                 multiplications = product(final.outputs[0], x, [x, gate_name], 0.5)
                 if multiplications is None:
@@ -3450,6 +3454,14 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
         if any(not -(2**31) <= value < 2**31 for value in metadata):
             raise ValueError(f"{kind} metadata exceeds int32")
         op.attrs["movement"] = metadata
+    return ag
+
+
+def _adopt_tflite_gelu(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """The compiler's own Gelu carries TFLite GELU below ONNX opset 20."""
+    for op in ag.ops:
+        if op.op_type == "tigris::Gelu":
+            op.op_type = "Gelu"
     return ag
 
 
