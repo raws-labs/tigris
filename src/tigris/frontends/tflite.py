@@ -1498,6 +1498,12 @@ class _Converter:
         out = self.tensors[op.outputs[0]]
         shape = list(source.shape)
         axes = sorted({a % len(shape) for a in self.ints(ins[1])})
+        # Unit axes hold one element each, so reducing over them or not
+        # gives the same values; a span they close needs no transpose.
+        extent = [a for a in axes if shape[a] != 1] or axes[:1]
+        span = list(range(extent[0], extent[-1] + 1))
+        if all(a in axes or shape[a] == 1 for a in span):
+            axes = span
         x = self.value(ins[0])
         if axes != list(range(axes[0], axes[-1] + 1)):
             # Keep both sets in their original order so each sum visits the
