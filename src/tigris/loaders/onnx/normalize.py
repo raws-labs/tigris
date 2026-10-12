@@ -64,32 +64,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _adopt_detection(ag)
     ag = _adopt_quantize(ag)
     ag = _normalize_arg_outputs(ag)
-    for op in ag.ops:
-        if (op.op_type != "Cast" or int(op.attrs.get("to", 0)) != 6
-                or len(op.inputs) != 1 or op.inputs[0] not in ag.model_inputs
-                or ag.tensors[op.inputs[0]].dtype != 7):
-            continue
-        pending, seen, valid = list(op.outputs), set(), True
-        while pending and valid:
-            name = pending.pop()
-            if name in seen:
-                continue
-            seen.add(name)
-            uses = [reader for reader in ag.ops if name in reader.inputs]
-            if name in ag.model_outputs or not uses:
-                valid = False
-                break
-            for reader in uses:
-                if reader.op_type in {"Gather", "GatherND", "EmbeddingLookup", "tigris::Gather", "tigris::GatherND"} and reader.inputs[1] == name:
-                    continue
-                if reader.op_type not in {"Identity", "Reshape", "Transpose"} or reader.inputs[0] != name:
-                    valid = False
-                    break
-                pending.extend(reader.outputs)
-        if valid:
-            ag.tensors[op.inputs[0]].dtype = 6
-            op.op_type = "Identity"
-            op.attrs = {}
+    ag = _narrow_index_casts(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
     ag = _fold_constant_ops(ag)
@@ -3483,6 +3458,43 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
         if any(not -(2**31) <= value < 2**31 for value in metadata):
             raise ValueError(f"{kind} metadata exceeds int32")
         op.attrs["movement"] = metadata
+    return ag
+
+
+def _narrow_index_casts(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """An int64 model input cast to int32 that only feeds gather indices,
+    through movement, enters as int32 and the Cast becomes an Identity."""
+    readers: dict[str, list[OpNode]] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            readers.setdefault(name, []).append(op)
+    gathers = {"Gather", "GatherND", "EmbeddingLookup", "tigris::Gather", "tigris::GatherND"}
+    for op in ag.ops:
+        if (op.op_type != "Cast" or int(op.attrs.get("to", 0)) != 6
+                or len(op.inputs) != 1 or op.inputs[0] not in ag.model_inputs
+                or ag.tensors[op.inputs[0]].dtype != 7):
+            continue
+        pending, seen, valid = list(op.outputs), set(), True
+        while pending and valid:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            uses = readers.get(name, [])
+            if name in ag.model_outputs or not uses:
+                valid = False
+                break
+            for reader in uses:
+                if reader.op_type in gathers and reader.inputs[1] == name:
+                    continue
+                if reader.op_type not in {"Identity", "Reshape", "Transpose"} or reader.inputs[0] != name:
+                    valid = False
+                    break
+                pending.extend(reader.outputs)
+        if valid:
+            ag.tensors[op.inputs[0]].dtype = 6
+            op.op_type = "Identity"
+            op.attrs = {}
     return ag
 
 

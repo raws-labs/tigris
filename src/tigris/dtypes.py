@@ -155,7 +155,7 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
                     source = by_name[inputs[0]][0]
                     if dtype not in {1, 3, 6, 9}:
                         issues.append(f"{kind} {direction} {position} ({name}) requires float32, "
-                                      f"int8 or bool, got ONNX dtype {dtype}")
+                                      f"int8, int32 or bool, got ONNX dtype {dtype}")
                     elif dtype != source:
                         issues.append(f"{kind} reads {_dtype_name(source)} and writes "
                                       f"{_dtype_name(dtype)}; it has to keep the dtype")
@@ -172,7 +172,7 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
     return data, tuple(issues)
 
 
-_NAMES = {1: "float32", 3: "int8", 9: "bool"}
+_NAMES = {1: "float32", 3: "int8", 6: "int32", 9: "bool"}
 
 
 def _dtype_name(dtype: int) -> str:
