@@ -137,6 +137,8 @@ class _Tensor:
         self.scale = np.asarray(quant.scalars(_Q_SCALE, "f") if quant else [], np.float32)
         self.zero_point = np.asarray(quant.scalars(_Q_ZERO_POINT, "q") if quant else [], np.int64)
         self.quantized_dimension = quant.scalar(_Q_DIMENSION, "i") if quant else 0
+        self.minimum = quant.scalars(0, "f") if quant else []
+        self.maximum = quant.scalars(1, "f") if quant else []
         # A variable tensor keeps what an operator wrote into it for the next invocation.
         self.variable = bool(table.scalar(_T_VARIABLE, "B"))
         self._model = model
@@ -312,9 +314,46 @@ def _dtype_name(tensor: _Tensor) -> str:
     return tensor.type.lower()
 
 
+def _narrow_index_inputs(graph):
+    """Keep an integer input and its index-only movement chain in int32."""
+    _, tensors, inputs, outputs, operators = graph
+    for entering in inputs:
+        if tensors[entering].type != "INT64":
+            continue
+        reached, pending, valid = set(), [entering], True
+        while pending and valid:
+            index = pending.pop()
+            if index in reached:
+                continue
+            reached.add(index)
+            t = tensors[index]
+            if (index in outputs or any(v < -2147483648 for v in t.minimum)
+                    or any(v > 2147483647 for v in t.maximum)):
+                valid = False
+                break
+            uses = [op for op in operators if index in op.inputs]
+            if not uses:
+                valid = False
+                break
+            for op in uses:
+                slot = _INDEX_SLOTS.get(op.kind)
+                if slot is not None and op.inputs[slot] == index:
+                    continue
+                if (op.kind not in {"CAST", "RESHAPE", "TRANSPOSE"} or op.inputs[0] != index
+                        or tensors[op.outputs[0]].type not in {"INT32", "INT64"}):
+                    valid = False
+                    break
+                pending.extend(op.outputs)
+        if valid:
+            for index in reached:
+                tensors[index].type = "INT32"
+    return graph
+
+
 def unsupported(data: bytes) -> list[str]:
     """Why the model cannot be converted, one reason per line; empty when it can."""
     model, graphs = _read(data)
+    graphs = [_narrow_index_inputs(g) for g in graphs]
     reasons = []
     init = _initializer_subgraphs(graphs)
     branches = _branch_subgraphs(graphs)
@@ -332,7 +371,7 @@ def unsupported(data: bytes) -> list[str]:
         index_inputs = {i for i in inputs if tensors[i].type == "INT32"}
         # int32 arithmetic results are values a run computes, usable as indices.
         computed = {op.outputs[0] for op in operators
-                    if op.kind in ("ADD", "SUB", "MUL") and tensors[op.outputs[0]].type == "INT32"}
+                    if op.kind in ("ADD", "SUB", "MUL", "CAST", "RESHAPE", "TRANSPOSE") and tensors[op.outputs[0]].type == "INT32"}
         for index in list(inputs) + list(outputs):
             if (tensors[index].type not in ("INT8", "UINT8", "FLOAT32", "BOOL") and index not in indices
                     and index not in index_inputs):
@@ -693,7 +732,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
 
 def _integer_use(op: _Operator) -> bool:
     """Operators that take an int32 model input as a value."""
-    return op.kind in ("ADD", "SUB", "MUL", "CAST", "IF", "WHILE", *_COMPARISONS)
+    return op.kind in ("ADD", "SUB", "MUL", "CAST", "RESHAPE", "TRANSPOSE", "IF", "WHILE", *_COMPARISONS)
 
 
 def _int32_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
@@ -711,8 +750,10 @@ def _int32_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None"
         if any(t.type != "INT32" for t in ins):
             return "int32 compared with another dtype"
         return ""
+    if op.kind in {"RESHAPE", "TRANSPOSE"} and ins[0].type == outs[0].type == "INT32":
+        return ""
     if op.kind == "CAST":
-        return "" if outs[0].type == "FLOAT32" else "int32 cast to other than float32"
+        return "" if outs[0].type in {"FLOAT32", "INT32"} else "int32 cast to other than float32"
     return None
 
 
@@ -1201,7 +1242,8 @@ class _Converter:
             y = b.node("Where", self.operands(op), tag)
         elif kind == "CAST":
             # A bool cast to int8 is the float 0.0 or 1.0 quantized into the output.
-            y = b.node("Cast", [self.value(ins[0])], tag, to=TensorProto.FLOAT)
+            y = (b.node("Identity", [self.value(ins[0])], tag) if out.type == "INT32" else
+                 b.node("Cast", [self.value(ins[0])], tag, to=TensorProto.FLOAT))
         elif kind == "ADD_N":
             y = b.node("Sum", [self.value(i) for i in ins], tag)
         elif kind == "RELU6":
@@ -1577,14 +1619,21 @@ class _Converter:
         """GATHER, GATHER_ND or EMBEDDING_LOOKUP with constant indices, run in
         TFLite's axis order, where its axis and index tuples are stated."""
         rank = len(self.tensors[data].shape)
-        x = self.last_to_last(self.value(data), rank, tag + "_last", data, True)
+        if _is_constant(self.tensors[data]):
+            tensor = self.tensors[data]
+            x = (self.b.constant(tensor.array(), tensor.name) if tensor.type == "FLOAT32" else
+                 self.b.dequantized_constant(tensor.array(), tensor.scale, tensor.zero_point,
+                                             tensor.name, axis=tensor.quantized_dimension))
+        else:
+            x = self.last_to_last(self.value(data), rank, tag + "_last", data, True)
         indices = (self.b.constant(np.asarray(self.tensors[ids].array(), np.int64), tag + "_indices")
-                   if _is_constant(self.tensors[ids]) else self.value(ids))
+                   if _is_constant(self.tensors[ids]) else self.last_to_last(
+                       self.value(ids), len(self.tensors[ids].shape), tag + "_index_order", ids, True))
         attributes = {} if axis is None else {"axis": axis % rank}
         batch = op.option(1, "i") if op.kind == "GATHER" else 0
-        if batch:
-            # ONNX Gather has no batch dimensions; the compiler's own form does.
-            y = self.custom("Gather", [x, indices], tag + "_gathered",
+        if batch or (kind == "GatherND" and not _is_constant(self.tensors[ids])):
+            # ONNX GatherND takes int64 indices; this form keeps runtime int32.
+            y = self.custom(kind, [x, indices], tag + "_gathered",
                             self.tensors[op.outputs[0]].shape, batch_dims=batch, **attributes)
         else:
             y = self.b.node(kind, [x, indices], tag + "_gathered", **attributes)
@@ -1875,6 +1924,8 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     if reasons:
         raise ValueError("TFLite model does not convert: " + "; ".join(reasons))
     _, graphs = _read(data)
+    original_types = {i: graphs[0][1][i].type for i in graphs[0][2]}
+    graphs = [_narrow_index_inputs(g) for g in graphs]
     _, tensors, inputs, outputs, operators = graphs[0]
     consumed = {i for op in operators for i in op.inputs}
     converter = _Converter(tensors, outputs, consumed)
@@ -1891,7 +1942,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         and op.outputs[0] not in outputs}
     b = converter.b
     boundary_type = {"INT8": TensorProto.INT8, "UINT8": TensorProto.UINT8, "FLOAT32": TensorProto.FLOAT,
-                     "INT32": TensorProto.INT32, "BOOL": TensorProto.BOOL}
+                     "INT32": TensorProto.INT32, "INT64": TensorProto.INT64, "BOOL": TensorProto.BOOL}
     indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
 
     # The interface keeps TFLite's dtypes: an int8 input is dequantized straight
@@ -1901,8 +1952,10 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         tensor = tensors[index]
         b._names.add(tensor.name)
         onnx_inputs.append(helper.make_tensor_value_info(
-            tensor.name, boundary_type[tensor.type], _onnx_shape(tensor.shape)))
-        if tensor.type in ("FLOAT32", "BOOL", "INT32"):
+            tensor.name, boundary_type[original_types[index]], _onnx_shape(tensor.shape)))
+        if original_types[index] == "INT64" and tensor.type == "INT32":
+            converter.values[index] = b.node("Cast", [tensor.name], tensor.name + "_i32", to=TensorProto.INT32)
+        elif tensor.type in ("FLOAT32", "BOOL", "INT32"):
             converter.values[index] = tensor.name
         else:
             scale = b.constant(np.float32(tensor.scale[0]), tensor.name + "_scale")

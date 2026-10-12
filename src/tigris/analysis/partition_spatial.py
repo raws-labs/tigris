@@ -687,7 +687,7 @@ def _whole_band_operands(stage_ops: list[OpNode]) -> set[str]:
     """
     whole: set[str] = set()
     for op in stage_ops:
-        if op.op_type in {"Gather", "GatherND", "EmbeddingLookup"}:
+        if op.op_type in {"Gather", "GatherND", "EmbeddingLookup"} and "table_shape" not in op.attrs:
             whole.update(op.inputs[1:])
         if op.op_type == "DynamicUpdateSlice" and len(op.inputs) == 3:
             whole.add(op.inputs[2])
@@ -767,7 +767,7 @@ def _reshape_tile_for_bytes(mapping, budget: int, alignment: int, element: int) 
 
 def _leading_view(info, trailing=False, axis=None) -> tuple[int, int, int] | None:
     shape = serialized_shape(info.shape, info.layout)
-    if not 2 <= len(shape) <= 6 or min(shape) <= 0:
+    if not 1 <= len(shape) <= 6 or min(shape) <= 0:
         return None
     if axis is None:
         axis = len(shape) - 1 if trailing else next((i for i, extent in enumerate(shape) if extent != 1), 0)
@@ -811,6 +811,19 @@ def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True,
                  for n in [*op.inputs, *op.outputs] if not ag.tensors[n].is_constant]
         return (leading and bool(views) and all(v is not None for v in views)
                 and views[0][1] > 1 and all(v[1] == views[0][1] for v in views))
+    if "table_shape" in op.attrs:
+        if leading != 1 or len(op.inputs) != 2:
+            return False
+        index = ag.tensors[op.inputs[1]]
+        target = ag.tensors[op.outputs[0]]
+        if index.is_constant or (op.op_type != "GatherND" and op.attrs["movement"][:2] != [0, 0]):
+            return False
+        first, last = _leading_view(index), _leading_view(target)
+        shape = serialized_shape(index.shape, index.layout)
+        axis = next((i for i, extent in enumerate(shape) if extent != 1), 0)
+        if op.op_type == "GatherND" and axis >= len(shape) - 1:
+            return False
+        return first is not None and last is not None and first[:2] == last[:2] and first[1] > 1
     unary = op.op_type in _ROW_TILING_OPS - {
         "Softmax", "LogSoftmax", "L2Normalization", "LayerNormalization",
         "Gemm", "MatMul", "Reshape", "Flatten",

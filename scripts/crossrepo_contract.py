@@ -2485,6 +2485,32 @@ def _nonadjacent_mean_case(suffix: str) -> ContractCase:
                         expected, mem_budget=budget, expect_tiled=True)
 
 
+def _constant_table_case(kind: str, quantized: bool, vector: bool) -> ContractCase:
+    shape = [32, 16] if kind == "Gather" else [6, 6, 16]
+    index_shape = ([31] if vector else [1, 31]) + ([2] if kind == "GatherND" else [])
+    indices = np.arange(math.prod(index_shape), dtype=np.int64).reshape(index_shape) % (32 if kind == "Gather" else 6)
+    indices.flat[0] = -1
+    data = ((np.arange(math.prod(shape)).reshape(shape) * 7) % 127 - 63).astype(np.float32) * 0.125
+    constants = [numpy_helper.from_array(data, "table")]
+    nodes = []
+    operand = "table"
+    target = "output"
+    if quantized:
+        constants += _scalars(x=(0.125, 0), y=(0.125, 0))
+        nodes += _qdq("table", "x_s", "x_z", "data")
+        operand, target = "data", "raw"
+    nodes.append(helper.make_node(kind, [operand, "indices"], [target]))
+    if quantized:
+        nodes += _qdq("raw", "y_s", "y_z", "output")
+    output_shape = index_shape[:-1] + [16] if kind == "GatherND" else index_shape + [16]
+    name = f"{'int8' if quantized else 'float'}_constant_{kind.lower()}_{'vector' if vector else 'matrix'}"
+    model = _model(name, nodes, [helper.make_tensor_value_info("indices", TensorProto.INT64, index_shape)],
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)], constants)
+    expected = (kind,) if vector else (kind, "Transpose")
+    return ContractCase(name, model, copy.deepcopy(model), {"indices": indices}, expected,
+                        mem_budget="256", expect_tiled=True)
+
+
 def _head_permutation_case() -> ContractCase:
     """The permutation that moves an attention block into its head layout.
 
@@ -7541,6 +7567,7 @@ def _assert_runtime_rejects_incompatible_plan(
 def _run_gate(runtime: Path, work_dir: Path) -> None:
     cases = [
         *[_nonadjacent_mean_case(s) for s in ("tokens", "keep", "image", "negative")],
+        *[_constant_table_case(k, q, v) for k in ("Gather", "GatherND") for q in (False, True) for v in (False, True)],
         _linear_spatial_max_case(quantized=False),
         _linear_spatial_max_case(quantized=True),
         *[_movement_case(kind, q, variant, tiled=True)

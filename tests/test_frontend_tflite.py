@@ -346,9 +346,11 @@ def test_run_time_indices_come_from_a_model_input_or_an_arg_max(monkeypatch):
     assert any("other than ARG_MAX, ARG_MIN or int32 arithmetic" in r for r in reasons)
 
 
-def test_int64_run_time_indices_are_refused(monkeypatch):
+def test_int64_run_time_indices_with_an_excessive_range_are_refused(monkeypatch):
     def widen(tensors, operators):
-        tensors[operators[0].inputs[1]].type = "INT64"
+        index = tensors[operators[0].inputs[1]]
+        index.type = "INT64"
+        index.maximum = [float(1 << 40)]
     reasons = _read_edited(monkeypatch, "float_gather_runtime", widen)
     assert any("INT64 run-time indices; the runtime takes int32" in r for r in reasons)
 
