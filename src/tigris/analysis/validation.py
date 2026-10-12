@@ -243,7 +243,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         elementwise_unary = {
             "Abs", "Rsqrt", "Neg", "Exp", "Log", "Sqrt", "Square",
             "Floor", "Ceil", "Round", "Sin", "Cos",
-            "LeakyRelu", "Elu", "LogSoftmax", "L2Normalization",
+            "LeakyRelu", "Elu", "LogSoftmax", "L2Normalization", "Gelu",
         }
         elementwise_binary = {"Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod", "PRelu"}
         constant_operand = (

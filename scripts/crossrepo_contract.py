@@ -3911,6 +3911,18 @@ def _layer_norm_case() -> ContractCase:
     )
 
 
+def _gelu_case(approximate: str, shape: list[int], budget: str, *, two_dimensional=False) -> ContractCase:
+    model = _model(
+        "gelu", [helper.make_node("Gelu", ["input"], ["output"], approximate=approximate)],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)], opset=20)
+    values = np.linspace(-8.0, 8.0, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    return ContractCase(
+        f"float_gelu_{approximate}_{len(shape)}d_{budget}", model, model, {"input": values}, ("Gelu",),
+        mem_budget=budget, slow_budget="32K", expect_tiled=True,
+        expect_2d=two_dimensional, exact_untiled=True)
+
+
 def _erf_case() -> ContractCase:
     """Erf, the exact form GELU is written in."""
     shape = [1, 3, 8]
@@ -4079,6 +4091,26 @@ def _qdq_erf_case() -> ContractCase:
     ).reshape(shape)
     return ContractCase(
         "int8_erf", compile_model, reference_model, {"input": data}, ("Erf",))
+
+
+def _qdq_gelu_case(approximate: str, shape: list[int], *, two_dimensional=False) -> ContractCase:
+    case = _qdq_erf_case()
+    model = copy.deepcopy(case.compile_model)
+    model.opset_import[0].version = 20
+    for value in (*model.graph.input, *model.graph.output):
+        value.type.tensor_type.shape.ClearField("dim")
+        for extent in shape:
+            value.type.tensor_type.shape.dim.add().dim_value = extent
+    for node in model.graph.node:
+        if node.op_type == "Erf":
+            node.op_type = "Gelu"
+            node.attribute.append(helper.make_attribute("approximate", approximate))
+    onnx.checker.check_model(model)
+    data = np.linspace(-2.0, 2.0, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    return ContractCase(
+        f"int8_gelu_{approximate}_{len(shape)}d_{int(two_dimensional)}", model, model,
+        {"input": data}, ("Gelu",), mem_budget="128", slow_budget="32K", expect_tiled=True,
+        expect_2d=two_dimensional, exact_untiled=True)
 
 
 def _qdq_layer_norm_case() -> ContractCase:
@@ -7655,8 +7687,18 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_last_axis_softmax_case(rank=3),
         _tiled_last_axis_softmax_case(rank=4),
         _layer_norm_case(),
+        *[_gelu_case(mode, shape, budget, two_dimensional=hw)
+          for mode in ("none", "tanh")
+          for shape, budget, hw in (([16, 8], "128", False),
+                                    ([1, 4, 64], "128", False),
+                                    ([1, 4, 8, 8], "384", False),
+                                    ([1, 8, 7, 19], "256", True))],
         _erf_case(),
         _qdq_erf_case(),
+        *[_qdq_gelu_case(mode, shape, two_dimensional=hw)
+          for mode in ("none", "tanh")
+          for shape, hw in (([16, 8], False), ([1, 4, 64], False),
+                            ([1, 4, 8, 8], False), ([1, 16, 5, 17], True))],
         _qdq_layer_norm_case(),
         _tiled_layer_norm_case(),
         _tiled_erf_case(),

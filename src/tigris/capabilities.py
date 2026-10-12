@@ -66,6 +66,7 @@ _FLOAT_REFERENCE_OPERATORS = frozenset({
     "Transpose",
     "LayerNormalization",
     "Erf",
+    "Gelu",
     "HardSwish",
     "Abs",
     "Rsqrt",

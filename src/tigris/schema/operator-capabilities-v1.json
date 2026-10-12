@@ -1205,6 +1205,16 @@
         "reference": "native",
         "s8_ref": "native"
       }
+    },
+    {
+      "opcode": 92,
+      "operator": "Gelu",
+      "routes": {
+        "cmsis-nn": "fallback:s8_ref",
+        "esp-nn": "fallback:s8_ref",
+        "reference": "native",
+        "s8_ref": "native"
+      }
     }
   ],
   "schema_version": 10,

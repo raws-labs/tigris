@@ -533,7 +533,7 @@ _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "Red
 _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
               *_INDEX, *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N", "IF", "WHILE",
               "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
-              "CUMSUM", "MEAN",
+              "CUMSUM", "MEAN", "GELU",
               "TRANSPOSE",
               "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
               "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE")
@@ -1186,6 +1186,9 @@ class _Converter:
             y = b.node("Floor", [b.node("Div", self.operands(op), tag + "_quotient")], tag)
         elif kind == "FLOOR_MOD":
             y = self._floor_mod(*self.operands(op), tag)
+        elif kind == "GELU":
+            y = self.custom("Gelu", [self.value(ins[0])], tag, _onnx_shape(out.shape),
+                       approximate="tanh" if op.option(0, "?", False) else "none")
         elif kind in _UNARY:
             y = b.node(_UNARY[kind], [self.value(ins[0])], tag)
         elif kind in _COMPARISONS:

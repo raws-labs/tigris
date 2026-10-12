@@ -55,6 +55,9 @@ from tigris.graph.ir import (
 def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Apply all normalization passes in sequence."""
     declared_outputs = list(ag.model_outputs)
+    for op in ag.ops:
+        if op.op_type == "tigris::Gelu":
+            op.op_type = "Gelu"
     ag = _adopt_tflite_cumsum(ag)
     ag = _adopt_svdf(ag)
     ag = _adopt_lstm(ag)
@@ -67,6 +70,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _lower_legacy_softmax(ag)
     ag = _fold_constant_ops(ag)
     ag = _fold_static_subgraphs(ag)
+    ag = _fold_gelu(ag)
     ag = _fold_elementwise_patterns(ag)
     ag = _quantize_inputs_first(ag)
     ag = _fold_qdq(ag)
@@ -2796,6 +2800,133 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
         for step, op in enumerate(ag.ops):
             op.step = step
 
+    return ag
+
+
+def _fold_gelu(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Recognize the erf and tanh GELU expressions without crossing a shared edge."""
+    producers = {name: i for i, op in enumerate(ag.ops) for name in op.outputs}
+    consumers: dict[str, set[int]] = {}
+    for i, op in enumerate(ag.ops):
+        for name in op.inputs:
+            consumers.setdefault(name, set()).add(i)
+
+    def scalar(name, expected):
+        value = ag.weight_data.get(name)
+        return (value is not None and value.size == 1 and value.dtype.kind == "f"
+                and np.float32(value.reshape(-1)[0]) == np.float32(expected))
+
+    def node(name, kind):
+        index = producers.get(name)
+        if index is None or ag.ops[index].op_type != kind:
+            return None
+        return index, ag.ops[index]
+
+    def scaled(name, factor):
+        held = node(name, "Mul")
+        if held is None:
+            return None
+        i, op = held
+        if len(op.inputs) != 2:
+            return None
+        for a, b in (op.inputs, op.inputs[::-1]):
+            if scalar(b, factor):
+                return a, {i}
+        return None
+
+    def product(name, x, expected, factor):
+        used = set()
+        leaves = []
+        coefficient = 1.0
+        def visit(value):
+            nonlocal coefficient
+            if value == x:
+                leaves.append(value)
+                return
+            constant = ag.weight_data.get(value)
+            if constant is not None and constant.size == 1 and constant.dtype.kind == "f":
+                coefficient *= float(constant.reshape(-1)[0])
+                return
+            held = node(value, "Mul")
+            if held is not None and len(held[1].inputs) == 2:
+                used.add(held[0])
+                for operand in held[1].inputs:
+                    visit(operand)
+            else:
+                leaves.append(value)
+        visit(name)
+        if sorted(leaves) == sorted(expected) and np.float32(coefficient) == np.float32(factor):
+            return used
+        return None
+
+    def cube(name, x):
+        held = node(name, "Pow")
+        if held is not None and held[1].inputs[0] == x and scalar(held[1].inputs[1], 3):
+            return {held[0]}
+        return product(name, x, [x, x, x], 1.0)
+
+    removed = set()
+    for activation_index, activation in enumerate(ag.ops):
+        if activation.op_type not in {"Erf", "Tanh"} or len(activation.inputs) != 1:
+            continue
+        used = {activation_index}
+        x = None
+        if activation.op_type == "Erf":
+            held = node(activation.inputs[0], "Div")
+            if held is not None and scalar(held[1].inputs[1], np.sqrt(2.0)):
+                x = held[1].inputs[0]
+                used.add(held[0])
+            else:
+                held = scaled(activation.inputs[0], 1.0 / np.sqrt(2.0))
+                if held is not None:
+                    x, indices = held
+                    used.update(indices)
+        else:
+            held = scaled(activation.inputs[0], np.sqrt(2.0 / np.pi))
+            addition = node(held[0], "Add") if held else None
+            if addition is not None:
+                for candidate, term in (addition[1].inputs, addition[1].inputs[::-1]):
+                    cubic = scaled(term, 0.044715)
+                    powers = cube(cubic[0], candidate) if cubic else None
+                    if powers is None:
+                        powers = product(term, candidate, [candidate] * 3, 0.044715)
+                    if powers is not None:
+                        x = candidate
+                        used.update(held[1] | {addition[0]} | powers)
+                        if cubic is not None:
+                            used.update(cubic[1])
+                        break
+        if x is None:
+            continue
+        for add_index in consumers.get(activation.outputs[0], set()):
+            gate = ag.ops[add_index]
+            if gate.op_type != "Add" or len(gate.inputs) != 2 or not any(
+                    scalar(value, 1.0) for value in gate.inputs):
+                continue
+            gate_name = gate.outputs[0]
+            for index, final in enumerate(ag.ops):
+                if final.op_type != "Mul" or len(final.outputs) != 1:
+                    continue
+                multiplications = product(final.outputs[0], x, [x, gate_name], 0.5)
+                if multiplications is None:
+                    continue
+                group = used | {add_index, index} | multiplications
+                if group & removed:
+                    continue
+                intermediate = [name for i in group if i != index for name in ag.ops[i].outputs]
+                if any(name in ag.model_outputs or not consumers.get(name, set()) <= group
+                       for name in intermediate):
+                    continue
+                if any(ag.tensors[name].dtype != 1 or ag.tensors[name].quant is not None
+                       for name in [x, final.outputs[0], *intermediate]):
+                    continue
+                ag.ops[index] = replace(final, op_type="Gelu", inputs=[x],
+                                        attrs={"approximate": "none" if activation.op_type == "Erf" else "tanh"})
+                removed.update(group - {index})
+                for name in intermediate:
+                    ag.tensors.pop(name, None)
+                break
+    ag.ops = [op for i, op in enumerate(ag.ops) if i not in removed]
     return ag
 
 

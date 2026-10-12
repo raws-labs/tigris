@@ -87,7 +87,10 @@ OP_ATTR_DETECTION = 18  # uint16 max detections, detections per class, classes; 
                         # regular (1) or fast (0), a zero byte; float32 score and IoU
                         # thresholds, y, x, h, w scales
 
+OP_ATTR_GELU_APPROXIMATE = 19  # uint8[1], exact (0) or tanh approximation (1)
+
 OP_ATTR_KINDS = (
+    OP_ATTR_GELU_APPROXIMATE,
     OP_ATTR_COMPARISON_REQUANT,
     OP_ATTR_CONSTANTS,
     OP_ATTR_SVDF,
@@ -208,6 +211,7 @@ OP_TYPE_MAP: dict[str, int] = {
     "DetectionPostProcess": 89,
     "Quantize": 90,
     "Dequantize": 91,
+    "Gelu": 92,
 }
 OP_TYPE_UNKNOWN = 255
 
