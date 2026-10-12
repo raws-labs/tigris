@@ -2478,7 +2478,8 @@ def _nonadjacent_mean_case(suffix: str) -> ContractCase:
         "ReduceMean", [model.graph.input[0].name], [model.graph.output[0].name],
         axes=axes, keepdims=int(keep))], list(model.graph.input), list(model.graph.output))
     budget = "2K" if suffix == "keep" else "512" if suffix == "tokens" else "1536"
-    transposes = 2 if suffix == "tokens" else 4 + int(keep)
+    # The batch of one makes the token mean adjacent: only the layout move remains.
+    transposes = 1 if suffix == "tokens" else 4 + int(keep)
     expected = ("Transpose",) * transposes + ("Reshape", "ReduceMean", "Reshape")
     return ContractCase(path.stem, model, reference, {model.graph.input[0].name: native},
                         expected, mem_budget=budget, expect_tiled=True)

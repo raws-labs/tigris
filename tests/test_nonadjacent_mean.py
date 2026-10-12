@@ -34,6 +34,10 @@ def test_nonadjacent_mean_matches_micro_and_onnx(name, tmp_path):
         ag, _ = _run_pipeline(str(source), (budget, '8M'), report_bindings=False)
         assert validate_budget(ag).feasible
         assert any(op.op_type == 'ReduceMean' for op in ag.ops)
+        # A batch of one leaves the reduced token and feature axes adjacent,
+        # so only the move out of the stored channels-first order remains.
+        if name.endswith('tokens'):
+            assert sum(op.op_type == 'Transpose' for op in ag.ops) == 1
         binary = emit_binary_bytes(ag)
         if budget == tight:
             assert any(t['tileable'] and t['num_tiles'] > 1 for t in read_binary_plan(binary)['tile_plans'])
