@@ -153,7 +153,7 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
                     continue
                 if expected == DATA_OR_BOOL:
                     source = by_name[inputs[0]][0]
-                    if dtype not in {1, 3, 9}:
+                    if dtype not in {1, 3, 6, 9}:
                         issues.append(f"{kind} {direction} {position} ({name}) requires float32, "
                                       f"int8 or bool, got ONNX dtype {dtype}")
                     elif dtype != source:

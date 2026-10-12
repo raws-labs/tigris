@@ -1146,8 +1146,9 @@ def test_a_layout_step_that_changes_the_dtype_names_both():
     _, issues = check_dtype_signatures(tensors, [("Reshape", ["x"], ["y"])], ["x"], ["y"])
     assert "Reshape reads int8 and writes float32; it has to keep the dtype" in issues
     _, issues = check_dtype_signatures(tensors, [("Reshape", ["i"], ["j"])], ["i"], ["j"])
-    assert ("Reshape input 0 (i) requires float32, int8 or bool, got ONNX dtype 6"
-            in issues)
+    assert not issues
+    _, issues = check_dtype_signatures(tensors, [("Reshape", ["i"], ["y"])], ["i"], ["y"])
+    assert "Reshape reads ONNX dtype 6 and writes float32; it has to keep the dtype" in issues
 
 
 def test_add_operands_and_output_are_named_by_the_operator():

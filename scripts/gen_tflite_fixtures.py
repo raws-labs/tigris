@@ -395,7 +395,13 @@ if _xla is not None:
 INDEX_INPUTS = {"gather_runtime": {1: (0, 6)}, "gather_nd_runtime": {1: (0, 6)},
                 "embedding_lookup_runtime": {1: (0, 6)},
                 "dynamic_update_slice_runtime": {2: (-2, 7)}, "if_int32": {1: (-3, 6)}}
+INDEX_INPUTS.update({"embedding_table_int64": {0: (0, 32)}, "embedding_table": {0: (0, 32)}, "gather_nd_table": {0: (0, 6)},
+                     "embedding_table_cast": {0: (0, 32)}})
 INDEXING.update({
+    "embedding_table": _unary(lambda i: tf.gather(_weights(314, 32, 16), i), (1, 31)),
+    "embedding_table_cast": _unary(lambda i: tf.gather(_weights(314, 32, 16),
+                                                       tf.reshape(tf.cast(i, tf.int32), [31])), (1, 31)),
+    "gather_nd_table": _unary(lambda i: tf.gather_nd(_weights(315, 6, 6, 16), i), (1, 31, 2)),
     "gather_runtime": ([_MAP, (3,)], lambda x, i: tf.gather(x, i, axis=2)),
     "gather_nd_runtime": ([(6, 6, 4), (3, 2)], lambda x, i: tf.gather_nd(x, i)),
     "embedding_lookup_runtime": ([(6, 4), (4,)], lambda x, i: tf.gather(x, i)),
@@ -518,6 +524,37 @@ def _embedding_lookup(model: bytes) -> bytes:
 
 REWRITES["embedding_lookup"] = _embedding_lookup
 REWRITES["embedding_lookup_runtime"] = _embedding_lookup
+def _embedding_table_int64():
+    T, B = schema.TensorType, schema.BuiltinOperator
+    cast = schema.CastOptionsT()
+    cast.inDataType, cast.outDataType = T.INT64, T.INT32
+    reshape = schema.ReshapeOptionsT()
+    reshape.newShape = np.asarray([31], np.int32)
+    values = _weights(314, 32, 16).numpy()
+    tensors = [([1, 31], T.INT64, None, None, None, False),
+               ([1, 31], T.INT32, None, None, None, False),
+               ([1], T.INT32, np.array([31], np.int32), None, None, False),
+               ([31], T.INT32, None, None, None, False),
+               ([32, 16], T.FLOAT32, values, None, None, False),
+               ([31, 16], T.FLOAT32, None, None, None, False)]
+    return _operators([(B.CAST, schema.BuiltinOptions.CastOptions, cast, [0], [1]),
+                       (B.RESHAPE, schema.BuiltinOptions.ReshapeOptions, reshape, [1, 2], [3]),
+                       (B.EMBEDDING_LOOKUP, schema.BuiltinOptions.NONE, None, [3, 4], [5])],
+                      tensors, [0], [5])
+
+
+def _int32_embedding_reference(model):
+    tree = schema.ModelT.InitFromPackedBuf(model, 0)
+    graph = tree.subgraphs[0]
+    cast = graph.operators.pop(0)
+    graph.tensors[graph.inputs[0]].type = schema.TensorType.INT32
+    for op in graph.operators:
+        op.inputs = np.where(op.inputs == cast.outputs[0], cast.inputs[0], op.inputs).astype(np.int32)
+    builder = flatbuffers.Builder(4096)
+    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
+    return bytes(builder.Output())
+
+
 def _one_operator(code, options_type, options, tensors, op_inputs, op_outputs, inputs, outputs):
     """A model of one builtin operator. `tensors` are (shape, type, data, scale,
     zero point, variable) records; data None marks an activation."""
@@ -793,6 +830,7 @@ def _detection(regular, quantized=False, boxes=16, classes=3, max_detections=8):
 _RELU = schema.ActivationFunctionType.RELU
 _NONE = schema.ActivationFunctionType.NONE
 HANDMADE = {
+    "float_embedding_table_int64": _embedding_table_int64,
     "float_svdf": lambda: _svdf(1, 8, 4, 1, 5, _NONE),
     "float_svdf_rank2_relu": lambda: _svdf(2, 6, 3, 2, 4, _RELU),
     "svdf": lambda: _svdf(1, 8, 4, 2, 5, _NONE, quantized=True),
@@ -942,7 +980,7 @@ def _convert(fn, shapes, ranges, rng, float_io=False, quantize=True, trackable=N
 def _inputs(details, rng, value_range=None, index_range=None):
     shape = (SAMPLES, *details["shape"])
     if index_range is not None:
-        return rng.integers(*index_range, shape, dtype=np.int32)
+        return rng.integers(*index_range, shape, dtype=details["dtype"])
     if details["dtype"] == np.float32:
         return rng.uniform(*(value_range or (-3.0, 3.0)), shape).astype(np.float32)
     info = np.iinfo(details["dtype"])
@@ -968,7 +1006,10 @@ def generate(name: str) -> bool:
                          index_inputs=INDEX_INPUTS.get(name.removeprefix("float_")))
     if name in REWRITES:
         model = REWRITES[name](model)
-    micro_interpreter = micro.Interpreter.from_bytes(model, arena_size=1024 * 1024)
+    wide_boundary = name == "float_embedding_table_int64"
+    # Micro takes the int32 values after the checked boundary conversion.
+    micro_model = _int32_embedding_reference(model) if wide_boundary else model
+    micro_interpreter = micro.Interpreter.from_bytes(micro_model, arena_size=1024 * 1024)
     graph = schema.Model.GetRootAs(model, 0).Subgraphs(0)
     details = []
     for index in range(graph.InputsLength()):
@@ -988,6 +1029,8 @@ def generate(name: str) -> bool:
         # CUMSUM); TFLite Micro's outputs are recorded unchecked for those.
         reference = None
     index_inputs = INDEX_INPUTS.get(name.removeprefix("float_"), {})
+    if wide_boundary:
+        details[0]["dtype"] = np.dtype("int64")
     inputs = [_inputs(found, rng, ranges[i] if ranges else None, index_inputs.get(i))
               for i, found in enumerate(details)]
     if name == "div":
@@ -1005,7 +1048,11 @@ def generate(name: str) -> bool:
     micro_outputs, reference_outputs = [], []
     for sample in range(SAMPLES):
         for index, values in enumerate(inputs):
-            micro_interpreter.set_input(values[sample], index)
+            value = values[sample]
+            if wide_boundary:
+                assert np.all(value >= np.iinfo(np.int32).min) and np.all(value <= np.iinfo(np.int32).max)
+                value = value.astype(np.int32)
+            micro_interpreter.set_input(value, index)
         micro_interpreter.invoke()
         micro_outputs.append([micro_interpreter.get_output(i).copy() for i in range(outputs_count)])
         if name in DETECTION:
@@ -1027,12 +1074,16 @@ def generate(name: str) -> bool:
                      and name not in SUMMATION_ORDER and name not in DETECTION)
     deviates = has_reference and any(not np.array_equal(m, r) for ms, rs in
                                      zip(micro_outputs, reference_outputs) for m, r in zip(ms, rs))
+    if wide_boundary:
+        assert not deviates
     outputs = reference_outputs if deviates else micro_outputs
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"{name}.tflite").write_bytes(model)
     arrays = {f"input_{i}": values for i, values in enumerate(inputs)}
     for index in range(outputs_count):
         arrays[f"output_{index}"] = np.stack([sample[index] for sample in outputs])
+    if wide_boundary:
+        arrays["reference"] = "TFLite Micro with checked int32 boundary values"
     np.savez_compressed(OUT / f"{name}.npz", **arrays)
     print(f"{name}: {len(model)} bytes" + (", TFLite Micro deviates" if deviates else ""))
     return deviates

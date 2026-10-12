@@ -64,6 +64,32 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _adopt_detection(ag)
     ag = _adopt_quantize(ag)
     ag = _normalize_arg_outputs(ag)
+    for op in ag.ops:
+        if (op.op_type != "Cast" or int(op.attrs.get("to", 0)) != 6
+                or len(op.inputs) != 1 or op.inputs[0] not in ag.model_inputs
+                or ag.tensors[op.inputs[0]].dtype != 7):
+            continue
+        pending, seen, valid = list(op.outputs), set(), True
+        while pending and valid:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            uses = [reader for reader in ag.ops if name in reader.inputs]
+            if name in ag.model_outputs or not uses:
+                valid = False
+                break
+            for reader in uses:
+                if reader.op_type in {"Gather", "GatherND", "EmbeddingLookup", "tigris::Gather", "tigris::GatherND"} and reader.inputs[1] == name:
+                    continue
+                if reader.op_type not in {"Identity", "Reshape", "Transpose"} or reader.inputs[0] != name:
+                    valid = False
+                    break
+                pending.extend(reader.outputs)
+        if valid:
+            ag.tensors[op.inputs[0]].dtype = 6
+            op.op_type = "Identity"
+            op.attrs = {}
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
     ag = _fold_constant_ops(ag)
@@ -3305,7 +3331,7 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
         source = ag.tensors[op.inputs[0]]
         shape = source.shape
         rank = len(shape)
-        if source.is_constant or not 1 <= rank <= 6 or any(d <= 0 for d in shape):
+        if (source.is_constant and op.op_type not in {"Gather", "GatherND", "EmbeddingLookup"}) or not 1 <= rank <= 6 or any(d <= 0 for d in shape):
             raise ValueError(f"{op.op_type} requires a nonempty data tensor of rank 1 through 6")
         output = ag.tensors[op.outputs[0]]
         if source.dtype != output.dtype or source.dtype not in {1, 3}:
@@ -3316,6 +3342,9 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
                 or not np.array_equal(source.quant.zero_point, output.quant.zero_point)):
             raise ValueError(f"{op.op_type} requires identical per-tensor quantization")
         kind = op.op_type
+        if source.is_constant:
+            source.layout = Layout.LINEAR
+            op.attrs["table_shape"] = list(shape)
         if kind in {"Gather", "GatherND", "EmbeddingLookup"}:
             if len(op.inputs) != 2:
                 raise ValueError(f"{kind} requires data and indices")

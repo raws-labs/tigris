@@ -42,6 +42,7 @@ from .defs import (
     OP_ATTR_GELU_APPROXIMATE,
     OP_ATTR_CUMSUM_OPTIONS,
     OP_ATTR_MOVEMENT,
+    OP_ATTR_TABLE_SHAPE,
     OP_ATTR_COMPARISON_REQUANT,
     OP_ATTR_CONSTANTS,
     OP_ATTR_SVDF,
@@ -1077,6 +1078,9 @@ def _build_op_attributes(
             if values is None:
                 raise ValueError(f"{op.op_type} requires normalized constant metadata")
             records.append((op_index, OP_ATTR_MOVEMENT, struct.pack(f"<{len(values)}i", *values)))
+            if "table_shape" in op.attrs:
+                shape = op.attrs["table_shape"]
+                records.append((op_index, OP_ATTR_TABLE_SHAPE, struct.pack(f"<{len(shape)}i", *shape)))
             continue
         if op.op_type == "CumSum":
             records.append((op_index, OP_ATTR_CUMSUM_OPTIONS, bytes([

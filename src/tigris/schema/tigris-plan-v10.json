@@ -29,6 +29,7 @@
     "resize_scales": 10,
     "subgraphs": 17,
     "svdf": 15,
+    "table_shape": 20,
     "transpose_perm": 1
   },
   "op_types": {
