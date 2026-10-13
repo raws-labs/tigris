@@ -1418,6 +1418,10 @@ def _compute_multiplier_shift(scale: float) -> tuple[int, int]:
     # (frexp), the correct shift is exactly `exp` (matches TFLite
     # QuantizeMultiplier). A `- 1` here halves every requant and collapses
     # deep int8 graphs to the output zero-point.
+    if exp < -31:
+        # Every bit shifts out, so the result is zero; TFLite's QuantizeMultiplier
+        # stores that as (0, 0), and kernels never shift by more than 31.
+        return 0, 0
     return multiplier, exp
 
 
