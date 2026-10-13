@@ -823,6 +823,26 @@ def test_quantization_entries_are_only_those_the_plan_reads(name, constants):
     assert all(graph.tensors[n].quant is not None for n in index)
 
 
+@pytest.mark.parametrize("scale, expected", [(0.75 * 2.0 ** -31, (1610612736, -31)),
+                                             (0.75 * 2.0 ** -32, (0, 0)),
+                                             (2.0 ** -40, (0, 0))])
+def test_a_scale_below_the_shift_range_quantizes_to_zero(scale, expected):
+    from tigris.emitters.binary.writer import _compute_multiplier_shift
+
+    assert _compute_multiplier_shift(scale) == expected
+
+
+def test_vww_plan_shifts_stay_within_31_bits():
+    """VWW has channels whose effective scale is below 2^-32."""
+    from tigris.cli import _run_pipeline
+
+    graph, _ = _run_pipeline(str(Path(__file__).parent / "fixtures" / "tflite" / "vww_96_int8.tflite"),
+                             ("256K",), report_bindings=False)
+    shifts = [s for qp in read_binary_plan(emit_binary_bytes(graph))["quant_params"]
+              for s in qp.get("shifts", [])]
+    assert shifts and min(shifts) >= -31
+
+
 def test_attribute_payloads_start_four_byte_aligned(tmp_path):
     """A three-byte transpose permutation ahead of a Pad's int32 pads must not
     leave the pads at an offset the loader refuses."""
