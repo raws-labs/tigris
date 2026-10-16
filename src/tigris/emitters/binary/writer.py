@@ -1367,7 +1367,8 @@ def _build_tile_plans(ag: AnalyzedGraph, version: int = SCHEMA_VERSION_BINARY_RE
             buf.extend(TILE_PLAN_V10_STRUCT.pack(
                 int(tp.tileable), tp.axis,
                 TILE_FLAG_BAND_ON_COLUMNS if tp.band_on_columns else 0,
-                input_band, output_band, tp.tile_width, 0, 0, 0, tp.tiled_peak_bytes,
+                input_band, output_band, tp.tile_width, tp.input_channel_group,
+                tp.input_spatial_interval, 0, tp.tiled_peak_bytes,
             ))
             continue
 
@@ -1809,7 +1810,10 @@ def _emit(
         ag, tensor_idx, quant_idx_map, weight_idx
     )
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
-    version = SCHEMA_VERSION_STATE if state_data or subgraph_data else SCHEMA_VERSION_BINARY_REQUANT
+    grouped = any(stage.tile_plan is not None and
+                  (stage.tile_plan.input_channel_group or stage.tile_plan.input_spatial_interval)
+                  for stage in ag.stages)
+    version = SCHEMA_VERSION_STATE if state_data or subgraph_data or grouped else SCHEMA_VERSION_BINARY_REQUANT
     tile_data, stage_to_tile = _build_tile_plans(ag, version)
     stage_data_final = _patch_stage_tile_indices(stage_data, ag, stage_to_tile)
 

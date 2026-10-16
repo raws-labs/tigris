@@ -90,8 +90,8 @@ def test_a_global_reduction_tiles_along_its_input(tmp_path):
     assert validate_memory_plan(graph).feasible
 
 
-def test_a_global_reduction_too_wide_for_one_row_stays_untileable(tmp_path):
-    """One row of a 64-wide plane needs more than the budget allows."""
+def test_a_global_reduction_cuts_a_row_that_does_not_fit(tmp_path):
+    """A spatial interval can end inside a row without changing the sum."""
     model_path = _write_oversized_height_op_model(
         tmp_path, "GlobalAveragePool")
 
@@ -101,8 +101,9 @@ def test_a_global_reduction_too_wide_for_one_row_stays_untileable(tmp_path):
     ]
 
     assert tile_plans
-    assert all(not tile_plan.tileable for tile_plan in tile_plans)
-    assert not validate_memory_plan(graph).feasible
+    assert all(tile_plan.tileable for tile_plan in tile_plans)
+    assert all(0 < tile_plan.input_spatial_interval < 64 for tile_plan in tile_plans)
+    assert validate_memory_plan(graph).feasible
 
 
 def test_a_resample_compiles_at_a_budget_below_its_output(tmp_path):
@@ -383,3 +384,31 @@ def test_a_plan_beyond_the_default_build_is_written_and_names_the_build(tmp_path
         assert expected in result.output
     report = json.loads(CliRunner().invoke(cli, ["analyze", str(source), "-m", "16K", "--json"]).output)
     assert report["runtime_build"] == [{"name": "TIGRIS_MAX_STAGE_OUTPUTS", "needed": 19, "default": 16}]
+
+
+@pytest.mark.parametrize("budget", ["128", "32M"])
+def test_int8_global_pool_refuses_an_overflowing_sum(tmp_path, budget):
+    from tigris.analysis.validation import validate_operator_support
+    from tigris.emitters.binary.reader import read_binary_plan
+    from tigris.runtime import Session, RuntimeError as HostError
+    from scripts.crossrepo_contract import _model, _qdq, _scalars
+
+    count = ((1 << 31) - 1) // 255 + 1
+    model = _model("large_mean", [*_qdq("input", "x_s", "x_z", "x"),
+                  helper.make_node("GlobalAveragePool", ["x"], ["raw"]),
+                  *_qdq("raw", "y_s", "y_z", "output")],
+                  [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 1, count])],
+                  [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 1, 1])],
+                  _scalars(x=(0.125, -128), y=(0.25, 9)))
+    source = tmp_path / "large.onnx"
+    onnx.save(model, source)
+    graph, _ = _run_pipeline(str(source), (budget, "32M"))
+    assert not validate_operator_support(graph).supported
+    path = tmp_path / "large.tgrs"
+    with pytest.raises(ValueError):
+        emit_binary_bytes(graph)
+    from tigris.emitters.binary.writer import _emit
+    path.write_bytes(_emit(graph, compress=None, validate=False))
+    assert read_binary_plan(path.read_bytes())["version"] == (10 if budget == "128" else 9)
+    with pytest.raises(HostError):
+        Session(path)

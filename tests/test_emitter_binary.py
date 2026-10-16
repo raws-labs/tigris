@@ -935,3 +935,29 @@ def test_compact_preserved_axis_transpose(tmp_path):
     expected = case.inputs["x"].transpose(0, 1, 4, 3, 2)
     assert np.array_equal(outputs[0], expected)
     assert np.array_equal(outputs[1], expected)
+
+
+@pytest.mark.parametrize("field_offset", [16, 20])
+def test_loader_refuses_incomplete_group_geometry(tmp_path, field_offset):
+    import onnx
+    from scripts.crossrepo_contract import _grouped_global_reduction_case
+    from tigris.cli import _run_pipeline
+    from tigris.runtime import Session, RuntimeError as HostError
+
+    case = _grouped_global_reduction_case(False, True)
+    source = tmp_path / "gap.onnx"
+    onnx.save(case.compile_model, source)
+    graph, _ = _run_pipeline(str(source), (case.mem_budget, "16K"))
+    data = bytearray(emit_binary_bytes(graph))
+    header = defs.HEADER_STRUCT.unpack_from(data)
+    for offset in range(header[3], len(data), defs.SECTION_ENTRY_SIZE):
+        kind, start = defs.SECTION_ENTRY_STRUCT.unpack_from(data, offset)
+        if kind == defs.SEC_TILE_PLANS:
+            struct.pack_into("<I", data, start + field_offset, 0)
+            break
+    plan = read_binary_plan(data)
+    assert plan["tile_plans"][0]["num_tiles"] == 0
+    path = tmp_path / "incomplete.tgrs"
+    path.write_bytes(data)
+    with pytest.raises(HostError):
+        Session(path)

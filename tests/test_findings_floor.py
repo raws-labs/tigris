@@ -19,22 +19,28 @@ def _global_pool(path, channels=64, side=8):
     onnx.save(model, path)
 
 
-def test_a_pool_whose_smallest_band_is_too_large_reports_that_band(tmp_path):
-    """64 channels over 8x8: the smallest band is one row (8 x 64 floats) plus the
-    per-channel sums and the output, 2560 bytes, not the 16 KiB untiled input."""
+def test_a_pool_groups_below_its_full_row_floor(tmp_path):
     path = tmp_path / "gap.onnx"
     _global_pool(path)
-    ag, _ = _run_pipeline(str(path), ("2K",))
+    graph, _ = _run_pipeline(str(path), ("2K",))
+    assert validate_memory_plan(graph).feasible
+    tile = graph.stages[0].tile_plan
+    assert tile.input_channel_group > 0
+    assert tile.input_spatial_interval > 0
+    assert tile.tiled_peak_bytes <= 2048
+    assert compute_findings(graph).blocking_stages == []
 
-    band = 64 * 4 + 8 * 64 * 4 + 64 * 4
-    issues = validate_memory_plan(ag).issues
-    assert [(issue.required_bytes, issue.reason) for issue in issues] == [(band, "smallest tile")]
 
-    findings = compute_findings(ag)
-    assert findings.stages_untileable == 0
-    assert findings.min_fast_for_partition == band
-    assert [(stage.required_bytes, stage.reason) for stage in findings.blocking_stages] == [
-        (band, "smallest tile")]
+def test_grouped_pool_has_three_aligned_buffers_at_its_floor(tmp_path):
+    path = tmp_path / "gap.onnx"
+    _global_pool(path)
+    for budget, feasible in ((95, False), (96, True)):
+        graph, _ = _run_pipeline(str(path), (str(budget),))
+        assert validate_memory_plan(graph).feasible is feasible
+        if not feasible:
+            assert [(issue.required_bytes, issue.reason) for issue in validate_memory_plan(graph).issues] == [
+                (96, "smallest tile")]
+            assert graph.stages[0].tile_plan.warnings
 
 
 def test_the_smallest_band_fits_one_budget_up(tmp_path):

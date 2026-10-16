@@ -585,6 +585,11 @@ def _tile_summary(tile, stage, tensors, ops, attributes):
         elif len(a) >= 3 and (source["flags"] & TENSOR_FLAG_LINEAR):
             total = a[-2]
     count = (total + extent - 1) // extent if extent else 0
+    if tile["input_channel_group"] and tile["input_spatial_interval"] and stage["inputs"]:
+        shape = tensors[stage["inputs"][0]]["shape"]
+        group, interval = tile["input_channel_group"], tile["input_spatial_interval"]
+        count = shape[0] * ((shape[3] + group - 1) // group) * ((shape[1] * shape[2] + interval - 1) // interval)
+        total = shape[1] * shape[2]
     if tile["output_width_extent"] and stage["outputs"]:
         width = tensors[stage["outputs"][0]]["shape"][2]
         count *= (width + tile["output_width_extent"] - 1) // tile["output_width_extent"]

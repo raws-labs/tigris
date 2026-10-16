@@ -95,6 +95,7 @@ class ContractCase:
     reference_unoptimized: bool = False
     exact_untiled: bool = False
     tiled_operators: tuple[str, ...] = ()
+    expect_grouped: bool = False
 
 
 def _model(
@@ -4640,6 +4641,29 @@ def _tiled_pool_case() -> ContractCase:
     )
 
 
+def _grouped_global_reduction_case(quantized: bool, width_only: bool) -> ContractCase:
+    shape = [2, 13, 1, 41] if width_only else [2, 31, 3, 19]
+    result_shape = [shape[0], shape[1], 1, 1]
+    values = ((np.arange(np.prod(shape)).reshape(shape) % 31) - 15).astype(np.float32) * 0.125
+    nodes, constants = [], []
+    source, target = "input", "output"
+    if quantized:
+        constants = _scalars(x=(0.125, -17), y=(0.25, 9))
+        nodes += _qdq("input", "x_s", "x_z", "x")
+        source, target = "x", "raw"
+    nodes.append(helper.make_node("GlobalAveragePool", [source], [target]))
+    if quantized:
+        nodes += _qdq("raw", "y_s", "y_z", "output")
+    model = _model("grouped_global_reduction", nodes,
+                   [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, result_shape)], constants)
+    return ContractCase(f"{'int8' if quantized else 'float'}_grouped_global_reduction_{int(width_only)}",
+                        model, model, {"input": values}, ("GlobalAveragePool",),
+                        mem_budget="128" if quantized or width_only else "256", slow_budget="16K",
+                        expect_tiled=True, expect_grouped=True, exact_untiled=True,
+                        tiled_operators=("GlobalAveragePool",), reference_unoptimized=True)
+
+
 def _tiled_global_reduction_case() -> ContractCase:
     """A GlobalAveragePool too large for the budget, so it reduces in bands."""
     model_input = helper.make_tensor_value_info(
@@ -7246,7 +7270,7 @@ def _run_case(
         expected_schema = 10 if (any(prop.key == STATE_KEY for prop in case.compile_model.metadata_props)
                                  or any(k in {"If", "While", "Svdf", "Lstm"}
                                         for k in case.expected_operators)) else 9
-        assert plan["version"] == expected_schema
+        assert plan["version"] == (10 if case.expect_grouped else expected_schema)
         banded_types = {OP_TYPE_MAP[k] for k in (case.tiled_operators or case.expected_operators) if k != "Transpose"}
         banded_stages = [stage for stage in plan["stages"] if any(
             plan["ops"][i]["op_type"] in banded_types for i in stage["ops"])]
@@ -7384,6 +7408,9 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
             f"{case.name}: plan operators {actual_operators}, expected "
             f"{case.expected_operators}"
         )
+
+    grouped = any(tile.get("input_channel_group", 0) > 0 for tile in plan["tile_plans"])
+    assert grouped == case.expect_grouped, case.name
 
     standalone_tiled = any(
         tile["tileable"] and tile["num_tiles"] > 1
@@ -7796,6 +7823,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
             _reshape_band_case(False, False), _reshape_band_case(False, True),
             _gelu_case("none", [1, 8, 7, 19], "256", two_dimensional=True),
         )],
+        _state_tile_case(_grouped_global_reduction_case(False, False)),
+        *[_grouped_global_reduction_case(quantized, width_only)
+          for quantized in (False, True) for width_only in (False, True)],
         _tiled_global_reduction_case(),
         _qdq_tiled_global_reduction_case(),
         _tiled_chain_case(compression="lz4"),

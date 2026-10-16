@@ -590,3 +590,27 @@ def test_a_variable_is_kept_across_runs_and_reset(tmp_path):
         again = session.run({"serving_default_x:0": golden["input_0"][0]})[name]
     np.testing.assert_array_equal(first, golden["output_0"][0])
     np.testing.assert_array_equal(again, first)
+
+
+@pytest.mark.parametrize("name", ["mean_spatial", "mean_spatial_flat", "float_mean_spatial", "float_mean_spatial_flat"])
+def test_grouped_pool_preserves_recorded_outputs(name, tmp_path):
+    from dataclasses import replace
+    from tigris.cli import _run_pipeline
+    from tigris.emitters.binary.writer import emit_binary_bytes
+
+    source = FIXTURES / "ops" / (name + ".tflite")
+    graph, _ = _run_pipeline(str(source), ("96", "16K"))
+    stage = next(stage for stage in graph.stages if
+                 len(stage.op_indices) == 1 and graph.ops[stage.op_indices[0]].op_type == "GlobalAveragePool")
+    stage.tile_plan = replace(stage.tile_plan, tile_height=0, input_channel_group=3,
+                              input_spatial_interval=1, tiled_peak_bytes=96)
+    path = tmp_path / "grouped.tgrs"
+    path.write_bytes(emit_binary_bytes(graph))
+    plan = read_binary_plan(path.read_bytes())
+    assert plan["version"] == 10
+    Session = _session()
+    golden = np.load(source.with_suffix(".npz"))
+    with Session(path, slow_capacity=slow_arena_required(plan)) as session:
+        for sample in range(len(golden["input_0"])):
+            actual = session.run({session.inputs[0]["name"]: golden["input_0"][sample]})[session.outputs[0]["name"]]
+            np.testing.assert_array_equal(actual, golden["output_0"][sample])
