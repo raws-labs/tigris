@@ -870,3 +870,68 @@ def test_attribute_payloads_start_four_byte_aligned(tmp_path):
     assert any(entry[1] == OP_ATTR_PADS for entry in entries)
     assert any(entry[2] % 4 for entry in entries), "the case needs a payload of odd length"
     assert all(entry[3] % 4 == 0 for entry in entries)
+
+
+@pytest.mark.parametrize("state", [False, True])
+def test_tile_wire_layout_by_schema(tmp_path, state):
+    import onnx
+    from scripts.crossrepo_contract import _state_tile_case, _tiled_global_reduction_case
+    from tigris.cli import _run_pipeline
+
+    case = _tiled_global_reduction_case()
+    if state:
+        case = _state_tile_case(case)
+    path = tmp_path / "reduction.onnx"
+    onnx.save(case.compile_model, path)
+    graph, _ = _run_pipeline(str(path), (case.mem_budget,))
+    data = emit_binary_bytes(graph)
+    plan = read_binary_plan(data)
+    tile = next(stage.tile_plan for stage in graph.stages if stage.tile_plan is not None)
+    assert plan["version"] == (10 if state else 9)
+    assert plan["tile_plans"] and plan["tile_plans"][0]["num_tiles"] > 1
+    # Read the record at its directory offset, independent of the reader.
+    directory = struct.unpack_from("<I", data, 12)[0]
+    offsets = {}
+    while True:
+        kind, offset = struct.unpack_from("<II", data, directory)
+        directory += 8
+        if not kind:
+            break
+        offsets[kind] = offset
+    start = offsets[defs.SEC_TILE_PLANS]
+    if state:
+        fields = struct.unpack_from("<BBH7I", data, start)
+        assert fields[:3] == (1, 1, 0)
+        assert fields[3] == tile.tile_height
+        assert fields[4:9] == (0, 0, 0, 0, 0)
+        assert fields[9] == tile.tiled_peak_bytes
+        assert defs.TILE_PLAN_V10_SIZE == 32
+    else:
+        assert struct.unpack_from("<H", data, start + 2)[0] == tile.tile_height
+        assert defs.TILE_PLAN_SIZE == 24
+
+
+def test_compact_preserved_axis_transpose(tmp_path):
+    import onnx
+    from scripts.crossrepo_contract import _state_tile_case, _fixed_axis_transpose_case
+    from tigris.cli import _run_pipeline
+    from tigris.runtime import Session
+
+    case = _state_tile_case(_fixed_axis_transpose_case())
+    source = tmp_path / "transpose.onnx"
+    onnx.save(case.compile_model, source)
+    outputs = []
+    for budget in ("512", "8K"):
+        graph, _ = _run_pipeline(str(source), (budget, "16K"))
+        path = tmp_path / (budget + ".tgrs")
+        path.write_bytes(emit_binary_bytes(graph))
+        plan = read_binary_plan(path.read_bytes())
+        if budget == "512":
+            tile = next(tile for tile in plan["tile_plans"] if tile["tileable"])
+            assert tile["input_band_extent"] > 0 and tile["output_band_extent"] == 0
+            assert tile["original_height"] == 17
+        with Session(path, slow_capacity=16384) as session:
+            outputs.append(session.run(case.inputs)["y"])
+    expected = case.inputs["x"].transpose(0, 1, 4, 3, 2)
+    assert np.array_equal(outputs[0], expected)
+    assert np.array_equal(outputs[1], expected)

@@ -98,6 +98,7 @@ from .defs import (
     TENSOR_STRUCT,
     TILE_FLAG_BAND_ON_COLUMNS,
     TILE_PLAN_STRUCT,
+    TILE_PLAN_V10_STRUCT,
     WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
     WEIGHT_BLOCK_STRUCT,
     WEIGHT_ENTRY_SIZE,
@@ -1334,7 +1335,7 @@ def _build_stages(
     return bytes(buf)
 
 
-def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
+def _build_tile_plans(ag: AnalyzedGraph, version: int = SCHEMA_VERSION_BINARY_REQUANT) -> tuple[bytes, dict[int, int]]:
     """Build tile plan table. Returns (bytes, stage_id->tile_plan_index map)."""
     buf = bytearray()
     stage_to_tile: dict[int, int] = {}
@@ -1355,6 +1356,21 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
             raise ValueError(
                 f"untileable stage {stage.stage_id} must use tile axis 0"
             )
+        if version >= SCHEMA_VERSION_STATE:
+            ops = [ag.ops[i] for i in stage.op_indices]
+            output_driven = tp.axis == TILE_AXIS_HW or any(
+                op.op_type in {"Resize", "ResizeLinear"} for op in ops)
+            from tigris.analysis.partition_spatial import _stage_is_tiled_transpose
+            transpose = _stage_is_tiled_transpose(ag, stage, ops)
+            input_band = tp.tile_height if tp.tileable and not output_driven and not transpose else 0
+            output_band = tp.tile_height if tp.tileable and output_driven else 0
+            buf.extend(TILE_PLAN_V10_STRUCT.pack(
+                int(tp.tileable), tp.axis,
+                TILE_FLAG_BAND_ON_COLUMNS if tp.band_on_columns else 0,
+                input_band, output_band, tp.tile_width, 0, 0, 0, tp.tiled_peak_bytes,
+            ))
+            continue
+
         # Every tile extent below is a uint16 field. Say which one overflowed
         # and on which stage: struct.pack alone reports neither, and
         # tile_width is masked rather than checked, so it would be silent.
@@ -1793,7 +1809,8 @@ def _emit(
         ag, tensor_idx, quant_idx_map, weight_idx
     )
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
-    tile_data, stage_to_tile = _build_tile_plans(ag)
+    version = SCHEMA_VERSION_STATE if state_data or subgraph_data else SCHEMA_VERSION_BINARY_REQUANT
+    tile_data, stage_to_tile = _build_tile_plans(ag, version)
     stage_data_final = _patch_stage_tile_indices(stage_data, ag, stage_to_tile)
 
     index_data = index_pool.data()
@@ -1889,7 +1906,7 @@ def _emit(
         header_flags |= FLAG_XIP
     header = HEADER_STRUCT.pack(
         MAGIC,
-        SCHEMA_VERSION_STATE if state_data or subgraph_data else SCHEMA_VERSION_BINARY_REQUANT,
+        version,
         file_size,
         HEADER_SIZE,  # section_dir starts right after header
         num_tensors,

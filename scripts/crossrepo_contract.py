@@ -115,6 +115,31 @@ def _model(
     return model
 
 
+def _fixed_axis_transpose_case() -> ContractCase:
+    shape, perm = [1, 2, 5, 17, 3], [0, 1, 4, 3, 2]
+    values = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) * 0.125
+    model = _model("transpose_fixed_axis", [helper.make_node("Transpose", ["x"], ["y"], perm=perm)],
+                   [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+                   [helper.make_tensor_value_info("y", TensorProto.FLOAT, [shape[i] for i in perm])])
+    return ContractCase("transpose_fixed_axis", model, model, {"x": values}, ("Transpose",),
+                        mem_budget="512", slow_budget="16K", expect_tiled=True)
+
+
+def _state_tile_case(case: ContractCase) -> ContractCase:
+    """Exercise the same tiled schedule with a schema-10 state section."""
+    model = copy.deepcopy(case.compile_model)
+    model.graph.input.append(helper.make_tensor_value_info("saved", TensorProto.FLOAT, [1]))
+    model.graph.initializer.append(numpy_helper.from_array(np.zeros(1, np.float32), "saved_initial"))
+    model.graph.output.append(helper.make_tensor_value_info("saved_out", TensorProto.FLOAT, [1]))
+    model.graph.node.insert(0, helper.make_node("Relu", ["saved"], ["saved_out"]))
+    helper.set_model_props(model, {STATE_KEY: json.dumps([
+        {"input": "saved", "output": "saved_out", "initial": "saved_initial"}])})
+    return replace(case, name=case.name + "_state", compile_model=model,
+                   expected_operators=("Relu", *case.expected_operators),
+                   tiled_operators=case.tiled_operators or tuple(
+                       kind for kind in case.expected_operators if kind not in {"Relu", "Transpose"}))
+
+
 def _constant_add_case() -> ContractCase:
     """A constant-operand Add, with the Relu ahead of it so it stays its own op.
 
@@ -7218,7 +7243,9 @@ def _run_case(
         )
     _assert_trace(case.name, plan_path, inputs_path.read_bytes(), outputs_path.read_bytes())
     if case.exact_untiled:
-        expected_schema = 10 if any(k in {"Svdf", "Lstm"} for k in case.expected_operators) else 9
+        expected_schema = 10 if (any(prop.key == STATE_KEY for prop in case.compile_model.metadata_props)
+                                 or any(k in {"If", "While", "Svdf", "Lstm"}
+                                        for k in case.expected_operators)) else 9
         assert plan["version"] == expected_schema
         banded_types = {OP_TYPE_MAP[k] for k in (case.tiled_operators or case.expected_operators) if k != "Transpose"}
         banded_stages = [stage for stage in plan["stages"] if any(
@@ -7395,7 +7422,12 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
     # recovers the W-axis tile count without needing a separate width field
     # in the plan format.
     if case.expect_2d:
-        tile_plan = decode_first_tile_plan(plan_bytes)
+        if plan["version"] >= 10:
+            from types import SimpleNamespace
+            tile_plan = SimpleNamespace(**next(tile for tile in plan["tile_plans"]
+                                              if tile["tileable"]))
+        else:
+            tile_plan = decode_first_tile_plan(plan_bytes)
         if tile_plan.axis != TILE_AXIS_HW:
             raise AssertionError(
                 f"{case.name}: tile plan axis {tile_plan.axis}, expected "
@@ -7758,6 +7790,12 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_pool_case(),
         _tiled_pool_chain_case(),
         _tiled_ceil_pool_case(),
+        *[_state_tile_case(case) for case in (
+            _tiled_pool_case(), _tiled_global_reduction_case(), _fixed_axis_transpose_case(),
+            _tiled_matrix_rows_case(), _tiled_attention_transpose_case(),
+            _reshape_band_case(False, False), _reshape_band_case(False, True),
+            _gelu_case("none", [1, 8, 7, 19], "256", two_dimensional=True),
+        )],
         _tiled_global_reduction_case(),
         _qdq_tiled_global_reduction_case(),
         _tiled_chain_case(compression="lz4"),
