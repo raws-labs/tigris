@@ -1115,13 +1115,48 @@ def _stage_is_global_reduction(
         return False
     # NCHW: the reduction collapses H and W, keeping N and C.
     return (
-        int(source.shape[2]) > 1
+        int(source.shape[2]) * int(source.shape[3]) > 0
         and int(source.shape[3]) > 0
         and int(result.shape[0]) == int(source.shape[0])
         and int(result.shape[1]) == int(source.shape[1])
         and int(result.shape[2]) == 1
         and int(result.shape[3]) == 1
     )
+
+
+def _solve_grouped_global_reduction(ag: AnalyzedGraph, stage: Stage, budget: int) -> TilePlan:
+    source = ag.tensors[stage.input_tensors[0]]
+    result = ag.tensors[stage.output_tensors[0]]
+    batch, channels, height, width = map(int, source.shape)
+    spatial = height * width
+    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
+    best = None
+    minimum = 3 * align
+    for group in range(1, min(channels, budget // (4 + source.elem_size + result.elem_size)) + 1):
+        fixed = _align_up(group * 4, align) + _align_up(group * result.elem_size, align)
+        available = max(0, (budget - fixed) // align * align)
+        interval = min(spatial, available // (group * source.elem_size))
+        if interval == 0:
+            continue
+        count = batch * math.ceil(channels / group) * math.ceil(spatial / interval)
+        cost = (count, math.ceil(channels / group), -group, -interval)
+        peak = fixed + _align_up(group * interval * source.elem_size, align)
+        if best is None or cost < best[0]:
+            best = cost, group, interval, peak
+    if best is None:
+        return TilePlan(
+            tileable=False,
+            min_tile_bytes=minimum,
+            warnings=[
+                f"Stage {stage.stage_id} minimum reduction group still "
+                f"exceeds budget ({budget:,} bytes)"
+            ],
+        )
+    cost, group, interval, peak = best
+    return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
+                    num_tiles=cost[0], original_height=height,
+                    tiled_peak_bytes=peak, input_channel_group=group,
+                    input_spatial_interval=interval)
 
 
 def _solve_global_reduction(
@@ -1159,14 +1194,7 @@ def _solve_global_reduction(
         )
 
     if working_set(1) > budget:
-        return TilePlan(
-            tileable=False,
-            min_tile_bytes=working_set(1),
-            warnings=[
-                f"Stage {stage.stage_id} minimum reduction band still "
-                f"exceeds budget ({budget:,} bytes)"
-            ],
-        )
+        return _solve_grouped_global_reduction(ag, stage, budget)
 
     low, high, rows = 1, full_h, 1
     while low <= high:

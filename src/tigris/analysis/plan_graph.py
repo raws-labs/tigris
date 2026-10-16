@@ -98,7 +98,9 @@ def graph_from_plan(plan: dict, fast_reserve: int = 0) -> AnalyzedGraph:
                     original_height=entry["original_height"],
                     tiled_peak_bytes=entry["tiled_peak_bytes"],
                     overhead_bytes=entry["overhead_bytes"],
-                    band_on_columns=entry["band_on_columns"])
+                    band_on_columns=entry["band_on_columns"],
+                    input_channel_group=entry.get("input_channel_group", 0),
+                    input_spatial_interval=entry.get("input_spatial_interval", 0))
             stage = Stage(
                 stage_id=position, op_indices=[local[i] for i in record["ops"]],
                 input_tensors=[names[i] for i in record["inputs"]],

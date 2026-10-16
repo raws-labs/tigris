@@ -75,7 +75,7 @@ def schema_package() -> dict[str, object]:
             "stage_assignment_v5": (
                 "stage table authoritative; operator byte is canonical low-byte hint"
             ),
-            "state_v10": "only a plan with a state section is written at schema 10",
+            "state_v10": "a plan with state, subgraphs or grouped tiles is written at schema 10",
             "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
             "subgraphs_v10": "a plan with control flow is written at schema 10; graph 0 is the main graph",
         },

@@ -225,6 +225,13 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             )
             continue
 
+        if op.op_type == "GlobalAveragePool" and op.inputs:
+            source = ag.tensors.get(op.inputs[0])
+            if (source is not None and source.dtype == 3 and len(source.shape) == 4
+                    and math.prod(source.shape[2:]) > ((1 << 31) - 1) // 255):
+                issues.append(UnsupportedOperatorIssue(op_name=op.name, op_type=op.op_type))
+                continue
+
         reasons: list[str] = []
         # An int8 activation's plan record states one scale and zero point; it
         # may also carry its producer's per-channel requantization, which

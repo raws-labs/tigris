@@ -178,6 +178,8 @@ class TilePlan:
     # The runtime used to derive it from the extents, which agrees with the
     # solver only by coincidence when the two axes are equal.
     band_on_columns: bool = False
+    input_channel_group: int = 0
+    input_spatial_interval: int = 0
     # Set when a stage was eligible for 2D (HW) tiling and solve_2d_tile
     # attempted the search but even a 1x1 core tile did not fit the budget.
     # Distinguishes this case from the generic 1D minimum-tile shortfall so
