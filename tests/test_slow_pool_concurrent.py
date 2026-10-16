@@ -5,9 +5,12 @@ step in between, and can coexist with a middle stage's own boundary
 tensors in a way no single stage's own input+output sum captures.
 """
 
+import json
+
 import numpy as np
 import onnx
-from onnx import TensorProto, helper
+import pytest
+from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.validation import row_band_aliases, slow_pool_usage
 from tigris.cli import _run_pipeline
@@ -280,3 +283,62 @@ def test_slow_requirement_is_reported_without_a_slow_budget(tmp_path):
     usage = slow_pool_usage(ag)
     assert usage.slow_peak_bytes == 64
     assert usage.fits
+
+
+def _softmax_with_unread_input(path, state: bool):
+    """Softmax over [1, 2, 3] beside a [1, 2] input no operator reads, as a
+    model input or as a variable without a next value."""
+    unread = helper.make_tensor_value_info("unread", TensorProto.FLOAT, [1, 2])
+    graph = helper.make_graph(
+        [helper.make_node("Softmax", ["input"], ["output"], axis=-1)], "softmax",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2, 3]), unread],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2, 3])],
+        [numpy_helper.from_array(np.zeros((1, 2), np.float32), "unread_initial")]
+        if state else [])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    if state:
+        helper.set_model_props(model, {"tigris.state": json.dumps(
+            [{"input": "unread", "output": None, "initial": "unread_initial"}])})
+    model.ir_version = 8
+    onnx.save(model, path)
+
+
+@pytest.mark.parametrize("state", [False, True])
+def test_an_input_no_operator_reads_still_takes_slow_memory(tmp_path, state):
+    """The caller places every model input, and the runtime every variable,
+    in slow memory before the first stage: 32 aligned bytes beside the two
+    32-byte boundary tensors."""
+    path = tmp_path / "softmax.onnx"
+    _softmax_with_unread_input(path, state)
+    ag, _ = _run_pipeline(str(path), ("16K", "8M"))
+    assert slow_pool_usage(ag).slow_peak_bytes == 96
+
+
+def test_a_branch_input_its_graph_does_not_read_is_counted_once(tmp_path):
+    """Each branch of an If reads one of its two inputs. The host runtime
+    measures 192 bytes for this plan on either branch."""
+    def value(name):
+        return helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 4])
+
+    def branch(name, used):
+        return helper.make_graph([helper.make_node("Relu", [f"{name}_{used}"], [f"{name}_y"])],
+                                 name, [value(f"{name}_x"), value(f"{name}_w")],
+                                 [value(f"{name}_y")])
+
+    constants = [numpy_helper.from_array(np.asarray([2], np.int64), "axes"),
+                 numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), "rows"),
+                 numpy_helper.from_array(np.asarray(0.0, np.float32), "zero")]
+    nodes = [helper.make_node("Reshape", ["x", "rows"], ["row"]),
+             helper.make_node("ReduceSum", ["row", "axes"], ["sum"], keepdims=0),
+             helper.make_node("Greater", ["sum", "zero"], ["positive"]),
+             helper.make_node("If", ["positive", "x", "w"], ["y"], domain="tigris",
+                              then_branch=branch("then", "x"), else_branch=branch("else", "w"))]
+    model = helper.make_model(
+        helper.make_graph(nodes, "if", [value("x"), value("w")], [value("y")], constants,
+                          value_info=[value("y")]),
+        opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+    model.ir_version = 9
+    path = tmp_path / "if.onnx"
+    onnx.save(model, path)
+    ag, _ = _run_pipeline(str(path), ("4K", "8M"))
+    assert slow_pool_usage(ag).slow_peak_bytes == 192

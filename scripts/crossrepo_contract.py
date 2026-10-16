@@ -141,6 +141,24 @@ def _state_tile_case(case: ContractCase) -> ContractCase:
                        kind for kind in case.expected_operators if kind not in {"Relu", "Transpose"}))
 
 
+def _unread_input_case(case: ContractCase, state: bool) -> ContractCase:
+    """Add an input no operator reads, as a model input or as a variable with
+    no next value; it takes slow memory until the first stage ends."""
+    model = copy.deepcopy(case.compile_model)
+    model.graph.input.append(helper.make_tensor_value_info("unread", TensorProto.FLOAT, [1, 3]))
+    inputs = dict(case.inputs)
+    if state:
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.zeros((1, 3), np.float32), "unread_initial"))
+        helper.set_model_props(model, {STATE_KEY: json.dumps(
+            [{"input": "unread", "output": None, "initial": "unread_initial"}])})
+    else:
+        inputs["unread"] = np.ones((1, 3), np.float32)
+    return replace(case, name=case.name + ("_unread_state" if state else "_unread_input"),
+                   compile_model=model, reference_model=case.reference_model if state else model,
+                   inputs=inputs)
+
+
 def _constant_add_case() -> ContractCase:
     """A constant-operand Add, with the Relu ahead of it so it stays its own op.
 
@@ -7824,6 +7842,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
             _gelu_case("none", [1, 8, 7, 19], "256", two_dimensional=True),
         )],
         _state_tile_case(_grouped_global_reduction_case(False, False)),
+        *[_unread_input_case(_tiled_pool_case(), state) for state in (False, True)],
         *[_grouped_global_reduction_case(quantized, width_only)
           for quantized in (False, True) for width_only in (False, True)],
         _tiled_global_reduction_case(),
