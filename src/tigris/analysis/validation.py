@@ -1018,7 +1018,7 @@ def row_band_aliases(ag: AnalyzedGraph, fast_total: int) -> dict[str, str]:
     return aliases
 
 
-def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
+def slow_pool_usage(ag: AnalyzedGraph, *, body: bool = False) -> SlowMemoryUsage:
     """Slow/PSRAM residency. Empty overflow_stage_ids == fits.
 
     Every stage spills its outputs to slow memory and loads its inputs back
@@ -1116,6 +1116,16 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
         if n in reinterpreted and reinterpreted[n] in slow_names and n in ag.tensors:
             size = ag.tensors[n].size_bytes
         buffers.append((lt.birth_step, lt.death_step, aligned(size)))
+    # The caller places every model input and the runtime every variable in
+    # slow memory before the first stage, read or not. One no stage reads is
+    # released after the first group of stages. A control-flow body's inputs
+    # are counted by the operator that runs it.
+    first_end = max((i for s in groups[0] for i in s.op_indices), default=-1)
+    for n in () if body else ag.model_inputs:
+        if n in slow_names or n not in ag.lifetimes:
+            continue
+        lt = ag.lifetimes[n]
+        buffers.append((lt.birth_step, max(lt.death_step, first_end), aligned(lt.size_bytes)))
 
     def interval_bytes(first: int, last: int) -> int:
         return sum(
@@ -1135,7 +1145,7 @@ def slow_pool_usage(ag: AnalyzedGraph) -> SlowMemoryUsage:
             group_peak += untiled_stage_spill(ag, group[0], fast_total)
         # A control-flow stage holds its own tensors while the subgraph it
         # runs holds its peak beside them.
-        group_peak += max((slow_pool_usage(ag.subgraphs[index]).slow_peak_bytes
+        group_peak += max((slow_pool_usage(ag.subgraphs[index], body=True).slow_peak_bytes
                            for op in (ag.ops[i] for i in steps) if op.op_type in CONTROL_FLOW
                            for index in (op.attrs[key] for key in CONTROL_FLOW[op.op_type])),
                           default=0)
