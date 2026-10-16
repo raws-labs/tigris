@@ -138,7 +138,8 @@
     "subgraph_entry": 12,
     "subgraph_header": 4,
     "tensor": 16,
-    "tile_plan": 24,
+    "tile_plan": 32,
+    "tile_plan_through_v9": 24,
     "weight_block": 20,
     "weight_entry": 12
   },
@@ -171,6 +172,51 @@
     "hw": 3,
     "none": 0,
     "width_reserved": 2
+  },
+  "tile_plan_v10": {
+    "fields": {
+      "axis": [
+        1,
+        1
+      ],
+      "flags": [
+        2,
+        2
+      ],
+      "input_band_extent": [
+        4,
+        4
+      ],
+      "input_channel_group": [
+        16,
+        4
+      ],
+      "input_spatial_interval": [
+        20,
+        4
+      ],
+      "output_band_extent": [
+        8,
+        4
+      ],
+      "output_linear_segment": [
+        24,
+        4
+      ],
+      "output_width_extent": [
+        12,
+        4
+      ],
+      "tileable": [
+        0,
+        1
+      ],
+      "tiled_peak_bytes": [
+        28,
+        4
+      ]
+    },
+    "struct": "<BBH7I"
   },
   "versioning": {
     "capability_growth_requires_schema_bump": false,
