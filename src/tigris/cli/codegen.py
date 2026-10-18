@@ -1,5 +1,6 @@
 """``tigris codegen`` command."""
 
+import re
 from pathlib import Path
 
 import click
@@ -43,12 +44,18 @@ def codegen(plan: str, backend: str, output: str | None,
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
+    from tigris.emitters.codegen import generate_kernel_config
+    kernels_path = out.with_name(out.stem + "_kernels.h")
+    guard = re.sub(r"[^A-Za-z0-9_]", "_", kernels_path.name).upper()
+    if guard[0].isdigit():
+        guard = "_" + guard
     out.write_text(c_source)
+    kernels_path.write_text(generate_kernel_config(plan_data, guard))
     if output_format == "core":
         from tigris.emitters.codegen import generate_core_header
         header_path.write_text(generate_core_header(plan_data, core_name))
 
-    details = f"{output_format}, {backend} backend, {fmt_bytes(len(c_source))}"
+    details = f"{output_format}, {backend} backend, {fmt_bytes(len(c_source))}, kernels {kernels_path}"
     if output_format == "core":
         details += f", header {header_path}, symbols {core_name}_*"
     text.echo(f"wrote {out}   {details}")

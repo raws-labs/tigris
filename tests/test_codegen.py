@@ -563,3 +563,52 @@ def test_codegen_preserves_existing_output_on_capability_failure(
 
     assert result.exit_code != 0
     assert output.read_text() == "sentinel"
+
+
+def _tensor(dtype, flags=0):
+    return {"dtype": dtype, "flags": flags}
+
+
+def test_kernel_macros_route_as_the_runtime_dispatches():
+    from tigris.emitters.binary.defs import OP_TYPE_MAP
+    from tigris.emitters.codegen import kernel_macros
+
+    def op(name, inputs):
+        return {"op_type": OP_TYPE_MAP[name], "inputs": inputs, "outputs": []}
+
+    # int8 activations 0-1, float32 2-3, int32 4, an int8 constant 5.
+    int8_plan = {"tensors": [_tensor(3), _tensor(3), _tensor(1), _tensor(1), _tensor(6),
+                             _tensor(3, flags=0x01)],
+                 "ops": [op("Conv", [0]), op("Dequantize", [1]), op("Add", [2, 3]),
+                         op("Add", [4, 4]), op("Quantize", [3]), op("If", [0]),
+                         op("Relu", [5])]}
+    assert kernel_macros(int8_plan) == [
+        "TIGRIS_KERNEL_F32_ADD", "TIGRIS_KERNEL_I32", "TIGRIS_KERNEL_S8_CONV",
+        "TIGRIS_KERNEL_S8_DEQUANTIZE", "TIGRIS_KERNEL_S8_QUANTIZE", "TIGRIS_KERNEL_S8_RELU"]
+
+    # Without an int8 activation every kernel is a float32 one; an int8
+    # constant does not make a plan int8.
+    float_plan = {"tensors": [_tensor(1), _tensor(3, flags=0x01)],
+                  "ops": [op("Relu", [0]), op("Gather", [1, 0]), op("While", [0])]}
+    assert kernel_macros(float_plan) == ["TIGRIS_KERNEL_F32_GATHER", "TIGRIS_KERNEL_F32_RELU"]
+
+
+def test_codegen_writes_the_kernel_selection_header(linear_3op_path, tmp_path):
+    from tigris.emitters.codegen import generate_kernel_config, kernel_macros
+
+    data = emit_binary_bytes(_full_pipeline(linear_3op_path, budget=4096))
+    header = generate_kernel_config(data, "MODEL_KERNELS_H")
+    assert "#define TIGRIS_KERNEL_DEFAULT 0\n" in header
+    macros = kernel_macros(read_binary_plan(data))
+    assert macros and all(f"#define {m} 1\n" in header for m in macros)
+    assert all(m.startswith("TIGRIS_KERNEL_F32_") for m in macros)
+    with pytest.raises(ValueError):
+        generate_kernel_config(data, "not a guard")
+
+    plan_path = tmp_path / "model.tgrs"
+    plan_path.write_bytes(data)
+    result = CliRunner().invoke(cli, ["codegen", str(plan_path), "-o", str(tmp_path / "app.c")])
+    assert result.exit_code == 0, result.output
+    written = (tmp_path / "app_kernels.h").read_text()
+    assert written == generate_kernel_config(data, "APP_KERNELS_H")
+    assert f"kernels {tmp_path / 'app_kernels.h'}" in result.output

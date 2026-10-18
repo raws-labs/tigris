@@ -9,7 +9,7 @@ from pathlib import Path
 
 from tigris.capabilities import EXECUTOR_OPERATORS, KERNEL_CAPABILITIES
 from tigris.dtypes import OP_DTYPE_SIGNATURES
-from tigris.emitters.binary.defs import OP_TYPE_MAP
+from tigris.emitters.binary.defs import OP_C_NAMES, OP_TYPE_MAP
 
 
 _ENUM_RE = re.compile(r"\b(TIGRIS_OP_[A-Z0-9_]+)\s*=\s*(\d+)\s*,")
@@ -65,6 +65,30 @@ def validate(runtime: Path) -> list[str]:
             f"runtime-only={sorted(runtime_schema_codes - expected_schema_codes)}, "
             f"compiler-only={sorted(expected_schema_codes - runtime_schema_codes)}"
         )
+
+    runtime_names = {value: name.removeprefix("TIGRIS_OP_")
+                     for name, value in enum_values.items() if value != 255}
+    if runtime_names != OP_C_NAMES:
+        errors.append("runtime/compiler opcode names differ")
+
+    # Codegen's kernel selection header names these macros.
+    try:
+        config = (runtime / "src/tigris_op_config.h").read_text()
+    except OSError as exc:
+        errors.append(f"cannot read the runtime kernel selection header: {exc}")
+        config = ""
+    control_flow = {OP_TYPE_MAP["If"], OP_TYPE_MAP["While"]}
+    expected_macros = {"TIGRIS_KERNEL_I32"} | {
+        f"TIGRIS_KERNEL_{family}_{name}"
+        for code, name in OP_C_NAMES.items() if code not in control_flow
+        for family in ("F32", "S8")}
+    defined = set(re.findall(r"^#define (TIGRIS_KERNEL_[A-Z0-9_]+) TIGRIS_KERNEL_DEFAULT$",
+                             config, re.M))
+    if defined != expected_macros:
+        errors.append(
+            "runtime kernel selection macros differ from codegen's: "
+            f"runtime-only={sorted(defined - expected_macros)}, "
+            f"codegen-only={sorted(expected_macros - defined)}")
 
     loader = (runtime / "src/tigris_loader.c").read_text()
     rows = re.findall(r"\[(TIGRIS_OP_[A-Z0-9_]+)\] = \{\{(\d+), (\d+), (\d+)\}, (\d+)\}", loader)
