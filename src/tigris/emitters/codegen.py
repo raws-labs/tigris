@@ -19,7 +19,9 @@ from tigris.capabilities import (
     resolve_kernel_backend,
 )
 from tigris.dtypes import check_dtype_signatures
-from tigris.emitters.binary.defs import FLAG_XIP, TENSOR_FLAG_STATE, OP_TYPE_MAP
+from tigris.emitters.binary.defs import (
+    FLAG_XIP, OP_C_NAMES, OP_TYPE_MAP, TENSOR_FLAG_CONSTANT, TENSOR_FLAG_STATE,
+)
 from tigris.analysis.plan_graph import slow_arena_required
 from tigris.emitters.binary.reader import read_binary_plan
 
@@ -297,6 +299,58 @@ def _validate_core_name(core_name: str) -> None:
             "Core name must be an ASCII C identifier "
             "([A-Za-z_][A-Za-z0-9_]*)"
         )
+
+
+# Operators the runtime runs as int32 arithmetic when their first input is int32.
+_INT32_OPERATORS = frozenset(OP_TYPE_MAP[name] for name in (
+    "Add", "Sub", "Mul", "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "Cast"))
+# Operators with typed dispatch of their own rather than a float32 kernel.
+_TYPED_OPERATORS = frozenset(OP_TYPE_MAP[name] for name in (
+    "Quantize", "Dequantize", "If", "While", "DetectionPostProcess"))
+_CONTROL_FLOW = frozenset((OP_TYPE_MAP["If"], OP_TYPE_MAP["While"]))
+
+
+def kernel_macros(plan: dict) -> list[str]:
+    """The runtime kernel macros a plan needs, routed as the runtime routes it:
+    int32 arithmetic, float32 kernels in a float32 plan and for float32
+    operands of an int8 plan, int8 kernels otherwise. Control flow runs in the
+    executor and needs none."""
+    tensors = plan["tensors"]
+    int8_plan = any(t["dtype"] == 3 and not t.get("flags", 0) & TENSOR_FLAG_CONSTANT
+                    for t in tensors)
+    macros = set()
+    for op in plan["ops"]:
+        code = op["op_type"]
+        if code in _CONTROL_FLOW:
+            continue
+        inputs = op["inputs"]
+        if code in _INT32_OPERATORS and inputs and tensors[inputs[0]]["dtype"] == 6:
+            macros.add("TIGRIS_KERNEL_I32")
+        elif not int8_plan or (code not in _TYPED_OPERATORS
+                               and any(tensors[i]["dtype"] == 1 for i in inputs)):
+            macros.add(f"TIGRIS_KERNEL_F32_{OP_C_NAMES[code]}")
+        else:
+            macros.add(f"TIGRIS_KERNEL_S8_{OP_C_NAMES[code]}")
+    return sorted(macros)
+
+
+def generate_kernel_config(plan_data: bytes, guard: str = "TIGRIS_PLAN_KERNELS_H") -> str:
+    """A header that makes the runtime link only the kernels this plan uses."""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", guard):
+        raise ValueError("Header guard must be an ASCII C identifier")
+    lines = "".join(f"#define {macro} 1\n" for macro in kernel_macros(read_binary_plan(plan_data)))
+    return f"""\
+/* Operator kernels this plan uses. Build the TiGrIS runtime with
+ * TIGRIS_OP_CONFIG set to this file (the CMake cache variable of that name, or
+ * -DTIGRIS_OP_CONFIG='"path"') so it links only these; a plan that needs any
+ * other kernel then fails to load. */
+#ifndef {guard}
+#define {guard}
+
+#define TIGRIS_KERNEL_DEFAULT 0
+{lines}
+#endif
+"""
 
 
 def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") -> str:
