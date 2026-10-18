@@ -79,17 +79,33 @@ def check_dtype_signatures(tensors, operators, model_inputs, model_outputs, stat
     by_name = {name: (dtype, constant, quantized) for name, dtype, constant, quantized in tensors}
     data = {}
     issues = []
-    # Float32 written where an operator's slot states float32 stands apart
-    # from the data dtype and must not be read.
     stated = {name for kind, _, outputs in operators
               if OP_DTYPE_SIGNATURES.get(kind, DTypeSignature()).outputs == (1,)
               for name in outputs}
-    for name in stated:
-        if any(name in inputs and kind not in _FLOAT_READERS for kind, inputs, _ in operators):
+    sections = {name for kind, _, outputs in operators if kind in _FLOAT_WRITERS
+                for name in outputs if name in by_name and by_name[name][0] == 1}
+    section_ops = set()
+    changed = True
+    while changed:
+        changed = False
+        for index, (kind, inputs, outputs) in enumerate(operators):
+            if index in section_ops or kind in {"Quantize", "DetectionPostProcess"}:
+                continue
+            float_inputs = [n for n in inputs if n in by_name and by_name[n][0] == 1
+                            and not by_name[n][1]]
+            if (float_inputs and all(n in sections for n in float_inputs)
+                    and all(n is None or (n in by_name and (by_name[n][0] == 1
+                                or by_name[n][0] in AUXILIARY_DTYPES)) for n in inputs)
+                    and all(n in by_name and (by_name[n][0] == 1
+                            or by_name[n][0] in AUXILIARY_DTYPES) for n in outputs)):
+                section_ops.add(index)
+                sections.update(n for n in outputs if by_name[n][0] == 1)
+                changed = True
+    for name in stated | sections:
+        if any(name in inputs and kind not in _FLOAT_READERS and index not in section_ops
+               for index, (kind, inputs, _) in enumerate(operators)):
             issues.append(f"float32 result {name} must not be read by another operator")
-    # In an int8 plan, float32 crosses a control-flow boundary: written by a
-    # Dequantize, control flow or as a graph input, read by a Quantize,
-    # control flow or as a graph output.
+    stated.update(sections)
     if any(dtype == 3 and not constant for dtype, constant, _ in by_name.values()):
         for name, (dtype, constant, _) in by_name.items():
             if dtype != 1 or constant or name in stated:

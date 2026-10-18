@@ -1386,3 +1386,17 @@ def test_runtime_index_inputs_narrow_and_keep_their_slot(tmp_path, kind, dtype):
     onnx.save(case.compile_model, path)
     with pytest.raises(ClickException, match="indices must be unquantized int32 or int64"):
         _run_pipeline(str(path), ("8K",))
+
+
+def test_float_section_can_produce_a_typed_comparison():
+    from tigris.dtypes import check_dtype_signatures
+
+    tensors = [("x", 3, False, True), ("real", 1, False, False),
+               ("bias", 1, True, False), ("sum", 1, False, False),
+               ("condition", 9, False, False)]
+    operators = [("Dequantize", ["x"], ["real"]),
+                 ("Add", ["real", "bias"], ["sum"]),
+                 ("Greater", ["sum", "bias"], ["condition"])]
+    data, issues = check_dtype_signatures(tensors, operators, ["x"], ["condition"])
+    assert not issues
+    assert data == {3: ["x"]}

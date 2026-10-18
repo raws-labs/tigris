@@ -936,7 +936,7 @@ def _svdf_payload(ag: AnalyzedGraph, op: OpNode) -> bytes:
     """The rank; for int8 also the state zero point and the two requantizations,
     each scale formed in float32 as TFLite Micro forms it."""
     rank = int(op.attrs["rank"])
-    if not ag.is_quantized:
+    if ag.tensors[op.inputs[0]].dtype != 3:
         return struct.pack("<i", rank)
     f32 = np.float32
     x_scale = f32(ag.tensors[op.inputs[0]].quant.scale[0])
@@ -955,7 +955,7 @@ def _lstm_payload(ag: AnalyzedGraph, op: OpNode) -> bytes:
     is formed as TFLite Micro's Prepare forms it."""
     payload = struct.pack("<if", int(op.attrs.get("time_major", 0)),
                           float(op.attrs.get("cell_clip", 0.0)))
-    if not ag.is_quantized:
+    if ag.tensors[op.inputs[0]].dtype != 3:
         return payload
     x = ag.tensors[op.inputs[0]].quant
     hidden = ag.tensors[op.inputs[13]].quant
@@ -1052,7 +1052,7 @@ def _build_op_attributes(
         # int32 operands compare and add as integers, without requantization.
         integer = any(ag.tensors[n].dtype == 6 for n in op.inputs if n in ag.tensors)
         if (op.op_type in {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"}
-                and ag.is_quantized and not integer):
+                and any(ag.tensors[n].dtype == 3 for n in op.inputs) and not integer):
             pairs = [_compute_multiplier_shift(float(ag.tensors[n].quant.scale[0])) for n in op.inputs]
             pairs = [(0, 0) if shift < -31 else (value, shift) for value, shift in pairs]
             records.append((op_index, OP_ATTR_COMPARISON_REQUANT,

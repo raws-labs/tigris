@@ -89,12 +89,7 @@ class ExecutionDTypeValidation:
 
 
 def validate_execution_dtype(ag: AnalyzedGraph) -> ExecutionDTypeValidation:
-    """Validate operator slots and one homogeneous data dtype.
-
-    Runtime dispatch is selected once for the whole plan.  A plan containing
-    both float32 and int8 activations cannot safely be routed through either
-    dispatcher, even if every individual opcode is otherwise supported.
-    """
+    """Validate operator slots and explicit float sections in an int8 plan."""
     by_dtype, signature_issues = check_dtype_signatures(
         [(name, tensor.dtype, tensor.is_constant, tensor.quant is not None)
          for name, tensor in ag.tensors.items()],
@@ -243,9 +238,11 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     and (info.quant.scale.size != 1 or info.quant.zero_point.size != 1)):
                 reasons.append(f"int8 activation {name!r} is not quantized per tensor")
         reasons.extend(_bool_and_sum_reasons(ag, op))
-        backend = "s8_ref" if ag.is_quantized else "reference"
+        quantized_op = any(ag.tensors[n].dtype == 3 for n in (*op.inputs, *op.outputs)
+                           if n in ag.tensors and not ag.tensors[n].is_constant)
+        backend = "s8_ref" if quantized_op else "reference"
         if op.op_type not in effective_operators(backend):
-            dtype = "int8" if ag.is_quantized else "float32"
+            dtype = "int8" if quantized_op else "float32"
             reasons.append(f"{op.op_type} has no {dtype} kernel in the runtime")
         elementwise_unary = {
             "Abs", "Rsqrt", "Neg", "Exp", "Log", "Sqrt", "Square",
@@ -273,7 +270,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     count == 2 and any(how is None for *_, how in stored_operands(ag, op) or [(None,)])):
                 reasons.append("each operand must broadcast to the output, a tensor "
                                "operand at the output's rank")
-            elif ag.is_quantized:
+            elif quantized_op:
                 if any(t.quant is None or t.quant.scale.size != 1
                        or t.quant.zero_point.size != 1 for t in tensors):
                     reasons.append("elementwise int8 requires per-tensor quantization")
@@ -301,7 +298,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 reasons.append("L2Normalization requires a finite nonnegative epsilon")
             if op.inputs and len(ag.tensors[op.inputs[0]].shape) > 4:
                 reasons.append("L2Normalization requires rank at most 4")
-        if ag.is_quantized and op.op_type in {"LogSoftmax", "L2Normalization"}:
+        if quantized_op and op.op_type in {"LogSoftmax", "L2Normalization"}:
             output = ag.tensors.get(op.outputs[0]) if op.outputs else None
             scale, zero = ((1 / 16, 127) if op.op_type == "LogSoftmax" else (1 / 128, 0))
             if (output is None or output.quant is None or output.quant.scale.size != 1
@@ -332,7 +329,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         shape.pop(axis)
                 if tuple(shape) != output.shape:
                     reasons.append("output shape does not match the reduction axis")
-                if ag.is_quantized and op.op_type not in {"ArgMax", "ArgMin", "ReduceAll"}:
+                if quantized_op and op.op_type not in {"ArgMax", "ArgMin", "ReduceAll"}:
                     quants = [source.quant, output.quant]
                     if any(q is None or q.scale.size != 1 or q.zero_point.size != 1 for q in quants):
                         reasons.append("int8 reductions require per-tensor quantization")
@@ -837,7 +834,7 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     if dynamic[0].dtype == 6:
         if str(constant.dtype) != "int32":
             reasons.append(f"constant operand {name!r} is not int32 like its operator")
-    elif ag.is_quantized:
+    elif dynamic[0].dtype == 3:
         quant = ag.tensors[name].quant if name in ag.tensors else None
         if str(constant.dtype) != "int8" or quant is None or quant.scale.size != 1:
             reasons.append(f"constant operand {name!r} is not per-tensor int8")
@@ -1186,14 +1183,16 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     if any(t is None for t in tensors):
         return ["missing operand metadata"]
     inputs, output = tensors[:-1], tensors[-1]
+    data_dtype = next((t.dtype for t in inputs + [output] if t.dtype in {1, 3}),
+                      3 if ag.is_quantized else 1)
     # Comparisons of int32 give bool; a CAST of int32 gives float32.
     integer = kind in _COMPARISONS | {"Cast"} and inputs[0].dtype == 6
     expected = ([6] * len(inputs) if integer
-                else [9, 3 if ag.is_quantized else 1, 3 if ag.is_quantized else 1] if kind == "Where"
+                else [9, data_dtype, data_dtype] if kind == "Where"
                 else [9] * len(inputs) if kind in _LOGICAL_BINARY | {"Not", "Cast"}
-                else [3 if ag.is_quantized else 1] * len(inputs))
+                else [data_dtype] * len(inputs))
     out_type = (9 if kind in _COMPARISONS | _LOGICAL_BINARY | {"Not"} else 1 if integer
-                else 3 if ag.is_quantized else 1)
+                else data_dtype)
     if [t.dtype for t in inputs] != expected or output.dtype != out_type:
         return ["operand dtypes do not match the operator signature"]
     if kind == "Cast" and int(op.attrs.get("to", output.dtype)) not in {1, 3}:
@@ -1219,7 +1218,7 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
                             or not 0 < float(t.quant.scale[0]) < float("inf")
                             or not -128 <= int(t.quant.zero_point[0]) <= 127):
             return ["int8 operands require valid per-tensor quantization"]
-    if not ag.is_quantized:
+    if data_dtype != 3:
         return []
     if kind in _COMPARISONS and not integer and any(not 0 < float(t.quant.scale[0]) < 1 for t in inputs):
         return ["int8 comparison input scales must be strictly between 0 and 1"]
