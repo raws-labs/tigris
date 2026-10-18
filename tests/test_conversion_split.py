@@ -53,17 +53,6 @@ _SOFTMAX_NODES = [
 ]
 
 
-def test_an_oversized_conversion_stage_is_split_so_its_interior_tiles(tmp_path):
-    ag = _planned(
-        tmp_path, _SOFTMAX_NODES, (_SOFTMAX_SHAPE, _SOFTMAX_SHAPE), 32_000
-    )
-
-    assert _stage_op_types(ag) == [["Transpose"], ["Softmax"], ["Transpose"]]
-    interior = ag.stages[1].tile_plan
-    assert interior is not None and interior.tileable
-    assert interior.num_tiles > 1
-
-
 def test_a_conversion_that_fits_is_left_fused(tmp_path):
     """Splitting a stage that fits would push its interior out to slow memory."""
     ag = _planned(

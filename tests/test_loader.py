@@ -6,56 +6,44 @@ from onnx import TensorProto, helper, numpy_helper
 
 from tigris.loaders import load_model
 
+from conftest import save_onnx
+
 
 def test_linear_load(linear_3op_path):
     ag = load_model(linear_3op_path)
 
     assert ag.model_name == "linear_3op"
-    assert len(ag.ops) == 3
+    # relu0 must come before add0, add0 before add1
+    assert [op.op_type for op in ag.ops] == ["Relu", "Add", "Add"]
     assert ag.model_inputs == ["input"]
     assert ag.model_outputs == ["output"]
-
-
-def test_linear_topo_order(linear_3op_path):
-    ag = load_model(linear_3op_path)
-
-    # Steps should be 0, 1, 2 in a valid topological order
-    op_types = [op.op_type for op in ag.ops]
-    # relu0 must come before add0, add0 before add1
-    assert op_types == ["Relu", "Add", "Add"]
-
-
-def test_diamond_load(diamond_path):
-    ag = load_model(diamond_path)
-
-    assert len(ag.ops) == 3
-    assert "input" in ag.model_inputs
-    assert "output" in ag.model_outputs
-
-
-def test_tensors_have_shapes(linear_3op_path):
-    ag = load_model(linear_3op_path)
 
     info = ag.tensors["input"]
     assert info.shape == (1, 64)
     assert info.size_bytes == 1 * 64 * 4  # float32
-
-
-def test_constants_marked(linear_3op_path):
-    ag = load_model(linear_3op_path)
 
     assert ag.tensors["w0"].is_constant is True
     assert ag.tensors["w1"].is_constant is True
     assert ag.tensors["input"].is_constant is False
 
 
+def test_loader_extracts_spatial_attrs(conv_relu_chain_path, conv_pool_chain_path):
+    conv_ops = [op for op in load_model(conv_relu_chain_path).ops if op.op_type == "Conv"]
+    assert len(conv_ops) == 2
+    for op in conv_ops:
+        assert op.attrs["kernel_shape"] == [3, 3]
+        assert op.attrs["strides"] == [1, 1]
+
+    pool_ops = [op for op in load_model(conv_pool_chain_path).ops if op.op_type == "MaxPool"]
+    assert len(pool_ops) == 1
+    assert pool_ops[0].attrs["kernel_shape"] == [2, 2]
+    assert pool_ops[0].attrs["strides"] == [2, 2]
+
+
 def _save_model(tmp_path, name, nodes, inputs, outputs, initializers):
-    graph = helper.make_graph(nodes, name, inputs, outputs, initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / f"{name}.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(
+        tmp_path, name, nodes, inputs, outputs, initializers, opset=17, ir_version=8
+    )
 
 
 def test_reshape_target_shape_is_not_a_weight(tmp_path):

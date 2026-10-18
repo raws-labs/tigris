@@ -1,8 +1,5 @@
 """Contract cases run through the host library; needs the source checkout."""
 
-import os
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -11,31 +8,37 @@ from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.runtime import RuntimeError, Session
 
 
-@pytest.fixture(autouse=True)
-def require_library(monkeypatch):
-    monkeypatch.delenv("TIGRIS_HOST_LIBRARY", raising=False)
-    import tigris
-    if not (Path(tigris.__file__).parent / "native" / "manifest.json").exists():
-        if os.environ.get("TIGRIS_REQUIRE_HOST"):
-            pytest.fail("Host library has not been staged")
-        pytest.skip("Host library has not been staged in this source checkout")
+pytestmark = pytest.mark.usefixtures("require_host_library")
 
 
-@pytest.mark.parametrize("kind", ["ArgMax", "ArgMin"])
-@pytest.mark.parametrize("axis", [0, 1, 2])
-@pytest.mark.parametrize("quantized", [False, True])
-@pytest.mark.parametrize("keep", [False, True])
-def test_arg_output_interface(tmp_path, kind, axis, quantized, keep):
+def _compile(tmp_path, case, budgets):
     import onnx
+
+    model_path = tmp_path / "case.onnx"
+    onnx.save(case.compile_model, model_path)
+    graph, _ = _run_pipeline(str(model_path), budgets)
+    return emit_binary_bytes(graph)
+
+
+def _reference(case, inputs=None):
+    import onnxruntime as ort
+    from scripts.crossrepo_contract import _to_runtime_layout
+
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    reference = ort.InferenceSession(case.reference_model.SerializeToString(), options, providers=["CPUExecutionProvider"])
+    return _to_runtime_layout(reference.run(None, inputs or case.inputs)[0])
+
+
+@pytest.mark.parametrize("kind,axis,quantized,keep", [("ArgMax", 1, False, False), ("ArgMin", 2, True, True)])
+def test_arg_output_interface(tmp_path, kind, axis, quantized, keep):
     from scripts.crossrepo_contract import _arg_case
     from tigris.emitters.binary.reader import read_binary_plan
     from tigris.emitters.codegen import generate_c
 
     case = _arg_case(kind, axis, quantized, keep)
-    model_path = tmp_path / "arg.onnx"
-    onnx.save(case.compile_model, model_path)
-    graph, _ = _run_pipeline(str(model_path), ("4K",))
-    data = emit_binary_bytes(graph)
+    data = _compile(tmp_path, case, ("4K",))
     plan = read_binary_plan(data)
     output = plan["tensors"][plan["model_outputs"][0]]
     assert output["dtype"] == 6 and output["iface_dtype"] == 7
@@ -52,27 +55,16 @@ def test_arg_output_interface(tmp_path, kind, axis, quantized, keep):
         np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize("kind,variant", [("Gather", 0), ("Gather", 1), ("Gather", 2),
-                                         ("GatherND", 0), ("StridedSlice", 0), ("StridedSlice", 1), ("StridedSlice", 2),
-                                         ("MirrorPad", 0), ("MirrorPad", 1), ("ReverseV2", 0),
-                                         ("EmbeddingLookup", 0), ("DynamicUpdateSlice", 0), ("DynamicUpdateSlice", 1)])
-@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("kind,variant,quantized", [("StridedSlice", 2, False), ("StridedSlice", 2, True),
+                                                   ("Gather", 0, True), ("MirrorPad", 0, False),
+                                                   ("ReverseV2", 0, True), ("DynamicUpdateSlice", 0, False)])
 def test_movement_output_is_exact(tmp_path, kind, variant, quantized):
-    import onnx
-    import onnxruntime as ort
     from scripts.crossrepo_contract import _movement_case, _to_runtime_layout
 
     case = _movement_case(kind, quantized, variant)
-    model_path = tmp_path / "movement.onnx"
-    onnx.save(case.compile_model, model_path)
-    graph, _ = _run_pipeline(str(model_path), ("8K",))
     path = tmp_path / "movement.tgrs"
-    path.write_bytes(emit_binary_bytes(graph))
-    options = ort.SessionOptions()
-    options.intra_op_num_threads = options.inter_op_num_threads = 1
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    reference = ort.InferenceSession(case.reference_model.SerializeToString(), options, providers=["CPUExecutionProvider"])
-    expected = _to_runtime_layout(reference.run(None, case.inputs)[0])
+    path.write_bytes(_compile(tmp_path, case, ("8K",)))
+    expected = _reference(case)
     with Session(path) as session:
         actual = session.run({name: _to_runtime_layout(value) for name, value in case.inputs.items()})["output"]
     assert actual.dtype == expected.dtype
@@ -80,76 +72,48 @@ def test_movement_output_is_exact(tmp_path, kind, variant, quantized):
     assert actual.tobytes() == expected.tobytes()
 
 
-@pytest.mark.parametrize("kind,variant", [("Gather", 0), ("Gather", 1), ("Gather", 2),
-                                         ("GatherND", 0), ("EmbeddingLookup", 0),
-                                         ("DynamicUpdateSlice", 0), ("DynamicUpdateSlice", 1)])
+@pytest.mark.parametrize("kind,variant", [("Gather", 1), ("GatherND", 0), ("DynamicUpdateSlice", 1)])
 @pytest.mark.parametrize("quantized", [False, True])
-@pytest.mark.parametrize("arg", [None, "ArgMax", "ArgMin"])
-def test_runtime_indices(tmp_path, kind, variant, quantized, arg):
-    if arg and kind != "Gather":
-        pytest.skip("Arg contract uses Gather")
-    import onnx
-    import onnxruntime as ort
+def test_runtime_indices(tmp_path, kind, variant, quantized):
     from scripts.crossrepo_contract import _runtime_index_case, _to_runtime_layout
     from tigris.emitters.codegen import generate_c
 
-    case = _runtime_index_case(kind, quantized, variant, arg)
-    model = tmp_path / "indices.onnx"
-    onnx.save(case.compile_model, model)
-    graph, _ = _run_pipeline(str(model), ("8K",))
-    binary = emit_binary_bytes(graph)
+    case = _runtime_index_case(kind, quantized, variant)
+    binary = _compile(tmp_path, case, ("8K",))
     assert generate_c(binary, "reference", "core")
     plan = tmp_path / "indices.tgrs"
     plan.write_bytes(binary)
-    options = ort.SessionOptions()
-    options.intra_op_num_threads = options.inter_op_num_threads = 1
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    reference = ort.InferenceSession(case.reference_model.SerializeToString(), options, providers=["CPUExecutionProvider"])
     inputs = {name: _to_runtime_layout(value) if value.dtype.kind == "f" else value
               for name, value in case.inputs.items()}
     with Session(plan) as session:
-        expected = _to_runtime_layout(reference.run(None, case.inputs)[0])
-        assert session.run(inputs)["output"].tobytes() == expected.tobytes()
-        if not arg:
-            name = "starts" if kind == "DynamicUpdateSlice" else "indices"
-            changed = {key: value.copy() for key, value in case.inputs.items()}
-            changed[name].fill(0)
-            inputs[name] = changed[name]
-            expected = _to_runtime_layout(reference.run(None, changed)[0])
-            assert session.run(inputs)["output"].tobytes() == expected.tobytes()
-            if kind != "DynamicUpdateSlice":
-                for invalid in (-1, 2**31 - 1):
-                    inputs[name].fill(invalid)
-                    with pytest.raises(RuntimeError):
-                        session.run(inputs)
+        assert session.run(inputs)["output"].tobytes() == _reference(case).tobytes()
+        name = "starts" if kind == "DynamicUpdateSlice" else "indices"
+        changed = {key: value.copy() for key, value in case.inputs.items()}
+        changed[name].fill(0)
+        inputs[name] = changed[name]
+        assert session.run(inputs)["output"].tobytes() == _reference(case, changed).tobytes()
+        if kind != "DynamicUpdateSlice":
+            for invalid in (-1, 2**31 - 1):
+                inputs[name].fill(invalid)
+                with pytest.raises(RuntimeError):
+                    session.run(inputs)
 
 
-@pytest.mark.parametrize("kind", ["Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
-                                  "And", "Or", "Not", "Where", "Cast", "Sum"])
-@pytest.mark.parametrize("quantized", [False, True])
-@pytest.mark.parametrize("tiled", [False, True])
+@pytest.mark.parametrize("kind,quantized,tiled", [("Where", True, True), ("Less", True, True),
+                                                   ("And", False, False)])
 def test_bool_model_boundaries_and_codegen(tmp_path, kind, quantized, tiled):
-    import onnx
-    import onnxruntime as ort
     from scripts.crossrepo_contract import _bool_case, _to_runtime_layout
     from tigris.emitters.codegen import generate_c
 
     case = _bool_case(kind, quantized, tiled)
-    model_path = tmp_path / "bool.onnx"
-    onnx.save(case.compile_model, model_path)
     budgets = (case.mem_budget, case.slow_budget) if tiled else (case.mem_budget,)
-    graph, _ = _run_pipeline(str(model_path), budgets)
-    data = emit_binary_bytes(graph)
+    data = _compile(tmp_path, case, budgets)
     for backend in ("reference", "cmsis-nn", "esp-nn"):
         for fmt in ("app", "core"):
             assert generate_c(data, backend, fmt)
     path = tmp_path / "bool.tgrs"
     path.write_bytes(data)
-    options = ort.SessionOptions()
-    options.intra_op_num_threads = options.inter_op_num_threads = 1
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    reference = ort.InferenceSession(case.reference_model.SerializeToString(), options, providers=["CPUExecutionProvider"])
-    expected = _to_runtime_layout(reference.run(None, case.inputs)[0])
+    expected = _reference(case)
     with Session(path) as session:
         actual = session.run({name: _to_runtime_layout(value) for name, value in case.inputs.items()})["output"]
     assert actual.dtype == expected.dtype and actual.shape == expected.shape

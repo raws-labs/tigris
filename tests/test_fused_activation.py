@@ -1,7 +1,7 @@
 """Tests for fused activation absorption pass."""
 
 import numpy as np
-import onnx
+import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.emitters.binary.defs import ACT_RELU, OP_TYPE_MAP
@@ -11,20 +11,15 @@ from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
 from tigris.loaders.onnx.normalize import _decompose_silu
 
+from conftest import save_onnx
+
 
 # Helpers
 
 
-def _make_model(nodes, name, X, Y, initializers=None):
-    graph = helper.make_graph(nodes, name, [X], [Y], initializer=initializers or [])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    return model
-
-
-def _save_and_load(model, tmp_path, filename="model.onnx"):
-    path = tmp_path / filename
-    onnx.save(model, str(path))
+def _load(tmp_path, name, nodes, X, Y, initializers=()):
+    path = save_onnx(tmp_path, name, nodes, [X], [Y], initializers,
+                     opset=17, ir_version=8, filename="model.onnx")
     return load_model(path)
 
 
@@ -62,98 +57,49 @@ def test_silu_decomposes_to_supported_sigmoid_mul():
 # Conv -> Relu fusion
 
 
-def test_conv_relu_fused(tmp_path):
-    """Conv followed by Relu should be fused into one op."""
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
+_CONV = {"kernel_shape": [3, 3], "strides": [1, 1], "pads": [0, 0, 0, 0]}
 
-    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3, 3, 3],
-                           np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
-    b = helper.make_tensor("b", TensorProto.FLOAT, [4],
-                           np.zeros(4, dtype=np.float32).tolist())
 
-    conv = helper.make_node("Conv", ["input", "w", "b"], ["t0"], name="conv0",
-                            kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
-    relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
+@pytest.mark.parametrize(
+    "in_shape, out_shape, producer, w_shape, attrs, activation, op_type, fused",
+    [
+        ([1, 3, 8, 8], [1, 4, 6, 6], "Conv", [4, 3, 3, 3], _CONV, "Relu", "Conv", "Relu"),
+        ([1, 3, 8, 8], [1, 4, 6, 6], "Conv", [4, 3, 3, 3], _CONV, "Clip", "Conv", "Relu6"),
+        ([1, 4, 8, 8], [1, 4, 6, 6], "Conv", [4, 1, 3, 3], {**_CONV, "group": 4}, "Relu",
+         "DepthwiseConv", "Relu"),
+        ([1, 16], [1, 8], "Gemm", [8, 16], {"transB": 1}, "Relu", "Gemm", "Relu"),
+    ],
+    ids=["conv_relu", "conv_relu6", "depthwise_relu", "gemm_relu"],
+)
+def test_activation_fuses_into_its_producer(
+    tmp_path, in_shape, out_shape, producer, w_shape, attrs, activation, op_type, fused
+):
+    """A Relu, or a Clip(0, 6) read as Relu6, folds into the op that feeds it."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, in_shape)
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shape)
+    initializers = [
+        numpy_helper.from_array(np.zeros(w_shape, dtype=np.float32), "w"),
+        numpy_helper.from_array(np.zeros(w_shape[0], dtype=np.float32), "b"),
+    ]
+    act_inputs = ["t0"]
+    if activation == "Clip":
+        initializers += [
+            numpy_helper.from_array(np.array([0.0], dtype=np.float32), "clip_min"),
+            numpy_helper.from_array(np.array([6.0], dtype=np.float32), "clip_max"),
+        ]
+        act_inputs += ["clip_min", "clip_max"]
+    nodes = [
+        helper.make_node(producer, ["input", "w", "b"], ["t0"], name="op0", **attrs),
+        helper.make_node(activation, act_inputs, ["output"], name="act0"),
+    ]
 
-    model = _make_model([conv, relu], "conv_relu", X, Y, [w, b])
-    ag = _save_and_load(model, tmp_path)
+    ag = _load(tmp_path, op_type, nodes, X, Y, initializers)
 
     assert len(ag.ops) == 1
-    assert ag.ops[0].op_type == "Conv"
-    assert ag.ops[0].attrs.get("fused_activation") == "Relu"
+    assert ag.ops[0].op_type == op_type
+    assert ag.ops[0].attrs.get("fused_activation") == fused
     assert ag.ops[0].outputs == ["output"]
     assert "t0" not in ag.tensors
-
-
-def test_conv_relu6_fused(tmp_path):
-    """Conv followed by Relu6 (from Clip(0,6)) should be fused."""
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
-
-    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3, 3, 3],
-                           np.zeros((4, 3, 3, 3), dtype=np.float32).flatten().tolist())
-    b = helper.make_tensor("b", TensorProto.FLOAT, [4],
-                           np.zeros(4, dtype=np.float32).tolist())
-
-    min_val = numpy_helper.from_array(np.array([0.0], dtype=np.float32), "clip_min")
-    max_val = numpy_helper.from_array(np.array([6.0], dtype=np.float32), "clip_max")
-
-    conv = helper.make_node("Conv", ["input", "w", "b"], ["t0"], name="conv0",
-                            kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
-    clip = helper.make_node("Clip", ["t0", "clip_min", "clip_max"], ["output"], name="clip0")
-
-    model = _make_model([conv, clip], "conv_relu6", X, Y, [w, b, min_val, max_val])
-    ag = _save_and_load(model, tmp_path)
-
-    assert len(ag.ops) == 1
-    assert ag.ops[0].op_type == "Conv"
-    assert ag.ops[0].attrs.get("fused_activation") == "Relu6"
-
-
-def test_depthwise_relu_fused(tmp_path):
-    """DepthwiseConv followed by Relu should be fused."""
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 8, 8])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 6, 6])
-
-    # Depthwise: group=4, weight shape [4, 1, 3, 3]
-    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 1, 3, 3],
-                           np.zeros((4, 1, 3, 3), dtype=np.float32).flatten().tolist())
-    b = helper.make_tensor("b", TensorProto.FLOAT, [4],
-                           np.zeros(4, dtype=np.float32).tolist())
-
-    conv = helper.make_node("Conv", ["input", "w", "b"], ["t0"], name="dw0",
-                            kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0], group=4)
-    relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
-
-    model = _make_model([conv, relu], "dw_relu", X, Y, [w, b])
-    ag = _save_and_load(model, tmp_path)
-
-    assert len(ag.ops) == 1
-    assert ag.ops[0].op_type == "DepthwiseConv"
-    assert ag.ops[0].attrs.get("fused_activation") == "Relu"
-
-
-def test_gemm_relu_fused(tmp_path):
-    """Gemm followed by Relu should be fused."""
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 16])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8])
-
-    w = helper.make_tensor("w", TensorProto.FLOAT, [8, 16],
-                           np.zeros((8, 16), dtype=np.float32).flatten().tolist())
-    b = helper.make_tensor("b", TensorProto.FLOAT, [8],
-                           np.zeros(8, dtype=np.float32).tolist())
-
-    gemm = helper.make_node("Gemm", ["input", "w", "b"], ["t0"], name="gemm0",
-                            transB=1)
-    relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
-
-    model = _make_model([gemm, relu], "gemm_relu", X, Y, [w, b])
-    ag = _save_and_load(model, tmp_path)
-
-    assert len(ag.ops) == 1
-    assert ag.ops[0].op_type == "Gemm"
-    assert ag.ops[0].attrs.get("fused_activation") == "Relu"
 
 
 # Cases that should NOT fuse
@@ -175,8 +121,7 @@ def test_add_relu_is_fused(tmp_path):
     add = helper.make_node("Add", ["input", "w"], ["t0"], name="add0")
     relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
 
-    model = _make_model([add, relu], "add_relu", X, Y, [w])
-    ag = _save_and_load(model, tmp_path)
+    ag = _load(tmp_path, "add_relu", [add, relu], X, Y, [w])
 
     assert len(ag.ops) == 1
     assert ag.ops[0].op_type == "Add"
@@ -200,8 +145,7 @@ def test_conv_two_consumers_not_fused(tmp_path):
     # Second consumer of t0
     add = helper.make_node("Add", ["t1", "t0"], ["output"], name="add0")
 
-    model = _make_model([conv, relu, add], "conv_branch", X, Y, [w, b])
-    ag = _save_and_load(model, tmp_path)
+    ag = _load(tmp_path, "conv_branch", [conv, relu, add], X, Y, [w, b])
 
     # Conv should not be fused because t0 has two consumers
     conv_op = [op for op in ag.ops if op.op_type == "Conv"][0]
@@ -231,8 +175,7 @@ def test_step_indices_contiguous(tmp_path):
     conv1 = helper.make_node("Conv", ["t1", "w1", "b1"], ["output"], name="conv1",
                              kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
 
-    model = _make_model([conv0, relu, conv1], "conv_relu_conv", X, Y, [w0, b0, w1, b1])
-    ag = _save_and_load(model, tmp_path)
+    ag = _load(tmp_path, "conv_relu_conv", [conv0, relu, conv1], X, Y, [w0, b0, w1, b1])
 
     # Relu absorbed -> 2 ops
     assert len(ag.ops) == 2
@@ -257,8 +200,7 @@ def test_binary_roundtrip_preserves_fused_act(tmp_path):
                             kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
     relu = helper.make_node("Relu", ["t0"], ["output"], name="relu0")
 
-    model = _make_model([conv, relu], "conv_relu_rt", X, Y, [w, b])
-    ag = _save_and_load(model, tmp_path)
+    ag = _load(tmp_path, "conv_relu_rt", [conv, relu], X, Y, [w, b])
 
     # Pipeline for binary
     from tigris.analysis.lifetime import compute_lifetimes
@@ -314,7 +256,7 @@ def test_quantized_intermediate_blocks_fusion(tmp_path):
             "DequantizeLinear", ["out_q", "scale", "zero_point"], ["output"]
         ),
     ]
-    ag = _save_and_load(_make_model(nodes, "quantized_edge", X, Y, initializers), tmp_path)
+    ag = _load(tmp_path, "quantized_edge", nodes, X, Y, initializers)
 
     assert [op.op_type for op in ag.ops] == ["Add", "Relu"]
     assert "fused_activation" not in ag.ops[0].attrs
@@ -349,7 +291,7 @@ def test_quantized_add_relu_carries_the_output_scale(tmp_path):
             "DequantizeLinear", ["out_q", "out_scale", "out_zp"], ["output"]
         ),
     ]
-    ag = _save_and_load(_make_model(nodes, "qdq_add_relu", X, Y, initializers), tmp_path)
+    ag = _load(tmp_path, "qdq_add_relu", nodes, X, Y, initializers)
 
     add = next(op for op in ag.ops if op.op_type == "Add")
     assert add.attrs["fused_activation"] == "Relu"

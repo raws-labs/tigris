@@ -23,16 +23,7 @@ from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import OpNode, Stage
 from tigris.loaders import load_model
 
-
-def _full_pipeline(path, budget=0):
-    ag = load_model(path)
-    ag = compute_lifetimes(ag)
-    ag = compute_memory_timeline(ag)
-    if budget > 0:
-        ag = partition_temporal(ag, budget)
-        ag = partition_spatial(ag)
-        ag = detect_and_solve_chains(ag)
-    return ag
+from conftest import full_pipeline
 
 
 # Fixtures
@@ -480,7 +471,7 @@ def test_padded_chain_fits_two_rows_without_unused_output_rows(tmp_path):
         initializers)
     path = tmp_path / "chain.onnx"
     onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
-    ag = _full_pipeline(path, budget=32768)
+    ag = full_pipeline(path, budget=32768, chains=True)
     head = ag.stages[0]
     assert head.chain_len == 4
     assert head.chain_tile_h == 2
@@ -492,7 +483,7 @@ def test_padded_chain_fits_two_rows_without_unused_output_rows(tmp_path):
 class TestDetectChains:
     def test_linear_chain_detected(self, three_conv_chain_path):
         """Three consecutive Conv+Relu stages should form a single chain."""
-        ag = _full_pipeline(three_conv_chain_path, budget=32000)
+        ag = full_pipeline(three_conv_chain_path, budget=32000, chains=True)
 
         # Should have multiple stages (tight budget forces partitioning)
         assert len(ag.stages) >= 2
@@ -513,7 +504,7 @@ class TestDetectChains:
         the two changes the rows, so the Add cannot join and read the carried
         tensor; the chain has to stop before the Relu's output leaves it.
         """
-        ag = _full_pipeline(chain_with_fanout_path, budget=32000)
+        ag = full_pipeline(chain_with_fanout_path, budget=32000, chains=True)
 
         readers: dict[str, set[int]] = {}
         for index, stage in enumerate(ag.stages):
@@ -529,75 +520,22 @@ class TestDetectChains:
                     assert readers.get(name, set()) <= inside, (
                         f"{name} is streamed but read outside the chain")
 
-    def test_no_chains_when_all_fits(self, three_conv_chain_path):
-        """With a huge budget, everything fits in one stage - no chains."""
-        ag = _full_pipeline(three_conv_chain_path, budget=10 * 1024 * 1024)
-
-        # With a big budget, likely 1 stage or few stages that all fit
-        chains = detect_chains(ag)
-        # Chains require at least 2 stages
-        if len(ag.stages) < 2:
-            assert len(chains) == 0
-
-    def test_chain_head_has_tile_h(self, three_conv_chain_path):
-        """The chain head stage should have chain_tile_h > 0."""
-        ag = _full_pipeline(three_conv_chain_path, budget=32000)
-
-        heads = [s for s in ag.stages if s.chain_len >= 2 and s.chain_id == s.stage_id]
-        for h in heads:
-            assert h.chain_tile_h > 0, f"Chain head {h.stage_id} has tile_h=0"
-
-
 # Tile height solver tests
 
 
 class TestChainTileSolver:
-    def test_back_propagate_pointwise(self):
-        """Pointwise chain: tile heights are identical throughout."""
-        # 3 pointwise stages: k=1, s=1, d=1
-        params = [(1, 1, 1), (1, 1, 1), (1, 1, 1)]
-        heights = _back_propagate_tile_heights(params, 4)
-        # All (in_h, out_h) should be (4, 4)
-        for in_h, out_h in heights:
-            assert in_h == 4
-            assert out_h == 4
-
-    def test_back_propagate_conv3x3_stride1(self):
-        """Conv3x3(s=1, d=1) chain: each stage adds 2 rows of halo."""
-        # 2 conv stages: k=3, s=1, d=1
-        params = [(3, 1, 1), (3, 1, 1)]
-        heights = _back_propagate_tile_heights(params, 4)
-
-        # Last stage: out=4, in = 4*1 + (3-1) = 6
-        assert heights[1] == (6, 4)
-        # First stage: out=6, in = 6*1 + (3-1) = 8
-        assert heights[0] == (8, 6)
-
-    def test_back_propagate_stride2(self):
-        """Conv3x3(s=2): out_h rows need stride*out_h + kernel-stride input rows."""
-        params = [(3, 2, 1)]
-        heights = _back_propagate_tile_heights(params, 3)
-        # out=3, in = 3*2 + (3-2) = 7
-        assert heights[0] == (7, 3)
-
-    def test_back_propagate_pool_stride2(self):
-        """Pool2x2(s=2) uses the same spatial range algebra as convolution."""
-        heights = _back_propagate_tile_heights([(2, 2, 1)], 3)
-        assert heights[0] == (6, 3)
-
-    def test_solver_returns_positive(self, three_conv_chain_path):
-        """Solver should find a valid tile height > 0."""
-        ag = load_model(three_conv_chain_path)
-        ag = compute_lifetimes(ag)
-        ag = compute_memory_timeline(ag)
-        ag = partition_temporal(ag, 32000)
-        ag = partition_spatial(ag)
-
-        chains = detect_chains(ag)
-        assert len(chains) > 0, "Expected at least one chain"
-        for chain in chains:
-            tile_h = solve_chain_tile_height(ag, chain)
-            assert tile_h > 0, f"Chain {chain} solver returned tile_h=0"
+    @pytest.mark.parametrize("params, out_h, expected", [
+        # Pointwise: tile heights are identical throughout.
+        ([(1, 1, 1), (1, 1, 1), (1, 1, 1)], 4, [(4, 4), (4, 4), (4, 4)]),
+        # Conv3x3(s=1): each stage adds 2 rows of halo.
+        ([(3, 1, 1), (3, 1, 1)], 4, [(8, 6), (6, 4)]),
+        # Conv3x3(s=2): out_h rows need stride*out_h + kernel-stride input rows.
+        ([(3, 2, 1)], 3, [(7, 3)]),
+        # Pool2x2(s=2) uses the same spatial range algebra as convolution.
+        ([(2, 2, 1)], 3, [(6, 3)]),
+    ], ids=["pointwise", "conv3x3-stride1", "conv3x3-stride2", "pool2x2-stride2"])
+    def test_back_propagate(self, params, out_h, expected):
+        assert list(_back_propagate_tile_heights(params, out_h)) == expected
 
 
 # Plan format round-trip
@@ -605,38 +543,55 @@ class TestChainTileSolver:
 
 class TestChainPlanFormat:
     def test_chain_fields_roundtrip(self, three_conv_chain_path):
-        """Chain fields should survive binary plan write -> read round-trip."""
-        ag = _full_pipeline(three_conv_chain_path, budget=32000)
+        """Chain fields survive binary write -> read, and chaining leaves the
+        ops and tensors of the loose-budget pipeline unchanged."""
+        ag = full_pipeline(three_conv_chain_path, budget=32000, chains=True)
+        assert any(s.chain_len >= 2 for s in ag.stages)
 
-        # Must have chains for this test to be meaningful
-        chained = [s for s in ag.stages if s.chain_len >= 2]
-        if not chained:
-            pytest.skip("No chains detected (budget may be too loose)")
-
-        data = emit_binary_bytes(ag)
-        plan = read_binary_plan(data)
-
-        # Verify chain fields in read-back plan
+        plan = read_binary_plan(emit_binary_bytes(ag))
         for i, stage in enumerate(plan["stages"]):
             ir_stage = ag.stages[i]
             assert stage["chain_id"] == (ir_stage.chain_id & 0xFFFF)
             assert stage["chain_len"] == (ir_stage.chain_len & 0xFFFF)
             assert stage["chain_tile_h"] == (ir_stage.chain_tile_h & 0xFFFF)
 
+        # A chain head sits at stage index == chain_id.
+        heads = [(i, s) for i, s in enumerate(plan["stages"])
+                 if s["chain_len"] >= 2 and s["chain_id"] == i]
+        assert len(heads) >= 1, "Expected at least one chain head in read-back plan"
+        for idx, head in heads:
+            assert head["chain_tile_h"] > 0, "Chain head should have tile_h > 0"
+            chain_id = head["chain_id"]
+            chain_len = head["chain_len"]
+            for i in range(chain_id, chain_id + chain_len):
+                s = plan["stages"][i]
+                assert s["chain_id"] == chain_id
+                assert s["chain_len"] == chain_len
+
+        ag_loose = full_pipeline(three_conv_chain_path, budget=10 * 1024 * 1024, chains=True)
+        assert len(ag.ops) == len(ag_loose.ops)
+        for a, b in zip(ag.ops, ag_loose.ops):
+            assert a.op_type == b.op_type
+            assert a.inputs == b.inputs
+            assert a.outputs == b.outputs
+        assert set(ag.tensors.keys()) == set(ag_loose.tensors.keys())
+
     def test_standalone_stages_have_no_chain(self, three_conv_chain_path):
         """Stages not in a chain should have chain_id=0xFFFF, chain_len=0."""
-        ag = _full_pipeline(three_conv_chain_path, budget=10 * 1024 * 1024)
+        ag = full_pipeline(three_conv_chain_path, budget=10 * 1024 * 1024, chains=True)
 
         data = emit_binary_bytes(ag)
         plan = read_binary_plan(data)
 
+        assert not any(s.line_buffered for s in ag.stages)
         for stage in plan["stages"]:
             assert stage["chain_id"] == 0xFFFF
             assert stage["chain_len"] == 0
+            assert stage["flags"] == 0
 
     def test_chain_clears_individual_tile_plans(self, three_conv_chain_path):
         """Stages in a chain should not have individual tile plans."""
-        ag = _full_pipeline(three_conv_chain_path, budget=32000)
+        ag = full_pipeline(three_conv_chain_path, budget=32000, chains=True)
 
         chained = [s for s in ag.stages if s.chain_len >= 2]
         for s in chained:
@@ -647,64 +602,16 @@ class TestChainPlanFormat:
 
 
 class TestChainExecution:
-    def test_chain_vs_no_chain_same_graph_structure(self, three_conv_chain_path):
-        """Pipeline with tight budget (chain) vs loose budget (no chain) should
-        produce the same ops and tensors, differing only in stage metadata."""
-        ag_chain = _full_pipeline(three_conv_chain_path, budget=32000)
-        ag_loose = _full_pipeline(three_conv_chain_path, budget=10 * 1024 * 1024)
-
-        # Same ops
-        assert len(ag_chain.ops) == len(ag_loose.ops)
-        for a, b in zip(ag_chain.ops, ag_loose.ops):
-            assert a.op_type == b.op_type
-            assert a.inputs == b.inputs
-            assert a.outputs == b.outputs
-
-        # Same tensors (keys)
-        assert set(ag_chain.tensors.keys()) == set(ag_loose.tensors.keys())
-
-    def test_chain_fields_survive_binary_roundtrip(self, three_conv_chain_path):
-        """Full pipeline -> emit binary -> read back -> chain fields intact."""
-        ag = _full_pipeline(three_conv_chain_path, budget=32000)
-
-        chained = [s for s in ag.stages if s.chain_len >= 2]
-        if not chained:
-            pytest.skip("No chains detected")
-
-        data = emit_binary_bytes(ag)
-        plan = read_binary_plan(data)
-
-        # Find chain head in the read-back plan (stage index == chain_id)
-        heads = [(i, s) for i, s in enumerate(plan["stages"])
-                 if s["chain_len"] >= 2 and s["chain_id"] == i]
-        assert len(heads) >= 1, "Expected at least one chain head in read-back plan"
-
-        for idx, head in heads:
-            assert head["chain_tile_h"] > 0, "Chain head should have tile_h > 0"
-            chain_id = head["chain_id"]
-            chain_len = head["chain_len"]
-            # All stages in this chain should share chain_id and chain_len
-            for i in range(chain_id, chain_id + chain_len):
-                s = plan["stages"][i]
-                assert s["chain_id"] == chain_id
-                assert s["chain_len"] == chain_len
-
     def test_chain_tile_h_fits_budget(self, three_conv_chain_path):
         """Solved chain_tile_h should produce tile buffers within budget."""
-        ag = _full_pipeline(three_conv_chain_path, budget=32000)
+        ag = full_pipeline(three_conv_chain_path, budget=32000, chains=True)
 
         for s in ag.stages:
             if s.chain_len >= 2 and s.chain_id == s.stage_id:
                 # This is a chain head - verify the tile buffer fits
                 chain_indices = list(range(s.chain_id, s.chain_id + s.chain_len))
                 chain_stages = [ag.stages[i] for i in chain_indices]
-                chain_params = [
-                    (
-                        *[1, 1, 1],  # default
-                    )
-                    for _ in chain_stages
-                ]
-                # Re-derive params properly
+                assert s.chain_tile_h > 0
                 chain_params = [_get_stage_spatial_params(ag, cs) for cs in chain_stages]
                 heights = _back_propagate_tile_heights(chain_params, s.chain_tile_h)
                 needed = _chain_fast_bytes(ag, chain_stages, heights)

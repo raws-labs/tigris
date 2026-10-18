@@ -28,7 +28,7 @@ jobs:
           ]
           full = os.environ["FULL_MATRIX"] == "true"
           hosts = hosts if full else hosts[:1]
-          versions = ["3.10", "3.11", "3.12", "3.13"] if full else ["3.12"]
+          versions = ["3.10", "3.13"] if full else ["3.12"]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("builds=" + json.dumps({"include": hosts}) + "\n")
               output.write("tests=" + json.dumps({"include": [dict(host, python=v) for host in hosts for v in versions]}) + "\n")

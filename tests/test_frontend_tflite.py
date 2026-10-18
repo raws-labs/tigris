@@ -41,17 +41,6 @@ def test_conversion_keeps_the_interface_names():
     assert [o.name for o in model.graph.output] == ["Identity"]
 
 
-def test_compile_and_analyze_accept_a_tflite_file(tmp_path):
-    plan_path = tmp_path / "kws.tgrs"
-    result = CliRunner().invoke(cli, ["compile", str(KWS), "-m", "16K", "-o", str(plan_path)])
-    assert result.exit_code == 0, result.output
-    plan = read_binary_plan(plan_path.read_bytes())
-    names = [[plan["tensors"][i]["name"] for i in plan[key]] for key in ("model_inputs", "model_outputs")]
-    assert names == [["input_1"], ["Identity"]]
-    result = CliRunner().invoke(cli, ["analyze", str(KWS), "-m", "16K"])
-    assert result.exit_code == 0, result.output
-
-
 def _session():
     import tigris
     if not (Path(tigris.__file__).parent / "native" / "manifest.json").exists():
@@ -62,18 +51,13 @@ def _session():
     return Session
 
 
-def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path,
-                                 tight: bool = False):
+def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path):
     """Runs the compiled plan on TFLite Micro's recorded inputs, in the
     model's own dtypes, and compares the outputs bit for bit. The slow arena
     is exactly what generated applications reserve for the plan."""
     Session = _session()
     plan_path = tmp_path / "model.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", budget, "-o", str(plan_path)])
-    if tight and result.exit_code != 0 and "does not fit" in result.output:
-        lines = result.output.splitlines()
-        verdict = next(k for k, line in enumerate(lines) if line.startswith("does not fit"))
-        pytest.skip(" ".join(line.strip() for line in lines[verdict:verdict + 2]))
     assert result.exit_code == 0, result.output
     _, graphs = tflite._read(model.read_bytes())
     _, tensors, inputs, outputs, _ = graphs[0]
@@ -106,6 +90,9 @@ def test_plan_reproduces_tflite_micro_outputs(tmp_path):
     recorded = np.load(FIXTURES / "kws_ref_model_tflm.npz")
     golden = {"input_0": recorded["inputs"], "output_0": recorded["outputs"].reshape(-1, 1, 12)}
     _assert_matches_tflite_micro(KWS, golden, "16K", tmp_path)
+    plan = read_binary_plan((tmp_path / "model.tgrs").read_bytes())
+    names = [[plan["tensors"][i]["name"] for i in plan[key]] for key in ("model_inputs", "model_outputs")]
+    assert names == [["input_1"], ["Identity"]]
 
 
 @pytest.mark.parametrize("name", ["vww_96_int8", "pretrainedResnet_quant"])
@@ -126,59 +113,139 @@ def test_single_operator_matches_tflite_micro(model, tmp_path):
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256K", tmp_path)
 
 
+# The fixtures that compile untiled at the tight budget.
+FITS_UNTILED = {
+    "arg_max", "arg_max_gather", "arg_min_rows", "batch_matmul", "batch_to_space", "broadcast_to",
+    "concat_outer", "concat_rank2", "depth_to_space", "embedding_lookup",
+    "embedding_lookup_runtime", "expand_dims", "expand_dims_op", "float_arg_max",
+    "float_arg_max_gather", "float_arg_min_rows", "float_broadcast_args", "float_concat_rank2",
+    "float_embedding_lookup", "float_embedding_lookup_runtime", "float_fill",
+    "float_fully_connected_bias", "float_if", "float_if_if", "float_if_int32",
+    "float_if_two_operands", "float_log_softmax", "float_lstm", "float_lstm_unrolled",
+    "float_pack_outer", "float_shape_arithmetic", "float_shape_pack_reshape", "float_shape_reshape",
+    "float_shape_reverse_reshape", "float_softmax", "float_svdf", "float_unpack_one",
+    "float_variable_window", "float_while", "float_while_countdown", "float_while_counter",
+    "float_while_feature_map", "float_while_two_variables", "float_zeros_like",
+    "fully_connected_bias", "fully_connected_rank3", "fully_connected_rank3_relu",
+    "fully_connected_row_relu", "gather_batch", "gather_batch_matrix", "gather_index_arithmetic",
+    "log_softmax", "lstm", "lstm_time_major_clip", "lstm_unrolled", "mean_spatial",
+    "mean_spatial_flat", "mul_broadcast_both", "pack", "pack_outer", "requantize_shared", "reshape",
+    "resize_bilinear", "resize_bilinear_asymmetric", "resize_nearest", "shape_pack_reshape",
+    "softmax", "space_to_batch", "space_to_depth", "split", "split_v", "squeeze", "squeeze_op",
+    "svdf", "svdf_batch", "transpose", "unpack", "unpack_one",
+}
+
+# The fixtures refused at 256 bytes, by what keeps a stage over it: the type of
+# an operator that runs untiled, or the refusal's reason.
+REFUSED = {
+    "DetectionPostProcess": {"detection_fast", "detection_regular", "float_detection_fast",
+                             "float_detection_regular"},
+    "ReduceMean": {"float_mean_all"},
+    "ReduceSum": {"float_if_feature_map"},
+    "smallest 2D tile": {"float_conv_dilated"},
+    "smallest tile": {"float_batch_to_space", "float_conv_split", "float_cumsum",
+                      "float_cumsum_offset_exclusive_reverse", "float_dynamic_update_slice",
+                      "float_dynamic_update_slice_runtime", "float_gelu_approximate_wide",
+                      "float_gelu_wide", "float_if_feature_map", "float_mean_all",
+                      "float_mean_nonadjacent_image", "float_mean_nonadjacent_keep",
+                      "float_mean_nonadjacent_negative", "float_mirror_pad_reflect",
+                      "float_mirror_pad_symmetric", "float_pad", "float_padv2",
+                      "float_reverse_spatial", "float_space_to_batch", "float_transpose_conv",
+                      "gelu_approximate_offset", "gelu_wide", "hard_swish_offset",
+                      "hard_swish_wide", "mean_nonadjacent_image", "mean_nonadjacent_keep",
+                      "mean_nonadjacent_negative"},
+}
+
+# Refused fixtures that tile at 1K.
+TILES_AT_1K = {
+    "float_conv_dilated", "float_conv_split", "float_cumsum",
+    "float_cumsum_offset_exclusive_reverse", "float_dynamic_update_slice",
+    "float_dynamic_update_slice_runtime", "float_mean_all", "float_mirror_pad_reflect",
+    "float_mirror_pad_symmetric", "float_pad", "float_padv2", "float_reverse_spatial",
+    "float_transpose_conv", "gelu_approximate_offset", "gelu_wide", "hard_swish_offset",
+    "hard_swish_wide",
+}
+
+# The fixtures whose tight plan runs a chain of stages.
+CHAINED = {
+    "cast_bool", "float_logical_not", "float_not_equal", "if_conv", "logical_not", "not_equal",
+    "while_conv",
+}
+
+# The operator whose own stage tiles, not only a stage next to it.
+INDEPENDENT_AXIS = {
+    "cumsum": "CumSum", "cumsum_offset": "CumSum", "cumsum_offset_exclusive_reverse": "CumSum",
+    "dynamic_update_slice": "DynamicUpdateSlice", "float_gather_indices": "Gather",
+    "float_reverse_channels": "ReverseV2", "reverse_channels": "ReverseV2",
+    "mirror_pad_reflect": "MirrorPad", "mirror_pad_symmetric": "MirrorPad",
+    "dynamic_update_slice_runtime": "DynamicUpdateSlice", "gather_runtime": "Gather",
+    "float_gather_runtime": "Gather", "float_gather_nd_runtime": "GatherND",
+    "float_gather_nd": "GatherND", "float_logistic_tails": "Sigmoid",
+    "float_lstm_time_major_clip": "Lstm", "float_svdf_rank2_relu": "Svdf",
+    "float_mean_rows": "ReduceMean", "float_strided_slice_steps": "StridedSlice",
+    "reverse_spatial": "ReverseV2", "float_arg_max_channels": "ArgMax",
+    "arg_max_channels": "ArgMax", "float_split": "Split", "float_slice": "Split",
+    "float_unpack": "Split", "float_concat_rows": "Concat", "float_broadcast_to": "Concat",
+    "float_concat_outer": "Concat", "pad": "Pad", "padv2": "Pad", "add_broadcast_rows": "Add",
+    "add_constant_rows": "Add", "add_constant_full": "Add", "float_add_rank": "Add",
+    "sub_broadcast_first": "Sub", "float_div_broadcast": "Div", "float_maximum_broadcast": "Max",
+    "float_maximum_rank": "Max", "float_less_rank": "Less", "float_select_v2_broadcast": "Where",
+    "float_select_v2_rank": "Where", "float_gather_matrix": "Transpose",
+    "float_gather_batch_matrix": "Transpose",
+}
+
+
+def _blockers(output: str) -> set[str]:
+    """The operator types that run untiled and the other reasons in a refusal."""
+    found = set()
+    for reason in re.findall(r"^\s+stage \d+\s+[\d.]+ \w+\s+(.+)$", output, re.M):
+        untiled = re.match(r"runs untiled: (\w+?)(?:_\d+)?$", reason)
+        found.add(untiled.group(1) if untiled else reason.strip())
+    return found
+
+
+def test_the_tight_budget_tables_name_fixtures():
+    stems = {model.stem for model in (FIXTURES / "ops").glob("*.tflite")}
+    refused = set().union(*REFUSED.values())
+    assert FITS_UNTILED | refused | CHAINED | set(INDEPENDENT_AXIS) <= stems
+    assert TILES_AT_1K <= refused and not FITS_UNTILED & refused
+    assert not (CHAINED | set(INDEPENDENT_AXIS)) & (FITS_UNTILED | refused)
+
+
 @pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("*.tflite")), ids=lambda p: p.stem)
-def test_single_operator_matches_tflite_micro_when_tiled(model, tmp_path):
-    """The same comparison at a budget that forces tiling wherever the
-    operator tiles; one that cannot fit it untiled is reported as a skip."""
-    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path,
-                                 tight=True)
-
-
-@pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("resize_*_down.tflite")), ids=lambda p: p.stem)
-def test_resize_downscales_in_height_bands(model, tmp_path):
-    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
+def test_single_operator_at_a_tight_budget(model, tmp_path):
+    """The same comparison at 256 bytes, or at 1K for the fixtures in
+    TILES_AT_1K, which forces tiling wherever the operator tiles. Whether
+    each fixture tiles, fits untiled or is refused is recorded above, so a
+    change in either direction fails."""
+    name = model.stem
+    budget, limit = "256", 256
+    expected = {blocker for blocker, names in REFUSED.items() if name in names}
+    if expected:
+        result = CliRunner().invoke(cli, ["compile", str(model), "-m", budget,
+                                         "-o", str(tmp_path / "model.tgrs")])
+        assert result.exit_code != 0
+        assert "does not fit 256 B fast memory" in result.output, result.output
+        assert _blockers(result.output) == expected, result.output
+        if name not in TILES_AT_1K:
+            return
+        budget, limit = "1K", 1024
+    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), budget, tmp_path)
     plan = read_binary_plan((tmp_path / "model.tgrs").read_bytes())
-    assert any(tile["num_tiles"] > 1 for tile in plan["tile_plans"])
+    for tile in plan["tile_plans"]:
+        assert tile["tileable"] and tile["tiled_peak_bytes"] <= limit
+    multi_tile = any(tile["num_tiles"] > 1 for tile in plan["tile_plans"])
+    chained = any(stage["chain_id"] != 0xFFFF for stage in plan["stages"])
+    assert chained == (name in CHAINED)
+    assert (multi_tile or chained) == (name not in FITS_UNTILED)
+    if name in INDEPENDENT_AXIS:
+        from tigris.emitters.binary.defs import OP_TYPE_MAP
 
-
-
-@pytest.mark.parametrize("name,kind", [
-    ("cumsum", "CumSum"), ("cumsum_offset", "CumSum"),
-    ("cumsum_offset_exclusive_reverse", "CumSum"),
-    ("dynamic_update_slice", "DynamicUpdateSlice"), ("float_gather_indices", "Gather"),
-    ("float_reverse_channels", "ReverseV2"),
-    ("reverse_channels", "ReverseV2"), ("mirror_pad_reflect", "MirrorPad"),
-    ("mirror_pad_symmetric", "MirrorPad"),
-    ("dynamic_update_slice_runtime", "DynamicUpdateSlice"),
-    ("gather_runtime", "Gather"), ("float_gather_runtime", "Gather"),
-    ("float_gather_nd_runtime", "GatherND"), ("float_gather_nd", "GatherND"),
-    ("float_logistic_tails", "Sigmoid"), ("float_lstm_time_major_clip", "Lstm"),
-    ("float_svdf_rank2_relu", "Svdf"), ("float_mean_rows", "ReduceMean"),
-    ("float_strided_slice_steps", "StridedSlice"), ("reverse_spatial", "ReverseV2"),
-    ("float_arg_max_channels", "ArgMax"), ("arg_max_channels", "ArgMax"),
-    ("float_split", "Split"), ("float_slice", "Split"), ("float_unpack", "Split"),
-    ("float_concat_rows", "Concat"), ("float_broadcast_to", "Concat"),
-    ("float_concat_outer", "Concat"),
-    ("pad", "Pad"), ("padv2", "Pad"),
-    ("add_broadcast_rows", "Add"), ("add_constant_rows", "Add"),
-    ("add_constant_full", "Add"), ("float_add_rank", "Add"),
-    ("sub_broadcast_first", "Sub"), ("float_div_broadcast", "Div"),
-    ("float_maximum_broadcast", "Max"), ("float_maximum_rank", "Max"),
-    ("float_less_rank", "Less"), ("float_select_v2_broadcast", "Where"),
-    ("float_select_v2_rank", "Where"), ("float_gather_matrix", "Transpose"),
-    ("float_gather_batch_matrix", "Transpose"),
-])
-def test_independent_axis_uses_tight_budget(name, kind, tmp_path):
-    from tigris.emitters.binary.defs import OP_TYPE_MAP
-
-    model = FIXTURES / "ops" / (name + ".tflite")
-    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
-    plan = read_binary_plan((tmp_path / "model.tgrs").read_bytes())
-    stage = next(stage for stage in plan["stages"]
-                 if any(plan["ops"][i]["op_type"] == OP_TYPE_MAP[kind] for i in stage["ops"]))
-    assert stage["tile_plan_idx"] != 65535
-    tile = plan["tile_plans"][stage["tile_plan_idx"]]
-    assert tile["tileable"] and tile["num_tiles"] > 1 and tile["tiled_peak_bytes"] <= 256
+        op_type = OP_TYPE_MAP[INDEPENDENT_AXIS[name]]
+        stage = next(stage for stage in plan["stages"]
+                     if any(plan["ops"][i]["op_type"] == op_type for i in stage["ops"]))
+        assert stage["tile_plan_idx"] != 0xFFFF
+        assert plan["tile_plans"][stage["tile_plan_idx"]]["num_tiles"] > 1
 
 
 @pytest.mark.parametrize("name,kind", [

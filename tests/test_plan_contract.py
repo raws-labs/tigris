@@ -1,8 +1,7 @@
 """Binary format contract tests.
 
 Verify that the Python writer produces .tgrs files with known
-field values. The same values are checked by test_plan_contract.c
-in tigris-runtime.
+field values.
 """
 
 import struct
@@ -10,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 import onnx
+import pytest
 
 from tigris import SCHEMA_VERSION
 from tigris.cli import _run_pipeline
@@ -51,8 +51,6 @@ def _parse_header(data):
 
 
 # Contract values
-# These must match the assertions in test_plan_contract.c exactly.
-# If the compiler changes output, update BOTH files.
 
 CONTRACT = {
     "linear_3op": {
@@ -119,9 +117,10 @@ def test_op_size():
     assert OP_SIZE == 38
 
 
-def test_linear_3op_contract():
-    """Verify linear_3op plan header matches contract values."""
-    spec = CONTRACT["linear_3op"]
+@pytest.mark.parametrize("name", CONTRACT)
+def test_plan_header_contract(name):
+    """Verify the plan header matches the contract values."""
+    spec = CONTRACT[name]
     data = _compile_fixture(spec["builder"], spec["budget_str"])
     h = _parse_header(data)
 
@@ -139,49 +138,10 @@ def test_linear_3op_contract():
     assert h["peak"] > 0
 
 
-def test_conv_relu_chain_contract():
-    """Verify conv_relu_chain plan header matches contract values."""
-    spec = CONTRACT["conv_relu_chain"]
-    data = _compile_fixture(spec["builder"], spec["budget_str"])
-    h = _parse_header(data)
-
-    assert h["magic"] == MAGIC
-    assert h["version"] == spec["version"]
-    assert h["file_size"] == len(data)
-    assert h["num_tensors"] == spec["num_tensors"]
-    assert h["num_ops"] == spec["num_ops"]
-    assert h["num_stages"] == spec["num_stages"]
-    assert h["num_tile_plans"] == spec["num_tile_plans"]
-    assert h["budget"] == spec["budget"]
-    assert h["num_model_inputs"] == spec["num_model_inputs"]
-    assert h["num_model_outputs"] == spec["num_model_outputs"]
-    assert h["num_weights"] == spec["num_weights"]
-    assert h["peak"] > 0
-
-
-def test_ds_cnn_contract():
-    """Verify ds_cnn plan header matches contract values."""
-    spec = CONTRACT["ds_cnn"]
-    data = _compile_fixture(spec["builder"], spec["budget_str"])
-    h = _parse_header(data)
-
-    assert h["magic"] == MAGIC
-    assert h["version"] == spec["version"]
-    assert h["file_size"] == len(data)
-    assert h["num_tensors"] == spec["num_tensors"]
-    assert h["num_ops"] == spec["num_ops"]
-    assert h["num_stages"] == spec["num_stages"]
-    assert h["num_tile_plans"] == spec["num_tile_plans"]
-    assert h["budget"] == spec["budget"]
-    assert h["num_model_inputs"] == spec["num_model_inputs"]
-    assert h["num_model_outputs"] == spec["num_model_outputs"]
-    assert h["num_weights"] == spec["num_weights"]
-    assert h["peak"] > 0
-
-
-def test_file_sizes_deterministic():
+@pytest.mark.parametrize("name", CONTRACT)
+def test_file_sizes_deterministic(name):
     """Verify that plan generation is deterministic (same input -> same bytes)."""
-    for name, spec in CONTRACT.items():
-        data1 = _compile_fixture(spec["builder"], spec["budget_str"])
-        data2 = _compile_fixture(spec["builder"], spec["budget_str"])
-        assert data1 == data2, f"{name}: non-deterministic plan output"
+    spec = CONTRACT[name]
+    data1 = _compile_fixture(spec["builder"], spec["budget_str"])
+    data2 = _compile_fixture(spec["builder"], spec["budget_str"])
+    assert data1 == data2, f"{name}: non-deterministic plan output"

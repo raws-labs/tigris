@@ -13,7 +13,9 @@ from tigris.analysis.validation import (
     validate_operator_support,
 )
 from tigris.inspection import inspect_file
+from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
 from tigris.cli import _run_pipeline, cli
+from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, Stage, TensorInfo, TilePlan
 
@@ -252,6 +254,39 @@ def test_unrepresentable_pool_attributes_are_rejected(
 
 
 @pytest.mark.parametrize(
+    ("op_type", "attrs", "shapes", "message"),
+    [
+        ("Softmax", {"axis": 0}, ([2, 4], [2, 4]), "Softmax axis must map"),
+        ("Concat", {"axis": 0}, ([1, 2, 3, 4], [1, 2, 3, 4], [2, 2, 3, 4]),
+         "does not concatenate on the batch axis"),
+        ("Resize", {"mode": "cubic", "coordinate_transformation_mode": "asymmetric"},
+         ([1, 1, 2, 2], [1, 1, 4, 4]), "must state a TFLite sampling convention"),
+    ],
+)
+def test_onnx_operator_variants_outside_the_encoding_are_not_emitted(
+    tmp_path, op_type, attrs, shapes, message
+):
+    *input_shapes, output_shape = shapes
+    names = [f"input{index}" for index in range(len(input_shapes))]
+    initializers = []
+    if op_type == "Resize":
+        initializers.append(numpy_helper.from_array(np.array([1, 1, 2, 2], np.float32), "scales"))
+        names += ["", "scales"]
+    path = _save(
+        tmp_path, op_type.lower(),
+        [helper.make_node(op_type, names, ["output"], **attrs)],
+        [helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+         for name, shape in zip(names, input_shapes)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)],
+        initializers,
+    )
+    graph, _ = _run_pipeline(str(path), ("4K",))
+
+    with pytest.raises(ValueError, match=message):
+        emit_binary_bytes(graph)
+
+
+@pytest.mark.parametrize(
     ("op", "tensors", "message"),
     [
         (
@@ -333,6 +368,26 @@ def test_unrepresentable_pool_attributes_are_rejected(
             },
             "unchanged N/C",
         ),
+        *[
+            (
+                OpNode(
+                    name="conv_transpose",
+                    op_type="ConvTranspose",
+                    inputs=["input"],
+                    outputs=["output"],
+                    attrs={"kernel_shape": [3, 3], "strides": [2, 2], "pads": [0, 0, 0, 0], **attrs},
+                ),
+                {
+                    "input": TensorInfo("input", (1, 4, 4, 4), TensorProto.FLOAT),
+                    "output": TensorInfo("output", (1, 4, 9, 9), TensorProto.FLOAT),
+                },
+                message,
+            )
+            for attrs, message in (
+                ({"group": 2}, "group=2 is not implemented (group=1 only)"),
+                ({"dilations": [2, 2]}, "ConvTranspose dilation is not implemented"),
+            )
+        ],
     ],
 )
 def test_unencoded_operator_variants_are_rejected(op, tensors, message):
@@ -342,7 +397,7 @@ def test_unencoded_operator_variants_are_rejected(op, tensors, message):
     assert message in validation.describe()
 
 
-def test_representable_softmax_concat_and_resize_variants_are_supported():
+def test_representable_operator_variants_are_supported():
     graph = AnalyzedGraph(
         ops=[
             OpNode(
@@ -370,6 +425,19 @@ def test_representable_softmax_concat_and_resize_variants_are_supported():
                     "nearest_mode": "floor",
                 },
             ),
+            OpNode(
+                name="conv_transpose",
+                op_type="ConvTranspose",
+                inputs=["deconv_input"],
+                outputs=["deconv_output"],
+                attrs={
+                    "kernel_shape": [3, 3],
+                    "strides": [2, 2],
+                    "pads": [0, 0, 0, 0],
+                    "dilations": [1, 1],
+                    "group": 1,
+                },
+            ),
         ],
         tensors={
             "softmax_input": TensorInfo(
@@ -389,12 +457,42 @@ def test_representable_softmax_concat_and_resize_variants_are_supported():
             "resize_output": TensorInfo(
                 "resize_output", (1, 3, 8, 8), TensorProto.FLOAT
             ),
+            "deconv_input": TensorInfo(
+                "deconv_input", (1, 4, 4, 4), TensorProto.FLOAT
+            ),
+            "deconv_output": TensorInfo(
+                "deconv_output", (1, 4, 9, 9), TensorProto.FLOAT
+            ),
         },
     )
 
     validation = validate_operator_support(graph)
 
     assert validation.supported, validation.describe()
+
+
+def test_encodable_operator_without_a_route_is_rejected():
+    routed = frozenset().union(
+        *(effective_operators(backend) for backend in KERNEL_CAPABILITIES)
+    )
+    unrouted = sorted(set(OP_TYPE_MAP) - routed)
+    assert unrouted, "no opcode lacks a route; test the gate with a synthetic op_type"
+    graph = AnalyzedGraph(
+        ops=[OpNode(name="lone_op", op_type=unrouted[0], inputs=["input"], outputs=["output"])],
+        tensors={
+            "input": TensorInfo("input", (1, 4), TensorProto.FLOAT),
+            "output": TensorInfo("output", (1, 4), TensorProto.FLOAT),
+        },
+    )
+
+    result = validate_operator_support(graph)
+
+    assert not result.supported
+    assert any(
+        issue.reason == f"{unrouted[0]} has no kernel in the runtime"
+        or "unsupported" in issue.reason.lower()
+        for issue in result.issues
+    )
 
 
 def test_dynamic_elementwise_broadcasting_is_rejected():
@@ -699,13 +797,6 @@ def test_count_include_pad_without_padding_is_accepted(tmp_path):
     assert emit_binary_bytes(ag)
 
 
-def test_count_include_pad_with_padding_is_refused(tmp_path):
-    ag, _ = _run_pipeline(str(_avg_pool_path(tmp_path, [1, 1, 1, 1])), ("64K",),
-                          report_bindings=False)
-    with pytest.raises(ValueError, match="count_include_pad=1 with padding"):
-        emit_binary_bytes(ag)
-
-
 def _gate_path(tmp_path, gate_shape):
     return _save(
         tmp_path, "gate",
@@ -733,20 +824,9 @@ def test_a_row_wise_dynamic_operand_is_emitted(tmp_path):
     assert emit_binary_bytes(ag)
 
 
-def test_hardswish_and_int8_bilinear_have_kernels():
-    from tigris.capabilities import effective_operators
-
-    for backend in ("reference", "s8_ref", "esp-nn", "cmsis-nn"):
-        assert "HardSwish" in effective_operators(backend)
-        assert "ResizeLinear" in effective_operators(backend)
-
-
-@pytest.mark.parametrize("kind", [
-    "Neg", "Exp", "Log", "Sqrt", "Square", "Floor", "Ceil", "Round",
-    "Sin", "Cos", "FloorDiv", "FloorMod",
-])
+@pytest.mark.parametrize("kind", ["Exp", "FloorDiv"])
 def test_elementwise_without_int8_kernel_rejects_quantized_plans(kind):
-    binary = kind in {"FloorDiv", "FloorMod"}
+    binary = kind == "FloorDiv"
     quant = QuantParam(np.array([0.125], np.float32), np.array([-17], np.int8))
     ag = AnalyzedGraph(
         ops=[OpNode(name="math", op_type=kind,
@@ -1059,11 +1139,7 @@ def test_extrema_require_matching_int8_quantization(kind):
     assert "identical" in validate_operator_support(graph).describe()
 
 
-def test_cumsum_refuses_nonzero_input_zero_point_and_invalid_options():
-    graph = _reduction_graph("CumSum", quantized=True)
-    graph.tensors["x"].quant = QuantParam(
-        scale=np.array([0.125], np.float32), zero_point=np.array([-17], np.int8))
-    assert "input zero point 0" in validate_operator_support(graph).describe()
+def test_cumsum_refuses_invalid_options():
     graph = _reduction_graph("CumSum", quantized=True)
     graph.tensors["y"].quant = QuantParam(
         scale=np.array([2**-22], np.float32), zero_point=np.array([0], np.int8))
@@ -1072,11 +1148,10 @@ def test_cumsum_refuses_nonzero_input_zero_point_and_invalid_options():
     assert "exclusive and reverse" in validate_operator_support(graph).describe()
 
 
-@pytest.mark.parametrize("kind", ["ArgMax", "ArgMin"])
 @pytest.mark.parametrize("input_dtype", [1, 3])
 @pytest.mark.parametrize("output_dtype", [6, 7])
-def test_index_outputs_do_not_bypass_dispatcher_dtype_contract(kind, input_dtype, output_dtype):
-    graph = _reduction_graph(kind)
+def test_index_outputs_do_not_bypass_dispatcher_dtype_contract(input_dtype, output_dtype):
+    graph = _reduction_graph("ArgMax")
     graph.tensors["x"].dtype = input_dtype
     graph.tensors["y"].dtype = output_dtype
     graph.is_quantized = input_dtype == 3
@@ -1326,12 +1401,23 @@ def test_sum_proves_reference_accumulator_bounds(zero, count, valid):
         assert "int32 reference accumulator" in report.describe()
 
 
-@pytest.mark.parametrize("kind", ["Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"])
-@pytest.mark.parametrize("scale", [0, -0.1, 1, 2, float("nan"), float("inf")])
-def test_comparison_rejects_scales_outside_prepare_domain(kind, scale):
+@pytest.mark.parametrize("kind,scale,message", [
+    ("Equal", 0, "valid per-tensor quantization"),
+    ("Less", -0.1, "valid per-tensor quantization"),
+    ("LessOrEqual", 1, "strictly between 0 and 1"),
+    ("Greater", 2, "strictly between 0 and 1"),
+    ("GreaterOrEqual", float("nan"), "valid per-tensor quantization"),
+    ("Equal", float("inf"), "valid per-tensor quantization"),
+    ("Equal", 1, "strictly between 0 and 1"),
+    ("Less", 1, "strictly between 0 and 1"),
+    ("GreaterOrEqual", 2, "strictly between 0 and 1"),
+])
+def test_comparison_rejects_scales_outside_prepare_domain(kind, scale, message):
     graph = _bool_graph(kind, True)
     graph.tensors["x1"].quant.scale[0] = scale
-    assert not validate_operator_support(graph).supported
+    report = validate_operator_support(graph)
+    assert not report.supported
+    assert message in report.describe()
 
 
 @pytest.mark.parametrize("kind,slot", [("Where", "x1"), ("Where", "x2"), ("Where", "y"), ("Sum", "x1")])

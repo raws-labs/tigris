@@ -1,5 +1,6 @@
 """Compile generated deployment harnesses as C99 with target API stubs."""
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,23 +17,34 @@ from tigris.loaders import load_model
 
 
 _ROOT = Path(__file__).resolve().parents[1]
+# With TIGRIS_RUNTIME_SOURCE set or under CI, a missing compiler or header fails.
+_RUNTIME_SOURCE = os.environ.get("TIGRIS_RUNTIME_SOURCE")
 _RUNTIME_INCLUDE = next(
     (
-        candidate
+        candidate / "include"
         for candidate in (
-            _ROOT / "tigris-runtime" / "include",
-            _ROOT.parent / "tigris-runtime" / "include",
+            (Path(_RUNTIME_SOURCE).resolve(),)
+            if _RUNTIME_SOURCE
+            else (
+                _ROOT / "runtime-source",
+                _ROOT / "tigris-runtime",
+                _ROOT.parent / "tigris-runtime",
+            )
         )
-        if candidate.is_dir()
+        if (candidate / "include").is_dir()
     ),
     None,
 )
 _CC = shutil.which("cc")
 
-pytestmark = pytest.mark.skipif(
-    _CC is None or _RUNTIME_INCLUDE is None,
-    reason="C compiler and tigris-runtime headers are required",
-)
+
+@pytest.fixture(autouse=True)
+def require_toolchain():
+    if _CC is None or _RUNTIME_INCLUDE is None:
+        message = "C compiler and tigris-runtime headers are required"
+        if _RUNTIME_SOURCE or os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
 
 
 def _plan_bytes(path, *, compress=None):

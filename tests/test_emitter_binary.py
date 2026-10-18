@@ -16,10 +16,7 @@ from tigris import (
     SUPPORTED_SCHEMA_VERSIONS,
     TILE_AXIS_HEIGHT_OR_LENGTH,
 )
-from tigris.analysis.lifetime import compute_lifetimes
-from tigris.analysis.memory import compute_memory_timeline
-from tigris.analysis.partition_spatial import partition_spatial
-from tigris.analysis.partition_temporal import partition_temporal
+from tigris.cli.compile import _run_compressed_pipeline
 from tigris.emitters.binary import defs
 from tigris.emitters.binary.defs import (
     HEADER_SIZE,
@@ -48,38 +45,11 @@ from tigris.graph.ir import (
     TensorInfo,
     TilePlan,
 )
-from tigris.loaders import load_model
+
+from conftest import full_pipeline
 
 
-def _full_pipeline(path, budget=0):
-    ag = load_model(path)
-    ag = compute_lifetimes(ag)
-    ag = compute_memory_timeline(ag)
-    if budget > 0:
-        ag = partition_temporal(ag, budget)
-        ag = partition_spatial(ag)
-    return ag
-
-
-# Header / magic tests
-
-
-def test_magic_and_version(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
-    data = emit_binary_bytes(ag)
-
-    assert data[:4] == MAGIC
-    version = struct.unpack_from("<I", data, 4)[0]
-    # Only a plan with state is written at the newest schema.
-    assert version == SCHEMA_VERSION_BINARY_REQUANT
-
-
-def test_file_size_matches(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
-    data = emit_binary_bytes(ag)
-
-    file_size = struct.unpack_from("<I", data, 8)[0]
-    assert file_size == len(data)
+# Quant param pages
 
 
 def test_v3_quant_data_pages_keep_offsets_in_uint16_range():
@@ -133,11 +103,19 @@ def test_v3_quant_param_rejects_arrays_that_cannot_fit_one_page():
 # Round-trip tests
 
 
-def test_roundtrip_linear(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
+def test_roundtrip_linear(linear_3op_path, tmp_path):
+    ag = full_pipeline(linear_3op_path)
+    out = tmp_path / "test.tgrs"
+    emit_binary(ag, out)
+    data = out.read_bytes()
 
+    assert data[:4] == MAGIC
+    version = struct.unpack_from("<I", data, 4)[0]
+    # Only a plan with state is written at the newest schema.
+    assert version == SCHEMA_VERSION_BINARY_REQUANT
+    assert struct.unpack_from("<I", data, 8)[0] == len(data), "file size"
+
+    plan = read_binary_plan(data)
     assert plan["model_name"] == "linear_3op"
     assert plan["num_ops"] == 3
     assert plan["version"] == SCHEMA_VERSION_BINARY_REQUANT
@@ -147,25 +125,37 @@ def test_roundtrip_linear(linear_3op_path):
     assert "input" in tensor_names
     assert "output" in tensor_names
 
+    for t in plan["tensors"]:
+        name = t["name"]
+        if name in ag.tensors:
+            assert t["shape"] == list(ag.tensors[name].shape), f"Shape mismatch for {name}"
+            assert t["dtype"] == ag.tensors[name].dtype, f"Dtype mismatch for {name}"
+        if name in ag.model_inputs:
+            assert t["flags"] & 0x02, f"{name} lacks MODEL_INPUT"
+        if name in ag.model_outputs:
+            assert t["flags"] & 0x04, f"{name} lacks MODEL_OUTPUT"
 
-def test_roundtrip_diamond(diamond_path):
-    ag = _full_pipeline(diamond_path, budget=1536)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
+    for i, op in enumerate(plan["ops"]):
+        assert op["op_type"] == OP_TYPE_MAP[ag.ops[i].op_type], f"op {i} type"
 
-    assert plan["model_name"] == "diamond"
-    assert plan["num_ops"] == 3
-    assert plan["num_stages"] >= 1
-    assert plan["budget"] == 1536
+    assert len(plan["model_inputs"]) == 1
+    assert len(plan["model_outputs"]) == 1
+    assert plan["tensors"][plan["model_inputs"][0]]["name"] == "input"
+    assert plan["tensors"][plan["model_outputs"][0]]["name"] == "output"
 
 
 def test_roundtrip_conv_chain(conv_relu_chain_path):
-    ag = _full_pipeline(conv_relu_chain_path, budget=6144)
+    ag = full_pipeline(conv_relu_chain_path, budget=6144)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
     assert plan["model_name"] == "conv_relu_chain"
     assert plan["num_ops"] == 2  # Relu absorbed into first Conv
+
+    assert len(ag.stages) >= 2
+    assert plan["num_stages"] == len(ag.stages)
+    for i, stage in enumerate(plan["stages"]):
+        assert stage["peak_bytes"] == ag.stages[i].peak_bytes
 
     # Check Conv op has spatial attrs
     conv_ops = [op for op in plan["ops"] if op["op_type"] == OP_TYPE_MAP["Conv"]]
@@ -182,7 +172,8 @@ def test_roundtrip_conv_chain(conv_relu_chain_path):
 
 
 def test_roundtrip_conv_pool(conv_pool_chain_path):
-    ag = _full_pipeline(conv_pool_chain_path, budget=4096)
+    # This fixture has a feasible 4 KiB tile plan.
+    ag = full_pipeline(conv_pool_chain_path, budget=4096)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -194,35 +185,25 @@ def test_roundtrip_conv_pool(conv_pool_chain_path):
     assert pool_ops[0]["spatial"]["kernel_h"] == 2
     assert pool_ops[0]["spatial"]["stride_h"] == 2
 
+    tiled_stages = [s for s in ag.stages if s.tile_plan is not None]
+    assert tiled_stages
+    assert plan["num_tile_plans"] == len(tiled_stages)
+
+    for tp_bin, stage in zip(plan["tile_plans"], tiled_stages):
+        tp = stage.tile_plan
+        assert tp_bin["tileable"] == tp.tileable
+        assert tp_bin["axis"] == tp.axis
+        assert tp_bin["tile_height"] == tp.tile_height
+        assert tp_bin["num_tiles"] == tp.num_tiles
+        assert tp_bin["halo"] == tp.halo
+        assert tp_bin["receptive_field"] == tp.receptive_field
+
 
 # Tensor validation
 
 
-def test_tensor_shapes(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
-
-    for t in plan["tensors"]:
-        name = t["name"]
-        if name in ag.tensors:
-            expected = list(ag.tensors[name].shape)
-            assert t["shape"] == expected, f"Shape mismatch for {name}"
-
-
-def test_tensor_dtypes(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
-
-    for t in plan["tensors"]:
-        name = t["name"]
-        if name in ag.tensors:
-            assert t["dtype"] == ag.tensors[name].dtype
-
-
 def test_tensor_sizes(conv_relu_chain_path):
-    ag = _full_pipeline(conv_relu_chain_path)
+    ag = full_pipeline(conv_relu_chain_path)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -232,43 +213,7 @@ def test_tensor_sizes(conv_relu_chain_path):
             assert t["size_bytes"] == ag.tensors[name].size_bytes
 
 
-def test_tensor_flags(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
-
-    for t in plan["tensors"]:
-        if t["name"] in ag.model_inputs:
-            assert t["flags"] & 0x02  # MODEL_INPUT
-        if t["name"] in ag.model_outputs:
-            assert t["flags"] & 0x04  # MODEL_OUTPUT
-
-
-# Op type mapping
-
-
-def test_op_types(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
-
-    for i, op in enumerate(plan["ops"]):
-        expected_type = OP_TYPE_MAP[ag.ops[i].op_type]
-        assert op["op_type"] == expected_type
-
-
 # Stage and tile plan tests
-
-
-def test_stages_preserved(conv_relu_chain_path):
-    ag = _full_pipeline(conv_relu_chain_path, budget=6144)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
-
-    assert len(ag.stages) >= 2
-    assert plan["num_stages"] == len(ag.stages)
-    for i, stage in enumerate(plan["stages"]):
-        assert stage["peak_bytes"] == ag.stages[i].peak_bytes
 
 
 def test_schema_v5_stage_table_supports_more_than_256_stages():
@@ -314,29 +259,8 @@ def test_schema_v5_stage_table_supports_more_than_256_stages():
     assert [op["stage"] for op in plan["ops"]] == list(range(stage_count))
 
 
-def test_tile_plans_preserved(conv_pool_chain_path):
-    """If pipeline produces tile plans, verify they survive the round-trip."""
-    # This fixture has a feasible 4 KiB tile plan.
-    ag = _full_pipeline(conv_pool_chain_path, budget=4096)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
-
-    tiled_stages = [s for s in ag.stages if s.tile_plan is not None]
-    assert tiled_stages
-    assert plan["num_tile_plans"] == len(tiled_stages)
-
-    for tp_bin, stage in zip(plan["tile_plans"], tiled_stages):
-        tp = stage.tile_plan
-        assert tp_bin["tileable"] == tp.tileable
-        assert tp_bin["axis"] == tp.axis
-        assert tp_bin["tile_height"] == tp.tile_height
-        assert tp_bin["num_tiles"] == tp.num_tiles
-        assert tp_bin["halo"] == tp.halo
-        assert tp_bin["receptive_field"] == tp.receptive_field
-
-
 def test_writer_rejects_reserved_width_axis(conv_pool_chain_path):
-    ag = _full_pipeline(conv_pool_chain_path, budget=4096)
+    ag = full_pipeline(conv_pool_chain_path, budget=4096)
     stage = next(item for item in ag.stages if item.tile_plan is not None)
     stage.tile_plan.axis = 2
 
@@ -344,73 +268,43 @@ def test_writer_rejects_reserved_width_axis(conv_pool_chain_path):
         emit_binary_bytes(ag)
 
 
-# Model I/O
-
-
-def test_model_io(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
-
-    assert len(plan["model_inputs"]) == 1
-    assert len(plan["model_outputs"]) == 1
-
-    # Input tensor index should map to "input"
-    inp_idx = plan["model_inputs"][0]
-    assert plan["tensors"][inp_idx]["name"] == "input"
-
-    out_idx = plan["model_outputs"][0]
-    assert plan["tensors"][out_idx]["name"] == "output"
-
-
-# File output
-
-
-def test_file_output(linear_3op_path, tmp_path):
-    ag = _full_pipeline(linear_3op_path)
-    out = tmp_path / "test.tgrs"
-    emit_binary(ag, out)
-
-    assert out.exists()
-    data = out.read_bytes()
-    assert data[:4] == MAGIC
-
-    plan = read_binary_plan(data)
-    assert plan["model_name"] == "linear_3op"
-
-
 # All fixtures produce valid binaries
 
 
-def test_all_fixtures_no_budget(
-    linear_3op_path, diamond_path, large_activations_path,
-    conv_relu_chain_path, conv_with_flatten_path, conv_pool_chain_path,
-):
-    for path in [
-        linear_3op_path, diamond_path, large_activations_path,
-        conv_relu_chain_path, conv_with_flatten_path, conv_pool_chain_path,
-    ]:
-        ag = _full_pipeline(path)
-        data = emit_binary_bytes(ag)
-        plan = read_binary_plan(data)
-        assert plan["magic"] == MAGIC
-        assert plan["num_ops"] == len(ag.ops)
+@pytest.mark.parametrize("plan_kind", ["no-budget", "budget", "lz4"])
+@pytest.mark.parametrize(
+    ("fixture", "model_name", "num_ops", "num_weights"),
+    [
+        ("linear_3op_path", "linear_3op", 3, 2),
+        ("diamond_path", "diamond", 3, 0),
+        ("large_activations_path", "large_chain", 5, 0),
+        ("conv_relu_chain_path", "conv_relu_chain", 2, 4),
+        ("conv_with_flatten_path", "conv_flatten", 3, 2),
+        ("conv_pool_chain_path", "conv_pool_chain", 3, 4),
+    ],
+)
+def test_all_fixtures(request, fixture, model_name, num_ops, num_weights, plan_kind):
+    path = request.getfixturevalue(fixture)
+    if plan_kind == "lz4":
+        ag = _run_compressed_pipeline(str(path), ("32K",))[0]
+        plan = read_binary_plan(emit_binary_bytes(ag, compress="lz4"))
+    else:
+        ag = full_pipeline(path, budget=8192 if plan_kind == "budget" else 0)
+        plan = read_binary_plan(emit_binary_bytes(ag))
 
-
-def test_all_fixtures_with_budget(
-    linear_3op_path, diamond_path, large_activations_path,
-    conv_relu_chain_path, conv_with_flatten_path, conv_pool_chain_path,
-):
-    for path in [
-        linear_3op_path, diamond_path, large_activations_path,
-        conv_relu_chain_path, conv_with_flatten_path, conv_pool_chain_path,
-    ]:
-        ag = _full_pipeline(path, budget=8192)
-        data = emit_binary_bytes(ag)
-        plan = read_binary_plan(data)
-        assert plan["magic"] == MAGIC
-        assert plan["num_ops"] == len(ag.ops)
+    assert plan["magic"] == MAGIC
+    assert plan["model_name"] == model_name
+    assert plan["num_ops"] == len(ag.ops) == num_ops
+    assert len(ag.weight_data) == num_weights
+    assert plan["num_weights"] == num_weights
+    assert len(plan["weights"]) == num_weights
+    if plan_kind == "budget":
         assert plan["budget"] == 8192
+        assert plan["num_stages"] == len(ag.stages) >= 1
+    if plan_kind == "lz4":
+        assert (len(plan["weight_blocks"]) > 0) == (num_weights > 0)
+        if num_weights:
+            assert plan["weight_blocks_compression"] == 1  # LZ4
 
 
 # Error handling
@@ -540,9 +434,12 @@ def test_immutable_supported_schema_fixtures():
                 assert tensor["iface_dtype"] == 1
 
 
-@pytest.mark.parametrize("version", [0, 1, *SUPPORTED_SCHEMA_VERSIONS, 99])
+@pytest.mark.parametrize(
+    "version",
+    [0, 1, max(SUPPORTED_SCHEMA_VERSIONS), max(SUPPORTED_SCHEMA_VERSIONS) + 1],
+)
 def test_schema_version_validation(linear_3op_path, version):
-    ag = _full_pipeline(linear_3op_path)
+    ag = full_pipeline(linear_3op_path)
     data = bytearray(emit_binary_bytes(ag))
     struct.pack_into("<I", data, 4, version)
 
@@ -558,7 +455,7 @@ def test_schema_version_validation(linear_3op_path, version):
 
 
 def test_missing_required_section_is_rejected_cleanly(linear_3op_path):
-    ag = _full_pipeline(linear_3op_path)
+    ag = full_pipeline(linear_3op_path)
     data = bytearray(emit_binary_bytes(ag))
     struct.pack_into("<II", data, HEADER_SIZE, 0, 0)
 
@@ -711,13 +608,13 @@ def _reduce_mean_model(path, shape, axes, keepdims, projected=False):
 
 
 def test_a_spatial_mean_over_both_image_axes_becomes_a_global_pool(tmp_path):
-    ag = _full_pipeline(_reduce_mean_model(
+    ag = full_pipeline(_reduce_mean_model(
         tmp_path / "gap.onnx", [1, 4, 8, 8], (2, 3), keepdims=True))
     assert [op.op_type for op in ag.ops] == ["GlobalAveragePool"]
 
 
 def test_a_mean_over_one_axis_keeps_its_operator_and_states_the_axis(tmp_path):
-    ag = _full_pipeline(_reduce_mean_model(
+    ag = full_pipeline(_reduce_mean_model(
         tmp_path / "tokens.onnx", [1, 12, 8], (1,), keepdims=True,
         projected=True))
     assert "ReduceMean" in [op.op_type for op in ag.ops]
@@ -738,7 +635,7 @@ def test_a_mean_over_a_stored_axis_is_emitted_where_the_runtime_holds_it(
     over the channel axis of an NCL tensor is a mean over the last stored axis,
     and emitting the model's own number would collapse the wrong one.
     """
-    ag = _full_pipeline(_reduce_mean_model(
+    ag = full_pipeline(_reduce_mean_model(
         tmp_path / "channels.onnx", [1, 12, 8], (1,), keepdims=True))
     plan = read_binary_plan(emit_binary_bytes(ag))
     axes = [a for a in plan["op_attributes"] if a["type"] == OP_ATTR_AXES]
@@ -784,7 +681,7 @@ def _pool_model(path, pool, quantized):
 
 
 def _pool_rounding_records(tmp_path, pool, quantized):
-    ag = _full_pipeline(_pool_model(tmp_path / "pool.onnx", pool, quantized))
+    ag = full_pipeline(_pool_model(tmp_path / "pool.onnx", pool, quantized))
     assert "GlobalAveragePool" in [op.op_type for op in ag.ops]
     plan = read_binary_plan(emit_binary_bytes(ag))
     return [a for a in plan["op_attributes"] if a["type"] == defs.OP_ATTR_POOL_ROUNDING]

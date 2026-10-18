@@ -1,8 +1,7 @@
 """A float per-channel constant Add folded into its producer's bias."""
 
 import numpy as np
-import onnx
-from onnx import TensorProto, helper, numpy_helper
+from onnx import helper, numpy_helper
 
 from tigris.loaders.onnx.loader import load_model
 from tigris.loaders.onnx.normalize import (
@@ -11,19 +10,12 @@ from tigris.loaders.onnx.normalize import (
     normalize,
 )
 
+from conftest import save_onnx, vi
+
 
 def _normalized(tmp_path, name, nodes, inputs, outputs, init=()):
-    model = helper.make_model(
-        helper.make_graph(nodes, name, inputs, outputs, list(init)),
-        opset_imports=[helper.make_opsetid("", 13)],
-    )
-    path = tmp_path / f"{name}.onnx"
-    onnx.save(model, str(path))
+    path = save_onnx(tmp_path, name, nodes, inputs, outputs, init)
     return normalize(load_model(str(path)))
-
-
-def _vi(name, shape):
-    return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
 
 
 def _weight(name="weight"):
@@ -44,7 +36,7 @@ def test_channel_add_becomes_the_producers_bias(tmp_path):
                              kernel_shape=[3, 3], pads=[1, 1, 1, 1], name="conv1"),
             helper.make_node("Add", ["p", "channel"], ["y"], name="add1"),
         ],
-        [_vi("x", [1, 2, 3, 3])], [_vi("y", [1, 3, 3, 3])],
+        [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
         [_weight(), _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
 
     assert [op.op_type for op in ag.ops] == ["Conv"]
@@ -63,7 +55,7 @@ def test_channel_add_sums_into_an_existing_bias(tmp_path):
                              kernel_shape=[3, 3], pads=[1, 1, 1, 1], name="conv1"),
             helper.make_node("Add", ["p", "channel"], ["y"], name="add1"),
         ],
-        [_vi("x", [1, 2, 3, 3])], [_vi("y", [1, 3, 3, 3])],
+        [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
         [_weight(),
          numpy_helper.from_array(np.array([1.0, 2.0, 3.0], np.float32), "bias"),
          _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
@@ -78,7 +70,7 @@ def test_add_without_a_bias_producer_is_left_alone(tmp_path):
     ag = _normalized(
         tmp_path, "no_producer",
         [helper.make_node("Add", ["x", "channel"], ["y"], name="add1")],
-        [_vi("x", [1, 3, 4, 4])], [_vi("y", [1, 3, 4, 4])],
+        [vi("x", [1, 3, 4, 4])], [vi("y", [1, 3, 4, 4])],
         [_channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
 
     assert [op.op_type for op in ag.ops] == ["Add"]
@@ -95,7 +87,7 @@ def test_add_feeding_a_second_consumer_is_left_alone(tmp_path):
             helper.make_node("Relu", ["p"], ["b"], name="relu1"),
             helper.make_node("Add", ["a", "b"], ["y"], name="add2"),
         ],
-        [_vi("x", [1, 2, 3, 3])], [_vi("y", [1, 3, 3, 3])],
+        [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
         [_weight(), _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
 
     assert "Add" in [op.op_type for op in ag.ops]

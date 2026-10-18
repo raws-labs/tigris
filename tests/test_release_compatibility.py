@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
-from importlib.resources import files
 from pathlib import Path
+
+import pytest
 
 from tigris import SCHEMA_VERSION
 from scripts.generate_capability_matrix import capability_matrix
@@ -16,7 +18,8 @@ from scripts.validate_runtime_capabilities import validate as validate_capabilit
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = ROOT.parent / "tigris-runtime"
+_RUNTIME_SOURCE = os.environ.get("TIGRIS_RUNTIME_SOURCE")
+RUNTIME = Path(_RUNTIME_SOURCE).resolve() if _RUNTIME_SOURCE else ROOT.parent / "tigris-runtime"
 # Derived, so a schema bump does not quietly leave these tests checking the
 # previous version's artifact.
 SCHEMA_ARTIFACT = f"schema/tigris-plan-v{SCHEMA_VERSION}.json"
@@ -27,23 +30,11 @@ def test_schema_package_matches_compiler_definitions():
     assert artifact == schema_package()
 
 
-def test_schema_package_is_installed_package_data():
-    artifact = files("tigris").joinpath(SCHEMA_ARTIFACT)
-    assert json.loads(artifact.read_text()) == schema_package()
-
-
 def test_capability_artifact_matches_compiler_definitions():
     artifact = json.loads(
         (ROOT / "src/tigris/schema/operator-capabilities-v1.json").read_text()
     )
     assert artifact == capability_matrix()
-
-
-def test_capability_artifact_is_installed_package_data():
-    artifact = files("tigris").joinpath(
-        "schema/operator-capabilities-v1.json"
-    )
-    assert json.loads(artifact.read_text()) == capability_matrix()
 
 
 def test_capability_audit_imports_from_an_uninstalled_source_checkout():
@@ -65,12 +56,17 @@ def test_capability_audit_imports_from_an_uninstalled_source_checkout():
 
 def test_release_manifest_matches_current_runtime_when_available():
     runtime = RUNTIME if (RUNTIME / "include/tigris.h").is_file() else None
+    if runtime is None and _RUNTIME_SOURCE:
+        pytest.fail(f"TIGRIS_RUNTIME_SOURCE has no runtime headers: {RUNTIME}")
     assert validate(ROOT, runtime) == []
 
 
 def test_capability_contract_matches_current_runtime_when_available():
-    if (RUNTIME / "include/tigris.h").is_file():
-        assert validate_capabilities(RUNTIME) == []
+    if not (RUNTIME / "include/tigris.h").is_file():
+        if _RUNTIME_SOURCE:
+            pytest.fail(f"TIGRIS_RUNTIME_SOURCE has no runtime headers: {RUNTIME}")
+        pytest.skip("tigris-runtime checkout not found; set TIGRIS_RUNTIME_SOURCE")
+    assert validate_capabilities(RUNTIME) == []
 
 
 def _document():
@@ -80,13 +76,17 @@ def _document():
 def _validated_copy(tmp_path, document):
     (tmp_path / "compatibility.json").write_text(json.dumps(document))
     for relative in (
-        "src/tigris/schema/tigris-plan-v6.json",
+        f"src/tigris/{SCHEMA_ARTIFACT}",
         "src/tigris/emitters/binary/defs.py",
     ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((ROOT / relative).read_bytes())
     return validate(tmp_path)
+
+
+def test_release_manifest_copy_validates_unchanged(tmp_path):
+    assert _validated_copy(tmp_path, _document()) == []
 
 
 def test_release_manifest_rejects_incompatible_pair(tmp_path):

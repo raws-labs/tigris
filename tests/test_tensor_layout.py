@@ -1,26 +1,19 @@
 """Layout as a tensor property rather than a rule inferred from rank."""
 
 import numpy as np
-import onnx
-from onnx import TensorProto, helper, numpy_helper
+import pytest
+from onnx import helper, numpy_helper
 
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import Layout, TensorInfo, serialized_axis_map
 from tigris.cli import _run_pipeline
 
-
-def _vi(name, shape):
-    return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+from conftest import save_onnx, vi
 
 
 def _plan(tmp_path, name, nodes, inputs, outputs, init=(), budget="64K"):
-    model = helper.make_model(
-        helper.make_graph(nodes, name, inputs, outputs, list(init)),
-        opset_imports=[helper.make_opsetid("", 13)],
-    )
-    path = tmp_path / f"{name}.onnx"
-    onnx.save(model, str(path))
+    path = save_onnx(tmp_path, name, nodes, inputs, outputs, init)
     ag, _ = _run_pipeline(str(path), (budget,))
     return ag, read_binary_plan(emit_binary_bytes(ag))
 
@@ -44,7 +37,7 @@ def test_spatial_activation_is_stored_channels_last(tmp_path):
         tmp_path, "spatial",
         [helper.make_node("Conv", ["x", "w"], ["y"],
                           kernel_shape=[3, 3], pads=[1, 1, 1, 1], name="conv1")],
-        [_vi("x", [1, 2, 5, 7])], [_vi("y", [1, 4, 5, 7])],
+        [vi("x", [1, 2, 5, 7])], [vi("y", [1, 4, 5, 7])],
         [numpy_helper.from_array(np.zeros((4, 2, 3, 3), np.float32), "w")])
 
     assert ag.tensors["y"].layout is Layout.SPATIAL
@@ -62,7 +55,7 @@ def test_terminal_transpose_output_is_linear_and_keeps_onnx_shape(tmp_path):
             helper.make_node("Transpose", ["c"], ["y"], perm=[0, 2, 3, 1],
                              name="t1"),
         ],
-        [_vi("x", [1, 2, 5, 7])], [_vi("y", [1, 5, 7, 4])],
+        [vi("x", [1, 2, 5, 7])], [vi("y", [1, 5, 7, 4])],
         [numpy_helper.from_array(np.zeros((4, 2, 3, 3), np.float32), "w")])
 
     assert ag.tensors["c"].layout is Layout.SPATIAL
@@ -81,7 +74,8 @@ def _operand_layouts(ag, op):
     ]
 
 
-def test_a_residual_over_a_matrix_product_unifies_its_operands(tmp_path):
+@pytest.mark.parametrize("add_is_output", [True, False], ids=["add-at-output", "add-inside"])
+def test_every_layout_agnostic_operator_has_operands_that_agree(tmp_path, add_is_output):
     """The skip arrives in storage order and the product's output does not.
 
     An elementwise Add reads both operands at the same offset, so two operands
@@ -90,37 +84,19 @@ def test_a_residual_over_a_matrix_product_unifies_its_operands(tmp_path):
     sequence length equals the width, nothing does and the answer is wrong.
     """
     tokens, width = 8, 8
-    ag, _ = _plan(
-        tmp_path, "residual_square",
-        [
-            helper.make_node("MatMul", ["x", "w"], ["p"], name="mm"),
-            helper.make_node("Add", ["x", "p"], ["y"], name="add"),
-        ],
-        [_vi("x", [1, tokens, width])], [_vi("y", [1, tokens, width])],
-        [numpy_helper.from_array(
-            np.zeros((width, width), np.float32), "w")],
-        budget="4M")
-
-    add = next(op for op in ag.ops if op.op_type == "Add")
-    layouts = _operand_layouts(ag, add)
-    assert len(layouts) == 2
-    assert len(set(layouts)) == 1, (
-        f"the Add's operands disagree about layout: {layouts}")
-
-
-def test_every_layout_agnostic_operator_has_operands_that_agree(tmp_path):
-    """The invariant, over the shapes that put a graph in both layouts."""
-    tokens, width = 8, 8
-    ag, _ = _plan(
-        tmp_path, "mixed",
-        [
-            helper.make_node("MatMul", ["x", "w"], ["p"], name="mm"),
-            helper.make_node("Add", ["x", "p"], ["s"], name="add"),
+    nodes = [
+        helper.make_node("MatMul", ["x", "w"], ["p"], name="mm"),
+        helper.make_node("Add", ["x", "p"], ["y" if add_is_output else "s"], name="add"),
+    ]
+    if not add_is_output:
+        nodes += [
             helper.make_node("Mul", ["s", "x"], ["m"], name="mul"),
             helper.make_node("Softmax", ["m"], ["sm"], axis=-1, name="sm"),
             helper.make_node("Sub", ["sm", "x"], ["y"], name="sub"),
-        ],
-        [_vi("x", [1, tokens, width])], [_vi("y", [1, tokens, width])],
+        ]
+    ag, _ = _plan(
+        tmp_path, "mixed", nodes,
+        [vi("x", [1, tokens, width])], [vi("y", [1, tokens, width])],
         [numpy_helper.from_array(
             np.zeros((width, width), np.float32), "w")],
         budget="4M")
@@ -129,6 +105,8 @@ def test_every_layout_agnostic_operator_has_operands_that_agree(tmp_path):
         if op.op_type not in ("Add", "Sub", "Mul", "Concat"):
             continue
         layouts = _operand_layouts(ag, op)
+        if op.op_type == "Add":
+            assert len(layouts) == 2
         assert len(set(layouts)) <= 1, (
             f"{op.name} ({op.op_type}) operands disagree: {layouts}")
 
@@ -143,7 +121,7 @@ def test_a_reshape_that_regroups_rows_into_a_product_is_held_in_model_order(tmp_
             helper.make_node("Reshape", ["x", "shape"], ["rows"], name="rows"),
             helper.make_node("Gemm", ["rows", "w"], ["y"], transB=1, name="fc"),
         ],
-        [_vi("x", [1, 6, 8])], [_vi("y", [6, 5])],
+        [vi("x", [1, 6, 8])], [vi("y", [6, 5])],
         [numpy_helper.from_array(np.array([6, 8], np.int64), "shape"),
          numpy_helper.from_array(np.ones((5, 8), np.float32), "w")])
 

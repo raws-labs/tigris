@@ -31,11 +31,12 @@ analysis, code generation, and zoo downloads also work in the pure wheel.
 
 CI builds runtime source from the same branch when available, otherwise from
 `develop`. Tag builds test against the matching runtime tag. Pull requests build
-and install one native wheel plus the pure wheel; `develop`, `main`, and release
-builds test the full platform and Python matrix outside the checkout. Only
-release-wheel builds download pinned archives. `runtime-host.json` records their
-release and per-platform SHA-256 values; an unset pin blocks release wheels,
-not source CI. Publishing uploads the tested wheels and source distribution.
+and install one native wheel plus the pure wheel; `develop` and release builds
+test every platform wheel on the oldest and newest supported Python outside the
+checkout. Only release-wheel builds download pinned archives. `runtime-host.json`
+records their release and per-platform SHA-256 values; an unset pin blocks
+release wheels, not source CI. Publishing uploads the tested wheels and source
+distribution.
 
 ## Releasing
 

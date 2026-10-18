@@ -1,9 +1,62 @@
 """Shared fixtures: small hand-crafted ONNX graphs for testing."""
 
+import os
+from pathlib import Path
+
 import pytest
 import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
+
+from tigris.analysis.lifetime import compute_lifetimes
+from tigris.analysis.memory import compute_memory_timeline
+from tigris.analysis.partition_spatial import detect_and_solve_chains, partition_spatial
+from tigris.analysis.partition_temporal import partition_temporal
+from tigris.fixtures import build_conv_relu_chain, build_linear_3op
+from tigris.loaders import load_model
+
+
+def vi(name, shape):
+    return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+
+
+def save_onnx(tmp_path, name, nodes, inputs, outputs, init=(), opset=13,
+              ir_version=None, filename=None):
+    """Save a one-graph model as tmp_path/<filename or name.onnx>; return the path."""
+    model = helper.make_model(
+        helper.make_graph(nodes, name, inputs, outputs, list(init)),
+        opset_imports=[helper.make_opsetid("", opset)],
+    )
+    if ir_version is not None:
+        model.ir_version = ir_version
+    path = tmp_path / (filename or f"{name}.onnx")
+    onnx.save(model, str(path))
+    return path
+
+
+@pytest.fixture
+def require_host_library(monkeypatch):
+    """Skip without the host library staged in the tigris package; fail under TIGRIS_REQUIRE_HOST."""
+    monkeypatch.delenv("TIGRIS_HOST_LIBRARY", raising=False)
+    import tigris
+    if not (Path(tigris.__file__).parent / "native" / "manifest.json").exists():
+        if os.environ.get("TIGRIS_REQUIRE_HOST"):
+            pytest.fail("Host library is not staged in the tigris package")
+        pytest.skip("Host library has not been staged in this source checkout")
+
+
+def full_pipeline(path, budget=0, spatial=True, chains=False):
+    """Load, compute lifetimes and memory; with a budget, partition the graph."""
+    ag = load_model(path)
+    ag = compute_lifetimes(ag)
+    ag = compute_memory_timeline(ag)
+    if budget > 0:
+        ag = partition_temporal(ag, budget)
+        if spatial:
+            ag = partition_spatial(ag)
+            if chains:
+                ag = detect_and_solve_chains(ag)
+    return ag
 
 
 @pytest.fixture
@@ -19,22 +72,8 @@ def linear_3op_path(tmp_path):
     The Relu leads so the chain keeps three operators: an activation that
     follows a fusable producer is absorbed into it.
     """
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 64])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 64])
-
-    w0 = helper.make_tensor("w0", TensorProto.FLOAT, [1, 64], np.zeros((1, 64), dtype=np.float32).flatten().tolist())
-    w1 = helper.make_tensor("w1", TensorProto.FLOAT, [1, 64], np.zeros((1, 64), dtype=np.float32).flatten().tolist())
-
-    relu = helper.make_node("Relu", ["input"], ["t0"], name="relu0")
-    add0 = helper.make_node("Add", ["t0", "w0"], ["t1"], name="add0")
-    add1 = helper.make_node("Add", ["t1", "w1"], ["output"], name="add1")
-
-    graph = helper.make_graph([relu, add0, add1], "linear_3op", [X], [Y], initializer=[w0, w1])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
     path = tmp_path / "linear_3op.onnx"
-    onnx.save(model, str(path))
+    onnx.save(build_linear_3op(), str(path))
     return path
 
 
@@ -55,13 +94,9 @@ def diamond_path(tmp_path):
     sigmoid = helper.make_node("Sigmoid", ["input"], ["right"], name="sigmoid")
     add = helper.make_node("Add", ["left", "right"], ["output"], name="add")
 
-    graph = helper.make_graph([relu, sigmoid, add], "diamond", [X], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "diamond.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(
+        tmp_path, "diamond", [relu, sigmoid, add], [X], [Y], opset=17, ir_version=8
+    )
 
 
 @pytest.fixture
@@ -86,13 +121,7 @@ def large_activations_path(tmp_path):
         out = "output" if i == 4 else f"t{i}"
         nodes.append(helper.make_node("Relu", [inp], [out], name=f"relu{i}"))
 
-    graph = helper.make_graph(nodes, "large_chain", [X], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "large_chain.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(tmp_path, "large_chain", nodes, [X], [Y], opset=17, ir_version=8)
 
 
 @pytest.fixture
@@ -101,34 +130,8 @@ def conv_relu_chain_path(tmp_path):
 
     Two 3x3 convolutions with a relu in between, NCHW layout.
     """
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 32, 32])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 28, 28])
-
-    # Conv1: 3->8 channels, 3x3 kernel, no padding
-    w0_data = np.zeros((8, 3, 3, 3), dtype=np.float32).flatten().tolist()
-    w0 = helper.make_tensor("w0", TensorProto.FLOAT, [8, 3, 3, 3], w0_data)
-    b0_data = np.zeros(8, dtype=np.float32).tolist()
-    b0 = helper.make_tensor("b0", TensorProto.FLOAT, [8], b0_data)
-
-    # Conv2: 8->8 channels, 3x3 kernel, no padding
-    w1_data = np.zeros((8, 8, 3, 3), dtype=np.float32).flatten().tolist()
-    w1 = helper.make_tensor("w1", TensorProto.FLOAT, [8, 8, 3, 3], w1_data)
-    b1_data = np.zeros(8, dtype=np.float32).tolist()
-    b1 = helper.make_tensor("b1", TensorProto.FLOAT, [8], b1_data)
-
-    conv0 = helper.make_node("Conv", ["input", "w0", "b0"], ["t0"], name="conv0",
-                             kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
-    relu = helper.make_node("Relu", ["t0"], ["t1"], name="relu0")
-    conv1 = helper.make_node("Conv", ["t1", "w1", "b1"], ["output"], name="conv1",
-                             kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
-
-    graph = helper.make_graph([conv0, relu, conv1], "conv_relu_chain",
-                              [X], [Y], initializer=[w0, b0, w1, b1])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
     path = tmp_path / "conv_relu_chain.onnx"
-    onnx.save(model, str(path))
+    onnx.save(build_conv_relu_chain(), str(path))
     return path
 
 
@@ -151,28 +154,16 @@ def conv_with_flatten_path(tmp_path):
     relu = helper.make_node("Relu", ["t0"], ["t1"], name="relu0")
     flatten = helper.make_node("Flatten", ["t1"], ["output"], name="flatten0", axis=1)
 
-    graph = helper.make_graph([conv, relu, flatten], "conv_flatten",
-                              [X], [Y], initializer=[w, b])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "conv_flatten.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(
+        tmp_path, "conv_flatten", [conv, relu, flatten], [X], [Y], [w, b],
+        opset=17, ir_version=8,
+    )
 
 
 @pytest.fixture
 def conv_pool_chain_path(tmp_path):
     """Conv3x3 -> Relu -> MaxPool2x2(stride=2) -> Conv3x3 - tests stride effect on RF.
 
-    RF calculation: conv1(k=3,s=1) -> relu(passthrough) -> pool(k=2,s=2) -> conv0(k=3,s=1)
-    Walking in reverse: rf=1, then conv1: rf=3, jump=1; pool: rf=4, jump=2; conv0: rf=8, jump=2
-    Actually: rf=1 -> conv1(k=3,s=1): rf = 1+(3-1)*1 = 3, j=1 -> pool(k=2,s=2): rf = 3+(2-1)*1 = 4, j=2 -> relu: pass -> conv0(k=3,s=1): rf = 4+(3-1)*2 = 8, j=2
-    Wait, we reverse: [conv0, relu, pool, conv1]. reversed = [conv1, pool, relu, conv0]
-    conv1(k=3,s=1): rf=1+(3-1)*1=3, j=1*1=1
-    pool(k=2,s=2): rf=3+(2-1)*1=4, j=1*2=2
-    relu: pass
-    conv0(k=3,s=1): rf=4+(3-1)*2=8, j=2*1=2
     RF=8, halo=7
     """
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 32, 32])
@@ -198,14 +189,10 @@ def conv_pool_chain_path(tmp_path):
     conv1 = helper.make_node("Conv", ["t2", "w1", "b1"], ["output"], name="conv1",
                              kernel_shape=[3, 3], strides=[1, 1], pads=[0, 0, 0, 0])
 
-    graph = helper.make_graph([conv0, relu, pool, conv1], "conv_pool_chain",
-                              [X], [Y], initializer=[w0, b0, w1, b1])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "conv_pool_chain.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(
+        tmp_path, "conv_pool_chain", [conv0, relu, pool, conv1], [X], [Y], [w0, b0, w1, b1],
+        opset=17, ir_version=8,
+    )
 
 
 @pytest.fixture
@@ -269,15 +256,8 @@ def qdq_conv_path(tmp_path):
     n_out_dq = helper.make_node("DequantizeLinear", ["out_q", "out_scale", "out_zp"],
                                 ["output"], name="out_dql")
 
-    graph = helper.make_graph(
-        [n_inp_q, n_inp_dq, n_w_q, n_w_dq, n_conv, n_relu, n_out_q, n_out_dq],
-        "qdq_conv",
-        [X], [Y],
-        initializer=[W_init, B_init, inp_scale, inp_zp, w_scale, w_zp, out_scale, out_zp],
+    return save_onnx(
+        tmp_path, "qdq_conv",
+        [n_inp_q, n_inp_dq, n_w_q, n_w_dq, n_conv, n_relu, n_out_q, n_out_dq], [X], [Y],
+        [W_init, B_init, inp_scale, inp_zp, w_scale, w_zp, out_scale, out_zp], ir_version=8,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-
-    path = tmp_path / "qdq_conv.onnx"
-    onnx.save(model, str(path))
-    return path

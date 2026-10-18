@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,14 +17,7 @@ from tigris import runtime
 from tigris.runtime import Session, runtime_info, runtime_version
 
 
-@pytest.fixture(autouse=True)
-def require_library(monkeypatch):
-    monkeypatch.delenv("TIGRIS_HOST_LIBRARY", raising=False)
-    import tigris
-    if not (Path(tigris.__file__).parent / "native" / "manifest.json").exists():
-        if os.environ.get("TIGRIS_REQUIRE_HOST"):
-            pytest.fail("Installed wheel has no host library")
-        pytest.skip("Host library has not been staged in this source checkout")
+pytestmark = pytest.mark.usefixtures("require_host_library")
 
 
 @pytest.fixture

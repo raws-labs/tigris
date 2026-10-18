@@ -106,3 +106,9 @@ def test_codegen_route_descriptions_do_not_imply_float_acceleration():
     assert describe_codegen_route("esp-nn", "float32") == (
         "reference (explicit float32 fallback; esp-nn acceleration is int8-only)"
     )
+
+
+def test_hardswish_and_int8_bilinear_have_kernels():
+    for backend in ("reference", "s8_ref", "esp-nn", "cmsis-nn"):
+        assert "HardSwish" in effective_operators(backend)
+        assert "ResizeLinear" in effective_operators(backend)

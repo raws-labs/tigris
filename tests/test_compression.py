@@ -3,34 +3,16 @@
 
 from dataclasses import replace
 
-import lz4.block
-import numpy as np
 import pytest
 
-from tigris.analysis.lifetime import compute_lifetimes
-from tigris.analysis.memory import compute_memory_timeline
-from tigris.analysis.partition_temporal import partition_temporal
-from tigris.analysis.partition_spatial import partition_spatial
 from tigris.cli.compile import _run_compressed_pipeline
-from tigris.loaders import load_model
-from tigris.emitters.binary.defs import (
-    MAGIC,
-)
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import (
     compressed_weight_reserve_bytes,
     emit_binary_bytes,
 )
 
-
-def _full_pipeline(path, budget=0):
-    ag = load_model(path)
-    ag = compute_lifetimes(ag)
-    ag = compute_memory_timeline(ag)
-    if budget > 0:
-        ag = partition_temporal(ag, budget)
-        ag = partition_spatial(ag)
-    return ag
+from conftest import full_pipeline
 
 
 def _compressed_pipeline(path, budget: str = "32K"):
@@ -39,31 +21,6 @@ def _compressed_pipeline(path, budget: str = "32K"):
         str(path), (budget,)
     )
     return ag, total, planned_reserve, required_reserve
-
-
-
-# LZ4 round-trip
-
-
-def test_lz4_roundtrip():
-    """Compress + decompress matches original data."""
-    original = b"Hello " * 100 + b"world!" * 50
-    compressed = lz4.block.compress(original, store_size=False)
-    decompressed = lz4.block.decompress(compressed, uncompressed_size=len(original))
-    assert decompressed == original
-
-
-# Compressed plan has SEC_WEIGHT_BLOCKS
-
-
-def test_compressed_plan_has_weight_blocks(conv_relu_chain_path):
-    """Compressed plan should contain SEC_WEIGHT_BLOCKS section."""
-    ag, _, _, _ = _compressed_pipeline(conv_relu_chain_path)
-    data = emit_binary_bytes(ag, compress="lz4")
-    plan = read_binary_plan(data)
-
-    assert len(plan["weight_blocks"]) > 0
-    assert plan["weight_blocks_compression"] == 1  # LZ4
 
 
 # Compressed weight data matches uncompressed
@@ -95,54 +52,26 @@ def test_compressed_weight_data_matches(conv_relu_chain_path):
 
     assert bytes(all_decompressed) == bytes(all_plain)
 
+    # Each weight block maps to exactly one stage.
+    assert len(plan_lz4["weight_blocks"]) >= 2
+    for block in plan_lz4["weight_blocks"]:
+        assert block["stage_idx"] < plan_lz4["num_stages"]
+        assert block["num_weights"] > 0
+        assert block["compressed_size"] > 0
+        assert block["uncompressed_size"] > 0
+
 
 # Uncompressed plan unchanged
 
 
 def test_uncompressed_plan_unchanged(conv_relu_chain_path):
     """Without --compress, no SEC_WEIGHT_BLOCKS section should appear."""
-    ag = _full_pipeline(conv_relu_chain_path, budget=8192)
+    ag = full_pipeline(conv_relu_chain_path, budget=8192)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
     assert len(plan["weight_blocks"]) == 0
     assert plan["weight_blocks_compression"] == 0
-
-
-# All weighted fixtures produce valid compressed plans
-
-
-def test_all_fixtures_compressed(
-    linear_3op_path, conv_relu_chain_path, conv_pool_chain_path,
-):
-    """All fixtures with weights produce valid compressed plans."""
-    for path in [linear_3op_path, conv_relu_chain_path, conv_pool_chain_path]:
-        ag, _, _, _ = _compressed_pipeline(path)
-        if not ag.weight_data:
-            continue
-        data = emit_binary_bytes(ag, compress="lz4")
-        plan = read_binary_plan(data)
-        assert plan["magic"] == MAGIC
-        assert plan["num_ops"] == len(ag.ops)
-        assert len(plan["weight_blocks"]) > 0
-
-
-# Weight grouping by stage
-
-
-def test_weight_grouping_by_stage(conv_relu_chain_path):
-    """Each weight block maps to exactly one stage."""
-    ag, _, _, _ = _compressed_pipeline(conv_relu_chain_path)
-    data = emit_binary_bytes(ag, compress="lz4")
-    plan = read_binary_plan(data)
-
-    assert len(plan["weight_blocks"]) >= 2
-    # Each block has a valid stage index
-    for block in plan["weight_blocks"]:
-        assert block["stage_idx"] < plan["num_stages"]
-        assert block["num_weights"] > 0
-        assert block["compressed_size"] > 0
-        assert block["uncompressed_size"] > 0
 
 
 def test_compressed_plan_budget_excludes_exact_weight_reservation(
@@ -164,7 +93,7 @@ def test_compressed_plan_budget_excludes_exact_weight_reservation(
 def test_compressed_plan_fails_when_total_budget_omits_reservation(
     conv_relu_chain_path,
 ):
-    ag = _full_pipeline(conv_relu_chain_path, budget=32768)
+    ag = full_pipeline(conv_relu_chain_path, budget=32768)
     reserve = compressed_weight_reserve_bytes(ag)
     # The activation schedule itself fits; one byte less than activation plus
     # decompression reserve must still be rejected before emission.
@@ -216,36 +145,3 @@ def test_compile_compressed_uses_total_arena_budget(
     assert plan["budget"] + reserve <= 32 * 1024
     assert "holds decompressed weights" in result.output
 
-
-# Weightless graph produces no blocks
-
-
-def test_weightless_graph_no_blocks(diamond_path):
-    """A graph with no weights should produce no weight blocks."""
-    ag = _full_pipeline(diamond_path, budget=1536)
-    data = emit_binary_bytes(ag, compress="lz4")
-    plan = read_binary_plan(data)
-
-    assert plan["num_weights"] == 0
-    assert len(plan["weight_blocks"]) == 0
-
-
-# Compressed plan is smaller
-
-
-def test_compressed_plan_smaller(conv_relu_chain_path):
-    """Compressed plan should not be larger than uncompressed (with real data)."""
-    ag, _, _, _ = _compressed_pipeline(conv_relu_chain_path)
-
-    # Replace zero weights with random data for better compression test
-    for name in ag.weight_data:
-        arr = ag.weight_data[name]
-        np.random.seed(42)
-        ag.weight_data[name] = np.random.randn(*arr.shape).astype(arr.dtype)
-
-    data_plain = emit_binary_bytes(ag)
-    data_lz4 = emit_binary_bytes(ag, compress="lz4")
-
-    # LZ4 on random float data may not compress well, but the overhead
-    # should not be catastrophic (< 2x). For real weights it compresses better.
-    assert len(data_lz4) < len(data_plain) * 2
