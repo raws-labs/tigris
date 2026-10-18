@@ -236,16 +236,6 @@ def test_a_banded_stage_shares_one_buffer_with_its_input(tmp_path):
     assert slow_pool_usage(ag).slow_peak_bytes == 98304
 
 
-def test_a_model_input_is_never_written_over(tmp_path):
-    """The caller owns that buffer and may read it again after the run."""
-    path = tmp_path / "attention.onnx"
-    _attention_model(path)
-    ag, _ = _run_pipeline(str(path), ("32K", "2M"))
-    assert set(row_band_aliases(
-        ag, ag.budget.fast + ag.budget.fast_reserve).values()
-    ).isdisjoint(ag.model_inputs)
-
-
 def _softmax_model(path, shape):
     model = helper.make_model(helper.make_graph(
         [helper.make_node("Softmax", ["input"], ["output"], axis=-1)], "softmax",

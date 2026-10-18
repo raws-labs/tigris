@@ -112,5 +112,5 @@ def test_2d_plan_encodes_hw_axis_and_tile_width(tmp_path):
 def test_even_2d_min_tile_infeasible_fails_closed(tmp_path):
     # Budget so small even a 1x1 2D core will not fit -> compile refuses.
     with pytest.raises(Exception) as exc:
-        compile_high_res_conv_to_bytes(h=64, w=64, c=4096, budget="1K", tmp_path=tmp_path)
+        compile_high_res_conv_to_bytes(h=64, w=64, c=64, budget="1K", tmp_path=tmp_path)
     assert "2D tile" in str(exc.value)

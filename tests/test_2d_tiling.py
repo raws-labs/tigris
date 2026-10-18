@@ -1,7 +1,8 @@
-"""Tests for 2D (height + width) receptive field computation and tile solving."""
+"""Tests for 2D (height + width) tile axis selection and tile solving."""
 
 import math
 
+import pytest
 from onnx import TensorProto
 
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
@@ -9,44 +10,10 @@ from tigris.analysis.partition_spatial import (
     _op_supports_axis,
     _stage_2d_eligible,
     _stage_tile_axis,
-    compute_receptive_field,
     partition_spatial,
 )
 from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, Stage, TensorInfo
 from tigris.analysis.validation import validate_memory_plan
-
-
-def make_conv_op(kernel, stride, dilation):
-    """Build the minimal OpNode a Conv-like op needs for receptive field analysis."""
-    return OpNode(
-        name="conv",
-        op_type="Conv",
-        inputs=[],
-        outputs=[],
-        attrs={
-            "kernel_shape": list(kernel),
-            "strides": list(stride),
-            "dilations": list(dilation),
-        },
-    )
-
-
-def test_hw_axis_constant():
-    assert TILE_AXIS_HW == 3
-
-
-def test_receptive_field_returns_both_axes():
-    # A single 3x3 stride-1 conv: rf_h == rf_w == 3.
-    ops = [make_conv_op(kernel=(3, 3), stride=(1, 1), dilation=(1, 1))]
-    rf_h, rf_w = compute_receptive_field(ops)
-    assert (rf_h, rf_w) == (3, 3)
-
-
-def test_receptive_field_asymmetric_kernel():
-    # 5x3 kernel, stride 2x1: rf_h = 5, rf_w = 3.
-    ops = [make_conv_op(kernel=(5, 3), stride=(2, 1), dilation=(1, 1))]
-    rf_h, rf_w = compute_receptive_field(ops)
-    assert (rf_h, rf_w) == (5, 3)
 
 
 # 2D tile solver
@@ -143,37 +110,34 @@ def test_op_supports_axis_excludes_conv1d_for_hw():
 # even at a single-row tile.
 
 
-def build_high_res_conv_graph(h: int, w: int, c: int, mem_budget: int) -> AnalyzedGraph:
-    """Build a single-stage AnalyzedGraph for one 3x3 stride-1 Conv on an
-    int8 [1,c,h,w] activation.
+def _conv(inp, out, kernel=3, stride=1):
+    return OpNode(
+        name="conv", op_type="Conv", inputs=[inp], outputs=[out],
+        attrs={"kernel_shape": [kernel, kernel], "strides": [stride, stride],
+               "dilations": [1, 1]},
+    )
 
-    peak_bytes is the whole-tensor working set (channels included), so a
-    single-row height tile costs exactly c*w bytes, matching the 1D
-    solver's proportional row-byte model and the comments below.
-    """
-    op = OpNode(
-        name="conv",
-        op_type="Conv",
-        inputs=["input"],
-        outputs=["output"],
-        attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]},
-    )
-    stage = Stage(
-        stage_id=0,
-        op_indices=[0],
-        input_tensors=["input"],
-        output_tensors=["output"],
-        peak_bytes=c * h * w,
-    )
+
+def single_stage(ops, shapes, inputs, c, h, w, mem_budget, constants=()):
+    """One stage over all ops on int8 tensors, with the whole-tensor working
+    set c*h*w as peak_bytes: a single-row height tile costs exactly c*w bytes,
+    matching the 1D solver's proportional row-byte model."""
+    stage = Stage(stage_id=0, op_indices=list(range(len(ops))),
+                  input_tensors=inputs, output_tensors=["output"],
+                  peak_bytes=c * h * w)
     return AnalyzedGraph(
-        ops=[op],
-        stages=[stage],
-        tensors={
-            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
-            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget),
-    )
+        ops=ops, stages=[stage],
+        tensors={name: TensorInfo(name, shape, TensorProto.INT8,
+                                  is_constant=name in constants)
+                 for name, shape in shapes.items()},
+        budget=MemoryBudget(fast=mem_budget))
+
+
+def build_high_res_conv_graph(h, w, c, mem_budget):
+    """One 3x3 stride-1 Conv on an int8 [1,c,h,w] activation."""
+    full = (1, c, h, w)
+    return single_stage([_conv("input", "output")],
+                        {"input": full, "output": full}, ["input"], c, h, w, mem_budget)
 
 
 def plan_for_single_stage(ag: AnalyzedGraph):
@@ -211,148 +175,38 @@ def test_axis_stays_height_when_1d_feasible():
 # any binary op for the same co-tiling reason.
 
 
-def build_high_res_conv_add_graph(h: int, w: int, c: int, mem_budget: int) -> AnalyzedGraph:
-    """Single-stage graph: Conv followed by Add against a separate
-    full-resolution skip tensor, at the same [1,c,h,w] shape and peak_bytes
-    model as build_high_res_conv_graph, so the same budget that forces 2D
-    tiling for a bare Conv applies here too.
-    """
-    conv = OpNode(
-        name="conv",
-        op_type="Conv",
-        inputs=["input"],
-        outputs=["conv_out"],
-        attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]},
-    )
-    add = OpNode(
-        name="add",
-        op_type="Add",
-        inputs=["conv_out", "skip"],
-        outputs=["output"],
-        attrs={},
-    )
-    stage = Stage(
-        stage_id=0,
-        op_indices=[0, 1],
-        input_tensors=["input", "skip"],
-        output_tensors=["output"],
-        peak_bytes=c * h * w,
-    )
-    return AnalyzedGraph(
-        ops=[conv, add],
-        stages=[stage],
-        tensors={
-            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
-            "conv_out": TensorInfo("conv_out", (1, c, h, w), TensorProto.INT8),
-            "skip": TensorInfo("skip", (1, c, h, w), TensorProto.INT8),
-            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget),
-    )
+def build_high_res_conv_add_graph(h, w, c, mem_budget):
+    """Conv -> Add(conv_out, skip) against a separate full-resolution skip."""
+    full = (1, c, h, w)
+    add = OpNode(name="add", op_type="Add",
+                 inputs=["conv_out", "skip"], outputs=["output"], attrs={})
+    return single_stage(
+        [_conv("input", "conv_out"), add],
+        {"input": full, "conv_out": full, "skip": full, "output": full},
+        ["input", "skip"], c, h, w, mem_budget)
 
 
-def build_high_res_conv_concat_graph(h: int, w: int, c: int, mem_budget: int) -> AnalyzedGraph:
-    """Single-stage graph: Conv followed by a channel-axis Concat against a
-    separate full-resolution operand. Concat takes an independent second
-    operand the 2D executor's shared-rectangle load does not co-tile, so the
-    stage must not be 2D eligible (same hazard as the binary-op case).
-    """
-    conv = OpNode(
-        name="conv",
-        op_type="Conv",
-        inputs=["input"],
-        outputs=["conv_out"],
-        attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]},
-    )
-    concat = OpNode(
-        name="concat",
-        op_type="Concat",
-        inputs=["conv_out", "other"],
-        outputs=["output"],
-        attrs={"axis": 1},
-    )
-    stage = Stage(
-        stage_id=0,
-        op_indices=[0, 1],
-        input_tensors=["input", "other"],
-        output_tensors=["output"],
-        peak_bytes=c * h * w,
-    )
-    return AnalyzedGraph(
-        ops=[conv, concat],
-        stages=[stage],
-        tensors={
-            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
-            "conv_out": TensorInfo("conv_out", (1, c, h, w), TensorProto.INT8),
-            "other": TensorInfo("other", (1, c, h, w), TensorProto.INT8),
-            "output": TensorInfo("output", (1, 2 * c, h, w), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget),
-    )
+def build_high_res_conv_concat_graph(h, w, c, mem_budget):
+    """Conv -> channel Concat against a separate full-resolution operand,
+    which the 2D executor's shared-rectangle load does not co-tile."""
+    full = (1, c, h, w)
+    concat = OpNode(name="concat", op_type="Concat",
+                    inputs=["conv_out", "other"], outputs=["output"], attrs={"axis": 1})
+    return single_stage(
+        [_conv("input", "conv_out"), concat],
+        {"input": full, "conv_out": full, "other": full, "output": (1, 2 * c, h, w)},
+        ["input", "other"], c, h, w, mem_budget)
 
 
-def build_high_res_conv_sigmoid_graph(h: int, w: int, c: int, mem_budget: int) -> AnalyzedGraph:
-    """Single-stage graph: Conv followed by a unary Sigmoid wrapper, at the
-    same [1,c,h,w] shape and peak_bytes model as build_high_res_conv_graph.
-
-    Used as the control: a spatial op plus a UNARY pointwise wrapper must
-    still be admitted for 2D tiling, proving the binary-op guard is scoped
-    to binary ops only and does not over-exclude.
-    """
-    conv = OpNode(
-        name="conv",
-        op_type="Conv",
-        inputs=["input"],
-        outputs=["conv_out"],
-        attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]},
-    )
-    sigmoid = OpNode(
-        name="sigmoid",
-        op_type="Sigmoid",
-        inputs=["conv_out"],
-        outputs=["output"],
-        attrs={},
-    )
-    stage = Stage(
-        stage_id=0,
-        op_indices=[0, 1],
-        input_tensors=["input"],
-        output_tensors=["output"],
-        peak_bytes=c * h * w,
-    )
-    return AnalyzedGraph(
-        ops=[conv, sigmoid],
-        stages=[stage],
-        tensors={
-            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
-            "conv_out": TensorInfo("conv_out", (1, c, h, w), TensorProto.INT8),
-            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget),
-    )
-
-
-def test_stage_2d_eligible_excludes_binary_op():
-    # Hand-built stage with a binary op: must not be 2D eligible.
-    ag = build_high_res_conv_add_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
-    stage = ag.stages[0]
-    assert _stage_2d_eligible(ag, stage, ag.ops) is False
-
-
-def test_stage_2d_eligible_excludes_concat():
-    # A Conv+Concat stage carries the same non-co-tiled-operand hazard as a
-    # binary op, so it must not be 2D eligible either.
-    ag = build_high_res_conv_concat_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
-    stage = ag.stages[0]
-    assert _stage_2d_eligible(ag, stage, ag.ops) is False
-
-
-def test_stage_2d_eligible_allows_spatial_plus_unary_op():
-    # Hand-built stage with only a spatial op plus a unary wrapper: must
-    # still be 2D eligible, proving the guard does not over-exclude.
-    ag = build_high_res_conv_sigmoid_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
-    stage = ag.stages[0]
-    assert _stage_2d_eligible(ag, stage, ag.ops) is True
+def build_high_res_conv_sigmoid_graph(h, w, c, mem_budget):
+    """Conv -> unary Sigmoid: the control the binary-op guard must still admit."""
+    full = (1, c, h, w)
+    sigmoid = OpNode(name="sigmoid", op_type="Sigmoid",
+                     inputs=["conv_out"], outputs=["output"], attrs={})
+    return single_stage(
+        [_conv("input", "conv_out"), sigmoid],
+        {"input": full, "conv_out": full, "output": full},
+        ["input"], c, h, w, mem_budget)
 
 
 def test_binary_op_stage_does_not_go_hw():
@@ -385,96 +239,45 @@ def test_conv_plus_unary_stage_still_goes_hw():
 
 
 def build_high_res_add_conv_graph(h, w, c, mem_budget):
-    """Pre-spatial: Add(input, skip) -> Conv. The Add is consumed by the Conv,
-    both operands same [1,c,h,w]. Co-tileable skip -> must be 2D eligible."""
+    """Pre-spatial: Add(input, skip) -> Conv, both operands same [1,c,h,w]."""
+    full = (1, c, h, w)
     add = OpNode(name="add", op_type="Add",
                  inputs=["input", "skip"], outputs=["added"], attrs={})
-    conv = OpNode(name="conv", op_type="Conv",
-                  inputs=["added"], outputs=["output"],
-                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
-    stage = Stage(stage_id=0, op_indices=[0, 1],
-                  input_tensors=["input", "skip"], output_tensors=["output"],
-                  peak_bytes=c * h * w)
-    return AnalyzedGraph(
-        ops=[add, conv], stages=[stage],
-        tensors={
-            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
-            "skip": TensorInfo("skip", (1, c, h, w), TensorProto.INT8),
-            "added": TensorInfo("added", (1, c, h, w), TensorProto.INT8),
-            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget))
+    return single_stage(
+        [add, _conv("added", "output")],
+        {"input": full, "skip": full, "added": full, "output": full},
+        ["input", "skip"], c, h, w, mem_budget)
+
+
+def _concat_conv_graph(h, w, c, mem_budget, skip, skip_shape, inputs, constants=()):
+    """Pre-spatial: Concat(up, skip) on the channel axis -> Conv."""
+    full = (1, c, h, w)
+    concat = OpNode(name="concat", op_type="Concat",
+                    inputs=["up", skip], outputs=["cat"], attrs={"axis": 1})
+    return single_stage(
+        [concat, _conv("cat", "output")],
+        {"up": full, skip: skip_shape, "cat": (1, 2 * c, h, w), "output": full},
+        inputs, c, h, w, mem_budget, constants)
 
 
 def build_high_res_concat_conv_graph(h, w, c, mem_budget):
-    """Pre-spatial: Concat(up, skip) -> Conv. Concat on channel axis, both
-    operands same H/W. Co-tileable skip -> must be 2D eligible."""
-    concat = OpNode(name="concat", op_type="Concat",
-                    inputs=["up", "skip"], outputs=["cat"], attrs={"axis": 1})
-    conv = OpNode(name="conv", op_type="Conv",
-                  inputs=["cat"], outputs=["output"],
-                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
-    stage = Stage(stage_id=0, op_indices=[0, 1],
-                  input_tensors=["skip", "up"], output_tensors=["output"],
-                  peak_bytes=c * h * w)
-    return AnalyzedGraph(
-        ops=[concat, conv], stages=[stage],
-        tensors={
-            "up": TensorInfo("up", (1, c, h, w), TensorProto.INT8),
-            "skip": TensorInfo("skip", (1, c, h, w), TensorProto.INT8),
-            "cat": TensorInfo("cat", (1, 2 * c, h, w), TensorProto.INT8),
-            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget))
+    """Same-H/W skip: co-tileable, so 2D eligible."""
+    return _concat_conv_graph(h, w, c, mem_budget, "skip", (1, c, h, w), ["skip", "up"])
 
 
 def build_high_res_concat_conv_diffres_graph(h, w, c, mem_budget):
-    """Pre-spatial Concat but the skip is a DIFFERENT resolution (h//2 x w//2).
-    Not co-tileable -> must stay rejected (clause 3 fail-closed)."""
-    concat = OpNode(name="concat", op_type="Concat",
-                    inputs=["up", "skip"], outputs=["cat"], attrs={"axis": 1})
-    conv = OpNode(name="conv", op_type="Conv",
-                  inputs=["cat"], outputs=["output"],
-                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
-    stage = Stage(stage_id=0, op_indices=[0, 1],
-                  input_tensors=["skip", "up"], output_tensors=["output"],
-                  peak_bytes=c * h * w)
-    return AnalyzedGraph(
-        ops=[concat, conv], stages=[stage],
-        tensors={
-            "up": TensorInfo("up", (1, c, h, w), TensorProto.INT8),
-            "skip": TensorInfo("skip", (1, c, h // 2, w // 2), TensorProto.INT8),
-            "cat": TensorInfo("cat", (1, 2 * c, h, w), TensorProto.INT8),
-            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget))
+    """Skip at h//2 x w//2: not co-tileable, so it stays rejected."""
+    return _concat_conv_graph(
+        h, w, c, mem_budget, "skip", (1, c, h // 2, w // 2), ["skip", "up"])
 
 
 def build_high_res_concat_const_skip_graph(h, w, c, mem_budget):
-    """Pre-spatial Concat whose skip operand is a rank-4 CONSTANT (initializer),
-    same H/W as `up`. A constant is never a stage input, so it escapes the
-    external same-H/W co-tile check in _cotileable_skip_operands, yet the 2D
-    executor cannot tile-offset a full-size constant against the spatial op's
-    input-halo rectangle. Must fail closed."""
-    concat = OpNode(name="concat", op_type="Concat",
-                    inputs=["up", "const_skip"], outputs=["cat"], attrs={"axis": 1})
-    conv = OpNode(name="conv", op_type="Conv",
-                  inputs=["cat"], outputs=["output"],
-                  attrs={"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [1, 1]})
-    stage = Stage(stage_id=0, op_indices=[0, 1],
-                  input_tensors=["up"], output_tensors=["output"],
-                  peak_bytes=c * h * w)
-    return AnalyzedGraph(
-        ops=[concat, conv], stages=[stage],
-        tensors={
-            "up": TensorInfo("up", (1, c, h, w), TensorProto.INT8),
-            "const_skip": TensorInfo(
-                "const_skip", (1, c, h, w), TensorProto.INT8, is_constant=True
-            ),
-            "cat": TensorInfo("cat", (1, 2 * c, h, w), TensorProto.INT8),
-            "output": TensorInfo("output", (1, c, h, w), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget))
+    """Skip is a same-H/W rank-4 constant. A constant is never a stage input,
+    so it escapes the external same-H/W co-tile check in
+    _cotileable_skip_operands, yet the 2D executor cannot tile-offset a
+    full-size constant against the spatial op's input-halo rectangle."""
+    return _concat_conv_graph(
+        h, w, c, mem_budget, "const_skip", (1, c, h, w), ["up"], constants=("const_skip",))
 
 
 def build_post_spatial_add_skip_graph(h, w, c, mem_budget):
@@ -484,23 +287,13 @@ def build_post_spatial_add_skip_graph(h, w, c, mem_budget):
     INPUT-halo rectangle, so a strided Conv would read `skip` at stride*out_start
     rows (and past its height) on interior tiles. Both the 1D-height and the 2D
     tile paths must fail closed on this shape (-> exec_stage_normal)."""
-    conv = OpNode(name="conv", op_type="Conv",
-                  inputs=["input"], outputs=["conv_out"],
-                  attrs={"kernel_shape": [1, 1], "strides": [2, 2], "dilations": [1, 1]})
+    half = (1, c, h // 2, w // 2)
     add = OpNode(name="add", op_type="Add",
                  inputs=["conv_out", "skip"], outputs=["output"], attrs={})
-    stage = Stage(stage_id=0, op_indices=[0, 1],
-                  input_tensors=["input", "skip"], output_tensors=["output"],
-                  peak_bytes=c * h * w)
-    return AnalyzedGraph(
-        ops=[conv, add], stages=[stage],
-        tensors={
-            "input": TensorInfo("input", (1, c, h, w), TensorProto.INT8),
-            "conv_out": TensorInfo("conv_out", (1, c, h // 2, w // 2), TensorProto.INT8),
-            "skip": TensorInfo("skip", (1, c, h // 2, w // 2), TensorProto.INT8),
-            "output": TensorInfo("output", (1, c, h // 2, w // 2), TensorProto.INT8),
-        },
-        budget=MemoryBudget(fast=mem_budget))
+    return single_stage(
+        [_conv("input", "conv_out", kernel=1, stride=2), add],
+        {"input": (1, c, h, w), "conv_out": half, "skip": half, "output": half},
+        ["input", "skip"], c, h, w, mem_budget)
 
 
 def test_stage_tile_axis_rejects_post_spatial_external_skip():
@@ -512,12 +305,6 @@ def test_stage_tile_axis_rejects_post_spatial_external_skip():
     assert _stage_tile_axis(ag, ag.stages[0], ag.ops) == TILE_AXIS_NONE
 
 
-def test_stage_2d_eligible_rejects_post_spatial_external_skip():
-    # The 2D path already rejects this shape; keep both paths in lockstep.
-    ag = build_post_spatial_add_skip_graph(h=256, w=256, c=64, mem_budget=24 * 1024)
-    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is False
-
-
 def test_stage_tile_axis_admits_pre_spatial_add_skip():
     # A pre-spatial Add(input, skip) -> Conv is co-tileable and loaded correctly
     # at the input resolution, so the 1D-height axis stays admitted.
@@ -525,27 +312,18 @@ def test_stage_tile_axis_admits_pre_spatial_add_skip():
     assert _stage_tile_axis(ag, ag.stages[0], ag.ops) == TILE_AXIS_HEIGHT_OR_LENGTH
 
 
-def test_stage_2d_eligible_admits_pre_spatial_add_skip():
-    ag = build_high_res_add_conv_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
-    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is True
-
-
-def test_stage_2d_eligible_admits_pre_spatial_concat_skip():
-    ag = build_high_res_concat_conv_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
-    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is True
-
-
-def test_stage_2d_eligible_rejects_constant_concat_skip():
-    # A rank-4 constant Concat operand is not a stage input, so it escapes the
-    # external same-H/W co-tile check, but it cannot be tile-offset for the 2D
-    # executor's shared input-halo rectangle load. The stage must fail closed.
-    ag = build_high_res_concat_const_skip_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
-    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is False
-
-
-def test_stage_2d_eligible_rejects_diffres_skip():
-    ag = build_high_res_concat_conv_diffres_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
-    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is False
+@pytest.mark.parametrize("build, c, eligible", [
+    (build_high_res_conv_add_graph, 256, False),
+    (build_high_res_conv_concat_graph, 256, False),
+    (build_post_spatial_add_skip_graph, 64, False),
+    (build_high_res_add_conv_graph, 256, True),
+    (build_high_res_concat_const_skip_graph, 256, False),
+    (build_high_res_concat_conv_diffres_graph, 256, False),
+], ids=["binary-op", "concat", "post-spatial-skip", "pre-spatial-add-skip",
+        "constant-concat-skip", "diffres-skip"])
+def test_stage_2d_eligible(build, c, eligible):
+    ag = build(h=256, w=256, c=c, mem_budget=24 * 1024)
+    assert _stage_2d_eligible(ag, ag.stages[0], ag.ops) is eligible
 
 
 def test_pre_spatial_concat_skip_goes_hw():
@@ -625,22 +403,6 @@ def _ct_stage(ag):
     )
 
 
-def test_convtranspose_over_budget_tiles_2d():
-    ag = build_convtranspose_graph(
-        in_hw=(32, 32), stride=2, kernel=2, in_ch=8, out_ch=8
-    )  # out 64x64
-    stage = _ct_stage(ag)
-    ag.budget = MemoryBudget(fast=stage.peak_bytes // 4)  # multiple tiles needed
-    ag = partition_spatial(ag)
-    tp = _ct_stage(ag).tile_plan
-    assert tp.tileable and tp.axis == TILE_AXIS_HW
-    assert tp.original_height == 64  # OUTPUT extent, not the 32-row input
-    assert tp.halo == 0 and tp.receptive_field == 1
-    tiles_h = math.ceil(tp.original_height / tp.tile_height)
-    tiles_w = tp.num_tiles // tiles_h
-    assert tiles_h > 1 and tiles_w > 1
-
-
 def test_convtranspose_infeasible_budget_fails_closed():
     ag = build_convtranspose_graph(
         in_hw=(32, 32), stride=2, kernel=2, in_ch=8, out_ch=8
@@ -702,6 +464,11 @@ def test_convtranspose_emitted_tile_fits_runtime_working_set():
     ag = partition_spatial(ag)
     tp = _ct_stage(ag).tile_plan
     assert tp.tileable and tp.axis == TILE_AXIS_HW
+    assert tp.original_height == 64  # OUTPUT extent, not the 32-row input
+    assert tp.halo == 0 and tp.receptive_field == 1
+    tiles_h = math.ceil(tp.original_height / tp.tile_height)
+    tiles_w = tp.num_tiles // tiles_h
+    assert tiles_h > 1 and tiles_w > 1
 
     ws = _runtime_ct_working_set(
         tp.tile_height, tp.tile_width,

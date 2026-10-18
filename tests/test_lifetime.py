@@ -1,69 +1,39 @@
 """Tests for tigris.analysis.lifetime."""
 
 import numpy as np
-import onnx
-from onnx import TensorProto, helper, numpy_helper
+from onnx import helper, numpy_helper
 
 from tigris.loaders import load_model
 from tigris.analysis.lifetime import compute_lifetimes, pure_reinterpretations
 
-
-def _vi(name, shape):
-    return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+from conftest import save_onnx, vi
 
 
 def _analyzed(tmp_path, name, nodes, inputs, outputs, init=()):
-    graph = helper.make_graph(nodes, name, inputs, outputs, list(init))
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / f"{name}.onnx"
-    onnx.save(model, str(path))
+    path = save_onnx(tmp_path, name, nodes, inputs, outputs, init, opset=17, ir_version=8)
     return compute_lifetimes(load_model(path))
 
 
-def test_model_input_birth(linear_3op_path):
-    ag = load_model(linear_3op_path)
-    ag = compute_lifetimes(ag)
-
-    assert ag.lifetimes["input"].birth_step == -1
+def _lifetimes(ag):
+    return {name: (lt.birth_step, lt.death_step, lt.size_bytes) for name, lt in ag.lifetimes.items()}
 
 
-def test_model_output_death(linear_3op_path):
-    ag = load_model(linear_3op_path)
-    ag = compute_lifetimes(ag)
+def test_linear_lifetimes(linear_3op_path):
+    """Model inputs are born at -1, outputs die after the last op, constants are absent."""
+    ag = compute_lifetimes(load_model(linear_3op_path))
 
-    assert ag.lifetimes["output"].death_step == len(ag.ops)
-
-
-def test_constants_excluded(linear_3op_path):
-    ag = load_model(linear_3op_path)
-    ag = compute_lifetimes(ag)
-
-    assert "w0" not in ag.lifetimes
-    assert "w1" not in ag.lifetimes
-
-
-def test_intermediate_lifetime(linear_3op_path):
-    ag = load_model(linear_3op_path)
-    ag = compute_lifetimes(ag)
-
-    # t0 is produced by add0 and consumed by relu0
-    lt = ag.lifetimes["t0"]
-    assert lt.birth_step >= 0
-    assert lt.death_step > lt.birth_step
+    assert _lifetimes(ag) == {
+        "input": (-1, 0, 256), "t0": (0, 1, 256), "t1": (1, 2, 256), "output": (2, 3, 256),
+    }
 
 
 def test_diamond_lifetimes(diamond_path):
-    ag = load_model(diamond_path)
-    ag = compute_lifetimes(ag)
+    """The input lives until its second reader; both branches live until the Add."""
+    ag = compute_lifetimes(load_model(diamond_path))
 
-    # Both left and right should be alive until the Add consumes them
-    assert "left" in ag.lifetimes
-    assert "right" in ag.lifetimes
-
-    # input is consumed by both relu and sigmoid - death = max of those steps
-    assert ag.lifetimes["input"].death_step >= 0
+    assert _lifetimes(ag) == {
+        "input": (-1, 1, 512), "right": (0, 2, 512), "left": (1, 2, 512), "output": (2, 3, 512),
+    }
 
 
 def test_a_reshape_that_moves_no_byte_shares_its_input(tmp_path):
@@ -81,7 +51,7 @@ def test_a_reshape_that_moves_no_byte_shares_its_input(tmp_path):
             helper.make_node("Reshape", ["p", "shp"], ["r"], name="rs"),
             helper.make_node("Erf", ["r"], ["y"], name="erf"),
         ],
-        [_vi("x", [1, tokens, width])], [_vi("y", [1, tokens, 2, width // 2])],
+        [vi("x", [1, tokens, width])], [vi("y", [1, tokens, 2, width // 2])],
         [
             numpy_helper.from_array(
                 np.zeros((width, width), np.float32), "w"),
@@ -107,8 +77,8 @@ def test_an_unfold_over_the_spatial_axes_shares_its_input(tmp_path):
                 "Conv", ["x", "w"], ["c"], kernel_shape=[1, 1], name="cv"),
             helper.make_node("Reshape", ["c", "shp"], ["u"], name="rs"),
         ],
-        [_vi("x", [1, channels, side, side])],
-        [_vi("u", [1, channels, side * side, 1])],
+        [vi("x", [1, channels, side, side])],
+        [vi("u", [1, channels, side * side, 1])],
         [
             numpy_helper.from_array(
                 np.zeros((channels, channels, 1, 1), np.float32), "w"),
@@ -131,8 +101,8 @@ def test_a_reshape_that_moves_channels_is_not_an_alias(tmp_path):
                 "Conv", ["x", "w"], ["c"], kernel_shape=[1, 1], name="cv"),
             helper.make_node("Reshape", ["c", "shp"], ["u"], name="rs"),
         ],
-        [_vi("x", [1, channels, side, side])],
-        [_vi("u", [1, side * side, channels, 1])],
+        [vi("x", [1, channels, side, side])],
+        [vi("u", [1, side * side, channels, 1])],
         [
             numpy_helper.from_array(
                 np.zeros((channels, channels, 1, 1), np.float32), "w"),

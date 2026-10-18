@@ -56,23 +56,6 @@ def _write_oversized_height_op_model(tmp_path, op_type):
     return path
 
 
-def test_a_resample_tiles_along_its_output(tmp_path):
-    """An upsample has more output rows than input rows.
-
-    The tile loop cuts its output into bands and divides to find the source
-    band each one reads, so a stage that is nothing but a resample fits a
-    budget far below its whole output.
-    """
-    model_path = _write_oversized_height_op_model(tmp_path, "Resize")
-
-    graph, _ = _run_pipeline(str(model_path), ("4K",))
-    plans = [s.tile_plan for s in graph.stages if s.tile_plan is not None]
-
-    assert plans
-    assert all(plan.tileable for plan in plans)
-    assert validate_memory_plan(graph).feasible
-
-
 def test_a_global_reduction_tiles_along_its_input(tmp_path):
     """It has no output axis to tile, so the band count comes from the input."""
     model_path = _write_oversized_height_op_model(
@@ -107,11 +90,12 @@ def test_a_global_reduction_cuts_a_row_that_does_not_fit(tmp_path):
 
 
 def test_a_resample_compiles_at_a_budget_below_its_output(tmp_path):
-    """The CLI path for the same fact, at a budget a whole output cannot fit.
+    """An upsample has more output rows than input rows.
 
-    The model upsamples 8x8 to 16x16 over 4 channels, so its output alone is
-    4 KiB and the two tensors together are 5 KiB. Compiling it to a 4 KiB
-    arena only works if the stage is cut.
+    The tile loop cuts its output into bands and divides to find the source
+    band each one reads. The model upsamples 8x8 to 16x16 over 4 channels, so
+    its output alone is 4 KiB and the two tensors together are 5 KiB.
+    Compiling it to a 4 KiB arena only works if the stage is cut.
     """
     model_path = _write_oversized_height_op_model(tmp_path, "Resize")
     plan = tmp_path / "resize-tight.tgrs"
@@ -221,13 +205,16 @@ def test_writer_defensively_rejects_budget_above_plan_format_limit(
         emit_binary_bytes(graph)
 
 
-def test_feasible_plan_still_compiles(conv_relu_chain_path, tmp_path):
-    output = tmp_path / "feasible.tgrs"
+@pytest.mark.parametrize("budget", [
+    ["-m", "64K"],
+    ["-m", "16K", "-m", "64M"],
+    ["-m", "64K", "-f", "16M"],
+], ids=["fast", "slow", "flash"])
+def test_plan_within_budget_compiles(conv_relu_chain_path, tmp_path, budget):
+    output = tmp_path / "out.tgrs"
 
     result = CliRunner().invoke(
-        cli,
-        ["compile", str(conv_relu_chain_path), "-m", "64K", "-o", str(output)],
-    )
+        cli, ["compile", str(conv_relu_chain_path), *budget, "-o", str(output)])
 
     assert result.exit_code == 0, result.output
     assert output.exists()
@@ -280,8 +267,6 @@ def test_run_pipeline_no_slow_tier_is_zero(conv_relu_chain_path):
 
 
 def test_compile_rejects_nonpositive_slow_tier(conv_relu_chain_path, tmp_path):
-    from click.testing import CliRunner
-    from tigris.cli import cli
     output = tmp_path / "out.tgrs"
     result = CliRunner().invoke(
         cli, ["compile", str(conv_relu_chain_path), "-m", "64K", "-m", "0",
@@ -292,8 +277,6 @@ def test_compile_rejects_nonpositive_slow_tier(conv_relu_chain_path, tmp_path):
 
 
 def test_compile_refuses_slow_overflow_without_output(conv_relu_chain_path, tmp_path):
-    from click.testing import CliRunner
-    from tigris.cli import cli
     output = tmp_path / "should-not-exist.tgrs"
     # 16K is below the naive peak (52.6K) so stages need tiling and are
     # still fast-feasible; 1K is a slow tier the stage in+out cannot fit.
@@ -305,60 +288,23 @@ def test_compile_refuses_slow_overflow_without_output(conv_relu_chain_path, tmp_
     assert not output.exists()
 
 
-def test_slow_within_budget_compiles(conv_relu_chain_path, tmp_path):
-    from click.testing import CliRunner
-    from tigris.cli import cli
-    output = tmp_path / "out.tgrs"
-    result = CliRunner().invoke(
-        cli, ["compile", str(conv_relu_chain_path), "-m", "16K", "-m", "64M",
-               "-o", str(output)])
-    assert result.exit_code == 0
-    assert output.exists()
-
-
-def test_compile_refuses_flash_overflow_without_output(conv_relu_chain_path, tmp_path):
-    from click.testing import CliRunner
-    from tigris.cli import cli
+@pytest.mark.parametrize("extra", [[], ["--compress", "lz4"]], ids=["raw", "lz4"])
+def test_compile_refuses_flash_overflow_without_output(conv_relu_chain_path, tmp_path, extra):
     output = tmp_path / "should-not-exist.tgrs"
     # -f far below any real plan size.
     result = CliRunner().invoke(
-        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
+        cli, ["compile", str(conv_relu_chain_path), "-m", "64K", *extra,
                "-f", "1", "-o", str(output)])
     assert result.exit_code != 0
     assert "exceeds it by" in result.output and "no plan written" in result.output
     assert not output.exists()
 
 
-def test_compile_refuses_flash_overflow_compressed(conv_relu_chain_path, tmp_path):
-    from click.testing import CliRunner
-    from tigris.cli import cli
-    output = tmp_path / "should-not-exist.tgrs"
-    result = CliRunner().invoke(
-        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
-               "--compress", "lz4", "-f", "1", "-o", str(output)])
-    assert result.exit_code != 0
-    assert "exceeds it by" in result.output and "no plan written" in result.output
-    assert not output.exists()
-
-
 def test_analyze_allows_nonpositive_slow_tier(conv_relu_chain_path):
-    from click.testing import CliRunner
-    from tigris.cli import cli
     result = CliRunner().invoke(
         cli, ["analyze", str(conv_relu_chain_path), "-m", "256K", "-m", "0"])
     assert result.exit_code == 0
     assert "Slow-memory budget must be greater than zero" not in result.output
-
-
-def test_flash_within_budget_compiles(conv_relu_chain_path, tmp_path):
-    from click.testing import CliRunner
-    from tigris.cli import cli
-    output = tmp_path / "out.tgrs"
-    result = CliRunner().invoke(
-        cli, ["compile", str(conv_relu_chain_path), "-m", "64K",
-               "-f", "16M", "-o", str(output)])
-    assert result.exit_code == 0
-    assert output.exists()
 
 
 def test_a_plan_beyond_the_default_build_is_written_and_names_the_build(tmp_path):

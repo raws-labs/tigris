@@ -15,6 +15,8 @@ from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.defs import NO_QUANT_PARAM
 
+from conftest import full_pipeline, save_onnx
+
 
 def _load_and_fold(path):
     """Load raw ONNX (no normalize) then apply full normalize."""
@@ -33,84 +35,37 @@ def test_qdq_fold_removes_ql_dql_ops(qdq_conv_path):
     assert not any(t in qdq_types for t in remaining), f"Q/DQ ops remain: {remaining}"
 
 
-def test_qdq_fold_preserves_compute_ops(qdq_conv_path):
-    """Conv should survive folding; Relu is absorbed as fused activation."""
+def test_qdq_fold_quantizes_the_conv(qdq_conv_path):
+    """Folding leaves one int8 Conv+Relu with weight, input and output quant params."""
     ag = _load_and_fold(qdq_conv_path)
+
+    # Relu is absorbed as fused activation
     op_types = [op.op_type for op in ag.ops]
     assert "Conv" in op_types
-    assert len(ag.ops) == 1  # Conv with fused Relu
+    assert len(ag.ops) == 1
     assert ag.ops[0].attrs.get("fused_activation") == "Relu"
-
-
-def test_qdq_fold_sets_is_quantized(qdq_conv_path):
-    """ag.is_quantized should be True after folding."""
-    ag = _load_and_fold(qdq_conv_path)
     assert ag.is_quantized is True
 
-
-def test_qdq_fold_weight_int8(qdq_conv_path):
-    """After folding, weight data should be int8."""
-    ag = _load_and_fold(qdq_conv_path)
-
-    # Find the conv op's weight input
     conv_op = next(op for op in ag.ops if op.op_type == "Conv")
     w_name = conv_op.inputs[1]
-
     assert w_name in ag.weight_data
     assert ag.weight_data[w_name].dtype == np.int8
 
-
-def test_qdq_fold_weight_quant_param(qdq_conv_path):
-    """Weight tensor should have a QuantParam attached."""
-    ag = _load_and_fold(qdq_conv_path)
-
-    conv_op = next(op for op in ag.ops if op.op_type == "Conv")
-    w_name = conv_op.inputs[1]
     w_info = ag.tensors[w_name]
-
     assert w_info.quant is not None
     assert isinstance(w_info.quant, QuantParam)
     assert w_info.quant.scale.shape[0] == 2  # per-channel, 2 output channels
 
-
-def test_qdq_fold_activation_quant_param(qdq_conv_path):
-    """Input activation should have a QuantParam from the input Q/DQ pair."""
-    ag = _load_and_fold(qdq_conv_path)
-
-    # The model input tensor should have quant param
-    input_name = ag.model_inputs[0]
-    input_info = ag.tensors[input_name]
+    input_info = ag.tensors[ag.model_inputs[0]]
     assert input_info.quant is not None
     assert input_info.quant.scale.size == 1  # per-tensor
     np.testing.assert_allclose(input_info.quant.scale, [0.05])
 
-
-def test_qdq_fold_output_quant_param(qdq_conv_path):
-    """Output of fused Conv+Relu should have quant param from the output Q/DQ."""
-    ag = _load_and_fold(qdq_conv_path)
-
-    # Relu is fused into Conv; the Conv output inherits the Relu output's quant param
-    conv_op = next(op for op in ag.ops if op.op_type == "Conv")
-    conv_out = conv_op.outputs[0]
-    conv_info = ag.tensors[conv_out]
+    # The Conv output inherits the fused Relu output's quant param
+    conv_info = ag.tensors[conv_op.outputs[0]]
     assert conv_info.quant is not None
     np.testing.assert_allclose(conv_info.quant.scale, [0.1])
 
-
-def test_qdq_fold_no_effect_on_float_model(linear_3op_path):
-    """Float model should be unchanged by QDQ folding."""
-    ag = load_raw(linear_3op_path)
-    orig_ops = len(ag.ops)
-    ag = normalize(ag)
-    assert ag.is_quantized is False
-    assert len(ag.ops) == orig_ops
-
-
-def test_qdq_fold_scale_zp_cleaned(qdq_conv_path):
-    """Scale/zero_point initializers should be removed from weight_data."""
-    ag = _load_and_fold(qdq_conv_path)
-
-    # Scale/zp tensor names should not remain in weight_data
     for name in ["inp_scale", "inp_zp", "w_scale", "w_zp", "out_scale", "out_zp"]:
         assert name not in ag.weight_data, f"{name} still in weight_data"
 
@@ -118,85 +73,51 @@ def test_qdq_fold_scale_zp_cleaned(qdq_conv_path):
 # Binary round-trip tests
 
 
-def _full_pipeline_qdq(path):
-    """Load QDQ model through full pipeline (normalize, lifetimes, memory)."""
-    ag = load_raw(path)
-    ag = normalize(ag)
-    ag = compute_lifetimes(ag)
-    ag = compute_memory_timeline(ag)
-    return ag
-
-
 def test_qdq_binary_roundtrip(qdq_conv_path):
-    """Quantized model emits valid binary with quant params section."""
-    ag = _full_pipeline_qdq(qdq_conv_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
+    """The quantized plan carries valid quant params and keeps the ONNX output name."""
+    ag = full_pipeline(qdq_conv_path)
+    assert ag.model_outputs == ["output"]
+    assert ag.tensors["output"].quant is not None
+
+    plan = read_binary_plan(emit_binary_bytes(ag))
 
     assert plan["model_name"] == "qdq_conv"
     assert plan["num_ops"] == 1  # Conv with fused Relu
     assert len(plan["quant_params"]) > 0
 
-
-def test_qdq_binary_quant_param_content(qdq_conv_path):
-    """Quant params have correct scale and zero_point values."""
-    ag = _full_pipeline_qdq(qdq_conv_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
-
-    # Find tensor with quant param
     tensors_with_qp = [t for t in plan["tensors"] if t["quant_param_idx"] != NO_QUANT_PARAM]
     assert len(tensors_with_qp) > 0
-
-    # Check that quant param indices reference valid entries
     for t in tensors_with_qp:
-        qp_idx = t["quant_param_idx"]
-        assert qp_idx < len(plan["quant_params"])
-
-
-def test_qdq_binary_weight_per_channel(qdq_conv_path):
-    """Per-channel weight quant params have multipliers and shifts."""
-    ag = _full_pipeline_qdq(qdq_conv_path)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
+        assert t["quant_param_idx"] < len(plan["quant_params"])
 
     # The weight has per-channel quant (2 output channels)
     per_channel = [qp for qp in plan["quant_params"] if qp["num_channels"] > 1]
     assert len(per_channel) > 0
-
     qp = per_channel[0]
     assert qp["num_channels"] == 2
-    assert "multipliers" in qp
-    assert "shifts" in qp
     assert len(qp["multipliers"]) == 2
     assert len(qp["shifts"]) == 2
-    # Multipliers should be positive non-zero
     assert all(m > 0 for m in qp["multipliers"])
+
+    names = [plan["tensors"][index]["name"] for index in plan["model_outputs"]]
+    assert names == ["output"]
 
 
 def test_float_model_no_quant_params(linear_3op_path):
-    """Float model should have no quant params in binary."""
+    """A float model is left unquantized and emits no quant params."""
     ag = load_raw(linear_3op_path)
+    orig_ops = len(ag.ops)
     ag = normalize(ag)
+    assert ag.is_quantized is False
+    assert len(ag.ops) == orig_ops
+
     ag = compute_lifetimes(ag)
     ag = compute_memory_timeline(ag)
-    data = emit_binary_bytes(ag)
-    plan = read_binary_plan(data)
+    plan = read_binary_plan(emit_binary_bytes(ag))
 
     assert len(plan["quant_params"]) == 0
     for t in plan["tensors"]:
         assert t["quant_param_idx"] == NO_QUANT_PARAM
-
-
-def test_qdq_plan_keeps_the_declared_output_name(qdq_conv_path):
-    """Folding the Q/DQ pair behind the output keeps the ONNX output name."""
-    ag = _full_pipeline_qdq(qdq_conv_path)
-    assert ag.model_outputs == ["output"]
-    assert ag.tensors["output"].quant is not None
-
-    plan = read_binary_plan(emit_binary_bytes(ag))
-    names = [plan["tensors"][index]["name"] for index in plan["model_outputs"]]
-    assert names == ["output"]
 
 
 def _qdq_gemm_bias_model(tmp_path, shared_scale: bool):
@@ -233,12 +154,10 @@ def _qdq_gemm_bias_model(tmp_path, shared_scale: bool):
         ),
         helper.make_node("Add", ["product_dq", "bias"], ["output"]),
     ]
-    graph = helper.make_graph(nodes, "qdq_gemm_bias", [X], [Y], initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / f"qdq_gemm_bias_{int(shared_scale)}.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(
+        tmp_path, "qdq_gemm_bias", nodes, [X], [Y], initializers,
+        opset=17, ir_version=8, filename=f"qdq_gemm_bias_{int(shared_scale)}.onnx",
+    )
 
 
 def test_constant_add_after_dequantize_stays_float(tmp_path):
@@ -352,11 +271,9 @@ def test_float_constant_add_becomes_the_gemm_bias(tmp_path):
         helper.make_node("Gemm", ["input", "weight"], ["product"], transB=1),
         helper.make_node("Add", ["product", "bias"], ["output"]),
     ]
-    graph = helper.make_graph(nodes, "float_gemm_bias", [X], [Y], initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "float_gemm_bias.onnx"
-    onnx.save(model, str(path))
+    path = save_onnx(
+        tmp_path, "float_gemm_bias", nodes, [X], [Y], initializers, opset=17, ir_version=8
+    )
 
     ag = load_model(path)
 
@@ -385,11 +302,10 @@ def _matmul_model(tmp_path, op_type, weight_constant=True, **attrs):
             helper.make_tensor_value_info("weight", TensorProto.FLOAT, [4, 3])
         )
     node = helper.make_node(op_type, ["input", "weight"], ["output"], **attrs)
-    graph = helper.make_graph([node], "product", inputs, [Y], initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / f"{op_type}_{int(weight_constant)}.onnx"
-    onnx.save(model, str(path))
+    path = save_onnx(
+        tmp_path, "product", [node], inputs, [Y], initializers,
+        opset=17, ir_version=8, filename=f"{op_type}_{int(weight_constant)}.onnx",
+    )
     return path, values
 
 
@@ -423,13 +339,10 @@ def test_gemm_with_transb_is_left_alone(tmp_path):
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3])
     values = np.arange(12, dtype=np.float32).reshape(3, 4)
     node = helper.make_node("Gemm", ["input", "weight"], ["output"], transB=1)
-    graph = helper.make_graph(
-        [node], "gemm_t", [X], [Y], [numpy_helper.from_array(values, "weight")]
+    path = save_onnx(
+        tmp_path, "gemm_t", [node], [X], [Y], [numpy_helper.from_array(values, "weight")],
+        opset=17, ir_version=8,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "gemm_t.onnx"
-    onnx.save(model, str(path))
 
     ag = load_model(path)
 
@@ -454,13 +367,10 @@ def test_matmul_weight_shared_with_another_op_is_left_alone(tmp_path):
         helper.make_node("MatMul", ["input", "weight"], ["product"]),
         helper.make_node("Add", ["product", "weight"], ["output"]),
     ]
-    graph = helper.make_graph(
-        nodes, "shared", [X], [Y], [numpy_helper.from_array(values, "weight")]
+    path = save_onnx(
+        tmp_path, "shared", nodes, [X], [Y], [numpy_helper.from_array(values, "weight")],
+        opset=17, ir_version=8,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "shared.onnx"
-    onnx.save(model, str(path))
 
     ag = load_model(path)
 
@@ -502,11 +412,9 @@ def test_quantized_matmul_weight_keeps_its_channel_axis(tmp_path):
             "DequantizeLinear", ["out_q", "io_scale", "io_zp"], ["output"]
         ),
     ]
-    graph = helper.make_graph(nodes, "qdq_matmul", [X], [Y], initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "qdq_matmul.onnx"
-    onnx.save(model, str(path))
+    path = save_onnx(
+        tmp_path, "qdq_matmul", nodes, [X], [Y], initializers, opset=17, ir_version=8
+    )
 
     ag = load_model(path)
 
@@ -519,8 +427,8 @@ def test_quantized_matmul_weight_keeps_its_channel_axis(tmp_path):
 # uint8 activations
 
 
-def _quint8_model(tmp_path, weight_unsigned=False):
-    """A Conv whose activations are stated as uint8, the ORT quantizer default."""
+def _quint8_model(tmp_path, weight_unsigned=False, act_zp=np.uint8(114)):
+    """A 1x1 Conv whose activations take the dtype of act_zp, uint8 by default as ORT emits."""
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 4, 4])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 4, 4])
     weight_values = (
@@ -530,7 +438,7 @@ def _quint8_model(tmp_path, weight_unsigned=False):
     )
     initializers = [
         numpy_helper.from_array(np.array(0.25, dtype=np.float32), "act_scale"),
-        numpy_helper.from_array(np.array(114, dtype=np.uint8), "act_zp"),
+        numpy_helper.from_array(np.array(act_zp), "act_zp"),
         numpy_helper.from_array(np.array(0.5, dtype=np.float32), "w_scale"),
         numpy_helper.from_array(weight_values, "weight_q"),
         numpy_helper.from_array(
@@ -555,12 +463,10 @@ def _quint8_model(tmp_path, weight_unsigned=False):
             "DequantizeLinear", ["out_q", "act_scale", "act_zp"], ["output"]
         ),
     ]
-    graph = helper.make_graph(nodes, "quint8", [X], [Y], initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / f"quint8_{int(weight_unsigned)}.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(
+        tmp_path, "quint8", nodes, [X], [Y], initializers,
+        opset=17, ir_version=8, filename=f"quint8_{int(weight_unsigned)}.onnx",
+    )
 
 
 def test_unsigned_activation_moves_to_the_signed_domain(tmp_path):
@@ -568,9 +474,11 @@ def test_unsigned_activation_moves_to_the_signed_domain(tmp_path):
     ag = load_model(_quint8_model(tmp_path))
 
     activation = ag.tensors["input"]
-    assert activation.dtype == 3  # INT8
+    assert activation.dtype == 3  # INT8, as the plan executes
     assert int(activation.quant.zero_point[0]) == 114 - 128
     assert float(activation.quant.scale[0]) == 0.25
+    # The caller hands over what the model declares, whatever the plan stores.
+    assert ag.model_input_dtypes == [1]
 
 
 def test_unsigned_weight_data_moves_with_its_zero_point(tmp_path):
@@ -585,48 +493,9 @@ def test_unsigned_weight_data_moves_with_its_zero_point(tmp_path):
     assert int(info.quant.zero_point[0]) == 128 - 128
 
 
-def test_unsigned_model_input_keeps_its_declared_interface(tmp_path):
-    """The caller hands over what the model declares, whatever the plan stores."""
-    ag = load_model(_quint8_model(tmp_path))
-
-    assert ag.model_input_dtypes == [1]  # float32, as the model states
-    assert ag.tensors["input"].dtype == 3  # int8, as the plan executes
-
-
 def test_signed_activations_are_untouched(tmp_path):
     """An int8 graph keeps the zero points the model states."""
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 4, 4])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 4, 4])
-    initializers = [
-        numpy_helper.from_array(np.array(0.25, dtype=np.float32), "act_scale"),
-        numpy_helper.from_array(np.array(-14, dtype=np.int8), "act_zp"),
-        numpy_helper.from_array(np.array(0.5, dtype=np.float32), "w_scale"),
-        numpy_helper.from_array(np.array([[[[72]]]], dtype=np.int8), "weight_q"),
-        numpy_helper.from_array(np.array(0, dtype=np.int8), "w_zp"),
-    ]
-    nodes = [
-        helper.make_node("QuantizeLinear", ["input", "act_scale", "act_zp"], ["in_q"]),
-        helper.make_node(
-            "DequantizeLinear", ["in_q", "act_scale", "act_zp"], ["in_dq"]
-        ),
-        helper.make_node(
-            "DequantizeLinear", ["weight_q", "w_scale", "w_zp"], ["w_dq"]
-        ),
-        helper.make_node("Conv", ["in_dq", "w_dq"], ["conv"]),
-        helper.make_node(
-            "QuantizeLinear", ["conv", "act_scale", "act_zp"], ["out_q"]
-        ),
-        helper.make_node(
-            "DequantizeLinear", ["out_q", "act_scale", "act_zp"], ["output"]
-        ),
-    ]
-    graph = helper.make_graph(nodes, "signed", [X], [Y], initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "signed.onnx"
-    onnx.save(model, str(path))
-
-    ag = load_model(path)
+    ag = load_model(_quint8_model(tmp_path, act_zp=np.int8(-14)))
 
     assert int(ag.tensors["input"].quant.zero_point[0]) == -14
     assert ag.weight_data["weight_q"].ravel().tolist() == [72]

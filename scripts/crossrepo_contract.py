@@ -44,7 +44,7 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
-from tigris.fixtures import build_tcn
+from tigris.fixtures import build_ds_cnn, build_fc_autoencoder, build_tcn
 from tigris.frontends.tflite import STATE_KEY
 from tigris.runtime import Session
 from tigris.cli.trace import check as check_trace
@@ -96,6 +96,8 @@ class ContractCase:
     exact_untiled: bool = False
     tiled_operators: tuple[str, ...] = ()
     expect_grouped: bool = False
+    # Compare outputs byte for byte instead of within one quantization step.
+    exact: bool = False
 
 
 def _model(
@@ -930,7 +932,7 @@ def _movement_case(kind: str, quantized: bool, variant: int = 0, tiled: bool = F
     return ContractCase(label, build(nodes), build(reference_nodes), inputs, tuple(operators),
                         mem_budget=("128" if quantized else "384") if leading else "256" if tiled else "8K",
                         slow_budget="16K" if tiled else None,
-                        expect_tiled=tiled, reference_unoptimized=True, exact_untiled=leading,
+                        expect_tiled=tiled, reference_unoptimized=True, exact_untiled=leading, exact=True,
                         compression="lz4" if kind == "Gather" and variant == 0 and not tiled else None)
 
 
@@ -1603,7 +1605,7 @@ def _bool_case(kind: str, quantized: bool = False, tiled: bool = False, variant:
     return ContractCase(label, model, copy.deepcopy(model), values,
                         (("Transpose",) * (3 if kind == "Where" else 2) + (kind,)) if variant == 2 else (kind,),
                         mem_budget="512" if tiled else "4K", slow_budget="32K" if tiled else None,
-                        expect_tiled=tiled, reference_unoptimized=True)
+                        expect_tiled=tiled, reference_unoptimized=True, exact=True)
 
 
 def _bool_composition_case(quantized: bool, tiled: bool) -> ContractCase:
@@ -1621,7 +1623,8 @@ def _bool_composition_case(quantized: bool, tiled: bool) -> ContractCase:
     model.graph.node.extend(nodes)
     return ContractCase(case.name + "_composed", model, copy.deepcopy(model), values,
                         ("Equal", "Not", "Where"), mem_budget=case.mem_budget,
-                        slow_budget=case.slow_budget, expect_tiled=tiled, expect_chain=tiled, reference_unoptimized=True)
+                        slow_budget=case.slow_budget, expect_tiled=tiled, expect_chain=tiled, reference_unoptimized=True,
+                        exact=True)
 
 
 def _arg_case(kind: str, axis: int, quantized: bool, keep: bool, tiled: bool = False,
@@ -3078,6 +3081,37 @@ def _tcn_16k_case() -> ContractCase:
         ),
         mem_budget="16K",
         expect_tiled=True,
+    )
+
+
+def _ds_cnn_256k_case() -> ContractCase:
+    """The project DS-CNN keyword spotter, whole model."""
+    model = build_ds_cnn()
+    return ContractCase(
+        "float_ds_cnn_256k",
+        model,
+        model,
+        {
+            "input": np.linspace(
+                -1.0, 1.0, 49 * 10, dtype=np.float32
+            ).reshape(1, 1, 49, 10)
+        },
+        ("Conv", "DepthwiseConv") * 4
+        + ("Conv", "GlobalAveragePool", "Flatten", "Gemm"),
+        mem_budget="256K",
+    )
+
+
+def _fc_autoencoder_256k_case() -> ContractCase:
+    """The project fully connected autoencoder, whole model."""
+    model = build_fc_autoencoder()
+    return ContractCase(
+        "float_fc_autoencoder_256k",
+        model,
+        model,
+        {"input": np.linspace(-1.0, 1.0, 128, dtype=np.float32).reshape(1, 128)},
+        ("Gemm",) * 10 + ("Sigmoid",),
+        mem_budget="256K",
     )
 
 
@@ -7212,7 +7246,7 @@ def _run_metric_case(
             plan, outputs_path.read_bytes(), reference_outputs
         )
         _assert_output_parity(
-        actual_outputs, reference_outputs, _output_scales(plan)
+        actual_outputs, reference_outputs, _output_scales(plan), case.exact
     )
         return _parse_rows(case, completed.stdout)
 
@@ -7393,7 +7427,7 @@ def _run_case(
     reference_outputs = _section_reference_outputs(
         case, runner, case_dir, plan, outputs_path.read_bytes(), reference_outputs)
     _assert_output_parity(
-        actual_outputs, reference_outputs, _output_scales(plan)
+        actual_outputs, reference_outputs, _output_scales(plan), case.exact
     )
     # Extra caller capacity must not change the scheduled memory bound.
     for full_runner in (runner, roomy_runner):
@@ -7514,12 +7548,22 @@ def _assert_output_parity(
     actual_outputs: list[Array],
     reference_outputs: list[Array],
     output_scales: list[float] | None = None,
+    exact: bool = False,
 ) -> None:
     output_scales = output_scales or [0.0] * len(actual_outputs)
-    for actual, expected, scale in zip(
+    for index, (actual, expected, scale) in enumerate(zip(
         actual_outputs, reference_outputs, output_scales
-    ):
-        if scale > 0.0:
+    )):
+        # Bool and index outputs carry no quantization step to round.
+        if exact or expected.dtype.kind == "b" or expected.dtype in (np.int32, np.int64):
+            if (actual.dtype != expected.dtype or actual.shape != expected.shape
+                    or actual.tobytes() != expected.tobytes()):
+                mismatched = int(np.count_nonzero(actual != expected)) if actual.shape == expected.shape else -1
+                raise AssertionError(
+                    f"output {index} is not exact: {actual.dtype}{list(actual.shape)} vs "
+                    f"{expected.dtype}{list(expected.shape)}, {mismatched} elements differ"
+                )
+        elif scale > 0.0:
             # The runtime uses integer half-away-from-zero quantization while
             # this ONNX Runtime QDQ reference follows a different half-tie
             # rule. Keep the same one-LSB acceptance bound used by benchmark
@@ -7789,8 +7833,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
           for kind, variants in (("Gather", 3), ("GatherND", 1), ("EmbeddingLookup", 1),
                                  ("DynamicUpdateSlice", 2))
           for variant in range(variants) for q in (False, True)],
-        *[_runtime_index_case("Gather", q, 1, arg, cast)
-          for arg in ("ArgMax", "ArgMin") for q in (False, True) for cast in (False, True)],
+        *[_runtime_index_case("Gather", q, variant, arg, cast)
+          for arg in ("ArgMax", "ArgMin") for q in (False, True)
+          for variant, cast in ((0, False), (1, False), (1, True), (2, False))],
         *[_arg_case(kind, axis, q, keep) for kind in ("ArgMax", "ArgMin")
           for axis in range(3) for q in (False, True) for keep in (False, True)],
         *[_reduction_case(kind, axis, quantized=q, keep=keep)
@@ -7894,6 +7939,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _rank3_pointwise_case(),
         _many_stage_case(),
         _tcn_16k_case(),
+        _ds_cnn_256k_case(),
+        _fc_autoencoder_256k_case(),
         _reduce_case(maximum=False),
         _reduce_case(maximum=True),
         _inference_identity_case(),

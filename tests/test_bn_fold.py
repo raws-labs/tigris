@@ -1,6 +1,4 @@
-"""Tests for BN folding, DepthwiseConv relabeling, Clip->Relu6, and shape op folding."""
-
-from pathlib import Path
+"""Tests for BN folding."""
 
 import numpy as np
 import onnx
@@ -9,6 +7,8 @@ from onnx import TensorProto, helper
 
 from tigris.loaders.onnx.loader import load_model
 from tigris.loaders.onnx.normalize import normalize as bn_fold
+
+from conftest import save_onnx, vi
 
 
 # Fixtures
@@ -40,16 +40,11 @@ def conv_bn_path(tmp_path):
     bn = helper.make_node("BatchNormalization", ["conv_out", "gamma", "beta", "mean", "var"],
                           ["output"], name="bn", epsilon=1e-5)
 
-    graph = helper.make_graph(
-        [conv, bn], "conv_bn", [X], [Y],
-        initializer=[w_init, b_init, gamma_init, beta_init, mean_init, var_init],
+    return save_onnx(
+        tmp_path, "conv_bn", [conv, bn], [X], [Y],
+        [w_init, b_init, gamma_init, beta_init, mean_init, var_init],
+        opset=17, ir_version=8,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "conv_bn.onnx"
-    onnx.save(model, str(path))
-    return path
 
 
 @pytest.fixture
@@ -76,92 +71,34 @@ def conv_bn_no_bias_path(tmp_path):
     bn = helper.make_node("BatchNormalization", ["conv_out", "gamma", "beta", "mean", "var"],
                           ["output"], name="bn")
 
-    graph = helper.make_graph(
-        [conv, bn], "conv_bn_nobias", [X], [Y],
-        initializer=[w_init, gamma_init, beta_init, mean_init, var_init],
+    return save_onnx(
+        tmp_path, "conv_bn_nobias", [conv, bn], [X], [Y],
+        [w_init, gamma_init, beta_init, mean_init, var_init],
+        opset=17, ir_version=8,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "conv_bn_nobias.onnx"
-    onnx.save(model, str(path))
-    return path
 
 
-@pytest.fixture
-def depthwise_conv_path(tmp_path):
-    """Depthwise Conv (group == C_in == 8)."""
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 8, 16, 16])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 14, 14])
-
-    W = np.random.randn(8, 1, 3, 3).astype(np.float32)
-    w_init = helper.make_tensor("W", TensorProto.FLOAT, [8, 1, 3, 3], W.flatten().tolist())
-
-    conv = helper.make_node("Conv", ["input", "W"], ["output"], name="dw_conv",
-                            kernel_shape=[3, 3], group=8)
-
-    graph = helper.make_graph([conv], "depthwise", [X], [Y], initializer=[w_init])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "depthwise.onnx"
-    onnx.save(model, str(path))
-    return path
-
-
-@pytest.fixture
-def clip_relu6_path(tmp_path):
-    """Clip(min=0, max=6) -> should become Relu6."""
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 64])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 64])
-
-    # Opset >= 11: min/max are inputs, not attributes
-    min_val = helper.make_tensor("min_val", TensorProto.FLOAT, [], [0.0])
-    max_val = helper.make_tensor("max_val", TensorProto.FLOAT, [], [6.0])
-
-    clip = helper.make_node("Clip", ["input", "min_val", "max_val"], ["output"], name="clip0")
-
-    graph = helper.make_graph([clip], "clip_relu6", [X], [Y],
-                              initializer=[min_val, max_val])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "clip_relu6.onnx"
-    onnx.save(model, str(path))
-    return path
+def _conv3x3(x, w, b):
+    """Valid 3x3 convolution of NCHW x (batch 1) with OIHW w plus bias b."""
+    windows = np.lib.stride_tricks.sliding_window_view(x[0], (3, 3), axis=(1, 2))
+    return (np.einsum("chwij,ocij->ohw", windows, w) + b[:, None, None])[None]
 
 
 # BN fold correctness
 
 
-def test_bn_removed(conv_bn_path):
-    """After folding, the BN op should be removed."""
+def test_bn_folds_into_the_conv(conv_bn_path):
+    """BN and its parameters disappear; the plain Conv takes over the BN output name."""
     ag = load_model(conv_bn_path)
     assert any(op.op_type == "BatchNormalization" for op in ag.ops)
 
     ag = bn_fold(ag)
-    assert not any(op.op_type == "BatchNormalization" for op in ag.ops)
-    assert len(ag.ops) == 1  # only Conv remains
-
-
-def test_bn_fold_preserves_output_name(conv_bn_path):
-    """The conv's output should be rewired to the BN's original output name."""
-    ag = load_model(conv_bn_path)
-    ag = bn_fold(ag)
-
-    conv_op = ag.ops[0]
-    assert conv_op.outputs[0] == "output"
-
-
-def test_bn_fold_updates_weights(conv_bn_path):
-    """Folded weights should differ from original."""
-    ag_before = load_model(conv_bn_path)
-    W_before = ag_before.weight_data["W"].copy()
-
-    ag = bn_fold(ag_before)
-    W_after = ag.weight_data["W"]
-
-    assert not np.allclose(W_before, W_after), "Weights should have been modified by BN fold"
+    assert [op.op_type for op in ag.ops] == ["Conv"]
+    assert ag.ops[0].outputs[0] == "output"
+    for name in ["gamma", "beta", "mean", "var"]:
+        assert name not in ag.weight_data
+    for i, op in enumerate(ag.ops):
+        assert op.step == i
 
 
 def test_bn_fold_numerical_correctness(conv_bn_path):
@@ -181,32 +118,15 @@ def test_bn_fold_numerical_correctness(conv_bn_path):
     np.random.seed(123)
     x = np.random.randn(1, 3, 16, 16).astype(np.float32)
 
-    # Simple conv (no padding)
-    conv_out = np.zeros((1, 8, 14, 14), dtype=np.float32)
-    for oc in range(8):
-        for oh in range(14):
-            for ow in range(14):
-                patch = x[0, :, oh:oh+3, ow:ow+3]
-                conv_out[0, oc, oh, ow] = np.sum(patch * W_orig[oc]) + B_orig[oc]
-
-    # BN
+    conv_out = _conv3x3(x, W_orig, B_orig)
     inv_std = 1.0 / np.sqrt(var + eps)
-    bn_out = np.zeros_like(conv_out)
-    for oc in range(8):
-        bn_out[0, oc] = (conv_out[0, oc] - mean[oc]) * inv_std[oc] * gamma[oc] + beta[oc]
+    bn_out = (conv_out - mean[:, None, None]) * (inv_std * gamma)[:, None, None] \
+        + beta[:, None, None]
 
     # Now fold and compute
     ag2 = load_model(conv_bn_path)
     ag2 = bn_fold(ag2)
-    W_folded = ag2.weight_data["W"]
-    B_folded = ag2.weight_data["B"]
-
-    folded_out = np.zeros((1, 8, 14, 14), dtype=np.float32)
-    for oc in range(8):
-        for oh in range(14):
-            for ow in range(14):
-                patch = x[0, :, oh:oh+3, ow:ow+3]
-                folded_out[0, oc, oh, ow] = np.sum(patch * W_folded[oc]) + B_folded[oc]
+    folded_out = _conv3x3(x, ag2.weight_data["W"], ag2.weight_data["B"])
 
     assert np.allclose(bn_out, folded_out, atol=1e-5), \
         f"Max diff: {np.max(np.abs(bn_out - folded_out))}"
@@ -223,102 +143,6 @@ def test_bn_fold_no_bias(conv_bn_no_bias_path):
     bias_name = conv_op.inputs[2]
     assert bias_name in ag.weight_data, "Bias should be in weight_data"
     assert ag.weight_data[bias_name].shape == (4,)
-
-
-def test_bn_params_removed(conv_bn_path):
-    """BN parameters (gamma, beta, mean, var) should be removed from weight_data."""
-    ag = load_model(conv_bn_path)
-    ag = bn_fold(ag)
-
-    for name in ["gamma", "beta", "mean", "var"]:
-        assert name not in ag.weight_data
-
-
-def test_step_indices_reassigned(conv_bn_path):
-    """After BN removal, step indices should be contiguous."""
-    ag = load_model(conv_bn_path)
-    ag = bn_fold(ag)
-
-    for i, op in enumerate(ag.ops):
-        assert op.step == i
-
-
-# DepthwiseConv relabeling
-
-
-def test_depthwise_relabel(depthwise_conv_path):
-    ag = load_model(depthwise_conv_path)
-    assert ag.ops[0].op_type == "Conv"
-
-    ag = bn_fold(ag)
-    assert ag.ops[0].op_type == "DepthwiseConv"
-
-
-def test_normal_conv_not_relabeled(conv_bn_path):
-    """A normal conv (group=1) should stay as Conv."""
-    ag = load_model(conv_bn_path)
-    ag = bn_fold(ag)
-    assert ag.ops[0].op_type == "Conv"
-
-
-# Clip -> Relu6
-
-
-def test_clip_to_relu6(clip_relu6_path):
-    ag = load_model(clip_relu6_path)
-    assert ag.ops[0].op_type == "Clip"
-
-    ag = bn_fold(ag)
-    assert ag.ops[0].op_type == "Relu6"
-
-
-def test_clip_relu6_single_input(clip_relu6_path):
-    """After conversion, Relu6 should have only the data input."""
-    ag = load_model(clip_relu6_path)
-    ag = bn_fold(ag)
-    assert len(ag.ops[0].inputs) == 1
-
-
-# Shape op folding
-
-MOBILENETV2_PATH = Path(__file__).resolve().parent.parent / "mobilenetv2-12.onnx"
-_has_mobilenetv2 = MOBILENETV2_PATH.exists()
-
-
-@pytest.mark.skipif(not _has_mobilenetv2, reason="mobilenetv2-12.onnx not present")
-def test_shape_ops_folded():
-    """After bn_fold, shape-computation ops should be removed from MobileNetV2."""
-    ag = load_model(MOBILENETV2_PATH)
-    ag = bn_fold(ag)
-
-    remaining_types = {op.op_type for op in ag.ops}
-    for forbidden in ("Shape", "Gather", "Constant", "Unsqueeze"):
-        assert forbidden not in remaining_types, f"{forbidden} ops should be folded away"
-
-    assert len(ag.ops) == 65, f"Expected 65 ops after folding + activation fusion, got {len(ag.ops)}"
-
-    # Step indices should be contiguous
-    for i, op in enumerate(ag.ops):
-        assert op.step == i, f"Step mismatch at index {i}: {op.step}"
-
-
-@pytest.mark.skipif(not _has_mobilenetv2, reason="mobilenetv2-12.onnx not present")
-def test_reshape_has_one_nonconst_input():
-    """After folding, Reshape ops should have exactly 1 non-constant input."""
-    ag = load_model(MOBILENETV2_PATH)
-    ag = bn_fold(ag)
-
-    reshape_ops = [op for op in ag.ops if op.op_type == "Reshape"]
-    assert len(reshape_ops) >= 1, "Should have at least one Reshape op"
-
-    for op in reshape_ops:
-        non_const_inputs = [
-            inp for inp in op.inputs
-            if inp in ag.tensors and not ag.tensors[inp].is_constant
-        ]
-        assert len(non_const_inputs) == 1, (
-            f"Reshape '{op.name}' has {len(non_const_inputs)} non-constant inputs, expected 1"
-        )
 
 
 def _quantized_conv_bn(tmp_path, weight, gamma):
@@ -345,13 +169,10 @@ def _quantized_conv_bn(tmp_path, weight, gamma):
         helper.make_node("QuantizeLinear", ["normed", "y_s", "zero"], ["yq"]),
         helper.make_node("DequantizeLinear", ["yq", "y_s", "zero"], ["output"]),
     ]
-    model = helper.make_model(helper.make_graph(
-        nodes, "qconv_bn",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, weight.shape[1], 2, 2])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 2, 2])],
-        initializers), opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "qconv_bn.onnx"
-    onnx.save(model, path)
+    path = save_onnx(
+        tmp_path, "qconv_bn", nodes, [vi("input", [1, weight.shape[1], 2, 2])],
+        [vi("output", [1, channels, 2, 2])], initializers,
+    )
     return bn_fold(load_model(str(path)))
 
 

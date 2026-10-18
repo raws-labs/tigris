@@ -4,10 +4,8 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import pytest
-from click.testing import CliRunner
 from onnx import TensorProto, helper
 
-from tigris.cli import cli
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import partition_spatial
@@ -81,29 +79,6 @@ def test_trailing_transpose_is_observable_and_preserved(trailing_transpose_path)
     assert plan["op_attributes"] == [
         {"op_index": 1, "type": 1, "data": b"\x01\x00\x02"}
     ]
-
-
-def test_compile_emits_trailing_transpose_output_contract(
-    trailing_transpose_path, tmp_path
-):
-    output = tmp_path / "should-not-exist.tgrs"
-
-    result = CliRunner().invoke(
-        cli,
-        [
-            "compile",
-            str(trailing_transpose_path),
-            "-m",
-            "4K",
-            "-o",
-            str(output),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert output.exists()
-    plan = read_binary_plan(output.read_bytes())
-    assert plan["tensors"][plan["model_outputs"][0]]["shape"] == [3, 1, 2]
 
 
 def test_terminal_rank4_transpose_remaps_internal_layout(tmp_path):

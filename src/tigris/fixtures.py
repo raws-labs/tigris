@@ -1,8 +1,8 @@
 """Inline ONNX model builders for test fixtures.
 
-Not part of the CLI. Used by:
-- Python tests (test_plan_contract.py)
-- scripts/gen_fixtures.py (fixture generation for tigris-runtime C tests)
+Not part of the CLI. Used by the Python tests (conftest.py,
+test_linebuffer_plan.py, test_plan_contract.py, test_tiling.py) and by the
+cross-repository contract gate (scripts/crossrepo_contract.py).
 """
 
 from __future__ import annotations

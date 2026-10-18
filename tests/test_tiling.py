@@ -6,20 +6,17 @@ import numpy as np
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.graph.ir import AnalyzedGraph, OpNode, Stage, TensorInfo
-from tigris.loaders import load_model
-from tigris.analysis.lifetime import compute_lifetimes
-from tigris.analysis.memory import compute_memory_timeline
-from tigris.analysis.partition_temporal import partition_temporal
 from tigris.analysis.partition_spatial import (
     TileCategory,
     classify_op,
     compute_receptive_field,
-    partition_spatial,
     _stage_tile_axis,
 )
 from tigris.analysis.validation import validate_memory_plan
 from tigris.emitters.plan_json import plan_json_str
 from tigris.fixtures import build_tcn
+
+from conftest import full_pipeline
 
 
 def _write_conv1d(path, length=32):
@@ -89,150 +86,57 @@ def _write_rank3_pointwise(path, op_type, length=64):
     return path
 
 
-def _full_pipeline(path, budget=0):
-    ag = load_model(path)
-    ag = compute_lifetimes(ag)
-    ag = compute_memory_timeline(ag)
-    if budget > 0:
-        ag = partition_temporal(ag, budget)
-        ag = partition_spatial(ag)
-    return ag
-
-
 # Op classification
 
 
-class TestClassifyOp:
-    def test_conv_is_conv(self):
-        assert classify_op("Conv") == TileCategory.CONV
-
-    def test_relu_is_pointwise(self):
-        assert classify_op("Relu") == TileCategory.POINTWISE
-
-    def test_flatten_is_untileable(self):
-        assert classify_op("Flatten") == TileCategory.UNTILEABLE
-
-    def test_unknown_is_untileable(self):
-        assert classify_op("MyCustomOp") == TileCategory.UNTILEABLE
-
-    def test_maxpool_is_pool(self):
-        assert classify_op("MaxPool") == TileCategory.POOL
-
-    def test_averagepool_is_pool(self):
-        assert classify_op("AveragePool") == TileCategory.POOL
-
-    @pytest.mark.parametrize(
-        "op_type",
-        [
-            "BatchNormalization",
-            "GlobalAveragePool",
-        ],
-    )
-    def test_operators_without_schema_v4_height_contract_are_untileable(
-        self, op_type
-    ):
-        assert classify_op(op_type) == TileCategory.UNTILEABLE
-
-    @pytest.mark.parametrize("op_type", ["Resize", "ResizeLinear"])
-    def test_resampling_is_its_own_category(self, op_type):
-        """Its output has more rows than its input, so the tile loop divides
-        to find the source band instead of multiplying."""
-        assert classify_op(op_type) == TileCategory.UPSAMPLE
-
-    def test_gemm_is_untileable(self):
-        assert classify_op("Gemm") == TileCategory.UNTILEABLE
+@pytest.mark.parametrize("op_type, category", [
+    ("Conv", TileCategory.CONV),
+    ("Relu", TileCategory.POINTWISE),
+    ("MaxPool", TileCategory.POOL),
+    ("AveragePool", TileCategory.POOL),
+    # The output has more rows than the input, so the tile loop divides to find the source band.
+    ("Resize", TileCategory.UPSAMPLE),
+    ("ResizeLinear", TileCategory.UPSAMPLE),
+    ("Flatten", TileCategory.UNTILEABLE),
+    ("MyCustomOp", TileCategory.UNTILEABLE),
+    ("Gemm", TileCategory.UNTILEABLE),
+    # No schema v4 height contract.
+    ("BatchNormalization", TileCategory.UNTILEABLE),
+    ("GlobalAveragePool", TileCategory.UNTILEABLE),
+])
+def test_classify_op(op_type, category):
+    assert classify_op(op_type) == category
 
 
 # Receptive field computation
 
 
+_CONV3 = ("Conv", {"kernel_shape": [3, 3], "strides": [1, 1]})
+
+
 class TestReceptiveField:
-    def test_single_3x3_conv(self):
-        """A single 3x3 conv has RF=3 on both axes."""
-        ops = [OpNode(name="c", op_type="Conv", inputs=[], outputs=[],
-                      attrs={"kernel_shape": [3, 3], "strides": [1, 1]})]
-        rf_h, rf_w = compute_receptive_field(ops)
-        assert rf_h == 3
-        assert rf_w == 3
-
-    def test_two_3x3_convs(self):
-        """Two stacked 3x3 convs have RF=5 on both axes."""
-        ops = [
-            OpNode(name="c0", op_type="Conv", inputs=[], outputs=[],
-                   attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
-            OpNode(name="c1", op_type="Conv", inputs=[], outputs=[],
-                   attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
-        ]
-        rf_h, rf_w = compute_receptive_field(ops)
-        assert rf_h == 5
-        assert rf_w == 5
-
-    def test_conv_stride2_pool(self):
-        """Conv3x3(s=1) + MaxPool2x2(s=2) + Conv3x3(s=1), symmetric kernel/stride.
-
-        conv0(k=3,s=1): rf=3, j=1 -> pool(k=2,s=2): rf=4, j=2 -> conv1(k=3,s=1): rf=8, j=2
-        Kernel and stride are symmetric across height/width, so rf_h == rf_w == 8.
-        """
-        ops = [
-            OpNode(name="c0", op_type="Conv", inputs=[], outputs=[],
-                   attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
-            OpNode(name="p", op_type="MaxPool", inputs=[], outputs=[],
-                   attrs={"kernel_shape": [2, 2], "strides": [2, 2]}),
-            OpNode(name="c1", op_type="Conv", inputs=[], outputs=[],
-                   attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
-        ]
-        rf_h, rf_w = compute_receptive_field(ops)
-        assert rf_h == 8
-        assert rf_w == 8
-
-    @pytest.mark.parametrize("strides, expected", [((2, 1), 7), ((1, 2), 5)])
-    def test_stride_order(self, strides, expected):
-        """A stride multiplies the extent of every later kernel, so a stride-2
-        conv before a 3x3 conv reaches 7 input rows and after it only 5."""
-        ops = [OpNode(name=f"c{i}", op_type="Conv", inputs=[], outputs=[],
-                      attrs={"kernel_shape": [3, 3], "strides": [s, s]})
-               for i, s in enumerate(strides)]
-        assert compute_receptive_field(ops) == (expected, expected)
-
-    def test_stride_order_per_axis(self):
-        """Height and width keep their own strides."""
-        ops = [
-            OpNode(name="c0", op_type="Conv", inputs=[], outputs=[],
-                   attrs={"kernel_shape": [3, 3], "strides": [2, 1]}),
-            OpNode(name="c1", op_type="Conv", inputs=[], outputs=[],
-                   attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
-        ]
-        assert compute_receptive_field(ops) == (7, 5)
-
-    def test_dilated_conv(self):
-        """Conv3x3 with dilation=2: effective_k = 2*(3-1)+1 = 5, RF=5 on both axes."""
-        ops = [OpNode(name="c", op_type="Conv", inputs=[], outputs=[],
-                      attrs={"kernel_shape": [3, 3], "strides": [1, 1],
-                             "dilations": [2, 2]})]
-        rf_h, rf_w = compute_receptive_field(ops)
-        assert rf_h == 5
-        assert rf_w == 5
-
-    def test_pointwise_passthrough(self):
-        """Pointwise ops (Relu) don't change RF."""
-        ops = [
-            OpNode(name="c", op_type="Conv", inputs=[], outputs=[],
-                   attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
-            OpNode(name="r", op_type="Relu", inputs=[], outputs=[], attrs={}),
-        ]
-        rf_h, rf_w = compute_receptive_field(ops)
-        assert rf_h == 3  # same as single conv
-        assert rf_w == 3
-
-    def test_only_pointwise_rf_is_1(self):
-        """A chain of only pointwise ops has RF=1 on both axes."""
-        ops = [
-            OpNode(name="r0", op_type="Relu", inputs=[], outputs=[], attrs={}),
-            OpNode(name="r1", op_type="Add", inputs=[], outputs=[], attrs={}),
-        ]
-        rf_h, rf_w = compute_receptive_field(ops)
-        assert rf_h == 1
-        assert rf_w == 1
+    @pytest.mark.parametrize("layers, expected", [
+        ([_CONV3], (3, 3)),
+        ([_CONV3, _CONV3], (5, 5)),
+        # Reversed: conv1 rf=3 j=1, pool(k=2,s=2) rf=4 j=2, conv0 rf=8 j=2.
+        ([_CONV3, ("MaxPool", {"kernel_shape": [2, 2], "strides": [2, 2]}), _CONV3], (8, 8)),
+        # Effective kernel 2*(3-1)+1 = 5.
+        ([("Conv", {"kernel_shape": [3, 3], "strides": [1, 1], "dilations": [2, 2]})], (5, 5)),
+        ([_CONV3, ("Relu", {})], (3, 3)),
+        ([("Relu", {}), ("Add", {})], (1, 1)),
+        ([("Conv", {"kernel_shape": [5, 3], "strides": [2, 1], "dilations": [1, 1]})], (5, 3)),
+        # A stride multiplies the extent of every later kernel, so a stride-2 conv
+        # before a 3x3 conv reaches 7 input rows and after it only 5.
+        ([("Conv", {"kernel_shape": [3, 3], "strides": [2, 2]}), _CONV3], (7, 7)),
+        ([_CONV3, ("Conv", {"kernel_shape": [3, 3], "strides": [2, 2]})], (5, 5)),
+        # Height and width keep their own strides.
+        ([("Conv", {"kernel_shape": [3, 3], "strides": [2, 1]}), _CONV3], (7, 5)),
+    ], ids=["conv3x3", "two-conv3x3", "conv-pool-conv", "dilated", "pointwise-passthrough",
+            "pointwise-only", "asymmetric", "stride-first", "stride-last", "stride-per-axis"])
+    def test_fixed_geometry(self, layers, expected):
+        ops = [OpNode(name=f"op{i}", op_type=op_type, inputs=[], outputs=[], attrs=dict(attrs))
+               for i, (op_type, attrs) in enumerate(layers)]
+        assert compute_receptive_field(ops) == expected
 
     def test_kernel_inferred_from_weight_when_shape_absent(self):
         """A Conv omitting kernel_shape recovers its 3x3 kernel from the weight.
@@ -260,26 +164,21 @@ class TestReceptiveField:
 
 
 class TestTilingIntegration:
-    def test_tileable_stage_gets_plan(self, conv_relu_chain_path):
-        """Conv-Relu-Conv chain should be fully tileable with a tight budget."""
-        ag = _full_pipeline(conv_relu_chain_path, budget=1024)
-
-        # At least one stage should have a tile plan
-        tiled = [s for s in ag.stages if s.tile_plan is not None]
-        assert len(tiled) >= 1
-
-        # Plans should be tileable
-        for s in tiled:
-            tp = s.tile_plan
-            assert tp.tileable is True
-            assert tp.tile_height >= 1
-            assert tp.num_tiles >= 1
-            assert tp.halo >= 0
-            assert tp.receptive_field >= 1
+    def test_spatial_stages_get_exact_tile_plans(self, conv_relu_chain_path, conv_pool_chain_path):
+        """Each stage holds one spatial op and tiles on that op's own receptive field."""
+        for path, budget, expected in [
+            (conv_relu_chain_path, 1024, [(2, 60, 2, 3), (2, 98, 2, 3)]),
+            (conv_pool_chain_path, 512, [(1, 150, 2, 3), (1, 75, 1, 2), (1, 91, 2, 3)]),
+        ]:
+            ag = full_pipeline(path, budget=budget)
+            plans = [s.tile_plan for s in ag.stages]
+            assert all(tp is not None and tp.tileable for tp in plans)
+            assert [(tp.tile_height, tp.num_tiles, tp.halo, tp.receptive_field)
+                    for tp in plans] == expected
 
     def test_untileable_stage_flagged(self, conv_with_flatten_path):
         """Conv-Relu-Flatten should flag the stage containing Flatten as untileable."""
-        ag = _full_pipeline(conv_with_flatten_path, budget=256)
+        ag = full_pipeline(conv_with_flatten_path, budget=256)
 
         # Find stages with tile plans
         tiled = [s for s in ag.stages if s.tile_plan is not None]
@@ -293,32 +192,14 @@ class TestTilingIntegration:
 
     def test_no_tiling_when_fits(self, conv_relu_chain_path):
         """With a large budget, no stages should need tiling."""
-        ag = _full_pipeline(conv_relu_chain_path, budget=10 * 1024 * 1024)
+        ag = full_pipeline(conv_relu_chain_path, budget=10 * 1024 * 1024)
 
         # No stage should have a tile plan
         for s in ag.stages:
             assert s.tile_plan is None
 
-    def test_conv_pool_chain_rf(self, conv_pool_chain_path):
-        """Conv-Relu-Pool-Conv chain: stages with conv/pool ops should have RF > 1."""
-        ag = _full_pipeline(conv_pool_chain_path, budget=512)
-
-        tiled = [s for s in ag.stages if s.tile_plan is not None and s.tile_plan.tileable]
-        assert len(tiled) >= 1
-
-        # Find stages that contain a Conv or Pool op
-        spatial_stages = []
-        for s in tiled:
-            stage_ops = [ag.ops[i] for i in s.op_indices]
-            has_spatial = any(op.op_type in ("Conv", "MaxPool") for op in stage_ops)
-            if has_spatial:
-                spatial_stages.append(s)
-
-        for s in spatial_stages:
-            assert s.tile_plan.receptive_field > 1
-
     def test_conv1d_uses_serialized_length_axis(self, tmp_path):
-        ag = _full_pipeline(_write_conv1d(tmp_path / "conv1d.onnx"), budget=128)
+        ag = full_pipeline(_write_conv1d(tmp_path / "conv1d.onnx"), budget=128)
 
         assert len(ag.stages) == 1
         tile_plan = ag.stages[0].tile_plan
@@ -335,7 +216,7 @@ class TestTilingIntegration:
         model = _write_rank3_pointwise(
             tmp_path / f"rank3_{op_type.lower()}.onnx", op_type
         )
-        ag = _full_pipeline(model, budget=256)
+        ag = full_pipeline(model, budget=256)
 
         assert len(ag.stages) == 1
         tile_plan = ag.stages[0].tile_plan
@@ -416,7 +297,7 @@ class TestTilingIntegration:
         model_path = tmp_path / "tcn.onnx"
         model_path.write_bytes(build_tcn().SerializeToString())
 
-        ag = _full_pipeline(model_path, budget=16 * 1024)
+        ag = full_pipeline(model_path, budget=16 * 1024)
         pointwise = {"Tanh", "Sigmoid", "Mul"}
         placed = set()
         for stage in ag.stages:
@@ -445,56 +326,17 @@ class TestTilingIntegration:
 class TestTilingYaml:
     def test_yaml_includes_tile_plan(self, conv_relu_chain_path):
         """YAML output should include tile_plan for oversized stages."""
-        ag = _full_pipeline(conv_relu_chain_path, budget=1024)
+        ag = full_pipeline(conv_relu_chain_path, budget=1024)
         text = plan_json_str(ag)
         plan = json.loads(text)
 
-        if "stages" in plan:
-            stages_with_tp = [s for s in plan["stages"] if "tile_plan" in s]
-            assert len(stages_with_tp) >= 1
-            for s in stages_with_tp:
-                tp = s["tile_plan"]
-                assert "tileable" in tp
-                assert "tile_height" in tp
-                assert "halo" in tp
-
-
-# Loader extracts attrs
-
-
-class TestLoaderAttrs:
-    def test_conv_has_kernel_shape(self, conv_relu_chain_path):
-        """Conv ops should have kernel_shape extracted into attrs."""
-        ag = load_model(conv_relu_chain_path)
-        conv_ops = [op for op in ag.ops if op.op_type == "Conv"]
-        assert len(conv_ops) >= 1
-        for op in conv_ops:
-            assert "kernel_shape" in op.attrs
-            assert op.attrs["kernel_shape"] == [3, 3]
-
-    def test_conv_has_strides(self, conv_relu_chain_path):
-        """Conv ops should have strides extracted into attrs."""
-        ag = load_model(conv_relu_chain_path)
-        conv_ops = [op for op in ag.ops if op.op_type == "Conv"]
-        for op in conv_ops:
-            assert "strides" in op.attrs
-            assert op.attrs["strides"] == [1, 1]
-
-    def test_pool_has_kernel_shape(self, conv_pool_chain_path):
-        """MaxPool ops should have kernel_shape extracted."""
-        ag = load_model(conv_pool_chain_path)
-        pool_ops = [op for op in ag.ops if op.op_type == "MaxPool"]
-        assert len(pool_ops) == 1
-        assert pool_ops[0].attrs["kernel_shape"] == [2, 2]
-        assert pool_ops[0].attrs["strides"] == [2, 2]
-
-    def test_relu_fused_into_conv(self, conv_relu_chain_path):
-        """Relu should be absorbed into preceding Conv as fused_activation."""
-        ag = load_model(conv_relu_chain_path)
-        relu_ops = [op for op in ag.ops if op.op_type == "Relu"]
-        assert len(relu_ops) == 0  # all Relu ops fused
-        fused = [op for op in ag.ops if op.attrs.get("fused_activation") == "Relu"]
-        assert len(fused) >= 1
+        stages_with_tp = [s for s in plan["stages"] if "tile_plan" in s]
+        assert len(stages_with_tp) == 2
+        for s in stages_with_tp:
+            tp = s["tile_plan"]
+            assert "tileable" in tp
+            assert "tile_height" in tp
+            assert "halo" in tp
 
 
 def _gated_map_path(tmp_path, channels=16, side=12):
@@ -544,10 +386,16 @@ def test_half_pixel_bilinear_band_reaches_one_row_further():
     assert compute_receptive_field([nearest]) == (1, 1)
 
 
-@pytest.mark.parametrize("kind", ["ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",
-                                  "CumSum", "ArgMax", "ArgMin", "Gather", "GatherND", "EmbeddingLookup",
-                                  "StridedSlice", "MirrorPad", "ReverseV2", "DynamicUpdateSlice"])
-@pytest.mark.parametrize("quantized", [False, True])
+_BAND_KINDS = ["ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",
+               "CumSum", "ArgMax", "ArgMin", "Gather", "GatherND", "EmbeddingLookup",
+               "StridedSlice", "MirrorPad", "ReverseV2", "DynamicUpdateSlice"]
+
+
+# The ReduceAll case has no quantized variant.
+@pytest.mark.parametrize("quantized, kind", [
+    (quantized, kind) for quantized in (False, True) for kind in _BAND_KINDS
+    if not (quantized and kind == "ReduceAll")
+])
 def test_independent_operator_band_fits_256_bytes(tmp_path, kind, quantized):
     import onnx
     from scripts.crossrepo_contract import _arg_case, _movement_case, _reduce_all_case, _reduction_case

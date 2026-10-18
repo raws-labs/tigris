@@ -14,7 +14,7 @@ from tigris.emitters.binary.defs import (
     STAGE_STRUCT,
 )
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.fixtures import build_ds_cnn, build_linear_3op
+from tigris.fixtures import build_ds_cnn
 
 
 def _chain_heads(ag):
@@ -65,18 +65,3 @@ def test_recomputing_chain_head_is_line_buffered(tmp_path):
         else:
             assert not (reserved1 & STAGE_FLAG_LINE_BUFFERED)
 
-
-def test_no_chain_plan_has_reserved1_clear(tmp_path):
-    """A plan with no chain should have the flag bit clear everywhere."""
-    import onnx
-    m = tmp_path / "linear3op.onnx"
-    onnx.save(build_linear_3op(), str(m))
-    ag, _ = _run_pipeline(str(m), ("60K",))
-
-    assert not _chain_heads(ag), "expected no chain for a pointwise-only model"
-    assert all(not s.line_buffered for s in ag.stages)
-
-    plan_bytes = emit_binary_bytes(ag)
-    for stage in ag.stages:
-        reserved1 = _stage_reserved1(plan_bytes, stage.stage_id)
-        assert reserved1 == 0

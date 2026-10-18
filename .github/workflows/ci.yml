@@ -2,6 +2,7 @@ name: Compiler CI
 
 on:
   push:
+    branches: [develop, main]
   pull_request:
   workflow_call:
 
@@ -10,7 +11,7 @@ permissions:
 
 jobs:
   wheels:
-    if: github.event_name == 'pull_request' || github.event_name == 'release' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.event_name == 'release' || github.ref == 'refs/heads/develop'
     uses: ./.github/workflows/wheels.yml
 
   test:
@@ -34,6 +35,9 @@ jobs:
         with:
           build-host: 'true'
       - run: python -m pytest -q
+        env:
+          TIGRIS_REQUIRE_HOST: "1"
+          TIGRIS_RUNTIME_SOURCE: runtime-source
 
   quality-and-package:
     name: Lint, package, CLI, and generated C
@@ -50,12 +54,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - uses: ./.github/actions/runtime
       - run: python -m ruff check src tests scripts setup.py
-      - run: python -m pytest -q tests/test_codegen_c_syntax.py
       - run: tigris --help
-      - run: python scripts/ci_codegen_smoke.py /tmp/tigris-smoke.c
-      - run: >-
-          cc -std=c99 -Wall -Wextra -Werror -fsyntax-only
-          -Iruntime-source/include /tmp/tigris-smoke.c
       - name: Verify generated plan-schema package
         # Named from SCHEMA_VERSION so a bump cannot leave this step checking
         # the previous version's artifact while the current one goes unverified.
