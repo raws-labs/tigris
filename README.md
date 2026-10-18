@@ -54,13 +54,14 @@ memory
   largest tensor      4.59 MiB   1x96x112x112
   this plan         252.00 KiB   4.00 KiB headroom
   slow memory         5.17 MiB
+  slow traffic       20.25 MiB   per inference: 7.21 MiB written, 13.04 MiB read
   also fits at      128.00 KiB   64 stages, 62 tiled
   also fits at       64.00 KiB   64 stages, 63 tiled
   does not fit at    32.00 KiB
 
 flash
-  plan           13.31 MiB   weights 13.30 MiB, overhead 9.41 KiB
-  as int8         3.34 MiB   estimate
+  plan           13.31 MiB   weights 13.30 MiB, overhead 8.22 KiB
+  as int8         3.33 MiB   estimate
   flash budget   16.00 MiB   fits
 ```
 
@@ -153,8 +154,9 @@ the stored axis order and declared interface dtype reported by `inspect`:
 tigris run downloaded-model/model.tgrs --input downloaded-model/example-input.bin --output prediction.bin
 ```
 
-Compare `prediction.bin` with `example-output.bin` numerically; the reference
-comes from ONNX Runtime, so float results differ in the last bits.
+Compare `prediction.bin` with `example-output.bin` numerically; the artifact's
+`readme.md` names the reference (TFLite Micro or ONNX Runtime) and how close the
+outputs must be.
 
 ```bash
 tigris run model.tgrs --input input.npy --output prediction.npy
