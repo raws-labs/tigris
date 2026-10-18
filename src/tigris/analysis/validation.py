@@ -225,6 +225,12 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         reasons.extend(_bool_and_sum_reasons(ag, op))
         quantized_op = any(ag.tensors[n].dtype == 3 for n in (*op.inputs, *op.outputs)
                            if n in ag.tensors and not ag.tensors[n].is_constant)
+        # The int8 products add an int32 bias to the accumulator; another
+        # dtype would be read as int32 bytes.
+        if (quantized_op and op.op_type in {"Conv", "DepthwiseConv", "Conv1D", "ConvTranspose", "Gemm"}
+                and len(op.inputs) >= 3 and op.inputs[2] in ag.weight_data
+                and ag.weight_data[op.inputs[2]].dtype != np.int32):
+            reasons.append(f"an int8 {op.op_type} needs an int32 bias")
         backend = "s8_ref" if quantized_op else "reference"
         if op.op_type not in effective_operators(backend):
             dtype = "int8" if quantized_op else "float32"
