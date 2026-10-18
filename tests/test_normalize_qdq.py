@@ -722,3 +722,71 @@ def test_int8_product_with_a_non_int32_bias_is_refused(tmp_path):
     result = validate_operator_support(ag)
     assert not result.supported
     assert "bias" in result.describe()
+
+
+def _qdq_linear_transposed_weight(tmp_path):
+    """PyTorch's nn.Linear in QDQ form: the weight is dequantized as [out, in]
+    and transposed before the Gemm."""
+    rng = np.random.default_rng(1)
+    w = rng.normal(0, 0.3, (4, 6)).astype(np.float32)
+    w_scale = (np.abs(w).max(axis=1) / 127).astype(np.float32)
+    w_q = np.clip(np.round(w / w_scale[:, None]), -127, 127).astype(np.int8)
+    b_scale = np.float32(0.02) * w_scale
+    initializers = [
+        numpy_helper.from_array(np.array(0.02, np.float32), "in_scale"),
+        numpy_helper.from_array(np.array(0, np.int8), "zp"),
+        numpy_helper.from_array(w_q, "w_q"),
+        numpy_helper.from_array(w_scale, "w_scale"),
+        numpy_helper.from_array(np.zeros(4, np.int8), "w_zp"),
+        numpy_helper.from_array(np.round(rng.normal(0, 0.5, 4) / b_scale).astype(np.int32), "b_q"),
+        numpy_helper.from_array(b_scale, "b_scale"),
+        numpy_helper.from_array(np.zeros(4, np.int32), "b_zp"),
+        numpy_helper.from_array(np.array(0.05, np.float32), "out_scale"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "in_scale", "zp"], ["in_q"]),
+        helper.make_node("DequantizeLinear", ["in_q", "in_scale", "zp"], ["in_dq"]),
+        helper.make_node("DequantizeLinear", ["w_q", "w_scale", "w_zp"], ["w_dq"], axis=0),
+        helper.make_node("Transpose", ["w_dq"], ["w_t"], perm=[1, 0]),
+        helper.make_node("DequantizeLinear", ["b_q", "b_scale", "b_zp"], ["b_dq"], axis=0),
+        helper.make_node("Gemm", ["in_dq", "w_t", "b_dq"], ["product"]),
+        helper.make_node("QuantizeLinear", ["product", "out_scale", "zp"], ["out_q"]),
+        helper.make_node("DequantizeLinear", ["out_q", "out_scale", "zp"], ["output"]),
+    ]
+    return save_onnx(
+        tmp_path, "qdq_linear", nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 6])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])],
+        initializers, opset=13, ir_version=8,
+    )
+
+
+def test_transposed_quantized_weight_folds_into_the_weight(tmp_path):
+    ag = load_model(_qdq_linear_transposed_weight(tmp_path))
+    assert [op.op_type for op in ag.ops] == ["Gemm"]
+    gemm = ag.ops[0]
+    weights = ag.weight_data[gemm.inputs[1]]
+    # Gemm weights are canonical [out, in], quantized per output channel.
+    assert weights.dtype == np.int8 and weights.shape == (4, 6)
+    assert ag.tensors[gemm.inputs[1]].quant.scale.size == 4
+
+
+@pytest.mark.usefixtures("require_host_library")
+def test_transposed_quantized_weight_matches_onnx_runtime(tmp_path):
+    import onnxruntime as ort
+
+    from tigris.cli import _run_pipeline
+    from tigris.runtime import Session
+
+    path = _qdq_linear_transposed_weight(tmp_path)
+    values = np.random.default_rng(5).uniform(-1, 1, (1, 6)).astype(np.float32)
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    expected = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]).run(
+        None, {"input": values})[0]
+    ag, _ = _run_pipeline(str(path), ("16K",), report_bindings=False)
+    binary = tmp_path / "linear.tgrs"
+    binary.write_bytes(emit_binary_bytes(ag))
+    with Session(binary) as session:
+        actual = session.run({"input": values})["output"]
+    assert np.abs(np.round((actual - expected) / 0.05)).max() <= 1
