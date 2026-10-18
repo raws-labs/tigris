@@ -114,15 +114,13 @@ def validate_execution_dtype(ag: AnalyzedGraph) -> ExecutionDTypeValidation:
         )
 
     if len(by_dtype) != 1:
-        details = ", ".join(
-            f"{labels[dtype]} ({', '.join(sorted(names))})"
-            for dtype, names in sorted(by_dtype.items())
-        )
+        # Float32 a Dequantize, If or While produces is a section and is not
+        # listed here; what remains is float32 an int8 plan cannot reach.
         return ExecutionDTypeValidation(
             dtype=None,
             issues=(
-                "mixed activation dtypes cannot use a graph-wide runtime "
-                f"dispatcher: {details}",
+                "float32 activations in an int8 plan must follow a Dequantize, "
+                f"If or While: {', '.join(sorted(by_dtype[_FLOAT32]))}",
             ),
         )
 
