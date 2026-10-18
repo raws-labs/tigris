@@ -15,8 +15,8 @@ from tigris.analysis.partition_spatial import (
     _stage_is_row_tiled,
 )
 from tigris.analysis.broadcast import DENSE, PERIODIC, stored_operands
-from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
-from tigris.emitters.binary.defs import OP_TYPE_MAP
+from tigris.capabilities import effective_operators
+from tigris.operator_contract import OPERATOR_CONTRACT
 from tigris.graph.ir import state_tensor_names
 from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.dtypes import check_dtype_signatures
@@ -176,25 +176,12 @@ class OperatorSupportValidation:
         return ", ".join(issue.describe() for issue in self.issues)
 
 
-def _routed_operators() -> frozenset[str]:
-    """Operators reachable through some runtime dispatcher, any backend.
-
-    Wire-encodability (OP_TYPE_MAP) and runtime routing (capabilities) are
-    two separate contracts. An op can be added to the binary schema before a
-    kernel exists for it; without this check the compiler would accept such
-    an op and only fail once the plan reaches a device.
-    """
-    return frozenset().union(
-        *(effective_operators(backend) for backend in KERNEL_CAPABILITIES)
-    )
-
-
 def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
     """Return operators or attributes not representable by the plan/runtime."""
     issues: list[UnsupportedOperatorIssue] = []
-    routed_operators = _routed_operators()
     for op in ag.ops:
-        if op.op_type not in OP_TYPE_MAP:
+        contract = OPERATOR_CONTRACT.get(op.op_type)
+        if contract is None:
             issues.append(
                 UnsupportedOperatorIssue(
                     op_name=op.name,
@@ -208,7 +195,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             )
             continue
 
-        if op.op_type not in routed_operators:
+        if not contract.backends and not contract.executor:
             issues.append(
                 UnsupportedOperatorIssue(
                     op_name=op.name,
