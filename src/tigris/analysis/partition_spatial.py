@@ -235,8 +235,9 @@ def compute_receptive_field(
 ) -> tuple[int, int]:
     """Compute the height and width receptive fields for a sequence of ops.
 
-    Walks the ops in reverse once, accumulating RF and jump (cumulative
-    stride) independently for the height and width axes.
+    Walks the ops in execution order once, accumulating RF and jump (the
+    product of the strides so far) independently for the height and width
+    axes: a kernel widens the field by its extent times the jump before it.
     Returns (rf_h, rf_w).
 
     For pointwise ops, RF and jump are unchanged on both axes.
@@ -251,7 +252,7 @@ def compute_receptive_field(
     rf_w = 1
     jump_w = 1
 
-    for op in reversed(ops):
+    for op in ops:
         cat = op_category(op)
         if cat is TileCategory.UPSAMPLE:
             # Measured in input rows, a nearest resample reads one row per

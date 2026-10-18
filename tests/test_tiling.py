@@ -170,7 +170,7 @@ class TestReceptiveField:
     def test_conv_stride2_pool(self):
         """Conv3x3(s=1) + MaxPool2x2(s=2) + Conv3x3(s=1), symmetric kernel/stride.
 
-        reversed: conv1(k=3,s=1): rf=3, j=1 -> pool(k=2,s=2): rf=4, j=2 -> conv0(k=3,s=1): rf=8, j=2
+        conv0(k=3,s=1): rf=3, j=1 -> pool(k=2,s=2): rf=4, j=2 -> conv1(k=3,s=1): rf=8, j=2
         Kernel and stride are symmetric across height/width, so rf_h == rf_w == 8.
         """
         ops = [
@@ -184,6 +184,25 @@ class TestReceptiveField:
         rf_h, rf_w = compute_receptive_field(ops)
         assert rf_h == 8
         assert rf_w == 8
+
+    @pytest.mark.parametrize("strides, expected", [((2, 1), 7), ((1, 2), 5)])
+    def test_stride_order(self, strides, expected):
+        """A stride multiplies the extent of every later kernel, so a stride-2
+        conv before a 3x3 conv reaches 7 input rows and after it only 5."""
+        ops = [OpNode(name=f"c{i}", op_type="Conv", inputs=[], outputs=[],
+                      attrs={"kernel_shape": [3, 3], "strides": [s, s]})
+               for i, s in enumerate(strides)]
+        assert compute_receptive_field(ops) == (expected, expected)
+
+    def test_stride_order_per_axis(self):
+        """Height and width keep their own strides."""
+        ops = [
+            OpNode(name="c0", op_type="Conv", inputs=[], outputs=[],
+                   attrs={"kernel_shape": [3, 3], "strides": [2, 1]}),
+            OpNode(name="c1", op_type="Conv", inputs=[], outputs=[],
+                   attrs={"kernel_shape": [3, 3], "strides": [1, 1]}),
+        ]
+        assert compute_receptive_field(ops) == (7, 5)
 
     def test_dilated_conv(self):
         """Conv3x3 with dilation=2: effective_k = 2*(3-1)+1 = 5, RF=5 on both axes."""
