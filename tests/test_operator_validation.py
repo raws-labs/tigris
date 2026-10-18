@@ -46,7 +46,7 @@ def acos_model_path(tmp_path):
 
 @pytest.fixture
 def mixed_dtype_model_path(tmp_path):
-    """One QDQ branch and one float branch cannot share one dispatcher."""
+    """A float branch that no Dequantize feeds cannot run in an int8 plan."""
     quant_input = helper.make_tensor_value_info(
         "quant_input", TensorProto.FLOAT, [1, 4]
     )
@@ -163,7 +163,10 @@ def test_mixed_activation_dtypes_are_never_reported_deployable(
     findings = compute_findings(graph)
 
     assert not validation.supported
-    assert "mixed activation dtypes" in validation.describe()
+    assert validation.issues == (
+        "float32 activations in an int8 plan must follow a Dequantize, If or "
+        "While: float_input, float_output",
+    )
     assert findings.verdict == "needs_work"
     assert findings.dtype_errors
     with pytest.raises(
