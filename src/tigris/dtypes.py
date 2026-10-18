@@ -2,29 +2,12 @@
 
 from dataclasses import dataclass
 
-from tigris.emitters.binary.defs import OP_TYPE_MAP
+from tigris.operator_contract import (
+    DTypeSignature, OP_DTYPE_SIGNATURES as OP_DTYPE_SIGNATURES,
+    DATA, DATA_OR_BOOL, STATE, DATA_OR_INT32, BOOL_OR_INT32,
+    CONTROL_FLOW_VALUE, FLOAT_OR_DATA,
+)
 
-
-DATA = 0
-DATA_OR_BOOL = 255
-# Data, or int16 on a tensor that holds state between runs.
-STATE = 254
-# Data, or int32 counters and indices; an operator's int32 slots go together.
-DATA_OR_INT32 = 253
-# Bool, or int32 a CAST turns into data.
-BOOL_OR_INT32 = 252
-# Data, int32, or float32 that control flow carries across an int8 plan's
-# subgraph boundary.
-CONTROL_FLOW_VALUE = 251
-# Float32, or data: a Quantize reads float32, or int8 it requantizes.
-FLOAT_OR_DATA = 250
-
-
-@dataclass(frozen=True)
-class DTypeSignature:
-    # The final slot repeats for variadic operators; semantic validation checks arity.
-    inputs: tuple[int, ...] = (DATA, DATA, DATA)
-    outputs: tuple[int, ...] = (DATA,)
 
 
 @dataclass(frozen=True)
@@ -36,36 +19,6 @@ class AuxiliaryDType:
 
 AUXILIARY_DTYPES = {6: AuxiliaryDType(False, requires_source=True), 9: AuxiliaryDType(False),
                     5: AuxiliaryDType(False, state_only=True)}
-OP_DTYPE_SIGNATURES = {kind: DTypeSignature() for kind in OP_TYPE_MAP}
-OP_DTYPE_SIGNATURES.update({
-    **{kind: DTypeSignature(inputs=(DATA, 6, 6))
-       for kind in ("Gather", "GatherND", "EmbeddingLookup")},
-    "DynamicUpdateSlice": DTypeSignature(inputs=(DATA, DATA, 6)),
-    "ArgMax": DTypeSignature(outputs=(6,)),
-    "ArgMin": DTypeSignature(outputs=(6,)),
-    **{kind: DTypeSignature(inputs=(DATA_OR_INT32,) * 3, outputs=(9,))
-       for kind in ("Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual")},
-    **{kind: DTypeSignature(inputs=(DATA_OR_INT32,) * 3, outputs=(DATA_OR_INT32,))
-       for kind in ("Add", "Sub", "Mul")},
-    "And": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
-    "Or": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
-    "Not": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
-    "Where": DTypeSignature(inputs=(9, DATA, DATA)),
-    "Cast": DTypeSignature(inputs=(BOOL_OR_INT32,) * 3),
-    "ReduceAll": DTypeSignature(inputs=(9, 9, 9), outputs=(9,)),
-    # Constant operands sit between the input and the state; slots skip them.
-    # The output role admits int16 only on the next state, a state tensor.
-    "Svdf": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
-    "Lstm": DTypeSignature(inputs=(DATA, STATE, STATE), outputs=(STATE,)),
-    "If": DTypeSignature(inputs=(9, CONTROL_FLOW_VALUE, CONTROL_FLOW_VALUE), outputs=(CONTROL_FLOW_VALUE,)),
-    # Float32 results in a float32 or an int8 plan, which no operator reads.
-    "DetectionPostProcess": DTypeSignature(outputs=(1,)),
-    "While": DTypeSignature(inputs=(CONTROL_FLOW_VALUE,) * 3, outputs=(CONTROL_FLOW_VALUE,)),
-    "Quantize": DTypeSignature(inputs=(FLOAT_OR_DATA,) * 3),
-    "Dequantize": DTypeSignature(outputs=(1,)),
-    **{kind: DTypeSignature(inputs=(DATA_OR_BOOL, DATA_OR_BOOL, DATA_OR_BOOL), outputs=(DATA_OR_BOOL,))
-       for kind in ("Transpose", "Reshape", "Flatten")},
-})
 
 
 _FLOAT_WRITERS = {"Dequantize", "If", "While"}

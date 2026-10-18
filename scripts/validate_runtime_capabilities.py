@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the compiler capability contract against runtime dispatch switches."""
+"""Check the runtime's operator tables and dispatch switches against the compiler."""
 
 from __future__ import annotations
 
@@ -8,8 +8,12 @@ import re
 from pathlib import Path
 
 from tigris.capabilities import EXECUTOR_OPERATORS, KERNEL_CAPABILITIES
-from tigris.dtypes import OP_DTYPE_SIGNATURES
-from tigris.emitters.binary.defs import OP_C_NAMES, OP_TYPE_MAP
+from tigris.operator_contract import OP_C_NAMES, OP_TYPE_MAP
+
+if __package__:
+    from .generate_operator_contract import render, render_config
+else:
+    from generate_operator_contract import render, render_config
 
 
 _ENUM_RE = re.compile(r"\b(TIGRIS_OP_[A-Z0-9_]+)\s*=\s*(\d+)\s*,")
@@ -45,66 +49,43 @@ def _opcodes(names: set[str], enum_values: dict[str, int]) -> set[int]:
 
 def validate(runtime: Path) -> list[str]:
     errors: list[str] = []
+    for name, content in (("tigris_op_contract.h", render()),
+                          ("tigris_op_config.h", render_config())):
+        path = runtime / "src" / name
+        try:
+            actual = path.read_text()
+        except OSError as exc:
+            errors.append(f"cannot read runtime operator contract {name}: {exc}")
+            continue
+        if actual != content:
+            errors.append(f"runtime operator contract {name} is stale")
+
     try:
         header = (runtime / "include/tigris.h").read_text()
-        enum_values = {name: int(value) for name, value in _ENUM_RE.findall(header)}
         sources = {
             "reference": (runtime / "src/tigris_kernels.c").read_text(),
             "s8_ref": (runtime / "src/tigris_kernels_s8.c").read_text(),
             "esp-nn": (runtime / "src/tigris_kernels_esp_nn.c").read_text(),
             "cmsis-nn": (runtime / "src/tigris_kernels_cmsis_nn.c").read_text(),
         }
+        executor = (runtime / "src/tigris_executor.c").read_text()
     except OSError as exc:
-        return [f"cannot read runtime capability source: {exc}"]
+        return errors + [f"cannot read runtime capability source: {exc}"]
 
-    expected_schema_codes = set(OP_TYPE_MAP.values())
-    runtime_schema_codes = set(enum_values.values()) - {255}
-    if runtime_schema_codes != expected_schema_codes:
-        errors.append(
-            "runtime/compiler opcode enums differ: "
-            f"runtime-only={sorted(runtime_schema_codes - expected_schema_codes)}, "
-            f"compiler-only={sorted(expected_schema_codes - runtime_schema_codes)}"
-        )
-
+    enum_values = {name: int(value) for name, value in _ENUM_RE.findall(header)}
     runtime_names = {value: name.removeprefix("TIGRIS_OP_")
                      for name, value in enum_values.items() if value != 255}
     if runtime_names != OP_C_NAMES:
         errors.append("runtime/compiler opcode names differ")
 
-    # Codegen's kernel selection header names these macros.
-    try:
-        config = (runtime / "src/tigris_op_config.h").read_text()
-    except OSError as exc:
-        errors.append(f"cannot read the runtime kernel selection header: {exc}")
-        config = ""
-    control_flow = {OP_TYPE_MAP["If"], OP_TYPE_MAP["While"]}
-    expected_macros = {"TIGRIS_KERNEL_I32"} | {
-        f"TIGRIS_KERNEL_{family}_{name}"
-        for code, name in OP_C_NAMES.items() if code not in control_flow
-        for family in ("F32", "S8")}
-    defined = set(re.findall(r"^#define (TIGRIS_KERNEL_[A-Z0-9_]+) TIGRIS_KERNEL_DEFAULT$",
-                             config, re.M))
-    if defined != expected_macros:
-        errors.append(
-            "runtime kernel selection macros differ from codegen's: "
-            f"runtime-only={sorted(defined - expected_macros)}, "
-            f"codegen-only={sorted(expected_macros - defined)}")
-
-    loader = (runtime / "src/tigris_loader.c").read_text()
-    rows = re.findall(r"\[(TIGRIS_OP_[A-Z0-9_]+)\] = \{\{(\d+), (\d+), (\d+)\}, (\d+)\}", loader)
-    actual_signatures = {enum_values[name]: (tuple(map(int, (a, b, c))), (int(out),))
-                         for name, a, b, c, out in rows}
-    expected_signatures = {OP_TYPE_MAP[name]: (signature.inputs, signature.outputs)
-                           for name, signature in OP_DTYPE_SIGNATURES.items()}
-    if actual_signatures != expected_signatures:
-        errors.append("runtime/compiler operator dtype signatures differ")
-
+    # The dispatch switches are written by hand, so the table cannot vouch for them.
     functions = {
         "reference": "tigris_dispatch_kernel",
         "s8_ref": "tigris_dispatch_kernel_s8",
         "esp-nn": "tigris_dispatch_kernel_esp_nn",
         "cmsis-nn": "tigris_dispatch_kernel_cmsis_nn",
     }
+    code_to_operator = {value: key for key, value in OP_TYPE_MAP.items()}
     for backend, function in functions.items():
         try:
             body = _function_body(sources[backend], function)
@@ -121,14 +102,12 @@ def validate(runtime: Path) -> list[str]:
             for operator in KERNEL_CAPABILITIES[backend].native_operators - EXECUTOR_OPERATORS
         }
         if actual != expected:
-            code_to_operator = {value: key for key, value in OP_TYPE_MAP.items()}
             errors.append(
                 f"{backend} dispatch differs from compiler capabilities: "
                 f"runtime-only={[code_to_operator[code] for code in sorted(actual - expected)]}, "
                 f"compiler-only={[code_to_operator[code] for code in sorted(expected - actual)]}"
             )
 
-    executor = (runtime / "src/tigris_executor.c").read_text()
     names = {value: name for name, value in enum_values.items()}
     for operator in sorted(EXECUTOR_OPERATORS):
         if names.get(OP_TYPE_MAP[operator], "?") not in executor:
