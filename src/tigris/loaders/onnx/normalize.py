@@ -74,6 +74,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_elementwise_patterns(ag)
     ag = _quantize_inputs_first(ag)
     ag = _fold_qdq(ag)
+    ag = _quantize_float_biases(ag)
     ag = _fold_float_square(ag)
     ag = _fold_gemm_scalars(ag)
     ag = _relabel_matmul_to_gemm(ag)
@@ -1586,6 +1587,61 @@ def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag.ops = [op for op in ag.ops if not removed.intersection(op.outputs)]
     for name in removed:
         ag.tensors.pop(name, None)
+    return ag
+
+
+def _quantize_float_biases(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Restate a float32 bias of an int8 Conv, ConvTranspose or Gemm as int32.
+
+    The int8 kernels add an int32 bias to the accumulator, whose scale is the
+    input scale times the weight scale of each output channel. ONNX QDQ models
+    from PyTorch's quantizers leave the bias in float32 with no
+    DequantizeLinear, so it is rounded to that scale here, as the TFLite
+    converter does. A bias this cannot express is left as it is and refused by
+    validation.
+    """
+    consumers: dict[str, int] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            consumers[name] = consumers.get(name, 0) + 1
+    for op in ag.ops:
+        if op.op_type not in {"Conv", "ConvTranspose", "Gemm"} or len(op.inputs) < 3:
+            continue
+        bias_name, weight_name = op.inputs[2], op.inputs[1]
+        bias = ag.weight_data.get(bias_name)
+        weights = ag.weight_data.get(weight_name)
+        x_info = ag.tensors.get(op.inputs[0])
+        w_info = ag.tensors.get(weight_name)
+        if (bias is None or bias.dtype != np.float32 or weights is None
+                or weights.dtype != np.int8 or x_info is None or x_info.dtype != 3
+                or x_info.quant is None or x_info.quant.scale.size != 1
+                or w_info is None or w_info.quant is None):
+            continue
+        channels = bias.size
+        w_scale = np.asarray(w_info.quant.scale, np.float64).reshape(-1)
+        if w_scale.size not in (1, channels):
+            continue
+        if w_scale.size > 1:
+            # The per-channel scale has to run along the output channels.
+            out_axis = {"Conv": 0, "ConvTranspose": 1}.get(
+                op.op_type, 0 if op.attrs.get("transB", 0) else weights.ndim - 1)
+            if w_info.quant.axis % weights.ndim != out_axis:
+                continue
+        scale = float(x_info.quant.scale.reshape(-1)[0]) * np.broadcast_to(w_scale, (channels,))
+        if np.any(scale <= 0) or not np.all(np.isfinite(bias)):
+            continue
+        quantized = np.round(bias.astype(np.float64).reshape(-1) / scale)
+        if np.any(np.abs(quantized) > np.iinfo(np.int32).max):
+            continue
+        target = bias_name
+        if consumers.get(bias_name, 0) > 1:
+            target = f"{bias_name}__int32_{op.name or len(ag.weight_data)}"
+            op.inputs[2] = target
+        ag.weight_data[target] = quantized.astype(np.int32).reshape(bias.shape)
+        ag.tensors[target] = TensorInfo(
+            name=target, shape=tuple(bias.shape), dtype=6, is_constant=True,
+            quant=QuantParam(scale=scale.astype(np.float32),
+                             zero_point=np.zeros(channels, dtype=np.int32), axis=0))
     return ag
 
 

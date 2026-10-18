@@ -626,3 +626,99 @@ def test_float_only_kernel_between_quantized_tensors(tmp_path):
     with Session(binary) as session:
         actual = session.run({"input": np.zeros((1, 4), dtype=np.float32)})["output"]
     np.testing.assert_array_equal(actual, [[1.0, 1.0]])
+
+
+def _qdq_float_bias_model(tmp_path, op_type):
+    """An int8 QDQ Conv or Gemm whose bias is a plain float32 initializer, as
+    PyTorch's PT2E quantizers export it."""
+    rng = np.random.default_rng(7)
+    if op_type == "Conv":
+        x_shape, out_shape, w = [1, 3, 6, 6], [1, 4, 6, 6], rng.normal(0, 0.3, (4, 3, 3, 3))
+        attrs = {"pads": [1, 1, 1, 1]}
+    else:
+        x_shape, out_shape, w = [1, 6], [1, 4], rng.normal(0, 0.3, (4, 6))
+        attrs = {"transB": 1}
+    w = w.astype(np.float32)
+    w_scale = (np.abs(w.reshape(4, -1)).max(axis=1) / 127).astype(np.float32)
+    w_q = np.clip(np.round(w / w_scale.reshape([4] + [1] * (w.ndim - 1))), -127, 127).astype(np.int8)
+    initializers = [
+        numpy_helper.from_array(np.array(0.02, np.float32), "in_scale"),
+        numpy_helper.from_array(np.array(0, np.int8), "zp"),
+        numpy_helper.from_array(w_q, "w_q"),
+        numpy_helper.from_array(w_scale, "w_scale"),
+        numpy_helper.from_array(np.zeros(4, np.int8), "w_zp"),
+        numpy_helper.from_array(rng.normal(0, 0.5, 4).astype(np.float32), "bias"),
+        numpy_helper.from_array(np.array(0.05, np.float32), "out_scale"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "in_scale", "zp"], ["in_q"]),
+        helper.make_node("DequantizeLinear", ["in_q", "in_scale", "zp"], ["in_dq"]),
+        helper.make_node("DequantizeLinear", ["w_q", "w_scale", "w_zp"], ["w_dq"], axis=0),
+        helper.make_node(op_type, ["in_dq", "w_dq", "bias"], ["product"], **attrs),
+        helper.make_node("QuantizeLinear", ["product", "out_scale", "zp"], ["out_q"]),
+        helper.make_node("DequantizeLinear", ["out_q", "out_scale", "zp"], ["output"]),
+    ]
+    return save_onnx(
+        tmp_path, f"qdq_{op_type.lower()}_float_bias", nodes,
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, x_shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shape)],
+        initializers, opset=13, ir_version=8,
+    )
+
+
+@pytest.mark.parametrize("op_type", ["Conv", "Gemm"])
+def test_float_bias_of_an_int8_product_becomes_int32(tmp_path, op_type):
+    """The int8 kernels add an int32 bias at the accumulator scale, so a float
+    bias is quantized to it, rounding as the TFLite converter does."""
+    path = _qdq_float_bias_model(tmp_path, op_type)
+    raw = onnx.load(path)
+    bias = numpy_helper.to_array(next(t for t in raw.graph.initializer if t.name == "bias"))
+    w_scale = numpy_helper.to_array(next(t for t in raw.graph.initializer if t.name == "w_scale"))
+    ag = load_model(path)
+    product = next(op for op in ag.ops if op.op_type == op_type)
+    stored = ag.weight_data[product.inputs[2]]
+    assert stored.dtype == np.int32
+    scale = np.float64(0.02) * w_scale.astype(np.float64)
+    np.testing.assert_array_equal(stored.reshape(-1), np.round(bias / scale).astype(np.int32))
+    quant = ag.tensors[product.inputs[2]].quant
+    np.testing.assert_allclose(quant.scale, scale.astype(np.float32))
+    assert ag.tensors[product.inputs[2]].dtype == 6
+
+
+@pytest.mark.usefixtures("require_host_library")
+@pytest.mark.parametrize("op_type", ["Conv", "Gemm"])
+def test_float_bias_of_an_int8_product_matches_onnx_runtime(tmp_path, op_type):
+    import onnxruntime as ort
+
+    from tigris.cli import _run_pipeline
+    from tigris.runtime import Session
+
+    path = _qdq_float_bias_model(tmp_path, op_type)
+    rng = np.random.default_rng(3)
+    shape = [1, 3, 6, 6] if op_type == "Conv" else [1, 6]
+    values = rng.uniform(-1, 1, shape).astype(np.float32)
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    expected = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]).run(
+        None, {"input": values})[0]
+    ag, _ = _run_pipeline(str(path), ("16K",), report_bindings=False)
+    binary = tmp_path / "float_bias.tgrs"
+    binary.write_bytes(emit_binary_bytes(ag))
+    stored = np.transpose(values, (0, 2, 3, 1)) if op_type == "Conv" else values
+    with Session(binary) as session:
+        actual = session.run({"input": np.ascontiguousarray(stored)})["output"]
+    if op_type == "Conv":
+        actual = np.transpose(actual, (0, 3, 1, 2))
+    assert np.abs(np.round((actual - expected) / 0.05)).max() <= 1
+
+
+def test_int8_product_with_a_non_int32_bias_is_refused(tmp_path):
+    from tigris.analysis.validation import validate_operator_support
+
+    ag = load_model(_qdq_float_bias_model(tmp_path, "Conv"))
+    conv = next(op for op in ag.ops if op.op_type == "Conv")
+    ag.weight_data[conv.inputs[2]] = ag.weight_data[conv.inputs[2]].astype(np.float32)
+    ag.tensors[conv.inputs[2]].dtype = 1
+    result = validate_operator_support(ag)
+    assert not result.supported
+    assert "bias" in result.describe()
