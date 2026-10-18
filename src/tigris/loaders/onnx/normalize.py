@@ -40,6 +40,7 @@ from dataclasses import replace
 
 import numpy as np
 
+from tigris.capabilities import effective_operators
 from tigris.analysis.broadcast import DENSE, GENERAL, PERIODIC, stored_operands
 from tigris.graph.ir import (
     AnalyzedGraph,
@@ -81,7 +82,6 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_sub_constant_to_add(ag)
     ag = _fold_div_constant_to_mul(ag)
     ag = _quantize_uniform_constants(ag)
-    ag = _fold_constant_add_into_bias(ag)
     ag = _fold_channel_bias_add(ag)
     ag = _decompose_silu(ag)
     ag = _explicit_auto_pad(ag)
@@ -209,6 +209,11 @@ def _quantize_uniform_constants(ag: AnalyzedGraph) -> AnalyzedGraph:
     """
     if not ag.is_quantized:
         return ag
+    float_constants = {name for op in ag.ops
+                       if any(n in ag.tensors and not ag.tensors[n].is_constant
+                              and ag.tensors[n].dtype == 1 for n in op.inputs)
+                       for name in op.inputs if name in ag.weight_data}
+    encoded_constants: dict[str, str] = {}
     for op in ag.ops:
         if op.op_type not in ("Add", "Mul") or len(op.inputs) != 2:
             continue
@@ -222,6 +227,20 @@ def _quantize_uniform_constants(ag: AnalyzedGraph) -> AnalyzedGraph:
         first = float(value.reshape(-1)[0])
         if not np.all(value == value.reshape(-1)[0]) or not np.isfinite(first):
             continue
+        if name in float_constants:
+            encoded = encoded_constants.get(name)
+            if encoded is not None:
+                op.inputs = [encoded if n == name else n for n in op.inputs]
+                continue
+            encoded = f"{name}_int8"
+            suffix = 0
+            while encoded in ag.tensors or encoded in ag.weight_data:
+                suffix += 1
+                encoded = f"{name}_int8_{suffix}"
+            encoded_constants[name] = encoded
+            op.inputs = [encoded if n == name else n for n in op.inputs]
+            name, info = encoded, replace(info, name=encoded)
+            ag.tensors[name] = info
         scale = np.float32(abs(first) / 127.0) if first != 0.0 else np.float32(1.0)
         level = 0 if first == 0.0 else (127 if first > 0 else -127)
         ag.weight_data[name] = np.full(value.shape, level, dtype=np.int8)
@@ -1661,7 +1680,7 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
        QuantParam on the weight TensorInfo, keeps raw int8 data.
     3. For QuantizeLinear on activations: extracts scale/zp, stores
        QuantParam on the quantized tensor, sets dtype to INT8.
-    4. Removes all Q/DQ ops and rewires connections.
+    4. Retains conversions at float sections and folds encoded operator edges.
     5. Sets ag.is_quantized = True.
     """
     qdq_types = {"QuantizeLinear", "DequantizeLinear"}
@@ -1681,7 +1700,114 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         for pos, inp in enumerate(op.inputs):
             input_to_consumers.setdefault(inp, []).append((i, pos))
 
+    # Operators with unencoded operands or results retain their float arithmetic.
+    encoded = {op.inputs[0] for op in ag.ops if op.op_type == "QuantizeLinear"}
+    binary = {"Add", "Sub", "Mul", "Div", "PRelu", "Max", "Min",
+              "SquaredDifference", "FloorDiv", "FloorMod"}
+    float_only = effective_operators("reference") - effective_operators("s8_ref")
+    float_required = {i for i, op in enumerate(ag.ops) if op.op_type in float_only}
+    float_required.update(output_to_op[n] for n in ag.model_outputs
+                          if n in output_to_op and ag.tensors[n].dtype == 1)
+    pending = list(float_required)
+    while pending:
+        index = pending.pop()
+        if ag.ops[index].op_type in qdq_types:
+            continue
+        for name in ag.ops[index].inputs:
+            parent = output_to_op.get(name)
+            if parent is not None and parent not in float_required:
+                float_required.add(parent)
+                pending.append(parent)
+
+    def float_constant_boundary(op):
+        constants = [n for n in op.inputs if n in ag.weight_data
+                     and ag.weight_data[n].dtype == np.float32]
+        if (op.op_type not in binary or not constants
+                or not any(n in output_to_op and
+                           ag.ops[output_to_op[n]].op_type == "DequantizeLinear"
+                           and ag.ops[output_to_op[n]].inputs[0] not in ag.weight_data
+                           for n in op.inputs)):
+            return False
+        if any(output_to_op.get(n) in float_required for n in op.outputs):
+            return True
+        # Sub and Div with a right-hand constant lower to Add and Mul.
+        lowerable = op.op_type in {"Add", "Mul"} or (
+            op.op_type in {"Sub", "Div"} and len(op.inputs) == 2 and op.inputs[1] in constants)
+        if not lowerable or len(constants) != 1 or len(op.inputs) != 2:
+            return True
+        value = ag.weight_data[constants[0]]
+        if value.size == 0 or not np.all(np.isfinite(value)):
+            return True
+        if op.op_type == "Div":
+            if np.any(value == 0.0):
+                return True
+            value = (1.0 / value.astype(np.float64)).astype(np.float32)
+        return not (np.all(np.isfinite(value)) and np.all(value == value.reshape(-1)[0]))
+    integer_ops = {i for i, op in enumerate(ag.ops)
+                   if op.op_type not in qdq_types | float_only and any(n in encoded for n in op.outputs)
+                   and not float_constant_boundary(op)}
+    pending = list(integer_ops)
+    while pending:
+        for name in ag.ops[pending.pop()].inputs:
+            parent = output_to_op.get(name)
+            if (parent is not None and parent not in integer_ops
+                    and ag.ops[parent].op_type not in qdq_types | float_only
+                    and not float_constant_boundary(ag.ops[parent])):
+                integer_ops.add(parent)
+                pending.append(parent)
+    float_ops: set[int] = set()
+    for i, op in enumerate(ag.ops):
+        if op.op_type in qdq_types:
+            continue
+        unencoded_constant = float_constant_boundary(op)
+        from_dequantize = any(n in output_to_op and
+                             ag.ops[output_to_op[n]].op_type == "DequantizeLinear" and
+                             ag.ops[output_to_op[n]].inputs[0] not in ag.weight_data
+                             for n in op.inputs)
+        from_section = any(output_to_op.get(n) in float_ops and n in ag.tensors
+                           and ag.tensors[n].dtype == 1 for n in op.inputs)
+        float_output = any(n in ag.tensors and ag.tensors[n].dtype == 1 for n in op.outputs)
+        typed = {"ArgMax", "ArgMin", "Cast", "DetectionPostProcess", "If", "While",
+                 "Quantize", "Dequantize", "Svdf", "Lstm"}
+        if (op.op_type not in typed and float_output
+                and (unencoded_constant or from_section or (from_dequantize and i not in integer_ops))):
+            float_ops.add(i)
+    float_results = {n for i in float_ops for n in ag.ops[i].outputs}
+
     removed: set[int] = set()
+
+    def bypass_dql(index: int, source: str, *, constant: bool = False):
+        dql = ag.ops[index]
+        target = dql.outputs[0]
+        deferred_cleanup.update(n for n in dql.inputs[1:] if n)
+        keep = any(c in float_ops for c, _ in input_to_consumers.get(target, []))
+        for consumer, position in input_to_consumers.get(target, []):
+            if consumer not in float_ops:
+                ag.ops[consumer].inputs[position] = source
+        if keep and constant:
+            quant = ag.tensors[source].quant
+            raw = ag.weight_data[source].astype(np.float64)
+            shape = [1] * raw.ndim
+            if quant.scale.size > 1:
+                shape[quant.axis] = quant.scale.size
+            scale = quant.scale.reshape(shape) if quant.scale.size > 1 else quant.scale[0]
+            zero = quant.zero_point.reshape(shape) if quant.zero_point.size > 1 else quant.zero_point[0]
+            ag.weight_data[target] = ((raw - zero) * scale).astype(np.float32)
+            ag.tensors[target] = TensorInfo(name=target, shape=tuple(raw.shape), dtype=1, is_constant=True)
+        elif keep:
+            dql.op_type = "Dequantize"
+            dql.inputs = [source]
+            ag.tensors[target].dtype = 1
+            ag.tensors[target].quant = None
+        if not keep or constant:
+            removed.add(index)
+        if not keep:
+            if target in ag.model_outputs:
+                ag.model_outputs = [source if n == target else n for n in ag.model_outputs]
+            if target != source:
+                ag.tensors.pop(target, None)
+        deferred_cleanup.update(n for n in dql.inputs[1:] if n)
+
     # A scale or zero point may be shared by a weight pair and an activation
     # pair. Deleting it as soon as the weight pair is folded leaves the
     # activation pairs with no parameters to read, so every removal waits until
@@ -1739,8 +1865,6 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         dql_input = op.inputs[0]
-        dql_output = op.outputs[0]
-
         # Check if the input is a weight (constant/initializer)
         is_weight_dql = False
 
@@ -1759,15 +1883,7 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 ag.tensors[dql_input].quant = qp
                 ag.tensors[dql_input].dtype = 3  # INT8
 
-            # Rewire: all consumers of DQL output now read the weight directly
-            for cons_idx, pos in input_to_consumers.get(dql_output, []):
-                ag.ops[cons_idx].inputs[pos] = dql_input
-
-            # Remove intermediate tensor
-            if dql_output in ag.tensors and dql_output != dql_input:
-                del ag.tensors[dql_output]
-
-            removed.add(i)
+            bypass_dql(i, dql_input, constant=True)
 
         # Case 2: QuantizeLinear -> DequantizeLinear on a weight
         elif dql_input in output_to_op:
@@ -1808,16 +1924,8 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                     ag.tensors[original_weight].dtype = 3  # INT8
                     ag.tensors[original_weight].quant = qp
 
-                # Rewire consumers of DQL output to the original weight
-                for cons_idx, pos in input_to_consumers.get(dql_output, []):
-                    ag.ops[cons_idx].inputs[pos] = original_weight
-
-                # Remove intermediate tensors
-                for tname in [dql_input, dql_output]:
-                    if tname in ag.tensors and tname != original_weight:
-                        del ag.tensors[tname]
-
-                removed.add(i)
+                bypass_dql(i, original_weight, constant=True)
+                ag.tensors.pop(dql_input, None)
                 removed.add(ql_idx)
 
         # Case 3: a quantized model input -> DequantizeLinear. The input keeps
@@ -1839,13 +1947,10 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
             qp, _ = _get_quant_param(op)
             if qp is not None:
                 is_boundary_dql = True
+                ag.is_quantized = True
                 ag.tensors[dql_input].quant = qp
                 ag.tensors[dql_input].dtype = 3  # INT8
-                for cons_idx, pos in input_to_consumers.get(dql_output, []):
-                    ag.ops[cons_idx].inputs[pos] = dql_input
-                if dql_output in ag.tensors and dql_output != dql_input:
-                    del ag.tensors[dql_output]
-                removed.add(i)
+                bypass_dql(i, dql_input)
 
         if is_weight_dql or is_boundary_dql:
             for inp_name in op.inputs[1:]:
@@ -1877,23 +1982,16 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         # encoding; a different one is a requantization of its own, which
         # writes the QuantizeLinear's output as an int8 tensor.
         source = ag.tensors.get(ql_input)
-        if (source is not None and source.quant is not None and source.dtype == 3
-                and not _same_quant(source.quant, qp)):
+        if (source is not None and (ql_input in float_results or (
+                source.quant is not None and source.dtype == 3
+                and not _same_quant(source.quant, qp)))):
             ag.tensors[ql_output] = TensorInfo(name=ql_output, shape=source.shape, dtype=3, quant=qp)
             requantize = OpNode(name=op.name, op_type="Quantize", inputs=[ql_input],
                                 outputs=[ql_output], step=op.step)
             requantized.append((i, requantize))
             for dql_idx in [c for c, _ in input_to_consumers.get(ql_output, [])
                             if ag.ops[c].op_type == "DequantizeLinear"]:
-                dql_output = ag.ops[dql_idx].outputs[0]
-                for cons_idx, pos in input_to_consumers.get(dql_output, []):
-                    ag.ops[cons_idx].inputs[pos] = ql_output
-                if dql_output in ag.model_outputs:
-                    ag.model_outputs = [ql_output if n == dql_output else n for n in ag.model_outputs]
-                if dql_output in ag.tensors and dql_output != ql_output:
-                    del ag.tensors[dql_output]
-                removed.add(dql_idx)
-                deferred_cleanup.update(name for name in ag.ops[dql_idx].inputs[1:] if name)
+                bypass_dql(dql_idx, ql_output)
             removed.add(i)
             deferred_cleanup.update(name for name in op.inputs[1:] if name)
             continue
@@ -1910,29 +2008,7 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 dql_indices.append(cons_idx)
 
         for dql_idx in dql_indices:
-            dql_op = ag.ops[dql_idx]
-            dql_output = dql_op.outputs[0]
-
-            # Rewire: consumers of DQL output now read the original activation
-            for cons_idx, pos in input_to_consumers.get(dql_output, []):
-                ag.ops[cons_idx].inputs[pos] = ql_input
-
-            # If this DQL output is a model output, update to point to ql_input
-            if dql_output in ag.model_outputs:
-                ag.model_outputs = [
-                    ql_input if n == dql_output else n for n in ag.model_outputs
-                ]
-
-            # Remove DQL intermediate tensor
-            if dql_output in ag.tensors and dql_output != ql_input:
-                del ag.tensors[dql_output]
-
-            removed.add(dql_idx)
-
-            # Defer DQL scale/zp cleanup
-            for inp_name in dql_op.inputs[1:]:
-                if inp_name:
-                    deferred_cleanup.add(inp_name)
+            bypass_dql(dql_idx, ql_input)
 
         # A graph output taken straight off the QuantizeLinear moves onto the
         # tensor it quantizes, which now carries the parameters. The declared
@@ -2558,103 +2634,6 @@ def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _fold_constant_add_into_bias(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Turn a constant Add after a quantized producer into that producer's bias.
-
-    A quantizer that leaves MatMul and its bias unfused writes the bias as a
-    float Add reading the dequantized product, which is the one form the
-    runtime cannot execute: a constant operand carries no scale or zero point
-    in the plan, so a quantized Add fails closed on it. Requantizing the
-    constant to the product's own int32 domain is how every quantized Gemm
-    already carries its bias.
-
-    Only the quantized case is folded. A float graph executes the Add as
-    written, so there is nothing to recover there.
-    """
-    output_to_op: dict[str, int] = {}
-    for i, op in enumerate(ag.ops):
-        for out in op.outputs:
-            output_to_op[out] = i
-
-    consumers: dict[str, list[int]] = {}
-    for i, op in enumerate(ag.ops):
-        for inp in op.inputs:
-            consumers.setdefault(inp, []).append(i)
-
-    removed: set[int] = set()
-
-    for i, op in enumerate(ag.ops):
-        if op.op_type != "Add" or len(op.inputs) != 2:
-            continue
-        constants = [n for n in op.inputs if n in ag.weight_data]
-        if len(constants) != 1:
-            continue
-        bias_name = constants[0]
-        product = next(n for n in op.inputs if n != bias_name)
-
-        producer_idx = output_to_op.get(product)
-        if producer_idx is None or producer_idx in removed:
-            continue
-        producer = ag.ops[producer_idx]
-        if producer.op_type not in _BIAS_PRODUCERS or len(producer.inputs) != 2:
-            continue
-        if consumers.get(product, []) != [i]:
-            continue
-
-        product_info = ag.tensors.get(product)
-        weight_info = ag.tensors.get(producer.inputs[1])
-        if product_info is None or weight_info is None:
-            continue
-        if product_info.quant is None or weight_info.quant is None:
-            continue
-        input_info = ag.tensors.get(producer.inputs[0])
-        if input_info is None or input_info.quant is None:
-            continue
-
-        bias = ag.weight_data[bias_name]
-        if bias.dtype != np.float32:
-            continue
-        channels = product_info.shape[-1] if product_info.shape else 0
-        if bias.size != channels:
-            continue
-
-        # The int32 bias lives in the product's own accumulator domain, which
-        # is the input scale times the weight scale, per channel where the
-        # weights are.
-        bias_scale = (
-            input_info.quant.scale.reshape(-1) * weight_info.quant.scale.reshape(-1)
-        )
-        if bias_scale.size not in (1, bias.size):
-            continue
-        quantized = np.round(bias.reshape(-1) / bias_scale).astype(np.int64)
-        if np.any(np.abs(quantized) > np.iinfo(np.int32).max):
-            continue
-
-        ag.weight_data[bias_name] = quantized.astype(np.int32)
-        if bias_name in ag.tensors:
-            ag.tensors[bias_name].dtype = 6  # INT32
-        producer.inputs.append(bias_name)
-
-        # The product's encoding becomes the model's: keep the Add's output
-        # name so the plan still names what the model named, and give it the
-        # product's dtype and quantization.
-        result = op.outputs[0]
-        result_info = ag.tensors.get(result)
-        if result_info is not None:
-            result_info.dtype = product_info.dtype
-            result_info.quant = product_info.quant
-        producer.outputs = [result]
-        del ag.tensors[product]
-        removed.add(i)
-
-    if removed:
-        ag.ops = [op for idx, op in enumerate(ag.ops) if idx not in removed]
-        for step, op in enumerate(ag.ops):
-            op.step = step
-
-    return ag
-
-
 def _axis_broadcast_size(
     constant_shape: tuple[int, ...],
     reference_shape: tuple[int, ...],
@@ -2720,8 +2699,7 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
     broadcasting it cannot do, even though the producer already has a bias slot
     holding exactly this quantity. Adding into that slot is exact for float.
 
-    The quantized form is handled by _fold_constant_add_into_bias, which has to
-    requantize into the accumulator domain. Here the bias is already float.
+    A Dequantize between the product and Add prevents folding across rounding.
     """
     output_to_op: dict[str, int] = {}
     for i, op in enumerate(ag.ops):

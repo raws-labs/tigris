@@ -5153,19 +5153,60 @@ def _qdq_add_relu_case() -> ContractCase:
     )
 
 
-def _qdq_gemm_bias_add_case() -> ContractCase:
-    """A quantized Gemm whose bias arrives as an unfused float Add.
+def _qdq_float_section_case(kind: str, terminal: bool, *, tiled: bool = False) -> ContractCase:
+    T = TensorProto
+    def q(name, s, zp=0, dt=np.int8):
+        return [numpy_helper.from_array(np.array(s, np.float32), name + "_s"),
+                numpy_helper.from_array(np.array(zp, dt), name + "_z")]
+    def qdq(x, name):
+        return [helper.make_node("QuantizeLinear", [x, name + "_s", name + "_z"], [x + "_q"]),
+                helper.make_node("DequantizeLinear", [x + "_q", name + "_s", name + "_z"], [x + "_dq"])]
+    def build(kind, terminal):
+        rng = np.random.default_rng(0)
+        inits = q("io", 0.25) + q("w", 0.05) + q("o2", 0.25)
+        if kind == "gemm":
+            X = helper.make_tensor_value_info("input", T.FLOAT, [1, 16])
+            w = rng.integers(-60, 60, (8, 16)).astype(np.int8)
+            prod = [helper.make_node("Gemm", ["input_dq", "w_dq"], ["p"], transB=1)]
+            bias = rng.normal(0, 1, 8).astype(np.float32)
+            oshape = [1, 8]
+        else:
+            X = helper.make_tensor_value_info("input", T.FLOAT, [1, 4, 8, 8])
+            w = rng.integers(-60, 60, (8, 4, 3, 3)).astype(np.int8)
+            prod = [helper.make_node("Conv", ["input_dq", "w_dq"], ["p"], pads=[1, 1, 1, 1])]
+            bias = rng.normal(0, 1, (1, 8, 1, 1)).astype(np.float32)
+            oshape = [1, 8, 8, 8]
+        inits += [numpy_helper.from_array(w, "wq"), numpy_helper.from_array(bias, "b")]
+        nodes = qdq("input", "io") + [helper.make_node("DequantizeLinear", ["wq", "w_s", "w_z"], ["w_dq"])] + prod + qdq("p", "io")
+        nodes.append(helper.make_node("Add", ["p_dq", "b"], ["a" if not terminal else "output"]))
+        if not terminal:
+            nodes += [helper.make_node("QuantizeLinear", ["a", "o2_s", "o2_z"], ["a_q"]),
+                      helper.make_node("DequantizeLinear", ["a_q", "o2_s", "o2_z"], ["a_dq"]),
+                      helper.make_node("Relu", ["a_dq"], ["r"]),
+                      helper.make_node("QuantizeLinear", ["r", "o2_s", "o2_z"], ["r_q"]),
+                      helper.make_node("DequantizeLinear", ["r_q", "o2_s", "o2_z"], ["output"])]
+        Y = helper.make_tensor_value_info("output", T.FLOAT, oshape)
+        m = helper.make_model(helper.make_graph(nodes, "g", [X], [Y], inits), opset_imports=[helper.make_opsetid("", 17)])
+        m.ir_version = 8
+        onnx.checker.check_model(m)
+        return m
 
-    A quantizer that does not fuse the classifier bias writes it as an Add on
-    the dequantized product, which the runtime cannot execute: a constant
-    operand carries no scale or zero point. The compiler requantizes the
-    constant into the product's int32 accumulator domain and hands it to the
-    operator as a bias, so the plan ends at the product's own int8 encoding
-    rather than the float the ONNX graph declares. The reference model
-    quantizes its float result with the same scale to compare on that footing.
-    Bias values are exact multiples of the bias scale, so the fold itself
-    introduces no rounding.
-    """
+    model = build(kind, terminal)
+    shape = [1, 16] if kind == "gemm" else [1, 4, 8, 8]
+    values = np.random.default_rng(8041).normal(size=shape).astype(np.float32)
+    operators = ("Gemm" if kind == "gemm" else "Conv", "Dequantize", "Add")
+    if not terminal:
+        operators += ("Quantize", "Relu")
+    return ContractCase(
+        f"qdq_{kind}_{'terminal' if terminal else 'inner'}_float_section{'_tiled' if tiled else ''}",
+        model, model, {"input": values}, operators,
+        mem_budget="512" if tiled else "128K", slow_budget="8M",
+        expect_tiled=tiled, expect_chain=tiled, expect_line_buffered=tiled, reference_unoptimized=True,
+    )
+
+
+def _qdq_gemm_bias_add_case() -> ContractCase:
+    """A float Add executes after the product rounds and clips."""
     model_input = helper.make_tensor_value_info(
         "input", TensorProto.FLOAT, [1, 4]
     )
@@ -5226,7 +5267,7 @@ def _qdq_gemm_bias_add_case() -> ContractCase:
         compile_model,
         reference_model,
         {"input": np.array([[1.0, -2.0, 0.5, 3.0]], dtype=np.float32)},
-        ("Gemm",),
+        ("Gemm", "Dequantize", "Add"),
     )
 
 
@@ -7224,6 +7265,88 @@ def _reference_session(case: ContractCase, path: Path) -> ort.InferenceSession:
     return ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
 
 
+def _section_reference_outputs(
+    case: ContractCase, runner: Path, case_dir: Path, plan: dict,
+    primary: bytes, reference_outputs: list[Array],
+) -> list[Array]:
+    """Check section entry codes and evaluate float outputs on those same codes."""
+    graph, _ = _run_pipeline(
+        str(case_dir / "compile.onnx"),
+        (case.mem_budget,) + ((case.slow_budget,) if case.slow_budget else ()),
+        report_bindings=False,
+    )
+    section_inputs = {op.outputs[0] for op in graph.ops if op.op_type == "Dequantize"
+                      and graph.tensors[op.inputs[0]].dtype == TensorProto.INT8}
+    entries = list(dict.fromkeys(
+        node.input[0] for node in case.compile_model.graph.node
+        if node.op_type == "DequantizeLinear" and node.output[0] in section_inputs))
+    if not entries:
+        return reference_outputs
+
+    variant = onnx.shape_inference.infer_shapes(case.compile_model)
+    infos = {item.name: item for item in
+             (*variant.graph.input, *variant.graph.value_info, *variant.graph.output)}
+    original_names = [item.name for item in variant.graph.output]
+    added = [name for name in entries if name not in original_names]
+    variant.graph.output.extend(infos[name] for name in added)
+    variant_path, variant_plan_path = case_dir / "entries.onnx", case_dir / "entries.tgrs"
+    onnx.save(variant, variant_path)
+    variant_plan = _compile_plan(
+        variant_path, variant_plan_path, mem_budget=case.mem_budget,
+        slow_budget=case.slow_budget, compression=case.compression, xip=case.xip,
+        force_one_op_stages=case.force_one_op_stages,
+    )
+    oracle = onnx.shape_inference.infer_shapes(case.reference_model)
+    oracle_infos = {item.name: item for item in
+                    (*oracle.graph.input, *oracle.graph.value_info, *oracle.graph.output)}
+    oracle.graph.output.extend(oracle_infos[name] for name in added)
+    oracle_path = case_dir / "reference-entries.onnx"
+    onnx.save(oracle, oracle_path)
+    expected = _reference_session(case, oracle_path).run(None, case.inputs)
+    variant_inputs, variant_outputs = case_dir / "entries-inputs.bin", case_dir / "entries-outputs.bin"
+    variant_inputs.write_bytes(_pack_inputs(variant_plan, case.inputs))
+    _run([str(runner), str(variant_plan_path), str(variant_inputs), str(variant_outputs)],
+         f"{case.name} section entry execution")
+    raw = variant_outputs.read_bytes()
+    assert raw[:len(primary)] == primary, f"{case.name}: adding entry outputs changed original outputs"
+    actual = _decode_outputs(variant_plan, raw, expected)
+    names = original_names + added
+    actual_by_name = dict(zip(names, actual))
+    expected_by_name = dict(zip(names, expected))
+    _assert_output_parity([actual_by_name[name] for name in entries],
+                          [expected_by_name[name] for name in entries])
+
+    outputs = list(reference_outputs)
+    extractor = onnx.utils.Extractor(onnx.shape_inference.infer_shapes(case.reference_model))
+    producers = {name: node for node in case.reference_model.graph.node for name in node.output}
+    model_inputs = {item.name for item in case.reference_model.graph.input}
+    for index, tensor_index in enumerate(plan["model_outputs"]):
+        if plan["tensors"][tensor_index]["dtype"] != TensorProto.FLOAT:
+            continue
+        name = original_names[index]
+        pending, visited, boundaries = [name], set(), set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            if current in entries or current in model_inputs:
+                boundaries.add(current)
+            elif current in producers:
+                pending.extend(producers[current].input)
+        if not boundaries.intersection(entries):
+            continue
+        inputs = sorted(boundaries)
+        section = extractor.extract_model(inputs, [name])
+        section_path = case_dir / f"section-{index}.onnx"
+        onnx.save(section, section_path)
+        section_session = _reference_session(case, section_path)
+        feeds = {item.name: (actual_by_name[item.name] if item.name in entries else case.inputs[item.name])
+                 for item in section_session.get_inputs()}
+        outputs[index] = section_session.run(None, feeds)[0]
+    return outputs
+
+
 def _run_case(
     case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Path | None = None
 ) -> Path:
@@ -7267,6 +7390,8 @@ def _run_case(
     actual_outputs = _decode_outputs(
         plan, outputs_path.read_bytes(), reference_outputs
     )
+    reference_outputs = _section_reference_outputs(
+        case, runner, case_dir, plan, outputs_path.read_bytes(), reference_outputs)
     _assert_output_parity(
         actual_outputs, reference_outputs, _output_scales(plan)
     )
@@ -7853,6 +7978,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _qdq_case("AveragePool"),
         _qdq_add_relu_case(),
         _qdq_gemm_bias_add_case(),
+        *[_qdq_float_section_case(kind, terminal, tiled=tiled)
+          for kind in ("gemm", "conv") for terminal in (True, False)
+          for tiled in ((False, True) if kind == "conv" else (False,))],
         _matmul_case(),
         _gemm_no_transpose_case(),
         _qdq_matmul_case(),

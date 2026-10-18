@@ -19,7 +19,7 @@ from tigris.capabilities import (
     resolve_kernel_backend,
 )
 from tigris.dtypes import check_dtype_signatures
-from tigris.emitters.binary.defs import FLAG_XIP, TENSOR_FLAG_STATE
+from tigris.emitters.binary.defs import FLAG_XIP, TENSOR_FLAG_STATE, OP_TYPE_MAP
 from tigris.analysis.plan_graph import slow_arena_required
 from tigris.emitters.binary.reader import read_binary_plan
 
@@ -230,7 +230,11 @@ def generate_c(
     for op in plan["ops"]:
         opcode = op["op_type"]
         op_type = OP_TYPE_BY_CODE.get(opcode)
-        if op_type is None or op_type not in supported:
+        float_op = any(plan["tensors"][i]["dtype"] == 1 for i in op["outputs"])
+        op_supported = effective_operators("reference") if float_op and opcode not in {
+            OP_TYPE_MAP["Dequantize"], OP_TYPE_MAP["If"], OP_TYPE_MAP["While"],
+            OP_TYPE_MAP["DetectionPostProcess"]} else supported
+        if op_type is None or op_type not in op_supported:
             label = op_type if op_type is not None else f"opcode {opcode}"
             unsupported.append(f"{op['name']} ({label})" if op["name"] else label)
 
@@ -922,11 +926,14 @@ void app_main(void)
                 printf("  [%u] %ld\\n", j, (long)indices[j]);
             continue;
         }}
-        {"int8_t" if is_quantized else "float"} *out = ({"int8_t" if is_quantized else "float"} *)ptr;
-        uint32_t n = t->size_bytes / {"1" if is_quantized else "sizeof(float)"};
+        uint32_t n = t->size_bytes / (t->dtype == 1u ? sizeof(float) : 1u);
         uint32_t show = n < 10 ? n : 10;
-        for (uint32_t j = 0; j < show; j++)
-            printf("  [%u] {"% d" if is_quantized else "%.6f"}\\n", j, {"(int)" if is_quantized else ""}out[j]);
+        for (uint32_t j = 0; j < show; j++) {{
+            if (t->dtype == 1u)
+                printf("  [%u] %.6f\\n", j, ((const float *)ptr)[j]);
+            else
+                printf("  [%u] % d\\n", j, (int)((const int8_t *)ptr)[j]);
+        }}
         if (n > show) printf("  ... (%u more)\\n", n - show);
     }}
 

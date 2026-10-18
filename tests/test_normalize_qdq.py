@@ -2,6 +2,7 @@
 
 import numpy as np
 import onnx
+import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.loaders import load_model
@@ -240,41 +241,103 @@ def _qdq_gemm_bias_model(tmp_path, shared_scale: bool):
     return path
 
 
-def test_constant_add_becomes_the_operator_bias(tmp_path):
-    """The float bias add is requantized into the product's int32 domain."""
+def test_constant_add_after_dequantize_stays_float(tmp_path):
     ag = load_model(_qdq_gemm_bias_model(tmp_path, shared_scale=False))
-
-    assert [op.op_type for op in ag.ops] == ["Gemm"]
-    gemm = ag.ops[0]
-    assert len(gemm.inputs) == 3
-    assert gemm.outputs == ["output"]
-    bias = ag.weight_data[gemm.inputs[2]]
-    assert bias.dtype == np.int32
-    # bias scale is input_scale * weight_scale = 0.25 * 0.25
-    assert bias.tolist() == [8, -4]
-    assert ag.tensors["output"].dtype == 3
-    assert ag.tensors["output"].quant is not None
-    # The model declares a float output, which the plan still presents.
+    assert [op.op_type for op in ag.ops] == ["Gemm", "Dequantize", "Add"]
+    assert len(ag.ops[0].inputs) == 2
+    assert ag.tensors[ag.ops[0].outputs[0]].dtype == 3
+    assert ag.weight_data["bias"].dtype == np.float32
+    assert ag.tensors["output"].dtype == 1
+    assert ag.tensors["output"].quant is None
     assert ag.model_output_dtypes == [1]
 
 
-def test_shared_scale_initializer_still_folds_activations(tmp_path):
-    """A scale shared by a weight pair and the activation pairs survives pass 1."""
-    ag = load_model(_qdq_gemm_bias_model(tmp_path, shared_scale=True))
+@pytest.mark.parametrize("kind", ["Add", "Mul", "Sub", "Div"])
+@pytest.mark.parametrize("ending", ["quantized", "terminal", "float_only", "nonuniform"])
+def test_constant_section_boundary_respects_integer_lowering(tmp_path, kind, ending):
+    path = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
+    model = onnx.load(path)
+    constant = np.array([0.5, 0.75] if ending == "nonuniform" else [0.5, 0.5], np.float32)
+    next(t for t in model.graph.initializer if t.name == "bias").CopyFrom(
+        numpy_helper.from_array(constant, "bias"))
+    model.graph.node[-1].op_type = kind
+    if ending != "terminal":
+        model.graph.node[-1].output[0] = "adjusted"
+        source = "adjusted"
+        if ending == "float_only":
+            model.graph.node.extend([helper.make_node("Exp", [source], ["expanded"])])
+            source = "expanded"
+        model.graph.node.extend([
+            helper.make_node("QuantizeLinear", [source, "io_scale", "io_zp"], ["encoded"]),
+            helper.make_node("DequantizeLinear", ["encoded", "io_scale", "io_zp"], ["output"]),
+        ])
+    onnx.save(model, path)
+    ag = load_model(path)
+    binary = next(op for op in ag.ops if op.op_type == ("Add" if kind in {"Add", "Sub"} else "Mul"))
+    expected_dtype = 3 if ending == "quantized" else 1
+    assert ag.tensors[binary.outputs[0]].dtype == expected_dtype
+    assert ag.weight_data[binary.inputs[1]].dtype == (np.int8 if ending == "quantized" else np.float32)
+    assert any(op.op_type == "Dequantize" for op in ag.ops) == (ending != "quantized")
 
-    assert [op.op_type for op in ag.ops] == ["Gemm"]
+
+def test_uniform_constant_shared_by_float_and_int8_adds(tmp_path):
+    from tigris.cli import _run_pipeline
+    from tigris.runtime import Session
+
+    path = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
+    model = onnx.load(path)
+    next(t for t in model.graph.initializer if t.name == "bias").CopyFrom(
+        numpy_helper.from_array(np.full(2, 0.5, np.float32), "bias"))
+    model.graph.node.extend([
+        helper.make_node("Add", ["product_dq", "bias"], ["adjusted"]),
+        helper.make_node("QuantizeLinear", ["adjusted", "io_scale", "io_zp"], ["encoded"]),
+        helper.make_node("DequantizeLinear", ["encoded", "io_scale", "io_zp"], ["quantized"]),
+    ])
+    model.graph.output.extend([helper.make_tensor_value_info("quantized", TensorProto.FLOAT, [1, 2])])
+    onnx.save(model, path)
+    ag = load_model(path)
+    adds = {ag.tensors[op.outputs[0]].dtype: op for op in ag.ops if op.op_type == "Add"}
+    assert set(adds) == {1, 3}
+    assert ag.weight_data[adds[1].inputs[1]].dtype == np.float32
+    assert ag.weight_data[adds[3].inputs[1]].dtype == np.int8
+    ag, _ = _run_pipeline(str(path), ("1K",), report_bindings=False)
+    binary = tmp_path / "shared.tgrs"
+    binary.write_bytes(emit_binary_bytes(ag))
+    with Session(binary) as session:
+        actual = session.run({"input": np.full((1, 4), 31.75, np.float32)})
+    assert actual["output"][0, 0] == np.float32(32.25)
+    assert actual["quantized"][0, 0] == np.float32(31.75)
+
+
+def test_bias_after_quantization_preserves_product_clipping(tmp_path):
+    import onnxruntime as ort
+
+    from tigris.cli import _run_pipeline
+    from tigris.runtime import Session
+
+    path = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
+    ag, _ = _run_pipeline(str(path), ("16K",), report_bindings=False)
+    binary = tmp_path / "bias.tgrs"
+    values = np.full((1, 4), 31.75, dtype=np.float32)
+    expected = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]).run(
+        None, {"input": values}
+    )[0]
+    for options in ({}, {"compress": "lz4"}, {"xip": True}):
+        binary.write_bytes(emit_binary_bytes(ag, **options))
+        with Session(binary) as session:
+            actual = session.run({"input": values})["output"]
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_shared_scale_initializer_still_folds_activations(tmp_path):
+    ag = load_model(_qdq_gemm_bias_model(tmp_path, shared_scale=True))
+    assert [op.op_type for op in ag.ops] == ["Gemm", "Dequantize", "Add"]
     assert ag.tensors["input"].dtype == 3
-    assert ag.tensors["output"].dtype == 3
+    assert ag.tensors["output"].dtype == 1
 
 
 def test_float_constant_add_becomes_the_gemm_bias(tmp_path):
-    """A float bias Add folds into Gemm's bias slot, as the quantized one does.
-
-    The two paths reach it differently: the quantized fold has to requantize
-    into the accumulator domain, while this one just moves float data. Leaving
-    the Add standing made the graph uncompilable, because its operand is
-    per-channel and the Add kernel takes two operands of one shape.
-    """
+    """A float bias Add folds into the float Gemm bias slot."""
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2])
     initializers = [
@@ -641,6 +704,56 @@ def test_a_second_encoding_of_an_activation_is_a_requantization(tmp_path):
     ag = _fold_qdq(load_raw(path))
     relu = next(op for op in ag.ops if op.op_type == "Relu")
     assert float(ag.tensors[relu.outputs[0]].quant.scale[0]) == np.float32(0.02)
-    requantize = [op for op in ag.ops if op.op_type == "Quantize"]
+    requantize = [op for op in ag.ops if op.op_type == "Quantize"
+                  and ag.tensors[op.inputs[0]].dtype == 3]
     assert len(requantize) == 1 and requantize[0].inputs == relu.outputs
     assert float(ag.tensors[requantize[0].outputs[0]].quant.scale[0]) == np.float32(0.07)
+
+
+def test_dequantize_float_section_keeps_int8_model_input(tmp_path):
+    from tigris.cli import _run_pipeline
+    from tigris.runtime import Session
+
+    source = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
+    model = onnx.load(source)
+    kept = [node for node in model.graph.node if node.op_type == "Add"]
+    kept.insert(0, helper.make_node("DequantizeLinear", ["input", "io_scale", "io_zp"], ["product_dq"]))
+    del model.graph.node[:]
+    model.graph.node.extend(kept)
+    model.graph.input[0].type.tensor_type.elem_type = TensorProto.INT8
+    for dim in model.graph.input[0].type.tensor_type.shape.dim:
+        dim.dim_value = 1
+    model.graph.input[0].type.tensor_type.shape.dim[1].dim_value = 2
+    onnx.save(model, source)
+    ag, _ = _run_pipeline(str(source), ("1K",), report_bindings=False)
+    assert ag.is_quantized
+    assert [op.op_type for op in ag.ops] == ["Dequantize", "Add"]
+    binary = tmp_path / "section.tgrs"
+    binary.write_bytes(emit_binary_bytes(ag))
+    values = np.array([[127, -128]], dtype=np.int8)
+    with Session(binary) as session:
+        actual = session.run({"input": values})["output"]
+    np.testing.assert_array_equal(actual, [[32.25, -32.25]])
+
+
+def test_float_only_kernel_between_quantized_tensors(tmp_path):
+    from tigris.cli import _run_pipeline
+    from tigris.runtime import Session
+
+    path = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
+    model = onnx.load(path)
+    model.graph.node[-1].op_type = "Exp"
+    del model.graph.node[-1].input[1:]
+    model.graph.node[-1].output[0] = "expanded"
+    model.graph.node.extend([
+        helper.make_node("QuantizeLinear", ["expanded", "io_scale", "io_zp"], ["encoded"]),
+        helper.make_node("DequantizeLinear", ["encoded", "io_scale", "io_zp"], ["output"]),
+    ])
+    onnx.save(model, path)
+    ag, _ = _run_pipeline(str(path), ("1K",), report_bindings=False)
+    assert [op.op_type for op in ag.ops] == ["Gemm", "Dequantize", "Exp", "Quantize"]
+    binary = tmp_path / "exp.tgrs"
+    binary.write_bytes(emit_binary_bytes(ag))
+    with Session(binary) as session:
+        actual = session.run({"input": np.zeros((1, 4), dtype=np.float32)})["output"]
+    np.testing.assert_array_equal(actual, [[1.0, 1.0]])
