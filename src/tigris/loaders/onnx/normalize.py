@@ -73,6 +73,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_gelu(ag)
     ag = _fold_elementwise_patterns(ag)
     ag = _quantize_inputs_first(ag)
+    ag = _transpose_quantized_weights(ag)
     ag = _fold_qdq(ag)
     ag = _quantize_float_biases(ag)
     ag = _fold_float_square(ag)
@@ -1587,6 +1588,49 @@ def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag.ops = [op for op in ag.ops if not removed.intersection(op.outputs)]
     for name in removed:
         ag.tensors.pop(name, None)
+    return ag
+
+
+def _transpose_quantized_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Fold a Transpose of a dequantized constant weight into the weight.
+
+    PyTorch exports nn.Linear as DequantizeLinear on the [out, in] weight, then
+    Transpose, then Gemm. The int8 data is transposed in place of the float
+    result and the quantization axis moves with it, so the Gemm reads an
+    int8 weight like any other.
+    """
+    producer = {out: op for op in ag.ops for out in op.outputs}
+    readers: dict[str, int] = {}
+    for op in ag.ops:
+        for name in op.inputs:
+            readers[name] = readers.get(name, 0) + 1
+    removed: set[int] = set()
+    for index, op in enumerate(ag.ops):
+        if op.op_type != "Transpose" or len(op.inputs) != 1:
+            continue
+        dql = producer.get(op.inputs[0])
+        if (dql is None or dql.op_type != "DequantizeLinear" or readers.get(op.inputs[0], 0) != 1
+                or dql.inputs[0] not in ag.weight_data or readers.get(dql.inputs[0], 0) != 1
+                or any(n and n not in ag.weight_data for n in dql.inputs[1:])):
+            continue
+        data = ag.weight_data[dql.inputs[0]]
+        perm = list(op.attrs.get("perm") or reversed(range(data.ndim)))
+        if sorted(perm) != list(range(data.ndim)):
+            continue
+        scale = ag.weight_data[dql.inputs[1]]
+        if scale.size > 1:
+            axis = dql.attrs.get("axis", 1) % data.ndim
+            dql.attrs["axis"] = perm.index(axis)
+        ag.weight_data[dql.inputs[0]] = np.ascontiguousarray(np.transpose(data, perm))
+        source = ag.tensors.get(dql.inputs[0])
+        if source is not None:
+            source.shape = tuple(source.shape[p] for p in perm)
+        old, new = dql.outputs[0], op.outputs[0]
+        dql.outputs[0] = new
+        ag.tensors.pop(old, None)
+        removed.add(index)
+    if removed:
+        ag.ops = [op for i, op in enumerate(ag.ops) if i not in removed]
     return ag
 
 
