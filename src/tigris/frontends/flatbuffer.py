@@ -47,6 +47,15 @@ class Table:
         relative = self._u16(self._vtable + entry)
         return self.position + relative if relative else 0
 
+    def present(self) -> dict[int, int]:
+        """Absolute offset of every field the table sets, by slot."""
+        fields = {}
+        for slot in range((self._vtable_size - 4) // 2):
+            offset = self._field(slot)
+            if offset:
+                fields[slot] = offset
+        return fields
+
     def scalar(self, slot: int, fmt: str, default=0):
         offset = self._field(slot)
         if not offset:

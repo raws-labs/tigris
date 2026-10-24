@@ -383,6 +383,110 @@ def test_a_reduction_over_axes_that_are_not_adjacent_is_refused():
     assert any("axes that are not adjacent" in reason for reason in tflite.unsupported(bytes(data)))
 
 
+def _with_option(data: bytes, kind: str, slot: int, fmt: str, value) -> bytes:
+    """A copy whose first `kind` operator stores `value` in options field `slot`,
+    which the file already holds."""
+    model = tflite._Model(data)
+    operators = [tflite._Operator(model, t, i) for i, t in enumerate(model.subgraphs[0].tables(3))]
+    position = next(op for op in operators if op.kind == kind).options.present().get(slot)
+    assert position, f"{kind} stores no field {slot}"
+    buffer = bytearray(data)
+    struct.pack_into(fmt, buffer, position, value)
+    return bytes(buffer)
+
+
+def _fc_quant_spec(payload: bytes) -> Table:
+    """FullyConnectedOptions that set only quant_spec, to `payload`."""
+    vtable = struct.pack("<8H", 16, 8, 0, 0, 0, 0, 0, 4)
+    return Table.root(struct.pack("<I", 4 + len(vtable)) + vtable
+                      + struct.pack("<iII", len(vtable), 4, len(payload)) + payload)
+
+
+def test_a_fully_connected_quantization_contract_is_refused(monkeypatch):
+    """A runtime that does not know the contract quant_spec names must refuse
+    the operator."""
+    def contract(tensors, operators):
+        operators[0].options = _fc_quant_spec(b"\x00\x01\x02")
+    assert _read_edited(monkeypatch, "fully_connected_bias", contract) == [
+        "operator 0 FULLY_CONNECTED: a non-standard quantization contract in quant_spec"]
+
+
+def test_an_empty_fully_connected_quant_spec_converts(monkeypatch):
+    """An empty quant_spec names no contract, and TFLite Micro runs the operator
+    as standard FULLY_CONNECTED."""
+    options = _fc_quant_spec(b"")
+    assert 5 in options.present()
+
+    def empty(tensors, operators):
+        operators[0].options = options
+    assert _read_edited(monkeypatch, "fully_connected_bias", empty) == []
+
+
+def test_a_depth_multiplier_that_disagrees_with_the_channels_is_refused():
+    """TFLite Micro maps the channels by depth_multiplier, not by the shapes."""
+    model = (FIXTURES / "ops" / "depthwise_multiplier.tflite").read_bytes()
+    data = _with_option(model, "DEPTHWISE_CONV_2D", 3, "<i", 1)
+    assert tflite.unsupported(data) == [
+        "operator 0 DEPTHWISE_CONV_2D: depth_multiplier 1 for 4 input and 8 output channels"]
+
+
+def test_a_window_whose_padding_does_not_give_its_shapes_is_refused(tmp_path):
+    """TFLite Micro pads by the padding option and runs over the stated output."""
+    model = (FIXTURES / "ops" / "pad_conv.tflite").read_bytes()
+    path = tmp_path / "same.tflite"
+    path.write_bytes(_with_option(model, "CONV_2D", 0, "<b", 0))
+    result = CliRunner().invoke(cli, ["compile", str(path), "-m", "256K", "-o", str(tmp_path / "x.tgrs")])
+    assert result.exit_code != 0
+    assert "CONV_2D: a 6x8 output where SAME padding gives 8x10" in result.output
+
+
+@pytest.mark.parametrize(("name", "padding", "reason"), [
+    ("transpose_conv", 1,
+     "operator 0 TRANSPOSE_CONV: a 4x4 input where VALID padding of the output gives 3x3"),
+    ("max_pool_same", 2, "operator 0 MAX_POOL_2D: padding 2, neither SAME nor VALID"),
+])
+def test_a_padding_option_the_shapes_do_not_follow_is_refused(monkeypatch, name, padding, reason):
+    def pad(tensors, operators):
+        stated = operators[0].option
+        operators[0].option = lambda slot, fmt, default=0: padding if slot == 0 else stated(slot, fmt, default)
+    assert _read_edited(monkeypatch, name, pad) == [reason]
+
+
+@pytest.mark.parametrize(("name", "kind", "count", "reason"), [
+    ("pack", "PACK", 1, "operator 0 PACK: values_count 1 for 2 inputs"),
+    ("shape_pack_reshape", "PACK", 1, "operator 2 PACK: values_count 1 for 2 inputs"),
+    ("unpack", "UNPACK", 1, "operator 0 UNPACK: num 1 for 3 outputs"),
+    ("unpack_one", "UNPACK", 2, "operator 0 UNPACK: num 2 for 1 output"),
+])
+def test_a_pack_count_that_disagrees_with_the_operands_is_refused(name, kind, count, reason):
+    """TFLite Micro packs and unpacks as many tensors as the count says; a
+    constant PACK is kept for the same check."""
+    model = (FIXTURES / "ops" / f"{name}.tflite").read_bytes()
+    assert reason in tflite.unsupported(_with_option(model, kind, 0, "<i", count))
+
+
+@pytest.mark.parametrize(("name", "kind", "block", "reason"), [
+    ("depth_to_space", "DEPTH_TO_SPACE", 1, "a 1x6x6x2 output where block_size 1 gives 1x3x3x8"),
+    ("depth_to_space", "DEPTH_TO_SPACE", 3, "block_size 3 for a 1x3x3x8 input"),
+    ("space_to_depth", "SPACE_TO_DEPTH", 1, "a 1x2x3x12 output where block_size 1 gives 1x4x6x3"),
+    ("space_to_depth", "SPACE_TO_DEPTH", 0, "block_size 0 for a 1x4x6x3 input"),
+])
+def test_a_block_size_the_shapes_do_not_follow_is_refused(name, kind, block, reason):
+    """TFLite Micro shapes the output by block_size, not by the file."""
+    model = (FIXTURES / "ops" / f"{name}.tflite").read_bytes()
+    assert tflite.unsupported(_with_option(model, kind, 0, "<i", block)) == [f"operator 0 {kind}: {reason}"]
+
+
+def test_an_lstm_with_diagonal_recurrent_weights_is_refused(monkeypatch):
+    """TFLite Micro fails to allocate an LSTM whose recurrent weights are vectors."""
+    def diagonal(tensors, operators):
+        for position in range(5, 9):
+            weight = tensors[operators[0].inputs[position]]
+            weight.shape = weight.shape[:1]
+    assert _read_edited(monkeypatch, "float_lstm", diagonal) == [
+        "operator 0 UNIDIRECTIONAL_SEQUENCE_LSTM: diagonal recurrent weights, which TFLite Micro does not run"]
+
+
 def _read_edited(monkeypatch, name, edit):
     """The fixture `name` as the frontend reads it, after `edit(tensors, operators)`."""
     data = (FIXTURES / "ops" / f"{name}.tflite").read_bytes()

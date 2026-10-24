@@ -249,6 +249,8 @@ def _constant_move(op: "_Operator", ins) -> "np.ndarray | None":
     if op.kind in ("RESHAPE", "SQUEEZE", "EXPAND_DIMS"):
         return x  # _fold_constants gives it the output's static shape
     if op.kind == "PACK":
+        if op.option(0, "i") != len(ins):
+            return None  # kept, so that the operator check refuses the count
         return np.stack([t.array() for t in ins], axis=op.option(1, "i"))
     if op.kind == "CONCATENATION":
         if op.option(1, "b") or not _same_quantization(ins):
@@ -580,6 +582,12 @@ _SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMEN
 # custom operator.
 _DETECTION = "CUSTOM:TFLite_Detection_PostProcess"
 _SUPPORTED = (*_SUPPORTED, _DETECTION)
+# FullyConnectedOptions.quant_spec: a non-empty one names a quantization contract a runtime must refuse unless it knows it.
+_FC_QUANT_SPEC = 5
+# Options slots of the stride and dilation of each windowed operator, width first.
+_WINDOWED = {"CONV_2D": (1, 2, 4, 5), "DEPTHWISE_CONV_2D": (1, 2, 5, 6),
+             "TRANSPOSE_CONV": (1, 2, None, None), "MAX_POOL_2D": (1, 2, None, None),
+             "AVERAGE_POOL_2D": (1, 2, None, None), "L2_POOL_2D": (1, 2, None, None)}
 # Positions of the data, weights and bias operands of the weighted operators.
 _WEIGHTED = {"CONV_2D": (0, 1, 2), "DEPTHWISE_CONV_2D": (0, 1, 2), "FULLY_CONNECTED": (0, 1, 2),
              "TRANSPOSE_CONV": (2, 1, 3)}
@@ -606,6 +614,13 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     outs = [tensors[i] for i in op.outputs]
     if op.kind == _DETECTION:
         return _detection_reason(op, ins, outs)
+    if op.kind == "FULLY_CONNECTED" and op.options is not None and op.options.bytes(_FC_QUANT_SPEC):
+        return "a non-standard quantization contract in quant_spec"
+    if op.kind in ("PACK", "UNPACK"):
+        stated, operands = op.option(0, "i"), len(ins) if op.kind == "PACK" else len(outs)
+        if stated != operands:
+            field, side = ("values_count", "input") if op.kind == "PACK" else ("num", "output")
+            return f"{field} {stated} for {operands} {side}{'s' if operands != 1 else ''}"
     if op.kind in _VARIABLES:
         values = [t for t in [*ins, *outs] if t is not None and t.type != "RESOURCE"]
         if any(t.type != "FLOAT32" for t in values):
@@ -719,6 +734,10 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         return "beta other than 1"
     if op.kind == "FULLY_CONNECTED" and op.option(1, "b") != 0:
         return "shuffled weights format"
+    if op.kind in _WINDOWED:
+        reason = _window_reason(op, ins, outs)
+        if reason:
+            return reason
     if op.kind == "BATCH_MATMUL" and len(ins[0].shape) != len(ins[1].shape):
         return "operands of different rank"
     if op.kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
@@ -838,6 +857,8 @@ def _lstm_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
         return "peepholes, projection or layer normalization, which TFLite Micro does not run"
     if len(ins[0].shape) != 3:
         return "input of rank other than 3"
+    if any(len(ins[i].shape) == 1 for i in range(5, 9)):
+        return "diagonal recurrent weights, which TFLite Micro does not run"
     if _activation(op.option(0, "b")) != "tanh":
         return f"cell activation {_activation(op.option(0, 'b'))}"
     if any(not _is_constant(ins[i]) for i in _LSTM_CONSTANTS):
@@ -921,6 +942,40 @@ def _spatial_mean(op: _Operator, tensors) -> bool:
     return len(source.shape) == 4 and axes == [1, 2]
 
 
+def _window_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
+    """TFLite Micro pads a window by its padding option and the input size and
+    maps depthwise channels by depth_multiplier, but runs over the output the
+    file states; the conversion pads by the stated shapes, so both must agree."""
+    if op.kind == "DEPTHWISE_CONV_2D":
+        multiplier, channels, produced = op.option(3, "i"), ins[0].shape[3], outs[0].shape[3]
+        if multiplier * channels != produced:
+            return f"depth_multiplier {multiplier} for {channels} input and {produced} output channels"
+    padding = op.option(0, "b")
+    if padding not in (0, 1):
+        return f"padding {padding}, neither SAME nor VALID"
+    if op.kind in _WEIGHTED:
+        kernel = ins[1].shape[1:3]
+    else:
+        kernel = [op.option(4, "i", 1), op.option(3, "i", 1)]
+    stride_w, stride_h, dilation_w, dilation_h = (1 if slot is None else op.option(slot, "i", 1)
+                                                  for slot in _WINDOWED[op.kind])
+    # A transposed convolution's input is what a convolution of its output gives.
+    source, target = (outs[0], ins[2]) if op.kind == "TRANSPOSE_CONV" else (ins[0], outs[0])
+    given = []
+    for extent, size, stride, dilation in zip(source.shape[1:3], kernel, (stride_h, stride_w),
+                                              (dilation_h, dilation_w)):
+        span = (size - 1) * dilation + 1
+        given.append((extent + stride - 1) // stride if padding == 0
+                     else (extent - span + stride) // stride)
+    if given == list(target.shape[1:3]):
+        return ""
+    stated, found = ("x".join(map(str, dims)) for dims in (target.shape[1:3], given))
+    name = ("SAME", "VALID")[padding]
+    if op.kind == "TRANSPOSE_CONV":
+        return f"a {stated} input where {name} padding of the output gives {found}"
+    return f"a {stated} output where {name} padding gives {found}"
+
+
 def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
     slot = _INDEX_SLOTS.get(op.kind)
     data = [t for i, t in enumerate(ins) if not _is_constant(t) and i != slot]
@@ -944,6 +999,26 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
     if op.kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND",
                    "BATCH_TO_SPACE_ND") and len(ins[0].shape) != 4:
         return "only rank-4 inputs convert"
+    if op.kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE"):
+        return _block_reason(op, ins[0], outs[0])
+    return ""
+
+
+def _block_reason(op: _Operator, source: _Tensor, target: _Tensor) -> str:
+    """TFLite Micro shapes the output by block_size; the conversion reshapes to
+    the output the file states, so both must agree."""
+    block, (n, h, w, c) = op.option(0, "i"), source.shape
+    if op.kind == "SPACE_TO_DEPTH":
+        valid = block > 0 and h % block == 0 and w % block == 0
+        given = [n, h // block, w // block, c * block * block] if valid else []
+    else:
+        valid = block > 0 and c % (block * block) == 0
+        given = [n, h * block, w * block, c // (block * block)] if valid else []
+    if not valid:
+        return f"block_size {block} for a {'x'.join(map(str, source.shape))} input"
+    if given != list(target.shape):
+        stated, found = ("x".join(map(str, dims)) for dims in (target.shape, given))
+        return f"a {stated} output where block_size {block} gives {found}"
     return ""
 
 
