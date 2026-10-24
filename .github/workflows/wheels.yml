@@ -123,8 +123,9 @@ jobs:
           TIGRIS_TEST_HOST_LIBRARY: ${{ github.workspace }}/runtime-source/build-host-ci/host/libtigris_host.so
         run: |
           python -m pip install dist/*-py3-none-any.whl pytest
-          mkdir -p "$RUNNER_TEMP/pure-tests"
+          mkdir -p "$RUNNER_TEMP/pure-tests/fixtures/tflite"
           cp tests/conftest.py tests/test_pure_wheel.py "$RUNNER_TEMP/pure-tests/"
+          cp tests/fixtures/tflite/vww_96_int8.tflite "$RUNNER_TEMP/pure-tests/fixtures/tflite/"
           cd "$RUNNER_TEMP/pure-tests"
           python -m pytest -q
       - uses: actions/upload-artifact@v4

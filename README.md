@@ -22,7 +22,7 @@ macOS x86-64 and ARM64, and Windows x86-64. The Linux wheels use
 `manylinux_2_28`; older glibc, musllinux, Windows ARM, and 32-bit ARM Linux
 install the pure Python wheel instead. A source distribution is also available.
 
-The pure wheel supports inspection, compilation, analysis, code generation, and zoo downloads.
+The pure wheel supports inspection, compilation, analysis, code generation, TFLite export, and zoo downloads.
 `run` reports "Bundled host runtime is unavailable" without the native
 library. Neither installation nor execution downloads a runtime separately.
 

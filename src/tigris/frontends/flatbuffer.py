@@ -56,6 +56,11 @@ class Table:
                 fields[slot] = offset
         return fields
 
+    @property
+    def size(self) -> int:
+        """Bytes of the table's inline part: its vtable offset and its fields."""
+        return self._u16(self._vtable + 2)
+
     def scalar(self, slot: int, fmt: str, default=0):
         offset = self._field(slot)
         if not offset:

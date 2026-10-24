@@ -16,8 +16,9 @@ _BUDGETS_TRIED = 3
 
 
 def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, source: str,
-            tflm_arena: int | None, tried: list, traffic) -> dict:
+            tflm_arena: int | None, tried: list, traffic, tflm_export=None) -> dict:
     """The analysis as versioned JSON; byte counts are integers."""
+    from tigris.cli.export import export_report
     f = findings
     return {
         "report": "tigris-analysis",
@@ -42,7 +43,9 @@ def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, sour
         },
         "tflite_micro": None if tflm_arena is None else {
             "tensor_arena_bytes": tflm_arena,
-            "excludes": ["kernel scratch buffers", "persistent allocations"],
+            "excludes": ["kernel scratch buffers other than those of MEAN, SUM, REDUCE_MAX, "
+                         "REDUCE_MIN and REDUCE_ALL", "persistent allocations"],
+            "export": None if tflm_export is None else export_report(tflm_export),
         },
         "fast": {
             "budget_bytes": budget,
@@ -194,10 +197,11 @@ def verdict_lines(findings, budget: int, slow_budget: int, stages=()) -> list[st
 
 def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budget: int,
             tflm_arena: int | None, tried: list | None = None, traffic=None,
-            lz4_tried: bool = False) -> None:
+            lz4_tried: bool = False, tflm_export=None) -> None:
     """The header, verdict, memory and flash, shared by analyze and compile.
     `traffic` is what trace.traffic measured; None leaves the row out. The LZ4
-    row needs `lz4_tried`: the estimate stands only where -c lz4 compiles."""
+    row needs `lz4_tried`: the estimate stands only where -c lz4 compiles.
+    `tflm_export` is what tflite_export.export found; None leaves its row out."""
     f = findings
     dtype = "int8" if f.is_quantized else "float32" if f.is_float32 else "mixed"
     graphs = len(getattr(ag, "subgraphs", []) or [])
@@ -212,8 +216,12 @@ def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budge
 
     memory = []
     if tflm_arena is not None:
-        memory.append(["TFLite Micro tensors", fmt_bytes(tflm_arena),
-                       text.dim("its planner; kernel scratch excluded")])
+        memory.append(["TFLite Micro arena", fmt_bytes(tflm_arena),
+                       text.dim("its planner and reduction scratch; persistent allocations and "
+                                "other kernel scratch excluded")])
+    if tflm_export is not None:
+        from tigris.cli.export import export_line
+        memory.append(export_line(tflm_export))
     memory.append(["unscheduled", fmt_bytes(ag.peak_memory_bytes), ""])
     if f.largest_tensor_bytes:
         memory.append(["largest tensor", fmt_bytes(f.largest_tensor_bytes),
@@ -329,12 +337,17 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
         findings.lz4_plan_size_bytes = 0
     from tigris.cli.trace import traffic as measure_traffic
     traffic = measure_traffic(ag) if supported else None
+    tflm_export = None
+    if tflm_arena is not None:
+        from tigris.frontends.tflite_export import export
+        tflm_export = export(data)
     if as_json:
         click.echo(json.dumps(_report(ag, findings, budget, slow_budget, flash_budget,
-                                      "tflite" if tflite else "onnx", tflm_arena, tried, traffic),
+                                      "tflite" if tflite else "onnx", tflm_arena, tried, traffic,
+                                      tflm_export),
                               indent=2, ensure_ascii=True, allow_nan=False))
         return
     summary(model, ag, findings, budget, slow_budget, flash_budget, tflm_arena, tried, traffic,
-            lz4_tried=True)
+            lz4_tried=True, tflm_export=tflm_export)
     if verbose and ag.stages:
         _stages(ag)

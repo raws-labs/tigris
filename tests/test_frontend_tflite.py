@@ -527,10 +527,12 @@ def test_int64_run_time_indices_with_an_excessive_range_are_refused(monkeypatch)
 
 
 @pytest.mark.parametrize(("name", "arena"), [
-    # TFLite Micro's own "Arena allocation head" (tflite-micro 0.dev20260925222358) for
-    # models whose kernels request no scratch buffer.
+    # TFLite Micro's own "Arena allocation head" (the dev-extra tflite-micro) for
+    # models whose kernels request no scratch buffer or a reduction's.
     ("vww_96_int8.tflite", 73728), ("pretrainedResnet_quant.tflite", 49152),
-    ("ops/conv_bias.tflite", 512),
+    ("ops/conv_bias.tflite", 512), ("ops/mean_channels.tflite", 368),
+    ("ops/sum_spatial.tflite", 208), ("ops/float_reduce_max_channels.tflite", 752),
+    ("ops/reduce_min_rows.tflite", 208),
 ])
 def test_tflm_tensor_arena_reproduces_its_planner(name, arena):
     assert tflite.tflm_tensor_arena((FIXTURES / name).read_bytes()) == arena
@@ -557,6 +559,13 @@ def test_analyze_reports_json_with_tflite_micro_arena_and_exact_plan_size(tmp_pa
     single = json.loads(CliRunner().invoke(
         cli, ["analyze", str(FIXTURES / "ops" / "conv_bias.tflite"), "-m", "256K", "--json"]).output)
     assert single["tflite_micro"]["tensor_arena_bytes"] == 512
+    assert single["tflite_micro"]["excludes"] == [
+        "kernel scratch buffers other than those of MEAN, SUM, REDUCE_MAX, REDUCE_MIN and "
+        "REDUCE_ALL", "persistent allocations"]
+    assert set(single["tflite_micro"]["export"]) == {
+        "arena_head_before_bytes", "arena_head_after_bytes", "persistent_growth_bytes",
+        "change_bytes", "region", "bands", "pads_folded", "macs", "extra_macs", "target",
+        "reason"}
 
 
 def test_analyze_shows_the_lz4_estimate_only_where_lz4_compiles():

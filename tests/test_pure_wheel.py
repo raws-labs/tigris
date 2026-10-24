@@ -23,15 +23,19 @@ def test_compiler_without_host_runtime(linear_3op_path, tmp_path, monkeypatch):
     runner = CliRunner()
     plan = tmp_path / "model.tgrs"
     harness = tmp_path / "model.c"
+    tflite = Path(__file__).parent / "fixtures" / "tflite" / "vww_96_int8.tflite"
+    exported = tmp_path / "vww_export.tflite"
     commands = [
         ["analyze", str(linear_3op_path), "-m", "64K"],
         ["compile", str(linear_3op_path), "-m", "64K", "-o", str(plan)],
         ["codegen", str(plan), "--backend", "reference", "-o", str(harness)],
+        ["export", str(tflite), "-o", str(exported)],
     ]
     for command in commands:
         result = runner.invoke(cli, command)
         assert result.exit_code == 0, result.output
     assert plan.stat().st_size > 0
+    assert exported.stat().st_size > 0
     assert "tigris" in harness.read_text()
 
     for model in (linear_3op_path, plan):
