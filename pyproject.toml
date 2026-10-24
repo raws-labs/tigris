@@ -29,6 +29,7 @@ dependencies = [
     "onnx>=1.15",
     "numpy>=1.24",
     "click>=8.0",
+    "flatbuffers>=2.0.7",
     "lz4>=4.0",
     "huggingface-hub>=1.2,<2",
     "packaging>=23.2",
@@ -40,6 +41,7 @@ dev = [
     "pytest>=7.0",
     "onnxruntime>=1.17",
     "ruff>=0.6",
+    "tflite-micro==0.dev20261023044614; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.urls]

@@ -6,7 +6,8 @@ TFLite Micro and through TFLite's reference kernels. The recorded outputs are
 TFLite Micro's; where TFLite Micro disagrees with the reference kernels, the
 reference kernels' are recorded and the case is named as a deviation. Models and
 outputs go to tests/fixtures/tflite/ops/ so the frontend tests need neither
-package. Needs tensorflow and tflite-micro, which are not project dependencies:
+package. Needs tensorflow, which is not a project dependency, and tflite-micro
+from the dev extra:
 
     python scripts/gen_tflite_fixtures.py [case ...]
     python scripts/gen_tflite_fixtures.py --models
@@ -23,7 +24,7 @@ import numpy as np
 from flatbuffers import flexbuffers
 import tensorflow as tf
 from tflite_micro.python.tflite_micro import runtime as micro
-from tflite_micro.tensorflow.lite.python import schema_py_generated as schema
+from tflite_micro.tensorflow.lite.micro.python import schema_py_generated as schema
 
 OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "tflite" / "ops"
 SAMPLES = 4
