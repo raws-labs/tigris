@@ -7,8 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from tigris import (
-    SCHEMA_VERSION_BINARY_REQUANT,
-    SCHEMA_VERSION_STATE,
+    SCHEMA_VERSION,
     TILE_AXIS_HEIGHT_OR_LENGTH,
     TILE_AXIS_HW,
     TILE_AXIS_NONE,
@@ -35,6 +34,7 @@ from .defs import (
     HEADER_SIZE,
     HEADER_STRUCT,
     INDEX_STRUCT,
+    MEMORY_STRUCT,
     MAGIC,
     NO_QUANT_PARAM,
     NO_WEIGHT,
@@ -69,6 +69,7 @@ from .defs import (
     QUANT_PARAM_STRUCT,
     QUANT_SECTION_HEADER_STRUCT,
     SEC_INDEX_POOL,
+    SEC_MEMORY,
     SEC_OP_ATTRIBUTES,
     SEC_STATE,
     SEC_SUBGRAPHS,
@@ -97,8 +98,7 @@ from .defs import (
     TENSOR_FLAG_MODEL_OUTPUT,
     TENSOR_STRUCT,
     TILE_FLAG_BAND_ON_COLUMNS,
-    TILE_PLAN_STRUCT,
-    TILE_PLAN_V10_STRUCT,
+    TILE_PLAN_V11_STRUCT,
     WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
     WEIGHT_BLOCK_STRUCT,
     WEIGHT_ENTRY_SIZE,
@@ -1335,8 +1335,10 @@ def _build_stages(
     return bytes(buf)
 
 
-def _build_tile_plans(ag: AnalyzedGraph, version: int = SCHEMA_VERSION_BINARY_REQUANT) -> tuple[bytes, dict[int, int]]:
-    """Build tile plan table. Returns (bytes, stage_id->tile_plan_index map)."""
+def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
+    """Build the table of schema 11 tile records. Returns (bytes, stage_id->tile_plan_index map)."""
+    from tigris.analysis.partition_spatial import _stage_is_tiled_transpose
+
     buf = bytearray()
     stage_to_tile: dict[int, int] = {}
     idx = 0
@@ -1356,55 +1358,29 @@ def _build_tile_plans(ag: AnalyzedGraph, version: int = SCHEMA_VERSION_BINARY_RE
             raise ValueError(
                 f"untileable stage {stage.stage_id} must use tile axis 0"
             )
-        if version >= SCHEMA_VERSION_STATE:
-            ops = [ag.ops[i] for i in stage.op_indices]
-            output_driven = tp.axis == TILE_AXIS_HW or any(
-                op.op_type in {"Resize", "ResizeLinear"} for op in ops)
-            from tigris.analysis.partition_spatial import _stage_is_tiled_transpose
-            transpose = _stage_is_tiled_transpose(ag, stage, ops)
-            input_band = tp.tile_height if tp.tileable and not output_driven and not transpose else 0
-            output_band = tp.tile_height if tp.tileable and output_driven else 0
-            buf.extend(TILE_PLAN_V10_STRUCT.pack(
-                int(tp.tileable), tp.axis,
-                TILE_FLAG_BAND_ON_COLUMNS if tp.band_on_columns else 0,
-                input_band, output_band, tp.tile_width, tp.input_channel_group,
-                tp.input_spatial_interval, 0, tp.tiled_peak_bytes,
-            ))
-            continue
-
-        # Every tile extent below is a uint16 field. Say which one overflowed
-        # and on which stage: struct.pack alone reports neither, and
-        # tile_width is masked rather than checked, so it would be silent.
-        for field in (
-            "tile_height", "num_tiles", "halo",
-            "receptive_field", "original_height", "tile_width",
-        ):
-            value = int(getattr(tp, field))
-            if not 0 <= value <= 0xFFFF:
-                raise ValueError(
-                    f"stage {stage.stage_id} tile plan {field} is {value:,}, "
-                    f"outside the 0..65,535 the plan format carries"
-                )
-
-        # tigris_tile_plan_t: 24 bytes
-        # tileable(u8) axis(u8) tile_height(u16)
-        # num_tiles(u16) halo(u16)
-        # receptive_field(u16) original_height(u16)
-        # tiled_peak_bytes(u32)
-        # overhead_bytes(u32)
-        # reserved(u32): tile_width packed into the low 16 bits
-        buf.extend(TILE_PLAN_STRUCT.pack(
-            1 if tp.tileable else 0,
-            tp.axis,
-            tp.tile_height,
-            tp.num_tiles,
-            tp.halo,
-            tp.receptive_field,
-            tp.original_height,
-            tp.tiled_peak_bytes,
-            tp.overhead_bytes,
-            tp.tile_width & 0xFFFF,
+        # struct.pack alone would name neither the field nor the stage.
+        for field in ("tile_height", "tile_width", "input_channel_group",
+                      "input_spatial_interval", "tiled_peak_bytes"):
+            _require_uint(int(getattr(tp, field)), 32, f"stage {stage.stage_id} tile plan {field}")
+        ops = [ag.ops[i] for i in stage.op_indices]
+        output_driven = tp.axis == TILE_AXIS_HW or any(
+            op.op_type in {"Resize", "ResizeLinear"} for op in ops)
+        transpose = _stage_is_tiled_transpose(ag, stage, ops)
+        input_band = tp.tile_height if tp.tileable and not output_driven and not transpose else 0
+        output_band = tp.tile_height if tp.tileable and output_driven else 0
+        # A grouped reduction's band is its interval of positions; an untileable record states no tiling.
+        facts = (0, 0, 0, 0, 0)
+        if tp.tileable:
+            facts = (tp.input_spatial_interval if tp.input_channel_group else tp.tile_height,
+                     tp.num_tiles, tp.original_height, tp.halo, tp.band_axis)
+        for field, value, bits in zip(("tile_extent", "num_tiles", "original_extent", "halo", "band_axis"),
+                                      facts, (32, 32, 32, 16, 8)):
+            _require_uint(int(value), bits, f"stage {stage.stage_id} tile plan {field}")
+        buf.extend(TILE_PLAN_V11_STRUCT.pack(
+            int(tp.tileable), tp.axis,
             TILE_FLAG_BAND_ON_COLUMNS if tp.band_on_columns else 0,
+            input_band, output_band, tp.tile_width, tp.input_channel_group,
+            tp.input_spatial_interval, 0, tp.tiled_peak_bytes, *facts, 0,
         ))
 
     return bytes(buf), stage_to_tile
@@ -1672,17 +1648,20 @@ def emit_binary_bytes(
     runtime reads."""
     if not ag.subgraphs:
         return _emit(ag, compress, xip, names=names)
+    from tigris.analysis.validation import scheduled_fast_peak
     from tigris.graph.subgraphs import all_graphs, flatten_subgraphs
 
     for graph in all_graphs(ag):
         _emit(graph, compress, xip, serialize=False)
     merged, ranges = flatten_subgraphs(ag)
-    return _emit(merged, compress, xip, ranges=ranges, validate=False, names=names)
+    return _emit(merged, compress, xip, ranges=ranges, validate=False, names=names,
+                 scheduled_peak=scheduled_fast_peak(ag))
 
 
 def _emit(
     ag: AnalyzedGraph, compress: str | None = None, xip: bool = False,
     *, serialize: bool = True, validate: bool = True, ranges=None, names: bool = False,
+    scheduled_peak: int | None = None,
 ) -> bytes:
     """Validate a graph for emission and, when `serialize`, the plan bytes.
 
@@ -1690,8 +1669,11 @@ def _emit(
         ag: Analyzed graph to serialize.
         compress: Weight compression method. ``None`` or ``"lz4"``.
         xip: If True, set FLAG_XIP in the header (weights read from flash).
+        scheduled_peak: The plan's scheduled fast peak, for a graph merged
+            from subgraphs; otherwise computed from ``ag``.
     """
     from tigris.analysis.validation import (
+        scheduled_fast_peak,
         validate_execution_dtype,
         validate_memory_plan,
         validate_model_outputs,
@@ -1817,11 +1799,12 @@ def _emit(
         ag, tensor_idx, quant_idx_map, weight_idx
     )
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
-    grouped = any(stage.tile_plan is not None and
-                  (stage.tile_plan.input_channel_group or stage.tile_plan.input_spatial_interval)
-                  for stage in ag.stages)
-    version = SCHEMA_VERSION_STATE if state_data or subgraph_data or grouped else SCHEMA_VERSION_BINARY_REQUANT
-    tile_data, stage_to_tile = _build_tile_plans(ag, version)
+    version = SCHEMA_VERSION
+    tile_data, stage_to_tile = _build_tile_plans(ag)
+    if scheduled_peak is None:
+        scheduled_peak = scheduled_fast_peak(ag)
+    _require_uint(scheduled_peak, 32, "scheduled fast peak")
+    memory_data = MEMORY_STRUCT.pack(scheduled_peak)
     stage_data_final = _patch_stage_tile_indices(stage_data, ag, stage_to_tile)
 
     index_data = index_pool.data()
@@ -1869,6 +1852,7 @@ def _emit(
         section_parts.append((SEC_STATE, state_data))
     if subgraph_data:
         section_parts.append((SEC_SUBGRAPHS, subgraph_data))
+    section_parts.append((SEC_MEMORY, memory_data))
 
     section_dir_size = (len(section_parts) + 1) * SECTION_ENTRY_SIZE  # +1 for sentinel
     body_start = HEADER_SIZE + section_dir_size

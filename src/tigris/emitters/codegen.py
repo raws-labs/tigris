@@ -22,7 +22,7 @@ from tigris.dtypes import check_dtype_signatures
 from tigris.emitters.binary.defs import (
     FLAG_XIP, OP_C_NAMES, OP_TYPE_MAP, TENSOR_FLAG_CONSTANT, TENSOR_FLAG_STATE,
 )
-from tigris.analysis.plan_graph import slow_arena_required
+from tigris.analysis.plan_graph import fast_activation_bytes, slow_arena_required
 from tigris.emitters.binary.reader import read_binary_plan
 
 
@@ -33,6 +33,15 @@ _PLAN_TENSOR_ALIGN = 32
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+# Headers with TIGRIS_RUNTIME_VERSION_MAJOR declare tigris_input_alloc(), which generated code calls.
+_RUNTIME_CHECK = (
+    "#ifndef TIGRIS_RUNTIME_VERSION_MAJOR\n"
+    '#error "these runtime headers predate tigris_input_alloc(), which this generated code '
+    'calls; build with the runtime of the same TiGrIS release as the compiler"\n'
+    "#endif\n"
+)
 
 
 def _weight_decompression_overhead(plan: dict, alignment: int) -> int:
@@ -78,7 +87,7 @@ def _cmsis_weight_decompression_overhead(plan: dict) -> int:
 
 
 # The operators the executor reserves per-op tiling state for in a chain
-# (is_height_spatial_op in the runtime executor).
+# (tigris_height_spatial_op in the runtime).
 _HEIGHT_SPATIAL_OPS = frozenset({"Conv", "DepthwiseConv", "MaxPool", "AveragePool", "L2Pool"})
 
 
@@ -360,7 +369,7 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
     macro_prefix = core_name.upper()
     guard = f"{macro_prefix}_CORE_H"
     weight_reserve = _weight_decompression_overhead(plan, _PLAN_TENSOR_ALIGN)
-    fast_arena_required = plan["budget"] + weight_reserve
+    fast_arena_required = fast_activation_bytes(plan) + weight_reserve
     slow_arena_bytes = slow_arena_required(plan)
     workspace_limits = _executor_workspace_limits(plan)
     workspace_limits_args = ", ".join(f"{value}u" for value in workspace_limits)
@@ -390,7 +399,7 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
 #define {macro_prefix}_PLAN_BUDGET_BYTES {plan['budget']}u
 #define {macro_prefix}_WEIGHT_DECOMPRESSION_RESERVE_BYTES {weight_reserve}u
 #define {macro_prefix}_CORE_FAST_ARENA_BYTES {fast_arena_required}u
-/* Slow memory the plan needs, model inputs and outputs included. */
+/* Slow memory the plan needs; for 0 pass a NULL slow arena of size 0. */
 #define {macro_prefix}_CORE_SLOW_ARENA_BYTES {slow_arena_bytes}u
 #define {macro_prefix}_EXECUTOR_WORKSPACE_BYTES \\
     TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS({workspace_limits_args})
@@ -406,9 +415,11 @@ typedef void (*{core_name}_input_init_fn)(
 tigris_error_t {core_name}_load_plan(
     const uint8_t *plan_data, uint32_t plan_len, tigris_plan_t *out_plan);
 
-/* Set up runtime memory, prepare the selected backend, and allocate inputs.
- * Call once before using reset/run. ``init_input`` may be NULL. */
-tigris_mem_error_t {core_name}_init(
+/* Set up runtime memory, prepare the selected backend, and place inputs with
+ * tigris_input_alloc(). Call once before using reset/run. ``init_input`` may
+ * be NULL. Returns TIGRIS_ERR_TENSOR_SLOTS when tensor_capacity is below the
+ * plan's tensor count, and TIGRIS_ERR_MEM when an arena is too small. */
+tigris_error_t {core_name}_init(
     const tigris_plan_t *plan, tigris_mem_t *mem,
     void **tensor_ptrs, uint16_t tensor_capacity,
     void *fast_arena, uint32_t fast_arena_size,
@@ -416,8 +427,11 @@ tigris_mem_error_t {core_name}_init(
     {core_name}_input_init_fn init_input, void *user_ctx);
 
 /* Reset activations and inputs for another inference. The backend reservation
- * created by init is retained, so CMSIS-NN scratch cannot alias activations. */
-tigris_mem_error_t {core_name}_reset(
+ * created by init is retained, so CMSIS-NN scratch cannot alias activations.
+ * Read the outputs first: reset drops every tensor, and a plan that reads
+ * its inputs in place leaves its outputs in the fast arena, where the next
+ * inputs go. */
+tigris_error_t {core_name}_reset(
     const tigris_plan_t *plan, tigris_mem_t *mem,
     {core_name}_input_init_fn init_input, void *user_ctx);
 
@@ -464,9 +478,9 @@ def _generate_core(
         tigris_cmsis_nn_fast_arena_required(plan);
     if (cmsis_fast_required == UINT32_MAX ||
         fast_arena_size < cmsis_fast_required)
-        return TIGRIS_MEM_ERR_OOM;
+        return TIGRIS_ERR_MEM;
     if (tigris_cmsis_nn_prepare(plan, mem) != 0)
-        return TIGRIS_MEM_ERR_OOM;
+        return TIGRIS_ERR_MEM;
 """ if is_quantized else ""
     elif backend == "esp-nn":
         dispatch = "tigris_dispatch_kernel_esp_nn" if is_quantized else "tigris_dispatch_kernel"
@@ -474,7 +488,7 @@ def _generate_core(
         teardown = ""
         prepare = """\
     if (tigris_esp_nn_prepare(plan, mem) != 0)
-        return TIGRIS_MEM_ERR_OOM;
+        return TIGRIS_ERR_MEM;
 """ if is_quantized else ""
     else:
         dispatch = "tigris_dispatch_kernel_s8" if is_quantized else "tigris_dispatch_kernel"
@@ -486,22 +500,27 @@ def _generate_core(
 #include <string.h>
 
 #include "{core_header}"
-{kernel_include}
+{_RUNTIME_CHECK}{kernel_include}
 
-static tigris_mem_error_t {core_name}_allocate_inputs(
+static tigris_error_t {core_name}_allocate_inputs(
     const tigris_plan_t *plan, tigris_mem_t *mem,
     {core_name}_input_init_fn init_input, void *user_ctx)
 {{
     for (uint8_t i = 0; i < plan->header->num_model_inputs; i++) {{
         uint16_t tidx = plan->model_inputs[i];
-        uint32_t size = plan->tensors[tidx].size_bytes;
-        tigris_mem_error_t err = tigris_mem_alloc_slow(mem, tidx, size);
-        if (err != TIGRIS_MEM_OK)
+        tigris_error_t err = tigris_input_alloc(plan, mem, tidx);
+        if (err != TIGRIS_OK)
             return err;
         if (init_input)
-            init_input(mem->tensor_ptrs[tidx], size, tidx, user_ctx);
+            init_input(mem->tensor_ptrs[tidx], plan->tensors[tidx].size_bytes, tidx, user_ctx);
     }}
-    return TIGRIS_MEM_OK;
+    return TIGRIS_OK;
+}}
+
+/* tigris_mem_init() fails only on a NULL argument or an arena too small to align. */
+static tigris_error_t {core_name}_mem_error(tigris_mem_error_t err)
+{{
+    return err == TIGRIS_MEM_ERR_OOM ? TIGRIS_ERR_MEM : TIGRIS_ERR_NULL;
 }}
 
 tigris_error_t {core_name}_load_plan(
@@ -510,7 +529,7 @@ tigris_error_t {core_name}_load_plan(
     return tigris_plan_load(plan_data, plan_len, out_plan);
 }}
 
-tigris_mem_error_t {core_name}_init(
+tigris_error_t {core_name}_init(
     const tigris_plan_t *plan, tigris_mem_t *mem,
     void **tensor_ptrs, uint16_t tensor_capacity,
     void *fast_arena, uint32_t fast_arena_size,
@@ -518,7 +537,7 @@ tigris_mem_error_t {core_name}_init(
     {core_name}_input_init_fn init_input, void *user_ctx)
 {{
     if (plan->header->num_tensors > tensor_capacity)
-        return TIGRIS_MEM_ERR_BAD_INDEX;
+        return TIGRIS_ERR_TENSOR_SLOTS;
 
 {teardown}
     memset(tensor_ptrs, 0, (size_t)tensor_capacity * sizeof(*tensor_ptrs));
@@ -526,18 +545,18 @@ tigris_mem_error_t {core_name}_init(
         mem, tensor_ptrs, plan->header->num_tensors,
         fast_arena, fast_arena_size, slow_arena, slow_arena_size);
     if (err != TIGRIS_MEM_OK)
-        return err;
+        return {core_name}_mem_error(err);
 {prepare}
     return {core_name}_allocate_inputs(plan, mem, init_input, user_ctx);
 }}
 
-tigris_mem_error_t {core_name}_reset(
+tigris_error_t {core_name}_reset(
     const tigris_plan_t *plan, tigris_mem_t *mem,
     {core_name}_input_init_fn init_input, void *user_ctx)
 {{
     if (!plan || !plan->header || !mem || !mem->tensor_ptrs ||
-        !mem->fast_base || !mem->slow_base)
-        return TIGRIS_MEM_ERR_NULL;
+        !mem->fast_base || (!mem->slow_base && mem->slow_size))
+        return TIGRIS_ERR_NULL;
 
     /* Preserve the backend's reservation. CMSIS-NN reduces fast_size in init;
      * reinitializing with that reduced size keeps scratch disjoint from fresh
@@ -546,7 +565,7 @@ tigris_mem_error_t {core_name}_reset(
         mem, mem->tensor_ptrs, plan->header->num_tensors,
         mem->fast_base, mem->fast_size, mem->slow_base, mem->slow_size);
     if (err != TIGRIS_MEM_OK)
-        return err;
+        return {core_name}_mem_error(err);
     return {core_name}_allocate_inputs(plan, mem, init_input, user_ctx);
 }}
 
@@ -613,6 +632,8 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
     workspace_declaration = (
         _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
     )
+    slow_buffer = "allocate_aligned(slow_size)" if slow_size else "NULL"
+    slow_missing = " || !slow_buf" if slow_size else ""
 
     return f"""\
 #define _POSIX_C_SOURCE 200112L
@@ -627,7 +648,7 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"
-{kernel_include}
+{_RUNTIME_CHECK}{kernel_include}
 
 {workspace_declaration}
 
@@ -699,10 +720,10 @@ int main(int argc, char **argv)
     uint32_t slow_size = {slow_size}u;
 
     void *fast_buf = allocate_aligned(fast_size);
-    void *slow_buf = allocate_aligned(slow_size);
+    void *slow_buf = {slow_buffer};
     uint16_t num_t = plan.header->num_tensors;
     void **tensor_ptrs = calloc(num_t, sizeof(void *));
-    if (!fast_buf || !slow_buf || !tensor_ptrs) {{
+    if (!fast_buf{slow_missing} || !tensor_ptrs) {{
         fprintf(stderr, "Allocation failed\\n");
         free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
         return 1;
@@ -721,10 +742,10 @@ int main(int argc, char **argv)
     /* 4. Allocate and zero-fill model inputs */
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {{
         uint16_t tidx = plan.model_inputs[i];
-        merr = tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
-        if (merr != TIGRIS_MEM_OK) {{
+        tigris_error_t ierr = tigris_input_alloc(&plan, &mem, tidx);
+        if (ierr != TIGRIS_OK) {{
             fprintf(stderr, "Input allocation failed for tensor %u: %s\\n",
-                    tidx, tigris_mem_error_str(merr));
+                    tidx, tigris_error_str(ierr));
             free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
             return 1;
         }}
@@ -804,6 +825,10 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
     workspace_declaration = (
         _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
     )
+    psram_buffer = "heap_caps_malloc(slow_size, MALLOC_CAP_SPIRAM)" if slow_size else "NULL"
+    sram_buffer = ("heap_caps_malloc(slow_size,\n        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)"
+                   if slow_size else "NULL")
+    slow_missing = " || !slow_buf" if slow_size else ""
 
     if is_quantized:
         dispatch = "tigris_dispatch_kernel_esp_nn"
@@ -839,7 +864,7 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"
-{kernel_includes}
+{_RUNTIME_CHECK}{kernel_includes}
 
 static const char *TAG = "tigris";
 {workspace_declaration}
@@ -903,17 +928,16 @@ void app_main(void)
     void *fast_buf = heap_caps_malloc(fast_size,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #if CONFIG_SPIRAM
-    void *slow_buf = heap_caps_malloc(slow_size, MALLOC_CAP_SPIRAM);
+    void *slow_buf = {psram_buffer};
     uint16_t num_t = plan.header->num_tensors;
     void **tensor_ptrs = heap_caps_calloc(num_t, sizeof(void *), MALLOC_CAP_SPIRAM);
 #else
-    void *slow_buf = heap_caps_malloc(slow_size,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *slow_buf = {sram_buffer};
     uint16_t num_t = plan.header->num_tensors;
     void **tensor_ptrs = heap_caps_calloc(num_t, sizeof(void *),
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #endif
-    if (!fast_buf || !slow_buf || !tensor_ptrs) {{
+    if (!fast_buf{slow_missing} || !tensor_ptrs) {{
         ESP_LOGE(TAG, "allocation failed");
         goto cleanup;
     }}
@@ -933,10 +957,10 @@ void app_main(void)
     /* 5. Allocate and zero-fill model inputs */
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {{
         uint16_t tidx = plan.model_inputs[i];
-        merr = tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
-        if (merr != TIGRIS_MEM_OK) {{
+        tigris_error_t ierr = tigris_input_alloc(&plan, &mem, tidx);
+        if (ierr != TIGRIS_OK) {{
             ESP_LOGE(TAG, "input allocation failed for tensor %u: %s",
-                     tidx, tigris_mem_error_str(merr));
+                     tidx, tigris_error_str(ierr));
             goto cleanup;
         }}
         memset(mem.tensor_ptrs[tidx], 0, plan.tensors[tidx].size_bytes);
@@ -1003,9 +1027,9 @@ cleanup:
 def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
     dispatch = "tigris_dispatch_kernel_cmsis_nn" if is_quantized else "tigris_dispatch_kernel"
     kernel_include = '#include "tigris_kernels_cmsis_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
-    budget = plan["budget"] or 65536
     weight_overhead = _cmsis_weight_decompression_overhead(plan)
-    core_fast_arena_size = _align_up(budget + weight_overhead, 16)
+    core_fast_arena_size = _align_up(
+        (fast_activation_bytes(plan) or 65536) + weight_overhead, 16)
     if core_fast_arena_size > 0xFFFFFFFF:
         raise ValueError(
             "CMSIS-NN static fast arena exceeds the uint32 runtime size limit"
@@ -1018,6 +1042,10 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
         raise ValueError(
             "CMSIS-NN static slow arena exceeds the uint32 runtime size limit"
         )
+    slow_declaration = (
+        f"static uint8_t slow_arena[{slow_arena_size}] __attribute__((aligned(16)));\n"
+        if slow_arena_size else "")
+    slow_arguments = "slow_arena, sizeof(slow_arena)" if slow_arena_size else "NULL, 0u"
 
     if is_quantized:
         scratch_declaration = f"""\
@@ -1077,7 +1105,7 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
 #include "tigris_loader.h"
 #include "tigris_mem.h"
 #include "tigris_executor.h"
-{kernel_include}
+{_RUNTIME_CHECK}{kernel_include}
 
 {scratch_declaration}
 
@@ -1087,8 +1115,7 @@ extern const uint8_t _binary_model_tgrs_end[];
 
 /* Static buffers. Fast memory preserves the full core arena below CMSIS scratch. */
 static uint8_t fast_arena[{fast_arena_expr}] __attribute__((aligned(16)));
-static uint8_t slow_arena[{slow_arena_size}] __attribute__((aligned(16)));
-static void *tensor_ptrs[{plan['num_tensors']}];
+{slow_declaration}static void *tensor_ptrs[{plan['num_tensors']}];
 {workspace_declaration}
 
 int main(void)
@@ -1117,7 +1144,7 @@ int main(void)
     memset(tensor_ptrs, 0, sizeof(tensor_ptrs));
     tigris_mem_error_t merr = tigris_mem_init(
         &mem, tensor_ptrs, {plan['num_tensors']},
-        fast_arena, sizeof(fast_arena), slow_arena, sizeof(slow_arena));
+        fast_arena, sizeof(fast_arena), {slow_arguments});
     if (merr != TIGRIS_MEM_OK) {{
         printf("Memory init failed: %s\\n", tigris_mem_error_str(merr));
         return 1;
@@ -1127,10 +1154,10 @@ int main(void)
     /* 3. Allocate and zero-fill model inputs */
     for (uint8_t i = 0; i < plan.header->num_model_inputs; i++) {{
         uint16_t tidx = plan.model_inputs[i];
-        merr = tigris_mem_alloc_slow(&mem, tidx, plan.tensors[tidx].size_bytes);
-        if (merr != TIGRIS_MEM_OK) {{
+        tigris_error_t ierr = tigris_input_alloc(&plan, &mem, tidx);
+        if (ierr != TIGRIS_OK) {{
             printf("Input allocation failed for tensor %u: %s\\n",
-                   tidx, tigris_mem_error_str(merr));
+                   tidx, tigris_error_str(ierr));
             return 1;
         }}
         memset(mem.tensor_ptrs[tidx], 0, plan.tensors[tidx].size_bytes);

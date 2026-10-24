@@ -28,6 +28,43 @@ def linear_plan(linear_3op_path, tmp_path):
     return path
 
 
+@pytest.mark.parametrize("path", sorted((Path(__file__).parent / "schema_compat").glob("*.tgrs")),
+                         ids=lambda path: path.stem)
+def test_runtime_places_inputs_where_the_compiler_says(path):
+    """The runtime reads model inputs in the fast pool exactly for the plans
+    the compiler sizes without slow memory for them, older schemas included."""
+    from tigris.analysis.plan_graph import graph_from_plan
+    from tigris.analysis.validation import io_in_fast
+    from tigris.emitters.binary.reader import read_binary_plan
+
+    in_fast = io_in_fast(graph_from_plan(read_binary_plan(path.read_bytes())))
+    with Session(path) as session:
+        inputs = {item["name"]: np.zeros(item["shape"], item["dtype"]) for item in session.inputs}
+        _, events, counters = session.trace(inputs)
+    allocations = [event["pool"] for event in events if event["kind"] == "alloc"]
+    assert allocations[0] == ("fast" if in_fast else "slow")
+    assert (counters["load_bytes"] == 0) == in_fast
+
+
+@pytest.mark.parametrize("path", sorted((Path(__file__).parent / "schema_compat").glob("*.tgrs")),
+                         ids=lambda path: path.stem)
+def test_a_slow_arena_that_cannot_hold_an_input_is_reported(path):
+    """With one byte of slow memory, a plan that reads its inputs in place
+    runs and any other plan reports that the arena cannot hold the input."""
+    from tigris.analysis.plan_graph import graph_from_plan
+    from tigris.analysis.validation import io_in_fast
+    from tigris.emitters.binary.reader import read_binary_plan
+
+    in_fast = io_in_fast(graph_from_plan(read_binary_plan(path.read_bytes())))
+    with Session(path, slow_capacity=1) as session:
+        inputs = {item["name"]: np.zeros(item["shape"], item["dtype"]) for item in session.inputs}
+        if in_fast:
+            session.run(inputs)
+        else:
+            with pytest.raises(runtime.RuntimeError, match="^arena cannot hold the tensor$"):
+                session.run(inputs)
+
+
 @pytest.fixture
 def override_library(tmp_path):
     directory = Path(runtime.__file__).with_name("native")
@@ -314,9 +351,10 @@ def test_session_trace_reports_events_in_order(linear_plan):
     with Session(linear_plan) as session:
         outputs, events, counters = session.trace({"input": np.ones((1, 64), np.float32)})
     assert outputs["output"].sum() == 64
-    # The input is placed in slow memory before the stage and the fast pool is reset after it.
+    # One stage: the input is allocated in fast first and read there.
     kinds = [event["kind"] for event in events]
-    assert (kinds[0], events[0]["pool"], events[0]["stage"]) == ("alloc", "slow", None)
+    assert (kinds[0], events[0]["pool"], events[0]["stage"]) == ("alloc", "fast", None)
+    assert counters["load_bytes"] == 0
     assert kinds.count("stage_begin") == kinds.count("stage_end") == 1
     assert kinds.index("stage_begin") < kinds.index("stage_end") == len(kinds) - 2
     assert [event["op"] for event in events if event["kind"] == "op"] == [0, 1, 2]

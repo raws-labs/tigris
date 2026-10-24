@@ -5,6 +5,7 @@ from pathlib import Path
 
 import click
 from tigris.cli import cli, text
+from tigris.analysis.plan_graph import fast_activation_bytes
 from tigris.emitters.binary.defs import FLAG_XIP, STAGE_FLAG_LINE_BUFFERED
 from tigris.inspection import inspect_file
 from tigris.utils import fmt_bytes
@@ -265,7 +266,7 @@ def _plan_summary(plan, needs):
     storage = "read in place (XIP)" if plan["flags"] & FLAG_XIP else "loaded by stage"
     arena_note = ""
     if needs["decompression_bytes"]:
-        arena_note = (f"{fmt_bytes(plan['budget'])} activations, "
+        arena_note = (f"{fmt_bytes(fast_activation_bytes(plan))} activations, "
                       f"{fmt_bytes(needs['decompression_bytes'])} decompressed weights")
     rows = [["fast arena", fmt_bytes(needs["fast_arena_bytes"]), text.dim(arena_note)],
             ["unscheduled", fmt_bytes(plan["peak"]), ""],
@@ -278,6 +279,15 @@ def _plan_summary(plan, needs):
                  ", ".join(f"-D{limit['name']}={limit['needed']}" for limit in over)]])
 
 
+def _layout_conversion(plan, stage, tile):
+    """One banded Transpose, whose record states no band because the run sizes it."""
+    if len(stage["ops"]) != 1 or tile.get("input_band_extent") != 0 or tile.get("output_band_extent") != 0:
+        return False
+    op = plan["ops"][stage["ops"][0]]
+    return (op["type"] == "Transpose" and stage["inputs"] == op["inputs"] and len(op["inputs"]) == 1
+            and stage["outputs"] == op["outputs"] and len(op["outputs"]) == 1)
+
+
 def _tiling(plan, index, stage):
     if stage["chain_id"] is not None and stage["chain_len"] >= 2:
         head = plan["stages"][stage["chain_id"]]
@@ -287,6 +297,10 @@ def _tiling(plan, index, stage):
         return f"chain of {stage['chain_len']}, tile height {head['chain_tile_h']}, {mode}"
     if stage["tile_plan_idx"] is not None:
         tile = plan["tile_plans"][stage["tile_plan_idx"]]
+        if tile["tileable"] and tile["num_tiles"] is None:
+            return f"tiled, axis {tile['axis']}"
+        if tile["tileable"] and _layout_conversion(plan, stage, tile):
+            return f"{tile['num_tiles']} tiles of the compiler's band, axis {tile['axis']}"
         if tile["tileable"]:
             return f"{tile['num_tiles']} tiles, axis {tile['axis']}, halo {tile['halo']}"
     return "untiled"

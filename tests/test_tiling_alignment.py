@@ -62,10 +62,27 @@ def test_transpose_band_counts_unchanged_trailing_block(tmp_path, budget, feasib
 def test_memory_contract_rejects_peak_above_schedule_in_roomy_arena(reserve):
     from scripts.crossrepo_contract import _assert_memory_contract
 
-    plan = {"budget": 256, "_compiler_scheduled_peak": 192,
+    plan = {"budget": 256, "scheduled_peak": 192, "_compiler_scheduled_peak": 192,
             "_compiler_slow_peak": 512, "_compiler_slow_budget": 0}
     report = (f"TIGRIS_CONTRACT_MEMORY budget=256 activation_limit=256 "
-              f"reserve={reserve} required={256 + reserve} allocated={256 + reserve} "
+              f"reserve={reserve} required={192 + reserve} allocated={256 + reserve} "
               f"peak={240 + reserve} slow_peak=128\n")
     with pytest.raises(AssertionError, match="runtime peak .* exceeds compiler"):
         _assert_memory_contract("roomy", plan, report, full_budget=True)
+
+
+def test_memory_contract_holds_the_runtime_to_the_stated_peak():
+    from scripts.crossrepo_contract import _assert_memory_contract
+
+    report = ("TIGRIS_CONTRACT_MEMORY budget=256 activation_limit=192 reserve=0 "
+              "required={required} allocated=192 peak=192 slow_peak=0\n")
+    plan = {"budget": 256, "scheduled_peak": 160, "_compiler_scheduled_peak": 192,
+            "_compiler_slow_peak": 0, "_compiler_slow_budget": 0}
+    with pytest.raises(AssertionError, match="plan states scheduled peak 160"):
+        _assert_memory_contract("stated", plan, report.format(required=192))
+    plan["scheduled_peak"] = 192
+    with pytest.raises(AssertionError, match=r"required arena 256 != activations \+ reserve"):
+        _assert_memory_contract("stated", plan, report.format(required=256))
+    _assert_memory_contract("stated", plan, report.format(required=192))
+    plan["scheduled_peak"] = None
+    _assert_memory_contract("older", plan, report.format(required=256))

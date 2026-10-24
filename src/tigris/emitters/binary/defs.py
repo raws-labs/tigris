@@ -28,6 +28,8 @@ SEC_STATE = 12
 SEC_SUBGRAPHS = 13  # u16 count, u16 0, then per graph (main first): u16 first stage,
                     # u16 stages, u16 inputs offset, u16 inputs, u16 outputs offset,
                     # u16 outputs (offsets into the index pool)
+# The plan's fast-arena figure (schema 11+): MEMORY_STRUCT.
+SEC_MEMORY = 14
 SUBGRAPH_HEADER_SIZE = 4
 SUBGRAPH_ENTRY_SIZE = 12
 STATE_HEADER_SIZE = 8
@@ -159,10 +161,14 @@ OP_ACTIVATION_STRUCT = struct.Struct("<Bbbx")
 STAGE_STRUCT = struct.Struct("<I12H")
 TILE_PLAN_STRUCT = struct.Struct("<BB5H2I2H")
 TILE_PLAN_V10_STRUCT = struct.Struct("<BBH7I")
+# The schema 10 fields, then the stated tiling: extent, tiles, original (u32), halo (u16), axis (u8), 0.
+TILE_PLAN_V11_STRUCT = struct.Struct("<BBH7I3IHBB")
 WEIGHT_ENTRY_STRUCT = struct.Struct("<III")
 QUANT_PARAM_STRUCT = struct.Struct("<fiHHHH")
 WEIGHT_BLOCK_STRUCT = struct.Struct("<HHHHIII")
 OP_ATTRIBUTE_STRUCT = struct.Struct("<HBBI")
+# scheduled_peak(u32): fast bytes the largest stage or chain holds, as validated; no decompressed weights.
+MEMORY_STRUCT = struct.Struct("<I")
 
 # Section-local headers and primitive pool elements are part of the wire
 # contract too, even though they are not named C record types.
@@ -188,12 +194,14 @@ OP_SIZE = (
     + OP_ACTIVATION_STRUCT.size
 )
 STAGE_SIZE = STAGE_STRUCT.size
+TILE_PLAN_V11_SIZE = TILE_PLAN_V11_STRUCT.size
 TILE_PLAN_V10_SIZE = TILE_PLAN_V10_STRUCT.size
 TILE_PLAN_SIZE = TILE_PLAN_STRUCT.size
 WEIGHT_ENTRY_SIZE = WEIGHT_ENTRY_STRUCT.size
 QUANT_PARAM_SIZE = QUANT_PARAM_STRUCT.size
 WEIGHT_BLOCK_SIZE = WEIGHT_BLOCK_STRUCT.size
 OP_ATTRIBUTE_SIZE = OP_ATTRIBUTE_STRUCT.size
+MEMORY_SIZE = MEMORY_STRUCT.size
 
 # Derived field offsets used for staged decoding/patching.
 OP_SPATIAL_OFFSET = OP_PREFIX_STRUCT.size

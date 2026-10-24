@@ -71,6 +71,67 @@ def test_supported_schemas_and_json(path):
     assert "stored tensors" in verbose.output
 
 
+def test_tile_records_list_the_fields_their_schema_states(tmp_path):
+    """Version 2 of the document lists each tile record by the fields its schema states."""
+    from tigris.analysis.plan_graph import graph_from_plan
+
+    data = (FIXTURES / "schema-v11-scheduled-peak.tgrs").read_bytes()
+    report = inspect_file(FIXTURES / "schema-v11-scheduled-peak.tgrs")
+    assert report["inspection_version"] == 2
+    (tile,) = report["plan"]["tile_plans"]
+    assert (tile["input_band_extent"], tile["tile_extent"], tile["num_tiles"],
+            tile["original_extent"], tile["halo"], tile["band_axis"]) == (1, 1, 7, 7, 2, 1)
+    assert not {"tile_height", "original_height", "receptive_field", "overhead_bytes"} & set(tile)
+
+    # The same plan at schema 10: its one record's first 32 bytes are the schema 10 record.
+    older = bytearray(data)
+    struct.pack_into("<I", older, 4, 10)
+    entry = defs.HEADER_SIZE
+    while struct.unpack_from("<I", older, entry)[0] != defs.SEC_MEMORY:
+        entry += defs.SECTION_ENTRY_SIZE
+    struct.pack_into("<II", older, entry, 0, 0)
+    path = tmp_path / "schema-10.tgrs"
+    path.write_bytes(bytes(older))
+    (tile,) = inspect_file(path)["plan"]["tile_plans"]
+    assert tile["input_band_extent"] == 1
+    assert [tile[key] for key in ("tile_extent", "num_tiles", "original_extent", "halo",
+                                  "band_axis")] == [None] * 5
+    read = graph_from_plan(read_binary_plan(bytes(older))).stages[0].tile_plan
+    assert (read.tile_height, read.num_tiles, read.original_height) == (1, 0, 0)
+    verbose = CliRunner().invoke(cli, ["inspect", str(path), "-v"])
+    assert verbose.exit_code == 0, verbose.output
+    assert "tiled, axis 1" in verbose.output
+
+    (legacy,) = inspect_file(FIXTURES / "schema-v5-conv1d-axis.tgrs")["plan"]["tile_plans"]
+    assert (legacy["tile_height"], legacy["num_tiles"], legacy["receptive_field"]) == (49, 6, 3)
+
+
+def test_a_layout_conversion_counts_the_compilers_band(tmp_path):
+    from tigris.cli import _run_pipeline
+    from tigris.emitters.binary.writer import emit_binary_bytes
+
+    shape = [1, 4096, 8]
+    graph = helper.make_graph([helper.make_node("Softmax", ["x"], ["y"], axis=-1)], "softmax",
+                              [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+                              [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
+    source = tmp_path / "softmax.onnx"
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), source)
+    compiled, _ = _run_pipeline(str(source), ("32000",))
+    path = tmp_path / "softmax.tgrs"
+    path.write_bytes(emit_binary_bytes(compiled))
+    stages = [[compiled.ops[i].op_type for i in stage.op_indices] for stage in compiled.stages]
+    assert stages == [["Transpose"], ["Softmax"], ["Transpose"]]
+
+    result = CliRunner().invoke(cli, ["inspect", str(path), "-v"])
+    assert result.exit_code == 0, result.output
+    for index in (0, 2):
+        tile = compiled.stages[index].tile_plan
+        assert tile.tileable and tile.num_tiles > 1
+        assert f"{tile.num_tiles} tiles of the compiler's band, axis {tile.axis}" in result.output
+    softmax = compiled.stages[1].tile_plan
+    assert f"{softmax.num_tiles} tiles, axis {softmax.axis}, halo {softmax.halo}" in result.output
+
+
 def test_plan_detected_by_content(tmp_path):
     path = tmp_path / "plan.onnx"
     path.write_bytes((FIXTURES / "schema-v7-tensor-layout.tgrs").read_bytes())

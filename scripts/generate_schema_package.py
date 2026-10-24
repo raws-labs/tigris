@@ -53,6 +53,7 @@ def schema_package() -> dict[str, object]:
         "op_types": dict(sorted(defs.OP_TYPE_MAP.items())),
         "record_sizes": {
             "header": defs.HEADER_SIZE,
+            "memory": defs.MEMORY_SIZE,
             "op": defs.OP_SIZE,
             "op_attribute": defs.OP_ATTRIBUTE_SIZE,
             "quant_param": defs.QUANT_PARAM_SIZE,
@@ -63,7 +64,8 @@ def schema_package() -> dict[str, object]:
             "state_header": defs.STATE_HEADER_SIZE,
             "stage": defs.STAGE_SIZE,
             "tensor": defs.TENSOR_SIZE,
-            "tile_plan": defs.TILE_PLAN_V10_SIZE,
+            "tile_plan": defs.TILE_PLAN_V11_SIZE,
+            "tile_plan_v10": defs.TILE_PLAN_V10_SIZE,
             "tile_plan_through_v9": defs.TILE_PLAN_SIZE,
             "weight_block": defs.WEIGHT_BLOCK_SIZE,
             "weight_entry": defs.WEIGHT_ENTRY_SIZE,
@@ -75,9 +77,19 @@ def schema_package() -> dict[str, object]:
             "stage_assignment_v5": (
                 "stage table authoritative; operator byte is canonical low-byte hint"
             ),
-            "state_v10": "a plan with state, subgraphs or grouped tiles is written at schema 10",
+            "memory_v11": (
+                "every plan is written at schema 11 with a memory section; scheduled_peak "
+                "is the fast-arena bytes the largest stage or chain holds at once, "
+                "decompressed weights excluded"
+            ),
+            "tile_facts_v11": (
+                "a tile record states the band axis, the extent the bands divide, the band, "
+                "the tile count and the halo; the runtime's loader derives them from the plan "
+                "and refuses a record that disagrees"
+            ),
+            "state_v10": "state, subgraphs and grouped tiles need schema 10 or later",
             "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
-            "subgraphs_v10": "a plan with control flow is written at schema 10; graph 0 is the main graph",
+            "subgraphs_v10": "control flow needs schema 10 or later; graph 0 is the main graph",
         },
         "section_alignment": defs.PLAN_SECTION_ALIGNMENT,
         "tensor_flags": {
@@ -87,13 +99,15 @@ def schema_package() -> dict[str, object]:
             "model_output": defs.TENSOR_FLAG_MODEL_OUTPUT,
             "state": defs.TENSOR_FLAG_STATE,
         },
-        "tile_plan_v10": {
-            "struct": defs.TILE_PLAN_V10_STRUCT.format,
+        "tile_plan_v11": {
+            "struct": defs.TILE_PLAN_V11_STRUCT.format,
             "fields": {"tileable": [0, 1], "axis": [1, 1], "flags": [2, 2],
                        "input_band_extent": [4, 4], "output_band_extent": [8, 4],
                        "output_width_extent": [12, 4], "input_channel_group": [16, 4],
                        "input_spatial_interval": [20, 4], "output_linear_segment": [24, 4],
-                       "tiled_peak_bytes": [28, 4]},
+                       "tiled_peak_bytes": [28, 4], "tile_extent": [32, 4],
+                       "num_tiles": [36, 4], "original_extent": [40, 4], "halo": [44, 2],
+                       "band_axis": [46, 1], "reserved": [47, 1]},
         },
         "tile_axes": {
             "height_or_length": TILE_AXIS_HEIGHT_OR_LENGTH,
@@ -103,6 +117,7 @@ def schema_package() -> dict[str, object]:
         },
         "section_types": {
             "index_pool": defs.SEC_INDEX_POOL,
+            "memory": defs.SEC_MEMORY,
             "op_attributes": defs.SEC_OP_ATTRIBUTES,
             "ops": defs.SEC_OPS,
             "quant_params": defs.SEC_QUANT_PARAMS,

@@ -5,7 +5,6 @@ Byte-level, mirrors test_linebuffer_plan.py: builds a real ONNX model, runs
 the shared CLI pipeline, and inspects the emitted binary tile-plan record.
 """
 
-import struct
 
 import numpy as np
 import onnx
@@ -19,10 +18,9 @@ from tigris.emitters.binary.defs import (
     HEADER_STRUCT,
     SEC_TILE_PLANS,
     SECTION_ENTRY_STRUCT,
+    TILE_PLAN_V11_STRUCT,
 )
 from tigris.emitters.binary.writer import emit_binary_bytes
-
-TILE_PLAN_STRUCT = struct.Struct("<BBHHHHHIII")  # matches tigris_tile_plan_t (24 bytes)
 
 
 def _build_high_res_conv(h: int, w: int, c: int) -> onnx.ModelProto:
@@ -77,12 +75,12 @@ def decode_first_tile_plan(plan_bytes: bytes):
         sections[sec_type] = sec_off
 
     tp_base = sections[SEC_TILE_PLANS]
+    # The schema 11 record layout, which every current plan uses.
     (
-        tileable, axis, tile_height,
-        num_tiles, halo,
-        receptive_field, original_height,
-        tiled_peak_bytes, overhead_bytes, reserved,
-    ) = TILE_PLAN_STRUCT.unpack_from(plan_bytes, tp_base)
+        tileable, axis, _flags, _input_band, _output_band, output_width,
+        _channel_group, _spatial_interval, _linear_segment, tiled_peak_bytes,
+        tile_extent, num_tiles, original_extent, _halo, _band_axis, _reserved,
+    ) = TILE_PLAN_V11_STRUCT.unpack_from(plan_bytes, tp_base)
 
     class _TilePlan:
         pass
@@ -90,14 +88,11 @@ def decode_first_tile_plan(plan_bytes: bytes):
     tp = _TilePlan()
     tp.tileable = tileable
     tp.axis = axis
-    tp.tile_height = tile_height
-    tp.tile_width = reserved & 0xFFFF
+    tp.tile_height = tile_extent
+    tp.tile_width = output_width
     tp.num_tiles = num_tiles
-    tp.halo = halo
-    tp.receptive_field = receptive_field
-    tp.original_height = original_height
+    tp.original_height = original_extent
     tp.tiled_peak_bytes = tiled_peak_bytes
-    tp.overhead_bytes = overhead_bytes
     return tp
 
 

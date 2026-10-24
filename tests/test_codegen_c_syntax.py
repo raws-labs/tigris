@@ -1,6 +1,7 @@
 """Compile generated deployment harnesses as C99 with target API stubs."""
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -259,3 +260,312 @@ def test_stateful_harness_and_core_are_valid_c99(tmp_path, backend):
         result = subprocess.run([*command, str(source)], text=True, capture_output=True,
                                 check=False)
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _syntax_check(source: Path, include: Path, tmp_path: Path, backend: str):
+    command = [_CC, "-std=c99", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
+               f"-I{include}", f"-I{tmp_path}"]
+    if backend == "esp-nn":
+        stub_dir = tmp_path / "esp-stubs"
+        if not stub_dir.is_dir():
+            stub_dir.mkdir()
+            _write_esp_stubs(stub_dir)
+        command.extend([f"-I{stub_dir}", "-DTIGRIS_HAS_ESP_NN"])
+    elif backend == "cmsis-nn":
+        command.append("-DTIGRIS_HAS_CMSIS_NN")
+    return subprocess.run([*command, str(source)], text=True, capture_output=True, check=False)
+
+
+@pytest.mark.parametrize("fmt", ["app", "core"])
+@pytest.mark.parametrize("backend", ["reference", "esp-nn", "cmsis-nn"])
+def test_generated_code_stops_on_older_runtime_headers(
+    qdq_conv_path, conv_relu_chain_path, tmp_path, backend, fmt
+):
+    """Generated code places its inputs with tigris_input_alloc(), so it builds
+    only against runtime headers that state their version, whether the plan
+    reads its inputs in place or is staged."""
+    older = tmp_path / "older-include"
+    shutil.copytree(_RUNTIME_INCLUDE, older)
+    header = older / "tigris.h"
+    text = header.read_text()
+    stripped = re.sub(r"^#define TIGRIS_RUNTIME_VERSION_\w+ \d+\n", "", text, flags=re.MULTILINE)
+    assert stripped.count("\n") == text.count("\n") - 3
+    header.write_text(stripped)
+
+    for path in (qdq_conv_path, conv_relu_chain_path):
+        data = _plan_bytes(path)
+        core_header = tmp_path / "generated_core.h"
+        core_header.write_text(generate_core_header(data))
+        source = tmp_path / f"generated-{fmt}.c"
+        source.write_text(generate_c(data, backend, output_format=fmt,
+                                     core_header=core_header.name))
+        assert "tigris_input_alloc(" in source.read_text()
+
+        current = _syntax_check(source, _RUNTIME_INCLUDE, tmp_path, backend)
+        assert current.returncode == 0, current.stdout + current.stderr
+        result = _syntax_check(source, older, tmp_path, backend)
+        assert result.returncode != 0
+        assert "these runtime headers predate tigris_input_alloc()" in result.stderr
+
+
+_CORE_DRIVER = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "generated_core.h"
+
+static _Alignas(32) uint8_t plan_buf[1 << 20];
+static _Alignas(32) uint8_t fast_arena[TIGRIS_CODEGEN_CORE_FAST_ARENA_BYTES];
+static _Alignas(32) uint8_t slow_arena[TIGRIS_CODEGEN_CORE_SLOW_ARENA_BYTES + 1u];
+static _Alignas(32) uint8_t workspace[TIGRIS_CODEGEN_EXECUTOR_WORKSPACE_BYTES];
+static void *tensor_ptrs[TIGRIS_CODEGEN_TENSOR_CAPACITY];
+static uint8_t outputs[3][1 << 16];
+
+static void fill(void *data, uint32_t size, uint16_t index, void *ctx)
+{
+    (void)ctx;
+    for (uint32_t i = 0; i < size; i++)
+        ((uint8_t *)data)[i] = (uint8_t)(7u * i + index);
+}
+
+int main(int argc, char **argv)
+{
+    FILE *f = fopen(argv[1], "rb");
+    size_t len = f ? fread(plan_buf, 1, sizeof(plan_buf), f) : 0;
+    if (f) fclose(f);
+    uint32_t fast_size = sizeof(fast_arena) - (uint32_t)atoi(argv[2]);
+    tigris_plan_t plan;
+    tigris_mem_t mem;
+    tigris_exec_stats_t stats;
+    if (tigris_codegen_load_plan(plan_buf, (uint32_t)len, &plan) != TIGRIS_OK)
+        return 2;
+    tigris_error_t err = tigris_codegen_init(
+        &plan, &mem, tensor_ptrs, TIGRIS_CODEGEN_TENSOR_CAPACITY, fast_arena, fast_size,
+        TIGRIS_CODEGEN_CORE_SLOW_ARENA_BYTES ? slow_arena : NULL,
+        TIGRIS_CODEGEN_CORE_SLOW_ARENA_BYTES, fill, NULL);
+    if (err != TIGRIS_OK) {
+        printf("init: %s\n", tigris_error_str(err));
+        return 3;
+    }
+    for (int run = 0; run < 3; run++) {
+        if (run > 0 && tigris_codegen_reset(&plan, &mem, fill, NULL) != TIGRIS_OK)
+            return 4;
+        void *placed[8];
+        uint8_t inputs = plan.header->num_model_inputs;
+        if (inputs > 8u)
+            return 8;
+        for (uint8_t i = 0; i < inputs; i++)
+            placed[i] = tensor_ptrs[plan.model_inputs[i]];
+        uint32_t entry = mem.fast_used;
+        tigris_exec_error_t ran = tigris_codegen_run_with_workspace_buffer(
+            &plan, &mem, &stats, workspace, sizeof(workspace));
+        if (ran != TIGRIS_EXEC_OK) {
+            int kept = 1;
+            for (uint8_t i = 0; i < inputs; i++)
+                kept &= tensor_ptrs[plan.model_inputs[i]] == placed[i];
+            printf("run: %s after %u stages; fast used %u before, %u after, peak %u; inputs %s\n",
+                   tigris_exec_error_str(ran),
+                   (unsigned)(stats.stages_normal + stats.stages_tiled + stats.stages_chain),
+                   (unsigned)entry, (unsigned)mem.fast_used, (unsigned)mem.fast_peak,
+                   kept ? "kept" : "moved");
+            return 5;
+        }
+        uint32_t offset = 0;
+        for (uint8_t i = 0; i < plan.header->num_model_outputs; i++) {
+            uint16_t tidx = plan.model_outputs[i];
+            uint32_t bytes = tigris_iface_bytes(&plan, tidx);
+            if (offset + bytes > sizeof(outputs[run]) ||
+                tigris_output_read(&plan, &mem, tidx, outputs[run] + offset, bytes) != TIGRIS_OK)
+                return 6;
+            offset += bytes;
+        }
+        if (run > 0 && memcmp(outputs[run], outputs[0], offset) != 0)
+            return 7;
+    }
+    printf("core: 3 identical runs, fast peak %u of %u\n", (unsigned)mem.fast_peak,
+           (unsigned)fast_size);
+    return 0;
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def sanitized_runtime(tmp_path_factory):
+    """The runtime sources compiled once with address and undefined-behavior sanitizers."""
+    if _CC is None or _RUNTIME_INCLUDE is None:
+        pytest.skip("C compiler and tigris-runtime headers are required")
+    build = tmp_path_factory.mktemp("sanitized-runtime")
+    objects = []
+    for source in sorted((_RUNTIME_INCLUDE.parent / "src").glob("*.c")):
+        target = build / f"{source.stem}.o"
+        result = subprocess.run(
+            [_CC, "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+             "-fno-sanitize-recover=all", "-fno-omit-frame-pointer", f"-I{_RUNTIME_INCLUDE}",
+             "-c", str(source), "-o", str(target)],
+            text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stdout + result.stderr
+        objects.append(str(target))
+    return objects
+
+
+def _sanitized_binary(objects, sources, include: Path, output: Path) -> Path:
+    result = subprocess.run(
+        [_CC, "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
+         "-fno-sanitize-recover=all", "-fno-omit-frame-pointer", f"-I{_RUNTIME_INCLUDE}",
+         f"-I{include}", *map(str, sources), *objects, "-lm", "-o", str(output)],
+        text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return output
+
+
+@pytest.mark.parametrize("plan_kind", ["compressed-one-stage", "staged"])
+def test_generated_code_runs_on_the_host(
+    sanitized_runtime, conv_relu_chain_path, tmp_path, plan_kind
+):
+    """Generated app and core code place their inputs with tigris_input_alloc()
+    and run under sanitizers at the arena the plan states: a compressed
+    one-stage plan reads its inputs in place above the weights, a staged plan
+    reads them from slow. The core runs three times on one manager with the
+    same result, and an arena one allocation unit short is refused."""
+    if plan_kind == "compressed-one-stage":
+        from click.testing import CliRunner
+        from tigris.cli import cli
+
+        model = Path(__file__).parent / "fixtures" / "tflite" / "ops" / "conv_bias.tflite"
+        result = CliRunner().invoke(cli, ["compile", str(model), "-m", "64K", "-c", "lz4",
+                                          "-o", str(tmp_path / "compiled.tgrs")])
+        assert result.exit_code == 0, result.output
+        data = (tmp_path / "compiled.tgrs").read_bytes()
+    else:
+        data = _plan_bytes(conv_relu_chain_path)
+    plan_path = tmp_path / "model.tgrs"
+    plan_path.write_bytes(data)
+    (tmp_path / "generated_core.h").write_text(generate_core_header(data))
+    env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=1", "UBSAN_OPTIONS": "halt_on_error=1"}
+
+    app = tmp_path / "app.c"
+    app.write_text(generate_c(data, "reference", output_format="app"))
+    binary = _sanitized_binary(sanitized_runtime, [app], tmp_path, tmp_path / "app")
+    result = subprocess.run([str(binary), str(plan_path)], text=True, capture_output=True,
+                            check=False, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK  normal=" in result.stdout
+
+    core = tmp_path / "core.c"
+    core.write_text(generate_c(data, "reference", output_format="core",
+                               core_header="generated_core.h"))
+    driver = tmp_path / "driver.c"
+    driver.write_text(_CORE_DRIVER)
+    binary = _sanitized_binary(sanitized_runtime, [core, driver], tmp_path, tmp_path / "core")
+    result = subprocess.run([str(binary), str(plan_path), "0"], text=True,
+                            capture_output=True, check=False, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "core: 3 identical runs" in result.stdout
+    short = subprocess.run([str(binary), str(plan_path), "32"], text=True,
+                           capture_output=True, check=False, env=env)
+    assert short.returncode == 5, short.stdout + short.stderr
+    # Refused before the first stage: nothing allocated, the inputs where they were placed.
+    refused = re.search(r"run: arena too small for the plan after 0 stages; "
+                        r"fast used (\d+) before, (\d+) after, peak (\d+); inputs kept", short.stdout)
+    assert refused, short.stdout
+    assert len(set(refused.groups())) == 1, short.stdout
+
+
+_TILE_FACTS_DUMP = r"""
+#include "tigris.h"
+#include "tigris_loader.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Per plan its load result, then what the runtime derives for each tile record. */
+int main(int argc, char **argv)
+{
+    for (int a = 1; a < argc; a++) {
+        FILE *file = fopen(argv[a], "rb");
+        if (!file) return 2;
+        fseek(file, 0, SEEK_END);
+        long size = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        uint8_t *buf = aligned_alloc(64, (size_t)(size + 63) / 64 * 64);
+        if (!buf || fread(buf, 1, (size_t)size, file) != (size_t)size) return 3;
+        fclose(file);
+        tigris_plan_t plan;
+        tigris_error_t err = tigris_plan_load(buf, (uint32_t)size, &plan);
+        printf("plan %d %d\n", a - 1, (int)err);
+        for (uint16_t s = 0; err == TIGRIS_OK && s < plan.header->num_stages; s++) {
+            if (plan.stages[s].tile_plan_idx == TIGRIS_NO_TILE_PLAN) continue;
+            tigris_tile_facts_t d;
+            int ok = tigris_stage_tile_facts(&plan, &plan.stages[s], &d);
+            printf("stage %u %d %u %u %u %u %u\n", (unsigned)s, ok, (unsigned)d.tile_extent,
+                   (unsigned)d.num_tiles, (unsigned)d.original_extent, (unsigned)d.halo,
+                   (unsigned)d.band_axis);
+        }
+        free(buf);
+    }
+    return 0;
+}
+"""
+
+
+def test_runtime_derives_every_stated_tile_fact(sanitized_runtime, tmp_path):
+    """Every tile record of the operator fixtures at 256 B, 1 KiB and 4 KiB
+    states what the runtime derives from the plan with the rules it bands the
+    stage by, and reads back as the compiler's tile plan: the band, the tile
+    count, the extent, the halo and the band axis, and the loader accepts the
+    plan."""
+    from tigris.analysis.plan_graph import graph_from_plan
+    from tigris.analysis.validation import validate_memory_plan
+    from tigris.cli import _run_pipeline
+    from tigris.emitters.binary.reader import read_binary_plan
+
+    facts = ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis")
+    fields = ("tileable", "axis", "band_on_columns", "tile_height", "tile_width", "num_tiles",
+              "original_height", "halo", "band_axis", "input_channel_group",
+              "input_spatial_interval", "tiled_peak_bytes")
+    expected, paths = [], []
+    fixtures = Path(__file__).parent / "fixtures" / "tflite" / "ops"
+    for model in sorted(fixtures.glob("*.tflite")):
+        for budget in ("256", "1K", "4K"):
+            graph, _ = _run_pipeline(str(model), (budget,), report_bindings=False)
+            if not validate_memory_plan(graph).feasible or not any(
+                    stage.tile_plan for stage in graph.stages):
+                continue
+            data = emit_binary_bytes(graph)
+            plan = read_binary_plan(data)
+            stated = {}
+            for index, stage in enumerate(plan["stages"]):
+                if stage["tile_plan_idx"] != 0xFFFF:
+                    record = plan["tile_plans"][stage["tile_plan_idx"]]
+                    stated[index] = tuple(record[field] for field in facts)
+            stages = graph_from_plan(plan).stages
+            assert len(stages) == len(graph.stages)
+            for compiled, read in zip(graph.stages, stages):
+                if compiled.tile_plan is not None and compiled.tile_plan.tileable:
+                    assert ([getattr(compiled.tile_plan, field) for field in fields] ==
+                            [getattr(read.tile_plan, field) for field in fields]), (
+                        model.stem, budget, compiled.stage_id)
+            paths.append(tmp_path / f"{model.stem}-{budget}.tgrs")
+            paths[-1].write_bytes(data)
+            expected.append(stated)
+    assert len(paths) > 300
+
+    source = tmp_path / "facts.c"
+    source.write_text(_TILE_FACTS_DUMP)
+    binary = _sanitized_binary(sanitized_runtime, [source], tmp_path, tmp_path / "facts")
+    result = subprocess.run([str(binary), *map(str, paths)], text=True, capture_output=True,
+                            check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    derived: list[dict] = []
+    for line in result.stdout.splitlines():
+        kind, *values = line.split()
+        if kind == "plan":
+            assert values[1] == "0", (paths[int(values[0])].name, line)
+            derived.append({})
+        else:
+            assert values[1] == "1", (paths[len(derived) - 1].name, line)
+            derived[-1][int(values[0])] = tuple(int(value) for value in values[2:])
+    differences = [(path.name, index, record, got.get(index))
+                   for path, want, got in zip(paths, expected, derived)
+                   for index, record in want.items() if got.get(index) != record]
+    assert len(derived) == len(paths) and not differences, differences[:10]

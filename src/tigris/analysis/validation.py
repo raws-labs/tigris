@@ -5,7 +5,7 @@ import math
 
 import numpy as np
 
-from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
+from tigris import SCHEMA_VERSION_TILE_AXIS, TILE_AXIS_HEIGHT_OR_LENGTH
 from tigris.analysis.lifetime import compute_lifetimes, pure_reinterpretations
 from tigris.analysis.partition_spatial import (
     _back_propagate_tile_heights,
@@ -719,12 +719,7 @@ def validate_memory_plan(
     issues: list[MemoryPlanIssue] = []
     scheduled_peak = 0
 
-    for stage in ag.stages:
-        # Non-head chain members execute as part of their head's memory unit.
-        if stage.chain_id != 0xFFFF and stage.chain_id != stage.stage_id:
-            continue
-
-        activation_required, reason, invalid = _execution_unit_requirement(ag, stage)
+    for stage, activation_required, reason, invalid in _execution_units(ag):
         required = activation_required + fast_reserve_bytes
         scheduled_peak = max(scheduled_peak, required)
         if fast_reserve_bytes:
@@ -760,6 +755,24 @@ def validate_memory_plan(
         scheduled_peak_bytes=scheduled_peak,
         issues=tuple(issues),
     )
+
+
+def scheduled_fast_peak(ag: AnalyzedGraph) -> int:
+    """Fast-pool bytes the largest stage or chain holds at once, in the graph
+    or a subgraph its control flow runs: the figure `validate_memory_plan`
+    checks against the budget, without the decompressed-weight reserve. It
+    does not depend on the budget."""
+    peak = max((required for _, required, _, _ in _execution_units(ag)), default=0)
+    return max([peak, *(scheduled_fast_peak(sub) for sub in ag.subgraphs)])
+
+
+def _execution_units(ag: AnalyzedGraph):
+    """Yield ``(stage, required_bytes, reason, invalid)`` per execution unit;
+    non-head chain members execute as part of their head's unit."""
+    for stage in ag.stages:
+        if stage.chain_id != 0xFFFF and stage.chain_id != stage.stage_id:
+            continue
+        yield (stage, *_execution_unit_requirement(ag, stage))
 
 
 def _execution_unit_requirement(
@@ -900,8 +913,33 @@ def _runs_whole(ag: AnalyzedGraph, stage: Stage, fast_total: int) -> bool:
     return total_io <= fast_total
 
 
+def io_in_fast(ag: AnalyzedGraph) -> bool:
+    """Whether the graph reads its model inputs in place and keeps its outputs
+    in the fast pool.
+
+    That is one stage with no tile plan, no chain, no control flow and no
+    state, which reads every model input and writes every model output. The
+    caller then places the inputs in the fast pool, the stage reads them there
+    and leaves its outputs there, so the run needs slow memory only for what
+    the stage cannot fit in the fast pool. Mirrors
+    tigris_plan_io_in_fast in the runtime, which also requires schema 5 or
+    later.
+    """
+    if ag.schema_version < SCHEMA_VERSION_TILE_AXIS:
+        return False
+    if len(ag.stages) != 1 or ag.state_ports:
+        return False
+    stage = ag.stages[0]
+    if stage.tile_plan is not None or stage.chain_len >= 2:
+        return False
+    if any(op.op_type in CONTROL_FLOW for op in ag.ops):
+        return False
+    return (set(ag.model_inputs) <= set(stage.input_tensors)
+            and set(ag.model_outputs) <= set(stage.output_tensors))
+
+
 def untiled_stage_spill(
-    ag: AnalyzedGraph, stage: Stage, fast_total: int
+    ag: AnalyzedGraph, stage: Stage, fast_total: int, *, outputs_in_fast: bool = False
 ) -> int:
     """Bytes a stage run in one pass pushes into slow memory on its own.
 
@@ -915,6 +953,8 @@ def untiled_stage_spill(
 
     This walks the stage the way the executor does, holding live bytes rather
     than a bump pointer because compaction is what makes those equivalent.
+    With ``outputs_in_fast`` the stage outputs are not otherwise counted in
+    slow memory, so one that lands there counts too.
     """
     alias = pure_reinterpretations(ag)
     align = ag.tensor_alignment
@@ -972,7 +1012,7 @@ def untiled_stage_spill(
             size = sized(name)
             if sum(live.values()) + size <= capacity:
                 live[name] = size
-            elif name not in outputs:
+            elif outputs_in_fast or name not in outputs:
                 # A stage output that lands in slow is already counted as a
                 # tensor crossing the boundary; only the intermediates the
                 # stage leaves behind are extra.
@@ -1065,6 +1105,11 @@ def slow_pool_usage(ag: AnalyzedGraph, *, body: bool = False) -> SlowMemoryUsage
     if not ag.stages:
         return SlowMemoryUsage(0, slow_budget, ())
     fast_total = ag.budget.fast + ag.budget.fast_reserve
+    if not body and io_in_fast(ag):
+        # Model I/O stays in fast; only what the stage cannot fit reaches slow memory.
+        peak = untiled_stage_spill(ag, ag.stages[0], fast_total, outputs_in_fast=True)
+        return SlowMemoryUsage(peak, slow_budget,
+                               (0,) if slow_budget > 0 and peak > slow_budget else ())
     ag = compute_lifetimes(ag)
     # The runtime rounds every allocation up to the tensor alignment.
     align = ag.tensor_alignment

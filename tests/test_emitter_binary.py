@@ -12,7 +12,7 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris import (
-    SCHEMA_VERSION_BINARY_REQUANT,
+    SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
     TILE_AXIS_HEIGHT_OR_LENGTH,
 )
@@ -111,14 +111,14 @@ def test_roundtrip_linear(linear_3op_path, tmp_path):
 
     assert data[:4] == MAGIC
     version = struct.unpack_from("<I", data, 4)[0]
-    # Only a plan with state is written at the newest schema.
-    assert version == SCHEMA_VERSION_BINARY_REQUANT
+    # Every plan carries its scheduled peak, so every plan is written at the newest schema.
+    assert version == SCHEMA_VERSION
     assert struct.unpack_from("<I", data, 8)[0] == len(data), "file size"
 
     plan = read_binary_plan(data)
     assert plan["model_name"] == "linear_3op"
     assert plan["num_ops"] == 3
-    assert plan["version"] == SCHEMA_VERSION_BINARY_REQUANT
+    assert plan["version"] == SCHEMA_VERSION
 
     # All activation tensors (non-constant) should be present
     tensor_names = {t["name"] for t in plan["tensors"]}
@@ -193,10 +193,11 @@ def test_roundtrip_conv_pool(conv_pool_chain_path):
         tp = stage.tile_plan
         assert tp_bin["tileable"] == tp.tileable
         assert tp_bin["axis"] == tp.axis
-        assert tp_bin["tile_height"] == tp.tile_height
+        assert tp_bin["tile_extent"] == tp.tile_height
         assert tp_bin["num_tiles"] == tp.num_tiles
         assert tp_bin["halo"] == tp.halo
-        assert tp_bin["receptive_field"] == tp.receptive_field
+        assert tp_bin["original_extent"] == tp.original_height
+        assert tp_bin["band_axis"] == tp.band_axis
 
 
 # Tensor validation
@@ -377,6 +378,13 @@ def test_immutable_supported_schema_fixtures():
             0,
             3,
         ),
+        (
+            11,
+            "schema-v11-scheduled-peak.tgrs",
+            "1af8980f086704e2db54db5d79b8cbb938624cc4f917692a861e8b7b53a2e78d",
+            2,
+            0,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -402,6 +410,16 @@ def test_immutable_supported_schema_fixtures():
             assert entry["input"] not in plan["model_inputs"]
             assert entry["output"] not in plan["model_outputs"]
             assert entry["initial"] == bytes(48)
+        if version == 11:
+            # A compressed tiled stage under its budget: seven bands of one of seven rows, halo 2.
+            assert plan["scheduled_peak"] == 233
+            assert plan["budget"] == 512 - 256
+            assert len(plan["weight_blocks"]) == 1
+            (tile,) = plan["tile_plans"]
+            assert (tile["tile_extent"], tile["num_tiles"], tile["original_extent"],
+                    tile["halo"], tile["band_axis"]) == (1, 7, 7, 2, 1)
+        else:
+            assert plan["scheduled_peak"] is None
         if version == 5:
             assert plan["tile_plans"][0]["axis"] == 1
             assert plan["tile_plans"][0]["num_tiles"] > 1
@@ -452,6 +470,50 @@ def test_schema_version_validation(linear_3op_path, version):
         assert str(exc_info.value) == (
             f"Unsupported schema version: {version} (expected one of: {supported})"
         )
+
+
+@pytest.mark.parametrize("compress", [None, "lz4"])
+def test_plan_states_its_scheduled_fast_peak(conv_relu_chain_path, compress):
+    """The memory section holds the figure the compiler validated against the
+    budget, without the decompressed weights."""
+    from tigris.analysis.validation import scheduled_fast_peak, validate_memory_plan
+
+    if compress:
+        ag, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("16K",))
+    else:
+        ag = full_pipeline(conv_relu_chain_path, budget=4096)
+    plan = read_binary_plan(emit_binary_bytes(ag, compress=compress))
+    assert plan["scheduled_peak"] == scheduled_fast_peak(ag) > 0
+    assert plan["scheduled_peak"] == validate_memory_plan(ag).scheduled_peak_bytes
+    assert plan["scheduled_peak"] <= plan["budget"]
+    assert bool(plan["weight_blocks"]) == bool(compress)
+
+
+def _memory_section_entry(data: bytes) -> int:
+    """Byte offset of the memory section's directory entry."""
+    off = HEADER_SIZE
+    while True:
+        kind, _ = struct.unpack_from("<II", data, off)
+        if kind == defs.SEC_MEMORY:
+            return off
+        assert kind, "plan has no memory section"
+        off += 8
+
+
+def test_memory_section_belongs_to_schema_11(linear_3op_path):
+    data = emit_binary_bytes(full_pipeline(linear_3op_path, budget=4096))
+    entry = _memory_section_entry(data)
+    older = bytearray(data)
+    struct.pack_into("<I", older, 4, 10)
+    with pytest.raises(ValueError, match="Schema 10 plan has a memory section"):
+        read_binary_plan(bytes(older))
+    # The memory section is the last directory entry, so the sentinel moves up.
+    missing = bytearray(data)
+    struct.pack_into("<II", missing, entry, 0, 0)
+    with pytest.raises(ValueError, match=r"Missing required section type\(s\): \[14\]"):
+        read_binary_plan(bytes(missing))
+    struct.pack_into("<I", missing, 4, 10)
+    assert read_binary_plan(bytes(missing))["scheduled_peak"] is None
 
 
 def test_missing_required_section_is_rejected_cleanly(linear_3op_path):
@@ -538,29 +600,24 @@ def test_truncated():
 
 
 def test_a_tile_extent_that_does_not_fit_names_the_field_and_the_stage():
-    """struct.pack alone would abort the compile with no diagnosis.
-
-    Every solver that bands a single axis stays inside a uint16 by the nature
-    of shapes that fit an embedded budget. The ones that band a product of
-    axes do not, so the writer says which field overflowed on which stage
-    rather than letting struct raise. tile_width is masked on the way out,
-    so without this it would truncate silently instead.
-    """
-    ag = SimpleNamespace(stages=[
+    """struct.pack alone would abort the compile with no diagnosis: the writer
+    says which field of the 32-bit tile record overflowed on which stage."""
+    ag = SimpleNamespace(ops=[], stages=[
         SimpleNamespace(
             stage_id=3,
+            op_indices=[],
             tile_plan=TilePlan(
                 tileable=True,
                 axis=TILE_AXIS_HEIGHT_OR_LENGTH,
-                tile_height=8192,
-                num_tiles=8,
-                original_height=65_536,
+                tile_height=1 << 32,
+                num_tiles=1,
+                original_height=1 << 32,
                 tiled_peak_bytes=262_144,
             ),
         ),
     ])
 
-    with pytest.raises(ValueError, match=r"stage 3 tile plan original_height"):
+    with pytest.raises(ValueError, match=r"stage 3 tile plan tile_height=4294967296 exceeds uint32"):
         _build_tile_plans(ag)
 
 
@@ -770,7 +827,7 @@ def test_attribute_payloads_start_four_byte_aligned(tmp_path):
 
 
 @pytest.mark.parametrize("state", [False, True])
-def test_tile_wire_layout_by_schema(tmp_path, state):
+def test_tile_wire_layout(tmp_path, state):
     import onnx
     from scripts.crossrepo_contract import _state_tile_case, _tiled_global_reduction_case
     from tigris.cli import _run_pipeline
@@ -784,7 +841,8 @@ def test_tile_wire_layout_by_schema(tmp_path, state):
     data = emit_binary_bytes(graph)
     plan = read_binary_plan(data)
     tile = next(stage.tile_plan for stage in graph.stages if stage.tile_plan is not None)
-    assert plan["version"] == (10 if state else 9)
+    # With or without state the plan is at the newest schema, whose tile record states its tiling.
+    assert plan["version"] == SCHEMA_VERSION
     assert plan["tile_plans"] and plan["tile_plans"][0]["num_tiles"] > 1
     # Read the record at its directory offset, independent of the reader.
     directory = struct.unpack_from("<I", data, 12)[0]
@@ -796,16 +854,14 @@ def test_tile_wire_layout_by_schema(tmp_path, state):
             break
         offsets[kind] = offset
     start = offsets[defs.SEC_TILE_PLANS]
-    if state:
-        fields = struct.unpack_from("<BBH7I", data, start)
-        assert fields[:3] == (1, 1, 0)
-        assert fields[3] == tile.tile_height
-        assert fields[4:9] == (0, 0, 0, 0, 0)
-        assert fields[9] == tile.tiled_peak_bytes
-        assert defs.TILE_PLAN_V10_SIZE == 32
-    else:
-        assert struct.unpack_from("<H", data, start + 2)[0] == tile.tile_height
-        assert defs.TILE_PLAN_SIZE == 24
+    fields = struct.unpack_from("<BBH7I3IHBB", data, start)
+    assert fields[:3] == (1, 1, 0)
+    assert fields[3] == tile.tile_height
+    assert fields[4:9] == (0, 0, 0, 0, 0)
+    assert fields[9] == tile.tiled_peak_bytes
+    assert fields[10:] == (tile.tile_height, tile.num_tiles, tile.original_height,
+                           tile.halo, tile.band_axis, 0)
+    assert defs.TILE_PLAN_V11_SIZE == 48
 
 
 def test_compact_preserved_axis_transpose(tmp_path):
@@ -826,7 +882,7 @@ def test_compact_preserved_axis_transpose(tmp_path):
         if budget == "512":
             tile = next(tile for tile in plan["tile_plans"] if tile["tileable"])
             assert tile["input_band_extent"] > 0 and tile["output_band_extent"] == 0
-            assert tile["original_height"] == 17
+            assert tile["original_extent"] == 17
         with Session(path, slow_capacity=16384) as session:
             outputs.append(session.run(case.inputs)["y"])
     expected = case.inputs["x"].transpose(0, 1, 4, 3, 2)
@@ -853,7 +909,8 @@ def test_loader_refuses_incomplete_group_geometry(tmp_path, field_offset):
             struct.pack_into("<I", data, start + field_offset, 0)
             break
     plan = read_binary_plan(data)
-    assert plan["tile_plans"][0]["num_tiles"] == 0
+    field = "input_channel_group" if field_offset == 16 else "input_spatial_interval"
+    assert plan["tile_plans"][0][field] == 0
     path = tmp_path / "incomplete.tgrs"
     path.write_bytes(data)
     with pytest.raises(HostError):

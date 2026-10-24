@@ -12,14 +12,20 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris.analysis.validation import row_band_aliases, slow_pool_usage
+from pathlib import Path
+
+from tigris.analysis.plan_graph import graph_from_plan, slow_arena_required
+from tigris.analysis.validation import io_in_fast, row_band_aliases, slow_pool_usage
 from tigris.cli import _run_pipeline
-from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
+from tigris.emitters.binary.reader import read_binary_plan
+from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris import SCHEMA_VERSION_TILE_AXIS, TILE_AXIS_HEIGHT_OR_LENGTH
 from tigris.graph.ir import (
     AnalyzedGraph,
     MemoryBudget,
     OpNode,
     Stage,
+    StatePort,
     TensorInfo,
     TilePlan,
 )
@@ -247,20 +253,21 @@ def _softmax_model(path, shape):
 
 
 def test_slow_requirement_counts_allocation_alignment(tmp_path):
-    """Two 24-byte boundary tensors take 32 bytes each in the runtime's pool."""
+    """Boundary tensors of 24, 24 and 8 bytes take 32 bytes each in the
+    runtime's pool. The unread input keeps the plan's inputs in slow memory."""
     from click.testing import CliRunner
     from tigris.cli import cli
 
     path = tmp_path / "softmax.onnx"
-    _softmax_model(path, [1, 2, 3])
-    ag, _ = _run_pipeline(str(path), ("16K", "64"))
-    assert slow_pool_usage(ag).slow_peak_bytes == 64
+    _softmax_with_unread_input(path, state=False)
+    ag, _ = _run_pipeline(str(path), ("16K", "96"))
+    assert slow_pool_usage(ag).slow_peak_bytes == 96
 
-    short = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-m", "48",
+    short = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-m", "80",
                                      "-o", str(tmp_path / "short.tgrs")])
     assert short.exit_code != 0
     assert not (tmp_path / "short.tgrs").exists()
-    exact = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-m", "64",
+    exact = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-m", "96",
                                      "-o", str(tmp_path / "exact.tgrs")])
     assert exact.exit_code == 0, exact.output
 
@@ -268,11 +275,116 @@ def test_slow_requirement_counts_allocation_alignment(tmp_path):
 def test_slow_requirement_is_reported_without_a_slow_budget(tmp_path):
     """An unconstrained slow pool still has a requirement; it is not zero."""
     path = tmp_path / "softmax.onnx"
-    _softmax_model(path, [1, 2, 3])
+    _softmax_with_unread_input(path, state=False)
     ag, _ = _run_pipeline(str(path), ("16K",))
     usage = slow_pool_usage(ag)
-    assert usage.slow_peak_bytes == 64
+    assert usage.slow_peak_bytes == 96
     assert usage.fits
+
+
+def test_a_one_stage_plan_that_fits_needs_no_slow_memory(tmp_path):
+    """The same softmax with every input read runs as one stage that keeps its
+    input and output in the fast pool, and the plan says so on its own."""
+    path = tmp_path / "softmax.onnx"
+    _softmax_model(path, [1, 2, 3])
+    ag, _ = _run_pipeline(str(path), ("16K", "64"))
+    assert io_in_fast(ag)
+    assert slow_pool_usage(ag).slow_peak_bytes == 0
+    plan = read_binary_plan(emit_binary_bytes(ag))
+    assert io_in_fast(graph_from_plan(plan))
+    assert slow_arena_required(plan) == 0
+
+
+def _one_stage_graph() -> AnalyzedGraph:
+    """x -> Relu -> y -> Relu -> z in one stage, 64 bytes each."""
+    ops = [OpNode(name="a", op_type="Relu", inputs=["x"], outputs=["y"], step=0, stage=0),
+           OpNode(name="b", op_type="Relu", inputs=["y"], outputs=["z"], step=1, stage=0)]
+    return AnalyzedGraph(
+        ops=ops,
+        stages=[Stage(stage_id=0, op_indices=[0, 1], input_tensors=["x"],
+                      output_tensors=["z"], peak_bytes=128)],
+        model_inputs=["x"], model_outputs=["z"],
+        tensors={name: TensorInfo(name, (1, 64), TensorProto.INT8) for name in "xyz"},
+        budget=MemoryBudget(fast=128))
+
+
+def test_io_in_fast_rule():
+    """One stage with no tile plan, chain, control flow or state, reading every
+    model input and writing every model output; the runtime's rule."""
+    assert io_in_fast(_one_stage_graph())
+
+    ag = _one_stage_graph()
+    ag.stages = [Stage(0, [0], ["x"], ["y"], 128), Stage(1, [1], ["y"], ["z"], 128)]
+    assert not io_in_fast(ag)
+
+    ag = _one_stage_graph()
+    ag.stages[0].tile_plan = TilePlan(tileable=False)
+    assert not io_in_fast(ag)
+
+    ag = _one_stage_graph()
+    ag.stages[0].chain_id, ag.stages[0].chain_len = 0, 2
+    assert not io_in_fast(ag)
+
+    ag = _one_stage_graph()
+    ag.ops[1].op_type = "If"
+    assert not io_in_fast(ag)
+
+    ag = _one_stage_graph()
+    ag.state_ports = [StatePort(input=0, output=0, initial=np.zeros(64, np.int8))]
+    assert not io_in_fast(ag)
+
+    ag = _one_stage_graph()
+    ag.tensors["w"] = TensorInfo("w", (1, 64), TensorProto.INT8)
+    ag.model_inputs.append("w")
+    assert not io_in_fast(ag)
+
+    ag = _one_stage_graph()
+    ag.model_outputs.append("y")
+    assert not io_in_fast(ag)
+
+    ag = _one_stage_graph()
+    ag.schema_version = SCHEMA_VERSION_TILE_AXIS - 1
+    assert not io_in_fast(ag)
+
+    ag = _one_stage_graph()
+    ag.model_inputs = []
+    ag.stages[0].input_tensors = []
+    assert io_in_fast(ag)
+
+
+def test_a_one_stage_output_that_overflows_counts_in_slow():
+    """In a fast pool smaller than the stage, the output the runtime places
+    in slow memory is all the slow memory the plan needs."""
+    ag = _one_stage_graph()
+    ag.ops = [OpNode(name="a", op_type="Relu", inputs=["x"], outputs=["z"], step=0, stage=0)]
+    ag.stages[0].op_indices = [0]
+    ag.budget = MemoryBudget(fast=64)
+    assert io_in_fast(ag)
+    assert slow_pool_usage(ag).slow_peak_bytes == 64
+
+
+@pytest.mark.parametrize("name", ["schema-v2-linear", "schema-v3-qdq-conv",
+                                  "schema-v4-transpose"])
+def test_a_plan_before_schema_5_keeps_its_slow_requirement(name):
+    """The runtime copies model inputs and outputs of a plan older than schema
+    5 through slow memory, so its one stage does not keep them in fast."""
+    plan = read_binary_plan((Path(__file__).parent / "schema_compat"
+                             / f"{name}.tgrs").read_bytes())
+    graph = graph_from_plan(plan)
+    assert len(graph.stages) == 1 and graph.schema_version < SCHEMA_VERSION_TILE_AXIS
+    assert not io_in_fast(graph)
+    assert slow_arena_required(plan) > 0
+
+
+def test_a_plan_with_state_keeps_its_slow_requirement():
+    """A variable is a model input to the analysis of the plan too, so a
+    stateful one-stage plan keeps its inputs and outputs in slow memory."""
+    plan = read_binary_plan((Path(__file__).parent / "schema_compat"
+                             / "schema-v10-state.tgrs").read_bytes())
+    graph = graph_from_plan(plan)
+    assert len(graph.stages) == 1 and graph.state_ports
+    assert not io_in_fast(graph)
+    assert slow_arena_required(plan) > 0
 
 
 def _softmax_with_unread_input(path, state: bool):
