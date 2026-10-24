@@ -11,7 +11,9 @@ from onnx import numpy_helper, shape_inference
 from tigris.frontends import load_onnx
 from tigris.frontends.tflite import BOUNDARY_LAYOUT_KEY, STATE_KEY
 from tigris.graph.ir import AnalyzedGraph, OpNode, StatePort, TensorInfo
-from tigris.loaders.onnx.shapes import bind_free_dims, fold_shape_subgraph
+from tigris.graph.subgraphs import CONTROL_FLOW
+from tigris.loaders.onnx.shapes import (
+    bind_free_dims, bodies, body_reads, fold_shape_subgraph, outer_reads)
 
 # One binding pass plus one fold usually resolves a stock export.  A fold can
 # expose shapes that let the next fold proceed, so iterate a few times and stop
@@ -120,7 +122,10 @@ def load_model(
         for prop in model.metadata_props)
     if channels_last and input_shapes:
         input_shapes = _file_shapes_only(model, input_shapes)
+    # Checked before shape resolution, which can fail on a cycle or fold one of its edges away.
+    _refuse_unordered(model.graph)
     bindings = resolve_shapes(model, input_shapes)
+    _operands_from_outer_reads(model)
 
     ag = _graph_to_ag(model.graph, model.opset_import)
     ag.model_name = Path(path).stem
@@ -189,10 +194,9 @@ def _graph_to_ag(graph: onnx.GraphProto, opset_import) -> AnalyzedGraph:
     ag.model_output_dtypes = [_extract_dtype(out.type) for out in graph.output]
 
     # --- Build OpNodes ----------------------------------------------------
-    nodes_by_output: dict[str, int] = {}  # tensor_name -> node index
     raw_nodes: list[OpNode] = []
     for i, node in enumerate(graph.node):
-        name = node.name or f"{node.op_type}_{i}"
+        name = _op_name(node, i)
         attrs: dict = {}
         for attr in node.attribute:
             if attr.type == onnx.AttributeProto.GRAPH:
@@ -208,24 +212,19 @@ def _graph_to_ag(graph: onnx.GraphProto, opset_import) -> AnalyzedGraph:
             elif hasattr(val, "__len__") and not isinstance(val, str):
                 val = list(val)
             attrs[attr.name] = val
-        # An operator from another domain is a different operator that may
-        # share a standard name; qualifying it keeps every pass and the
-        # support check from reading it as the standard one.
-        op_type = (node.op_type if node.domain in ("", "ai.onnx")
-                   else f"{node.domain}::{node.op_type}")
         op = OpNode(
             name=name,
-            op_type=op_type,
+            op_type=_op_type(node),
             inputs=list(node.input),
             outputs=list(node.output),
             attrs=attrs,
         )
         raw_nodes.append(op)
-        for out in node.output:
-            nodes_by_output[out] = i
 
     # --- DFS topological sort (prefer early consumption) ------------------
-    ag.ops = _topo_sort(raw_nodes, nodes_by_output, initializer_names, ag.model_inputs)
+    ag.ops = [raw_nodes[i] for i in _topo_sort(graph)]
+    for step, op in enumerate(ag.ops):
+        op.step = step
 
     # A graph optimizer can leave value_info behind for a tensor its fusion
     # removed. Those entries describe nothing the graph computes, and carrying
@@ -242,38 +241,135 @@ def _graph_to_ag(graph: onnx.GraphProto, opset_import) -> AnalyzedGraph:
     return ag
 
 
-def _topo_sort(
-    nodes: list[OpNode],
-    tensor_to_producer: dict[str, int],
-    constants: set[str],
-    model_inputs: list[str],
-) -> list[OpNode]:
-    """DFS-based topological sort.
+def _op_name(node: onnx.NodeProto, index: int) -> str:
+    return node.name or f"{node.op_type}_{index}"
 
-    Visits children in reverse order so that the first consumer of a tensor
-    appears earliest - this tends to reduce peak live memory by freeing
-    tensors sooner.
+
+def _op_type(node: onnx.NodeProto) -> str:
+    # An operator from another domain is a different operator that may
+    # share a standard name; qualifying it keeps every pass and the
+    # support check from reading it as the standard one.
+    return node.op_type if node.domain in ("", "ai.onnx") else f"{node.domain}::{node.op_type}"
+
+
+def _scope(graph: onnx.GraphProto, typed: onnx.GraphProto, enclosing: dict) -> dict:
+    """Every name the graph sees: a constant's tensor, or a value's type as
+    ``typed``, the graph after inference, gives it (None when it gives none)."""
+    stated = {value.name: value.type for value in (*typed.input, *typed.value_info, *typed.output)}
+    scope = dict(enclosing)
+    for node in graph.node:
+        for name in node.output:
+            scope[name] = stated.get(name)
+        value = next((attr.t for attr in node.attribute if attr.name == "value"), None)
+        if _op_type(node) == "Constant" and value is not None:
+            scope[node.output[0]] = onnx.TensorProto()
+            scope[node.output[0]].CopyFrom(value)
+            scope[node.output[0]].name = node.output[0]
+    scope.update((tensor.values.name, None) for tensor in graph.sparse_initializer)
+    scope.update((value.name, value.type) for value in graph.input)
+    scope.update((tensor.name, tensor) for tensor in graph.initializer)
+    return scope
+
+
+def _operands_from_outer_reads(model: onnx.ModelProto) -> None:
+    """Make each If take what its branches read from enclosing graphs, in place:
+    a value becomes an operand and an input of both branches, a constant is
+    copied into the branch that reads it. ONNX's If becomes the compiler's
+    own, whose branches take its operands after the condition. A While is
+    refused instead, as is a read of a name no graph defines."""
+
+    def rewrite(graph: onnx.GraphProto, enclosing: dict | None) -> None:
+        # A subgraph's values are typed by inferring it on its own, as _graph_to_ag does.
+        typed = graph if enclosing is None else _infer(
+            onnx_helper.make_model(graph, opset_imports=list(model.opset_import))).graph
+        scope = _scope(graph, typed, enclosing or {})
+        for index, node in enumerate(graph.node):
+            kind = _op_type(node).removeprefix("tigris::")
+            graphs = {attr.name: attr.g for attr in node.attribute
+                      if attr.type == onnx.AttributeProto.GRAPH}
+            roles = [role for role in CONTROL_FLOW.get(kind, ()) if role in graphs]
+            reads = {role: list(dict.fromkeys(outer_reads(graphs[role]))) for role in roles}
+            for role in roles:
+                for name in reads[role]:
+                    if name not in scope:
+                        raise ValueError(f"operator {_op_name(node, index)} reads {name}, "
+                                         "which no graph defines")
+                    if kind == "While":
+                        raise ValueError(
+                            f"operator {_op_name(node, index)} reads {name} from an enclosing "
+                            f"graph in its {role}; a While condition and body can read only "
+                            "its loop variables and the values they define")
+            if kind == "If":
+                if node.domain != "tigris" and not any(
+                        entry.domain == "tigris" for entry in model.opset_import):
+                    model.opset_import.append(onnx_helper.make_opsetid("tigris", 1))
+                node.domain = "tigris"
+                values = [name for name in dict.fromkeys(n for r in roles for n in reads[r])
+                          if not isinstance(scope[name], onnx.TensorProto)]
+                node.input.extend(values)
+                for role in roles:
+                    graphs[role].initializer.extend(
+                        scope[name] for name in reads[role] if isinstance(scope[name], onnx.TensorProto))
+                    for name in values:
+                        entering = graphs[role].input.add()
+                        entering.name = name
+                        if scope[name] is not None:
+                            entering.type.CopyFrom(scope[name])
+            for role in roles:
+                rewrite(graphs[role], scope)
+
+    rewrite(model.graph, None)
+
+
+def _refuse_unordered(graph: onnx.GraphProto) -> None:
+    """Refuse the graph if it or any subgraph in it has no execution order."""
+    _topo_sort(graph)
+    for node in graph.node:
+        for body in bodies(node):
+            _refuse_unordered(body)
+
+
+def _topo_sort(graph: onnx.GraphProto) -> list[int]:
+    """DFS-based topological sort, as indices into ``graph.node``.
+
+    A node reads its inputs and every value its subgraphs read from this
+    graph.  Visits children in reverse order so that the first consumer of a
+    tensor appears earliest, which tends to reduce peak live memory by freeing
+    tensors sooner.  A graph whose nodes cannot all be ordered is refused.
     """
+    nodes = graph.node
     n = len(nodes)
+    sources = {tensor.name for tensor in graph.initializer} | {value.name for value in graph.input}
+    producer_of = {name: idx for idx, node in enumerate(nodes) for name in node.output}
     # Build adjacency: producer_idx -> list[consumer_idx]
     children: list[list[int]] = [[] for _ in range(n)]
-    for idx, node in enumerate(nodes):
-        for inp in node.inputs:
-            if inp in constants or inp in model_inputs or inp == "":
-                continue
-            producer = tensor_to_producer.get(inp)
-            if producer is not None and producer != idx:
-                children[producer].append(idx)
-
-    # Also build in-degree for cycle-safety
     in_degree = [0] * n
     for idx, node in enumerate(nodes):
-        for inp in node.inputs:
-            if inp in constants or inp in model_inputs or inp == "":
+        for inp in (*node.input, *body_reads(node)):
+            if inp in sources or inp == "":
                 continue
-            producer = tensor_to_producer.get(inp)
-            if producer is not None and producer != idx:
+            producer = producer_of.get(inp)
+            if producer is not None:
+                children[producer].append(idx)
                 in_degree[idx] += 1
+
+    # Kahn's algorithm: a node is placed once all its producers are.
+    waiting = list(in_degree)
+    ready = [i for i in range(n) if waiting[i] == 0]
+    placed = [False] * n
+    while ready:
+        idx = ready.pop()
+        placed[idx] = True
+        for child in children[idx]:
+            waiting[child] -= 1
+            if waiting[child] == 0:
+                ready.append(child)
+    unplaced = next((i for i in range(n) if not placed[i]), None)
+    if unplaced is not None:
+        raise ValueError(
+            f"operator {_op_name(nodes[unplaced], unplaced)} is on a cycle or depends on one, "
+            "so the graph has no execution order"
+        )
 
     # DFS post-order, then reverse
     visited = [False] * n
@@ -287,23 +383,10 @@ def _topo_sort(
                 dfs(child)
         order.append(idx)
 
-    # Start from roots (nodes with in_degree 0)
-    roots = [i for i in range(n) if in_degree[i] == 0]
-    for r in roots:
-        if not visited[r]:
+    # Start from roots (nodes with in_degree 0); in an acyclic graph they reach every node.
+    for r in range(n):
+        if in_degree[r] == 0 and not visited[r]:
             dfs(r)
 
-    # Any unvisited (e.g. cycles or disconnected) - append in original order
-    for i in range(n):
-        if not visited[i]:
-            order.append(i)
-
     order.reverse()
-
-    # Assign step indices and return
-    sorted_ops: list[OpNode] = []
-    for step, idx in enumerate(order):
-        node = nodes[idx]
-        node.step = step
-        sorted_ops.append(node)
-    return sorted_ops
+    return order

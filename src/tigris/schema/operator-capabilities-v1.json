@@ -1143,7 +1143,7 @@
     },
     {
       "constraints": [
-        "one bool condition; branches run as their own stages; float32 or int32 operands, also in int8 plans, where the boundary stays float32 between a Dequantize and a Quantize; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
+        "one bool condition; branches run as their own stages; a value a branch reads from an enclosing graph becomes an operand, a constant is copied into the branch; float32 or int32 operands, also in int8 plans, where the boundary stays float32 between a Dequantize and a Quantize; nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
       ],
       "opcode": 87,
       "operator": "If",
@@ -1156,7 +1156,7 @@
     },
     {
       "constraints": [
-        "a condition giving one bool and a body, each run as its own stages; float32 or int32 loop variables, also in int8 plans, where the boundary stays float32 between a Dequantize and a Quantize, each from an input or a constant (uncompressed plans); nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
+        "a condition giving one bool and a body, each run as its own stages, reading only the loop variables and their own values; float32 or int32 loop variables, also in int8 plans, where the boundary stays float32 between a Dequantize and a Quantize, each from an input or a constant (uncompressed plans); nests within the runtime's TIGRIS_MAX_SUBGRAPH_DEPTH and TIGRIS_MAX_SUBGRAPHS"
       ],
       "opcode": 88,
       "operator": "While",

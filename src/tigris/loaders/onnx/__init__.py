@@ -9,7 +9,7 @@ def load_model(path, input_shapes=None):
     return _normalized(ag)
 
 
-def _normalized(ag):
+def _normalized(ag, subgraph=False):
     """The graph and every subgraph it runs, each normalized on its own."""
-    ag.subgraphs = [_normalized(sub) for sub in ag.subgraphs]
-    return normalize(ag)
+    ag.subgraphs = [_normalized(sub, True) for sub in ag.subgraphs]
+    return normalize(ag, subgraph)
