@@ -914,3 +914,129 @@ def test_a_variable_the_model_also_returns_keeps_every_output(tmp_path, kind):
             actual = session.run({"x": x})
             for name, value in expected.items():
                 np.testing.assert_array_equal(actual[name], value, err_msg=name)
+
+
+def _if_reading_enclosing_values(form):
+    """A model whose If branches read values and constants of enclosing graphs,
+    and the standard ONNX model ONNX Runtime runs for it."""
+    from onnx import TensorProto, helper, numpy_helper
+
+    def info(name, kind=TensorProto.FLOAT, dims=(1, 4)):
+        return helper.make_tensor_value_info(name, kind, list(dims))
+
+    def const(name, value, dtype=np.float32):
+        return numpy_helper.from_array(np.asarray(value, dtype), name)
+
+    def branch(name, nodes, output, constants=(), inputs=()):
+        return helper.make_graph(nodes, name, list(inputs), [output], list(constants))
+
+    def qdq(source, scale, zero, result):
+        return [helper.make_node("QuantizeLinear", [source, scale, zero], [f"{result}_q"]),
+                helper.make_node("DequantizeLinear", [f"{result}_q", scale, zero], [result])]
+
+    k = np.asarray([[0.5, -1.0, 2.0, 0.25]], np.float32)
+    inputs, outputs, constants = [info("x"), info("cond", TensorProto.BOOL, (1,))], [info("y")], []
+    if form == "values":
+        nodes = [helper.make_node("Relu", ["x"], ["a"]), helper.make_node("Mul", ["x", "k"], ["b"]),
+                 helper.make_node("If", ["cond"], ["y"], then_branch=branch(
+                     "then", [helper.make_node("Add", ["a", "t_one"], ["t_y"])], info("t_y"),
+                     [const("t_one", 1.0)]),
+                     else_branch=branch("else", [helper.make_node("Sub", ["b", "e_three"], ["e_y"])],
+                                        info("e_y"), [const("e_three", 3.0)]))]
+        constants = [const("k", 2.5)]
+    elif form == "weight":
+        nodes = [helper.make_node("Sigmoid", ["x"], ["act"]),
+                 helper.make_node("If", ["cond"], ["y"], then_branch=branch(
+                     "then", [helper.make_node("MatMul", ["act", "w"], ["t_y"])], info("t_y")),
+                     else_branch=branch("else", [helper.make_node("Add", ["act", "k"], ["e_y"])], info("e_y")))]
+        constants = [const("w", np.linspace(-1, 1, 16).reshape(4, 4)), const("k", k)]
+    elif form == "constant_node":
+        nodes = [helper.make_node("Constant", [], ["k"], value=const("k", k)),
+                 helper.make_node("Relu", ["x"], ["act"]),
+                 helper.make_node("If", ["cond"], ["y"], then_branch=branch(
+                     "then", [helper.make_node("Add", ["act", "k"], ["t_y"])], info("t_y")),
+                     else_branch=branch("else", [helper.make_node("Tanh", ["act"], ["e_y"])], info("e_y")))]
+    elif form == "nested":
+        # The inner If reads act and k from the main graph and t_r from the then branch.
+        inner = helper.make_node("If", ["t_large"], ["t_y"], then_branch=branch(
+            "inner_then", [helper.make_node("Mul", ["act", "k"], ["i_y"])], info("i_y")),
+            else_branch=branch("inner_else", [helper.make_node("Sigmoid", ["t_r"], ["j_y"])], info("j_y")))
+        nodes = [helper.make_node("Sigmoid", ["x"], ["act"]),
+                 helper.make_node("If", ["cond"], ["y"], then_branch=branch("then", [
+                     helper.make_node("Relu", ["act"], ["t_r"]),
+                     helper.make_node("Reshape", ["t_r", "rows"], ["t_row"]),
+                     helper.make_node("ReduceMax", ["t_row"], ["t_max"], axes=[2], keepdims=0),
+                     helper.make_node("Greater", ["t_max", "half"], ["t_large"]), inner], info("t_y")),
+                     else_branch=branch("else", [helper.make_node("Tanh", ["act"], ["e_y"])], info("e_y")))]
+        constants = [const("k", k), const("rows", [1, 1, 4], np.int64), const("half", 0.5)]
+    elif form == "beside_operands":
+        def model(tigris):
+            x_then, x_else = ("t_x", "e_x") if tigris else ("x", "x")
+            return [helper.make_node("Sigmoid", ["x"], ["b"]), helper.make_node(
+                "If", ["cond", "x"] if tigris else ["cond"], ["y"], **({"domain": "tigris"} if tigris else {}),
+                then_branch=branch("then", [helper.make_node("Mul", [x_then, "t_two"], ["t_y"])], info("t_y"),
+                                   [const("t_two", 2.0)], [info("t_x")] if tigris else []),
+                else_branch=branch("else", [helper.make_node("Add", [x_else, "b"], ["e_y"])], info("e_y"),
+                                   (), [info("e_x")] if tigris else []))]
+        nodes, reference = model(True), model(False)
+    else:
+        # int8: the branches requantize a, which a DequantizeLinear in the main graph gives.
+        shape = (1, 8)
+        nodes = [helper.make_node("DequantizeLinear", ["image", "in_s", "in_z"], ["xd"]),
+                 helper.make_node("Sigmoid", ["xd"], ["sg"]), *qdq("sg", "a_s", "a_z", "a"),
+                 helper.make_node("If", ["cond"], ["yf"], then_branch=branch(
+                     "then", [*qdq("a", "t_s", "t_z", "t_v"), helper.make_node("Relu", ["t_v"], ["t_r"]),
+                              *qdq("t_r", "t_s", "t_z", "t_y")], info("t_y", dims=shape)),
+                     else_branch=branch("else", qdq("a", "e_s", "e_z", "e_y"), info("e_y", dims=shape))),
+                 helper.make_node("QuantizeLinear", ["yf", "out_s", "out_z"], ["y"])]
+        inputs = [info("image", TensorProto.INT8, shape), inputs[1]]
+        outputs = [info("y", TensorProto.INT8, shape)]
+        constants = [const(name, value, np.int8 if name.endswith("_z") else np.float32) for name, value in (
+            ("in_s", 0.04), ("in_z", -2), ("out_s", 0.035), ("out_z", -10), ("a_s", 0.03), ("a_z", -5),
+            ("t_s", 0.02), ("t_z", 3), ("e_s", 0.05), ("e_z", -7))]
+
+    def built(graph_nodes):
+        opsets = [helper.make_opsetid("", 17)] + (
+            [helper.make_opsetid("tigris", 1)] if any(n.domain for n in graph_nodes) else [])
+        result = helper.make_model(helper.make_graph(graph_nodes, form, inputs, outputs, constants),
+                                   opset_imports=opsets)
+        result.ir_version = 9
+        return result
+
+    compiled = built(nodes)
+    return compiled, (built(reference) if form == "beside_operands" else compiled)
+
+
+@pytest.mark.parametrize("form", ["values", "weight", "constant_node", "nested", "beside_operands", "int8"])
+def test_an_if_whose_branches_read_enclosing_values_matches_onnx_runtime(tmp_path, form):
+    """ONNX's If reads its inputs from the enclosing graphs; the compiler passes
+    them as operands."""
+    import onnx
+    import onnxruntime as ort
+
+    compiled, reference = _if_reading_enclosing_values(form)
+    source = tmp_path / f"{form}.onnx"
+    onnx.save(compiled, source)
+    plan = tmp_path / f"{form}.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    rng = np.random.default_rng(15)
+    if form == "int8":
+        feeds = [{"image": rng.integers(-128, 128, (1, 8)).astype(np.int8)} for _ in range(2)]
+    else:
+        x = rng.uniform(0.1, 2.0, (1, 4)).astype(np.float32)
+        # Both signs, so the nested inner condition takes both branches.
+        feeds = [{"x": x}, {"x": -x}]
+    expected_session = ort.InferenceSession(reference.SerializeToString(), providers=["CPUExecutionProvider"])
+    with Session(plan) as session:
+        for feed in feeds:
+            for take in (True, False):
+                inputs = {**feed, "cond": np.asarray([take])}
+                expected = expected_session.run(None, inputs)[0]
+                actual = session.run(inputs)["y"]
+                if form == "int8":
+                    # One output step: the int8 kernels round as TFLite does, ONNX Runtime in float.
+                    np.testing.assert_allclose(actual.astype(np.int32), expected.astype(np.int32),
+                                               rtol=0, atol=1)
+                else:
+                    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)

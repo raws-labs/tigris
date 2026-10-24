@@ -174,6 +174,29 @@ def _fold_node(
 _MAX_FOLDED_ELEMENTS = 4096
 
 
+def bodies(node: onnx.NodeProto) -> list[onnx.GraphProto]:
+    return [body for attr in node.attribute
+            for body in ([attr.g] if attr.type == onnx.AttributeProto.GRAPH else attr.graphs)]
+
+
+def outer_reads(body: onnx.GraphProto) -> list[str]:
+    """Values from enclosing scopes that the body reads."""
+    defined = (
+        {value.name for value in body.input}
+        | {tensor.name for tensor in body.initializer}
+        | {tensor.values.name for tensor in body.sparse_initializer}
+        | {name for inner in body.node for name in inner.output}
+    )
+    used = [name for inner in body.node for name in (*inner.input, *body_reads(inner))]
+    return [name for name in (*used, *(value.name for value in body.output))
+            if name and name not in defined]
+
+
+def body_reads(node: onnx.NodeProto) -> list[str]:
+    """Values from enclosing scopes that the node's subgraphs read."""
+    return [name for body in bodies(node) for name in outer_reads(body)]
+
+
 def fold_shape_subgraph(model: onnx.ModelProto) -> int:
     """Replace runtime shape arithmetic with the constants it evaluates to.
 
@@ -205,9 +228,9 @@ def fold_shape_subgraph(model: onnx.ModelProto) -> int:
     if not folded:
         return 0
 
-    # Keep the values that a surviving node or a graph output still reads.
+    # Keep the values that a surviving node, its subgraphs or a graph output still read.
     survivors = [n for i, n in enumerate(graph.node) if i not in folded]
-    needed = {name for node in survivors for name in node.input}
+    needed = {name for node in survivors for name in (*node.input, *body_reads(node))}
     needed |= {value_info.name for value_info in graph.output}
     existing = {init.name for init in graph.initializer}
     for index in sorted(folded):

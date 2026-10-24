@@ -1200,9 +1200,10 @@ def _lstm_case() -> ContractCase:
                         expected_operators=("Transpose", "Lstm", "Transpose"))
 
 
-def _if_case(take_then: bool) -> ContractCase:
+def _if_case(take_then: bool, standard: bool = False) -> ContractCase:
     """An If on the sign of a sum, each branch a different computation of x;
-    the input is chosen so the given branch runs."""
+    the input is chosen so the given branch runs. ``standard`` compiles ONNX's
+    If, whose branches read x from the main graph."""
     x = np.asarray([[0.5, -1.25, 2.0, 0.75]], np.float32) * (1.0 if take_then else -1.0)
     weights = [numpy_helper.from_array(np.asarray([2], np.int64), "axes"),
                numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), "rows"),
@@ -1252,7 +1253,8 @@ def _if_case(take_then: bool) -> ContractCase:
             else_branch=branch("else", else_nodes, else_constants, False))],
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])], weights, opset=17)
-    return ContractCase(name="if_then" if take_then else "if_else", compile_model=compile_model,
+    return ContractCase(name=f"if_{'standard_' if standard else ''}{'then' if take_then else 'else'}",
+                        compile_model=reference if standard else compile_model,
                         reference_model=reference, inputs={"x": x},
                         # The main graph's stages, then each branch's, the else
                         # branch's Sub folded into an Add.
@@ -1318,9 +1320,10 @@ def _if_tiled_case(take_then: bool) -> ContractCase:
                         expect_line_buffered=True)
 
 
-def _nested_if_case() -> ContractCase:
+def _nested_if_case(standard: bool = False) -> ContractCase:
     """An If whose then branch holds another If; inputs reach each innermost
-    branch once across the runs the reference checks."""
+    branch once across the runs the reference checks. ``standard`` compiles
+    ONNX's If, whose branches read x from the main graph."""
     x = np.asarray([[0.5, 2.5, -0.25, 1.0]], np.float32)
     shape = [1, 4]
     weights = [numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), "rows"),
@@ -1378,7 +1381,8 @@ def _nested_if_case() -> ContractCase:
         [*condition, helper.make_node("If", ["positive"], ["y"], then_branch=outer_then(False),
                                       else_branch=outer_else(False))],
         [info("x")], [info("y")], weights, opset=17)
-    return ContractCase(name="nested_if", compile_model=compile_model, reference_model=reference,
+    return ContractCase(name="nested_if_standard" if standard else "nested_if",
+                        compile_model=reference if standard else compile_model, reference_model=reference,
                         inputs={"x": x},
                         expected_operators=("Reshape", "Transpose", "ReduceSum", "Greater", "If",
                                             "Reshape", "Transpose", "ReduceMax", "Greater", "If",
@@ -1386,10 +1390,11 @@ def _nested_if_case() -> ContractCase:
                                             "Mul", "Add", "Add"))
 
 
-def _int8_if_case(take_then: bool) -> ContractCase:
+def _int8_if_case(take_then: bool, standard: bool = False) -> ContractCase:
     """An int8 If whose operand and result cross the boundary in float32, as
     the TFLite converter writes it: Dequantize before, Quantize after, each
-    branch requantizing its input in its own encoding."""
+    branch requantizing its input in its own encoding. ``standard`` compiles
+    the QDQ form with ONNX's If, whose branches read xf from the main graph."""
     rng = np.random.default_rng(90)
     data = rng.integers(-128, 128, (1, 4, 4, 2)).astype(np.int8)
     shape = [1, 2, 4, 4]
@@ -1438,7 +1443,8 @@ def _int8_if_case(take_then: bool) -> ContractCase:
         built.ir_version = 9
         return built
 
-    return ContractCase(name=f"int8_if_{'then' if take_then else 'else'}", compile_model=model(True),
+    return ContractCase(name=f"int8_if_{'standard_' if standard else ''}{'then' if take_then else 'else'}",
+                        compile_model=model(not standard),
                         reference_model=model(False),
                         inputs={"image": data.transpose(0, 3, 1, 2).copy(),
                                 "take": np.asarray([take_then])},
@@ -7786,6 +7792,43 @@ def _assert_compile_rejected(work_dir: Path) -> None:
             ],
             [resize_scales],
         ),
+        helper.make_model(
+            # The body reads w from the main graph instead of taking it as a loop variable.
+            helper.make_graph(
+                [
+                    helper.make_node("Relu", ["input"], ["w"]),
+                    helper.make_node(
+                        "While",
+                        ["zero", "input"],
+                        ["count", "output"],
+                        domain="tigris",
+                        cond_branch=helper.make_graph(
+                            [helper.make_node("Less", ["c_i", "c_three"], ["c_go"])], "condition",
+                            [helper.make_tensor_value_info("c_i", TensorProto.INT32, []),
+                             helper.make_tensor_value_info("c_v", TensorProto.FLOAT, [1, 4])],
+                            [helper.make_tensor_value_info("c_go", TensorProto.BOOL, [])],
+                            [numpy_helper.from_array(np.asarray(3, np.int32), "c_three")],
+                        ),
+                        body_branch=helper.make_graph(
+                            [helper.make_node("Add", ["b_i", "b_one"], ["b_next"]),
+                             helper.make_node("Tanh", ["w"], ["b_y"])], "body",
+                            [helper.make_tensor_value_info("b_i", TensorProto.INT32, []),
+                             helper.make_tensor_value_info("b_v", TensorProto.FLOAT, [1, 4])],
+                            [helper.make_tensor_value_info("b_next", TensorProto.INT32, []),
+                             helper.make_tensor_value_info("b_y", TensorProto.FLOAT, [1, 4])],
+                            [numpy_helper.from_array(np.asarray(1, np.int32), "b_one")],
+                        ),
+                    ),
+                ],
+                "unsupported_outer_read",
+                [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])],
+                [helper.make_tensor_value_info("count", TensorProto.INT32, []),
+                 helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])],
+                [numpy_helper.from_array(np.asarray(0, np.int32), "zero")],
+            ),
+            opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)],
+            ir_version=9,
+        ),
         _model(
             # Rounding up adds a window that starts past the input, which no
             # end padding states.
@@ -8108,6 +8151,11 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _if_tiled_case(True),
         _if_tiled_case(False),
         _nested_if_case(),
+        _if_case(True, standard=True),
+        _if_case(False, standard=True),
+        _int8_if_case(True, standard=True),
+        _int8_if_case(False, standard=True),
+        _nested_if_case(standard=True),
     ]
     cases.extend(_reshape_band_case(quantized, merge)
                  for quantized in (False, True) for merge in (False, True))

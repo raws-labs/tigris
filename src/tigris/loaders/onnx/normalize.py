@@ -53,8 +53,9 @@ from tigris.graph.ir import (
 )
 
 
-def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Apply all normalization passes in sequence."""
+def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
+    """Apply all normalization passes in sequence; ``subgraph`` for a graph an
+    If or While runs."""
     declared_outputs = list(ag.model_outputs)
     ag = _adopt_tflite_gelu(ag)
     ag = _adopt_tflite_cumsum(ag)
@@ -74,7 +75,7 @@ def normalize(ag: AnalyzedGraph) -> AnalyzedGraph:
     ag = _fold_elementwise_patterns(ag)
     ag = _quantize_inputs_first(ag)
     ag = _transpose_quantized_weights(ag)
-    ag = _fold_qdq(ag)
+    ag = _fold_qdq(ag, subgraph)
     ag = _quantize_float_biases(ag)
     ag = _fold_float_square(ag)
     ag = _fold_gemm_scalars(ag)
@@ -1803,7 +1804,7 @@ def _quantize_inputs_first(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
+def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     """Fold QuantizeLinear / DequantizeLinear ops.
 
     ONNX QDQ format places Q/DQ pairs around weights and activations:
@@ -1818,6 +1819,10 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
        QuantParam on the quantized tensor, sets dtype to INT8.
     4. Retains conversions at float sections and folds encoded operator edges.
     5. Sets ag.is_quantized = True.
+
+    Values an If or While passes in or out stay float32, so a pair at that
+    boundary becomes a Dequantize or Quantize: around the operator, and in a
+    ``subgraph`` at its inputs and outputs.
     """
     qdq_types = {"QuantizeLinear", "DequantizeLinear"}
     has_qdq = any(op.op_type in qdq_types for op in ag.ops)
@@ -1909,6 +1914,10 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
                 and (unencoded_constant or from_section or (from_dequantize and i not in integer_ops))):
             float_ops.add(i)
     float_results = {n for i in float_ops for n in ag.ops[i].outputs}
+    crossing = {i for i, op in enumerate(ag.ops) if op.op_type in {"If", "While"}}
+    float_results.update(n for i in crossing for n in ag.ops[i].outputs)
+    if subgraph:
+        float_results.update(ag.model_inputs)
 
     removed: set[int] = set()
 
@@ -1916,9 +1925,10 @@ def _fold_qdq(ag: AnalyzedGraph) -> AnalyzedGraph:
         dql = ag.ops[index]
         target = dql.outputs[0]
         deferred_cleanup.update(n for n in dql.inputs[1:] if n)
-        keep = any(c in float_ops for c, _ in input_to_consumers.get(target, []))
+        keep = any(c in float_ops | crossing for c, _ in input_to_consumers.get(target, [])) or (
+            subgraph and target in ag.model_outputs)
         for consumer, position in input_to_consumers.get(target, []):
-            if consumer not in float_ops:
+            if consumer not in float_ops | crossing:
                 ag.ops[consumer].inputs[position] = source
         if keep and constant:
             quant = ag.tensors[source].quant
