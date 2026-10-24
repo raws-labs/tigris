@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from tigris import TILE_AXIS_NONE
+from tigris import SCHEMA_VERSION, TILE_AXIS_NONE
 
 DTYPE_BYTES: dict[int, int] = {
     1: 4,   # FLOAT
@@ -180,6 +180,8 @@ class TilePlan:
     band_on_columns: bool = False
     input_channel_group: int = 0
     input_spatial_interval: int = 0
+    # Serialized axis the bands run along: on the input they cut, or the first output for output rows.
+    band_axis: int = 0
     # Set when a stage was eligible for 2D (HW) tiling and solve_2d_tile
     # attempted the search but even a 1x1 core tile did not fit the budget.
     # Distinguishes this case from the generic 1D minimum-tile shortfall so
@@ -301,6 +303,9 @@ class AnalyzedGraph:
 
     # Quantization
     is_quantized: bool = False
+
+    # Plan schema the graph runs under: the compiler's, or the file's for a graph read from a plan.
+    schema_version: int = SCHEMA_VERSION
 
     @property
     def mem_budget(self) -> int:

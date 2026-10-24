@@ -3,9 +3,11 @@
 import struct
 
 from tigris import (
+    SCHEMA_VERSION_SCHEDULED_PEAK,
     SCHEMA_VERSION_TILE_AXIS,
     SCHEMA_VERSION_STATE,
     SCHEMA_VERSION_STAGE_TABLE_AUTHORITY,
+    SCHEMA_VERSION_TILE_FACTS,
     SUPPORTED_SCHEMA_VERSIONS,
     TILE_AXIS_HEIGHT_OR_LENGTH,
     TILE_AXIS_HW,
@@ -15,6 +17,8 @@ from tigris import (
 from .defs import (
     HEADER_SIZE,
     HEADER_STRUCT,
+    MEMORY_SIZE,
+    MEMORY_STRUCT,
     MAGIC,
     OP_ACTIVATION_OFFSET,
     OP_ACTIVATION_STRUCT,
@@ -32,6 +36,7 @@ from .defs import (
     SECTION_ENTRY_SIZE,
     SECTION_ENTRY_STRUCT,
     SEC_INDEX_POOL,
+    SEC_MEMORY,
     SEC_OP_ATTRIBUTES,
     SEC_STATE,
     SEC_SUBGRAPHS,
@@ -50,11 +55,12 @@ from .defs import (
     TENSOR_SIZE,
     TENSOR_STRUCT,
     TILE_PLAN_SIZE,
-    TENSOR_FLAG_LINEAR,
     TILE_FLAG_BAND_ON_COLUMNS,
     TILE_PLAN_STRUCT,
     TILE_PLAN_V10_STRUCT,
     TILE_PLAN_V10_SIZE,
+    TILE_PLAN_V11_STRUCT,
+    TILE_PLAN_V11_SIZE,
     WEIGHT_BLOCK_SIZE,
     WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
     WEIGHT_BLOCK_STRUCT,
@@ -67,8 +73,9 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
     """Parse a binary plan, optionally leaving weight blocks compressed.
 
     Returns a dict with keys: magic, version, file_size, num_tensors, num_ops,
-    num_stages, num_tile_plans, budget, peak, model_name, tensors, ops, stages,
-    tile_plans, model_inputs, model_outputs.
+    num_stages, num_tile_plans, budget, peak, scheduled_peak (None before
+    schema 11), model_name, tensors, ops, stages, tile_plans, model_inputs,
+    model_outputs.
     """
     if len(data) < HEADER_SIZE:
         raise ValueError(f"File too small: {len(data)} < {HEADER_SIZE}")
@@ -106,7 +113,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         if sec_type == 0:
             found_sentinel = True
             break
-        if sec_type > SEC_SUBGRAPHS:
+        if sec_type > SEC_MEMORY:
             raise ValueError(f"Unknown section type: {sec_type}")
         if sec_type in sections:
             raise ValueError(f"Duplicate section type: {sec_type}")
@@ -145,6 +152,10 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         required_sections.add(SEC_WEIGHTS)
     if num_quant_params:
         required_sections.add(SEC_QUANT_PARAMS)
+    if version >= SCHEMA_VERSION_SCHEDULED_PEAK:
+        required_sections.add(SEC_MEMORY)
+    elif SEC_MEMORY in sections:
+        raise ValueError(f"Schema {version} plan has a memory section, which only schema {SCHEMA_VERSION_SCHEDULED_PEAK} and later carry")
     missing = sorted(
         sec_type
         for sec_type in required_sections
@@ -158,6 +169,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         (SEC_OPS, num_ops, OP_SIZE),
         (SEC_STAGES, num_stages, STAGE_SIZE),
         (SEC_TILE_PLANS, num_tile_plans,
+         TILE_PLAN_V11_SIZE if version >= SCHEMA_VERSION_TILE_FACTS else
          TILE_PLAN_V10_SIZE if version >= SCHEMA_VERSION_STATE else TILE_PLAN_SIZE),
         (SEC_WEIGHTS, num_weights, WEIGHT_ENTRY_SIZE),
     ):
@@ -283,11 +295,18 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
     tp_base = sections.get(SEC_TILE_PLANS, 0)
     for i in range(num_tile_plans):
         if version >= SCHEMA_VERSION_STATE:
-            values = TILE_PLAN_V10_STRUCT.unpack_from(data, tp_base + i * TILE_PLAN_V10_SIZE)
             names = ("tileable", "axis", "flags", "input_band_extent", "output_band_extent",
                      "output_width_extent", "input_channel_group", "input_spatial_interval",
                      "output_linear_segment", "tiled_peak_bytes")
+            names += ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis", "_reserved")
+            if version >= SCHEMA_VERSION_TILE_FACTS:
+                values = TILE_PLAN_V11_STRUCT.unpack_from(data, tp_base + i * TILE_PLAN_V11_SIZE)
+            else:
+                # A schema 10 record states its scheduling choices only.
+                values = TILE_PLAN_V10_STRUCT.unpack_from(data, tp_base + i * TILE_PLAN_V10_SIZE)
+                values += (None, None, None, None, None, 0)
             tile = dict(zip(names, values))
+            del tile["_reserved"]
             tile["tileable"] = bool(tile["tileable"])
             tile["band_on_columns"] = bool(tile["flags"] & TILE_FLAG_BAND_ON_COLUMNS)
             tile_plans.append(tile)
@@ -453,11 +472,6 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
                 "data": data[data_start + data_off:data_start + data_off + data_len],
             })
 
-    if version >= SCHEMA_VERSION_STATE:
-        for stage in stages:
-            if stage["tile_plan_idx"] < len(tile_plans):
-                _tile_summary(tile_plans[stage["tile_plan_idx"]], stage, tensors, ops, op_attributes)
-
     # Resolve model I/O from index pool
     # Variables kept across invocations, with their initial values.
     subgraphs = []
@@ -487,6 +501,11 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
                 "offset": offset, "bytes": size,
                 "initial": data[state_base + initial:state_base + initial + size]})
 
+    scheduled_peak = None
+    if SEC_MEMORY in sections:
+        _check_range(SEC_MEMORY, sections[SEC_MEMORY], MEMORY_SIZE)
+        (scheduled_peak,) = MEMORY_STRUCT.unpack_from(data, sections[SEC_MEMORY])
+
     all_io = _read_index_pool(model_io_off, num_model_inputs + num_model_outputs)
     model_inputs_idx = all_io[:num_model_inputs]
     model_outputs_idx = all_io[num_model_inputs:]
@@ -504,6 +523,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         "flags": flags,
         "budget": budget,
         "peak": peak,
+        "scheduled_peak": scheduled_peak,
         "model_name": model_name,
         "tensors": tensors,
         "ops": ops,
@@ -520,79 +540,3 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         "subgraphs": subgraphs,
     }
 
-
-def _tile_summary(tile, stage, tensors, ops, attributes):
-    """Derive inspection fields from shapes, leaving scheduling choices explicit."""
-    from math import prod
-    from .defs import OP_TYPE_MAP, OP_ATTR_TRANSPOSE_PERM, OP_ATTR_LSTM
-
-    extent = tile["input_band_extent"] or tile["output_band_extent"]
-    total = 0
-    rf, stride = 1, 1
-    stage_ops = [ops[i] for i in stage["ops"]]
-    if tile["tileable"] and stage["inputs"] and stage["outputs"]:
-        source = tensors[stage["inputs"][0]]
-        target = tensors[stage["outputs"][0]]
-        a, b = source["shape"], target["shape"]
-        total = a[1] if len(a) > 2 else a[0]
-        for op in stage_ops:
-            if op["op_type"] in {OP_TYPE_MAP[t] for t in
-                                   ("Conv", "Conv1D", "DepthwiseConv", "MaxPool", "AveragePool", "L2Pool")}:
-                sp = op["spatial"]
-                rf += (sp["kernel_h"] - 1) * max(1, sp["dilation_h"]) * stride
-                stride *= sp["stride_h"]
-        if len(stage_ops) == 1 and stage_ops[0]["op_type"] in {OP_TYPE_MAP["Svdf"], OP_TYPE_MAP["Lstm"]}:
-            params = next((attr["data"] for attr in attributes if
-                           attr["op_index"] == stage["ops"][0] and attr["type"] == OP_ATTR_LSTM), b"")
-            time_major = bool(params and struct.unpack_from("<i", params)[0])
-            total = a[int(time_major and len(a) == 3)]
-        elif tile["output_band_extent"]:
-            total = b[1]
-        elif len(stage_ops) == 1 and stage_ops[0]["op_type"] in {
-                OP_TYPE_MAP["Reshape"], OP_TYPE_MAP["Flatten"]}:
-            own = all(len(t["shape"]) <= 2 or t["flags"] & TENSOR_FLAG_LINEAR for t in (source, target))
-            candidates = [(len(a) - 2, len(b) - 2)] if own else []
-            candidates += [(1, 1), (next((i for i, n in enumerate(a) if n != 1), 0),
-                                   next((i for i, n in enumerate(b) if n != 1), 0))]
-            for ia, ib in candidates:
-                if (ia < len(a) and ib < len(b) and a[ia] > 1 and
-                        prod(a[:ia]) == prod(b[:ib]) and prod(a[ia:]) == prod(b[ib:])):
-                    total = a[ia]
-                    break
-        elif len(stage_ops) == 1 and stage_ops[0]["op_type"] == OP_TYPE_MAP["Transpose"]:
-            perm = next((attr["data"] for attr in attributes if
-                         attr["op_index"] == stage["ops"][0] and attr["type"] == OP_ATTR_TRANSPOSE_PERM), b"")
-            if tile["input_band_extent"]:
-                total = max((a[i] for i, axis in enumerate(perm) if i == axis), default=0)
-            # Adjacent groups exchange positions while the outer axes stay put.
-            for start in range(len(a)):
-                for split in range(start + 1, len(a)):
-                    for end in range(split + 1, len(a) + 1):
-                        expected = list(range(start)) + list(range(split, end)) + list(range(start, split)) + list(range(end, len(a)))
-                        if list(perm) == expected:
-                            total = prod(a[split:end] if tile["band_on_columns"] else a[start:split])
-            # The adaptive transpose executor fits two separately aligned bands.
-            bytes_per_axis = source["size_bytes"] // total if total else 0
-            low, high = (1, total) if not tile["input_band_extent"] else (1, 0)
-            extent = tile["input_band_extent"]
-            while low <= high:
-                candidate = (low + high) // 2
-                required = 2 * ((candidate * bytes_per_axis + 31) // 32 * 32)
-                if required <= tile["tiled_peak_bytes"]:
-                    extent, low = candidate, candidate + 1
-                else:
-                    high = candidate - 1
-        elif len(a) >= 3 and (source["flags"] & TENSOR_FLAG_LINEAR):
-            total = a[-2]
-    count = (total + extent - 1) // extent if extent else 0
-    if tile["input_channel_group"] and tile["input_spatial_interval"] and stage["inputs"]:
-        shape = tensors[stage["inputs"][0]]["shape"]
-        group, interval = tile["input_channel_group"], tile["input_spatial_interval"]
-        count = shape[0] * ((shape[3] + group - 1) // group) * ((shape[1] * shape[2] + interval - 1) // interval)
-        total = shape[1] * shape[2]
-    if tile["output_width_extent"] and stage["outputs"]:
-        width = tensors[stage["outputs"][0]]["shape"][2]
-        count *= (width + tile["output_width_extent"] - 1) // tile["output_width_extent"]
-    tile.update(tile_height=extent, tile_width=tile["output_width_extent"],
-                original_height=total, num_tiles=count, receptive_field=rf,
-                halo=rf - 1, overhead_bytes=0)

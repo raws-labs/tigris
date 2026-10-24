@@ -29,9 +29,9 @@ from click import ClickException
 from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris import TILE_AXIS_HW
-from tigris.analysis.plan_graph import slow_arena_required
-from tigris.analysis.validation import slow_pool_usage, validate_memory_plan
+from tigris import SCHEMA_VERSION, TILE_AXIS_HW
+from tigris.analysis.plan_graph import graph_from_plan, slow_arena_required
+from tigris.analysis.validation import io_in_fast, slow_pool_usage, validate_memory_plan
 from tigris.capabilities import KERNEL_CAPABILITIES, OP_TYPE_BY_CODE
 from tigris.cli import _run_pipeline
 from tigris.emitters.codegen import _executor_workspace_limits
@@ -55,7 +55,6 @@ from tigris.graph.ir import Stage
 # plan test-suite; reuse it rather than duplicating the stage-record parser.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 from test_linebuffer_plan import _stage_reserved1  # noqa: E402
-from test_2d_tiling_plan import decode_first_tile_plan  # noqa: E402
 
 
 Array = NDArray[np.generic]
@@ -98,6 +97,8 @@ class ContractCase:
     expect_grouped: bool = False
     # Compare outputs byte for byte instead of within one quantization step.
     exact: bool = False
+    # The plan reads its inputs in place, so the gate also runs it without a slow arena.
+    expect_inputs_in_fast: bool = False
 
 
 def _model(
@@ -4644,6 +4645,31 @@ def _normalized_classifier_case() -> ContractCase:
     )
 
 
+def _two_input_compressed_case() -> ContractCase:
+    """Two model inputs read in place by one stage whose weights are compressed.
+
+    Only the first input placed leaves room for the decompressed weights below
+    it, so the inputs sit together above one room and the run needs no slow
+    arena at the stated fast figure.
+    """
+    shape = [1, 2, 4, 4]
+    weight = (np.arange(54, dtype=np.float32).reshape(3, 2, 3, 3) % 7 - 3) * 0.125
+    bias = np.array([0.5, -0.25, 0.125], dtype=np.float32)
+    model = _model(
+        "two_input_compressed",
+        [helper.make_node("Add", ["left", "right"], ["sum"]),
+         helper.make_node("Conv", ["sum", "weight", "bias"], ["output"], pads=[1, 1, 1, 1])],
+        [helper.make_tensor_value_info("left", TensorProto.FLOAT, shape),
+         helper.make_tensor_value_info("right", TensorProto.FLOAT, shape)],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 4, 4])],
+        [numpy_helper.from_array(weight, "weight"), numpy_helper.from_array(bias, "bias")],
+    )
+    values = np.arange(32, dtype=np.float32).reshape(shape) * 0.0625
+    return ContractCase("two_input_compressed", model, model,
+                        {"left": values, "right": values[:, ::-1].copy() - 1.0}, ("Add", "Conv"),
+                        compression="lz4", expect_inputs_in_fast=True)
+
+
 def _resize_concat_case() -> ContractCase:
     """Resize scale extraction and NCHW-to-NHWC Concat-axis mapping."""
     model_input = helper.make_tensor_value_info(
@@ -7103,10 +7129,18 @@ def _assert_memory_contract(
         raise AssertionError(
             f"{case_name}: runtime budget {budget} != plan budget {plan['budget']}"
         )
-    if required != budget + reserve:
+    # A plan that states its scheduled peak is sized by it, an older one by its budget.
+    stated = plan["scheduled_peak"]
+    if stated is not None and stated != scheduled_peak:
         raise AssertionError(
-            f"{case_name}: required arena {required} != budget + reserve "
-            f"({budget} + {reserve})"
+            f"{case_name}: plan states scheduled peak {stated}, the compiler "
+            f"validated {scheduled_peak}"
+        )
+    activations = budget if stated is None else stated
+    if required != activations + reserve:
+        raise AssertionError(
+            f"{case_name}: required arena {required} != activations + reserve "
+            f"({activations} + {reserve})"
         )
     expected_limit = budget if full_budget else scheduled_peak
     if activation_limit != expected_limit:
@@ -7145,6 +7179,44 @@ def _assert_memory_contract(
             f"{case_name}: runtime slow peak {slow_peak} exceeds the slow "
             f"budget {slow_budget} the compiler accepted"
         )
+
+
+def _assert_runs_without_slow(
+    case_name: str, plan: dict, runner: Path, plan_path: Path, inputs_path: Path,
+    outputs_path: Path, limit: int,
+) -> bool:
+    """For a plan that keeps its model inputs and outputs in the fast pool, the
+    compiler must state no slow memory, and the runtime must run it without a
+    slow arena at the compiler's fast figure, to the same bytes. Inputs the
+    caller allocates in slow instead are copied through it at the same fast
+    figure, to the same bytes. Returns whether the plan is one."""
+    if not io_in_fast(graph_from_plan(plan)):
+        return False
+    if plan["_compiler_slow_peak"] != 0:
+        raise AssertionError(
+            f"{case_name}: the compiler needs {plan['_compiler_slow_peak']} slow bytes "
+            "for a plan that keeps its inputs and outputs in the fast pool")
+    expected = outputs_path.read_bytes()
+    alone = outputs_path.with_name("no-slow.bin")
+    completed = _run([str(runner), str(plan_path), str(inputs_path), str(alone), str(limit),
+                      "--slow-arena=0"], f"{case_name} run without a slow arena")
+    _assert_memory_contract(case_name, plan, completed.stdout,
+                            full_budget=limit != plan["_compiler_scheduled_peak"])
+    if alone.read_bytes() != expected:
+        raise AssertionError(f"{case_name}: the run without a slow arena changed the outputs")
+    copied = outputs_path.with_name("inputs-in-slow.bin")
+    completed = _run([str(runner), str(plan_path), str(inputs_path), str(copied), str(limit),
+                      "--inputs-in-slow"], f"{case_name} run with inputs in slow")
+    match = _MEMORY_REPORT.search(completed.stdout)
+    if match is None:
+        raise AssertionError(f"{case_name}: runtime emitted no memory report")
+    reserve, peak, slow_peak = (int(match.group(i)) for i in (3, 6, 7))
+    if peak > plan["_compiler_scheduled_peak"] + reserve or slow_peak == 0:
+        raise AssertionError(
+            f"{case_name}: inputs in slow peaked at {peak} fast and {slow_peak} slow bytes")
+    if copied.read_bytes() != expected:
+        raise AssertionError(f"{case_name}: the run with inputs in slow changed the outputs")
+    return True
 
 
 def _run_peak_fixtures(runners: tuple[Path, ...], work_dir: Path) -> None:
@@ -7190,7 +7262,28 @@ def _run_peak_fixtures(runners: tuple[Path, ...], work_dir: Path) -> None:
                                 case_name, plan, completed.stdout, full_budget=full_budget,
                             )
                             assert output_path.read_bytes() == expected, case_name
+                            _assert_runs_without_slow(case_name, plan, runner, plan_path,
+                                                      input_path, output_path, limit)
+                        _assert_refused_below_peak(case_name, plan, runner, plan_path,
+                                                   input_path, output_path)
                 print(f"PASS {case_name}")
+
+
+def _assert_refused_below_peak(
+    case_name: str, plan: dict, runner: Path, plan_path: Path, inputs_path: Path,
+    outputs_path: Path,
+) -> None:
+    """One byte below the plan's scheduled peak, the run is refused before any stage."""
+    limit = plan["scheduled_peak"] - 1
+    completed = subprocess.run(
+        [str(runner), str(plan_path), str(inputs_path), str(outputs_path), str(limit)],
+        text=True, capture_output=True, check=False)
+    if completed.returncode == 0 or (
+            "inference failed: arena too small for the plan after 0 stages"
+            not in completed.stderr):
+        raise AssertionError(
+            f"{case_name}: a fast arena one byte below the scheduled peak was not refused "
+            f"up front (exit {completed.returncode}):\n{completed.stdout}{completed.stderr}")
 
 
 def _build_runner(
@@ -7470,6 +7563,11 @@ def _run_case(
         f"{case.name} runtime execution",
     )
     _assert_memory_contract(case.name, plan, completed.stdout)
+    without_slow = _assert_runs_without_slow(
+        case.name, plan, runner, plan_path, inputs_path, outputs_path,
+        plan["_compiler_scheduled_peak"])
+    if case.expect_inputs_in_fast and not without_slow:
+        raise AssertionError(f"{case.name}: the plan does not read its inputs in place")
     actual_outputs = _decode_outputs(
         plan, outputs_path.read_bytes(), reference_outputs
     )
@@ -7493,10 +7591,7 @@ def _run_case(
         )
     _assert_trace(case.name, plan_path, inputs_path.read_bytes(), outputs_path.read_bytes())
     if case.exact_untiled:
-        expected_schema = 10 if (any(prop.key == STATE_KEY for prop in case.compile_model.metadata_props)
-                                 or any(k in {"If", "While", "Svdf", "Lstm"}
-                                        for k in case.expected_operators)) else 9
-        assert plan["version"] == (10 if case.expect_grouped else expected_schema)
+        assert plan["version"] == SCHEMA_VERSION
         banded_types = {OP_TYPE_MAP[k] for k in (case.tiled_operators or case.expected_operators) if k != "Transpose"}
         banded_stages = [stage for stage in plan["stages"] if any(
             plan["ops"][i]["op_type"] in banded_types for i in stage["ops"])]
@@ -7506,12 +7601,12 @@ def _run_case(
         untiled = _compile_plan(compile_path, untiled_path, mem_budget="64K", slow_budget="16K",
                                 compression=None, xip=False)
         assert not any(tile["tileable"] for tile in untiled["tile_plans"])
-        assert untiled["version"] == expected_schema
+        assert untiled["version"] == SCHEMA_VERSION
         untiled_outputs = case_dir / "untiled.bin"
         _run([str(runner), str(untiled_path), str(inputs_path), str(untiled_outputs),
               str(untiled["_compiler_scheduled_peak"])], f"{case.name} untiled execution")
         assert outputs_path.read_bytes() == untiled_outputs.read_bytes()
-    print(f"PASS {case.name} memory-contract")
+    print(f"PASS {case.name} memory-contract" + (" no-slow" if without_slow else ""))
     return plan_path
 
 
@@ -7677,33 +7772,24 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
             f"{case.expect_line_buffered}"
         )
 
-    # A 2D case decodes the plan's first tile-plan record straight from the
-    # emitted bytes (reusing test_2d_tiling_plan.py's decoder) and confirms
-    # both axes actually split into more than one tile. num_tiles is the
-    # solver's ceil(H/tile_h) * ceil(W/tile_w) product, so dividing it by the
-    # H-axis tile count derived from the decoded original_height/tile_height
-    # recovers the W-axis tile count without needing a separate width field
-    # in the plan format.
+    # Both axes of a 2D case split, by the stated counts: num_tiles // ceil(H / tile_h) columns.
     if case.expect_2d:
-        if plan["version"] >= 10:
-            from types import SimpleNamespace
-            tile_plan = SimpleNamespace(**next(tile for tile in plan["tile_plans"]
-                                              if tile["tileable"]))
-        else:
-            tile_plan = decode_first_tile_plan(plan_bytes)
+        from types import SimpleNamespace
+        tile_plan = SimpleNamespace(**next(tile for tile in plan["tile_plans"]
+                                          if tile["tileable"]))
         if tile_plan.axis != TILE_AXIS_HW:
             raise AssertionError(
                 f"{case.name}: tile plan axis {tile_plan.axis}, expected "
                 f"TILE_AXIS_HW ({TILE_AXIS_HW})"
             )
-        tiles_h = math.ceil(tile_plan.original_height / tile_plan.tile_height)
+        tiles_h = math.ceil(tile_plan.original_extent / tile_plan.tile_extent)
         tiles_w = tile_plan.num_tiles // tiles_h
         if not (tiles_h > 1 and tiles_w > 1):
             raise AssertionError(
                 f"{case.name}: expected multi-tile on both axes, got "
                 f"tiles_h={tiles_h} tiles_w={tiles_w} "
                 f"(num_tiles={tile_plan.num_tiles}, "
-                f"tile_h={tile_plan.tile_height}, tile_w={tile_plan.tile_width})"
+                f"tile_h={tile_plan.tile_extent}, tile_w={tile_plan.output_width_extent})"
             )
 
     if case.compression == "lz4":
@@ -8090,6 +8176,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_matrix_rows_case(),
         _tiled_attention_transpose_case(),
         _normalized_classifier_case(),
+        _two_input_compressed_case(),
         _resize_concat_case(),
         _tiled_pool_case(),
         _tiled_pool_chain_case(),

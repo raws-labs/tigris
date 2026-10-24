@@ -220,7 +220,7 @@ def test_a_transpose_the_model_asks_for_is_banded_too(tmp_path):
 
 
 def test_band_extents_come_from_the_permutation_not_the_layout():
-    """The executor's transpose_extents reads the stored permutation alone.
+    """The runtime's tigris_transpose_extents reads the stored permutation alone.
 
     Splitting the tensor by its layout instead agrees only when the
     permutation happens to run the way that layout implies. Where it runs the

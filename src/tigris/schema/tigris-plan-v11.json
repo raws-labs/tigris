@@ -1,0 +1,258 @@
+{
+  "artifact_format": 1,
+  "endianness": "little",
+  "magic_ascii": "TGRS",
+  "op_attribute_contract": {
+    "duplicates": "rejected by (op_index, type)",
+    "ordering": [
+      "op_index",
+      "type"
+    ],
+    "payload_length_bits": 8
+  },
+  "op_attribute_types": {
+    "alpha": 3,
+    "axes": 6,
+    "binary_requant": 7,
+    "clip_bounds": 4,
+    "comparison_requant": 13,
+    "constant_operand": 9,
+    "constants": 14,
+    "cumsum_options": 11,
+    "detection": 18,
+    "epsilon": 2,
+    "gelu_approximate": 19,
+    "lstm": 16,
+    "movement": 12,
+    "pads": 5,
+    "pool_rounding": 8,
+    "resize_scales": 10,
+    "subgraphs": 17,
+    "svdf": 15,
+    "table_shape": 20,
+    "transpose_perm": 1
+  },
+  "op_types": {
+    "Abs": 38,
+    "Add": 7,
+    "And": 78,
+    "ArgMax": 64,
+    "ArgMin": 65,
+    "AveragePool": 6,
+    "BatchNormalization": 22,
+    "Cast": 82,
+    "Ceil": 49,
+    "Clip": 11,
+    "Concat": 13,
+    "Conv": 1,
+    "Conv1D": 32,
+    "ConvTranspose": 24,
+    "Cos": 52,
+    "CumSum": 63,
+    "DepthwiseConv": 2,
+    "Dequantize": 91,
+    "DetectionPostProcess": 89,
+    "Div": 19,
+    "DynamicUpdateSlice": 72,
+    "Elu": 56,
+    "EmbeddingLookup": 71,
+    "Equal": 73,
+    "Erf": 34,
+    "Exp": 44,
+    "Flatten": 16,
+    "Floor": 48,
+    "FloorDiv": 53,
+    "FloorMod": 54,
+    "Gather": 66,
+    "GatherND": 67,
+    "Gelu": 92,
+    "Gemm": 9,
+    "GlobalAveragePool": 15,
+    "GlobalMaxPool": 31,
+    "Greater": 76,
+    "GreaterOrEqual": 77,
+    "HardSwish": 37,
+    "If": 87,
+    "InstanceNormalization": 23,
+    "L2Normalization": 58,
+    "L2Pool": 59,
+    "LayerNormalization": 33,
+    "LeakyRelu": 21,
+    "Less": 74,
+    "LessOrEqual": 75,
+    "Log": 45,
+    "LogSoftmax": 57,
+    "Lstm": 86,
+    "MatMul": 25,
+    "Max": 41,
+    "MaxPool": 5,
+    "Min": 42,
+    "MirrorPad": 69,
+    "Mul": 8,
+    "Neg": 43,
+    "Not": 80,
+    "Or": 79,
+    "PRelu": 55,
+    "Pad": 14,
+    "Quantize": 90,
+    "ReduceAll": 84,
+    "ReduceMax": 60,
+    "ReduceMean": 26,
+    "ReduceMin": 61,
+    "ReduceSum": 62,
+    "Relu": 3,
+    "Relu6": 4,
+    "Reshape": 17,
+    "Resize": 30,
+    "ResizeLinear": 36,
+    "ReverseV2": 70,
+    "Round": 50,
+    "Rsqrt": 39,
+    "Sigmoid": 12,
+    "Sin": 51,
+    "Softmax": 10,
+    "Split": 35,
+    "Sqrt": 46,
+    "Square": 47,
+    "SquaredDifference": 40,
+    "Squeeze": 27,
+    "StridedSlice": 68,
+    "Sub": 18,
+    "Sum": 83,
+    "Svdf": 85,
+    "Tanh": 20,
+    "Transpose": 29,
+    "Unsqueeze": 28,
+    "Where": 81,
+    "While": 88
+  },
+  "record_sizes": {
+    "header": 48,
+    "memory": 4,
+    "op": 38,
+    "op_attribute": 8,
+    "quant_param": 16,
+    "section_entry": 8,
+    "stage": 28,
+    "state_entry": 16,
+    "state_header": 8,
+    "subgraph_entry": 12,
+    "subgraph_header": 4,
+    "tensor": 16,
+    "tile_plan": 48,
+    "tile_plan_through_v9": 24,
+    "tile_plan_v10": 32,
+    "weight_block": 20,
+    "weight_entry": 12
+  },
+  "schema_version": 11,
+  "section_alignment": 16,
+  "section_types": {
+    "index_pool": 5,
+    "memory": 14,
+    "op_attributes": 11,
+    "ops": 2,
+    "quant_params": 9,
+    "shape_pool": 6,
+    "stages": 3,
+    "state": 12,
+    "strings": 7,
+    "subgraphs": 13,
+    "tensors": 1,
+    "tile_plans": 4,
+    "weight_blocks": 10,
+    "weights": 8
+  },
+  "tensor_flags": {
+    "constant": 1,
+    "linear": 8,
+    "model_input": 2,
+    "model_output": 4,
+    "state": 16
+  },
+  "tile_axes": {
+    "height_or_length": 1,
+    "hw": 3,
+    "none": 0,
+    "width_reserved": 2
+  },
+  "tile_plan_v11": {
+    "fields": {
+      "axis": [
+        1,
+        1
+      ],
+      "band_axis": [
+        46,
+        1
+      ],
+      "flags": [
+        2,
+        2
+      ],
+      "halo": [
+        44,
+        2
+      ],
+      "input_band_extent": [
+        4,
+        4
+      ],
+      "input_channel_group": [
+        16,
+        4
+      ],
+      "input_spatial_interval": [
+        20,
+        4
+      ],
+      "num_tiles": [
+        36,
+        4
+      ],
+      "original_extent": [
+        40,
+        4
+      ],
+      "output_band_extent": [
+        8,
+        4
+      ],
+      "output_linear_segment": [
+        24,
+        4
+      ],
+      "output_width_extent": [
+        12,
+        4
+      ],
+      "reserved": [
+        47,
+        1
+      ],
+      "tile_extent": [
+        32,
+        4
+      ],
+      "tileable": [
+        0,
+        1
+      ],
+      "tiled_peak_bytes": [
+        28,
+        4
+      ]
+    },
+    "struct": "<BBH7I3IHBB"
+  },
+  "versioning": {
+    "capability_growth_requires_schema_bump": false,
+    "memory_v11": "every plan is written at schema 11 with a memory section; scheduled_peak is the fast-arena bytes the largest stage or chain holds at once, decompressed weights excluded",
+    "scope": "wire_format",
+    "stage_assignment_v5": "stage table authoritative; operator byte is canonical low-byte hint",
+    "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
+    "state_v10": "state, subgraphs and grouped tiles need schema 10 or later",
+    "subgraphs_v10": "control flow needs schema 10 or later; graph 0 is the main graph",
+    "tile_facts_v11": "a tile record states the band axis, the extent the bands divide, the band, the tile count and the halo; the runtime's loader derives them from the plan and refuses a record that disagrees"
+  }
+}

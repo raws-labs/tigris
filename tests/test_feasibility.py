@@ -355,6 +355,6 @@ def test_int8_global_pool_refuses_an_overflowing_sum(tmp_path, budget):
         emit_binary_bytes(graph)
     from tigris.emitters.binary.writer import _emit
     path.write_bytes(_emit(graph, compress=None, validate=False))
-    assert read_binary_plan(path.read_bytes())["version"] == (10 if budget == "128" else 9)
+    assert read_binary_plan(path.read_bytes())["version"] == 11
     with pytest.raises(HostError):
         Session(path)

@@ -24,6 +24,7 @@ from tigris.graph.ir import (
     OpNode,
     QuantParam,
     Stage,
+    StatePort,
     TensorInfo,
     TilePlan,
     serialized_axis_map,
@@ -92,15 +93,8 @@ def graph_from_plan(plan: dict, fast_reserve: int = 0) -> AnalyzedGraph:
                 entry = plan["tile_plans"][record["tile_plan_idx"]]
                 tile = TilePlan(
                     tileable=entry["tileable"], axis=entry["axis"],
-                    tile_height=entry["tile_height"], tile_width=entry["tile_width"],
-                    num_tiles=entry["num_tiles"], halo=entry["halo"],
-                    receptive_field=entry["receptive_field"],
-                    original_height=entry["original_height"],
                     tiled_peak_bytes=entry["tiled_peak_bytes"],
-                    overhead_bytes=entry["overhead_bytes"],
-                    band_on_columns=entry["band_on_columns"],
-                    input_channel_group=entry.get("input_channel_group", 0),
-                    input_spatial_interval=entry.get("input_spatial_interval", 0))
+                    band_on_columns=entry["band_on_columns"], **_tile_fields(entry))
             stage = Stage(
                 stage_id=position, op_indices=[local[i] for i in record["ops"]],
                 input_tensors=[names[i] for i in record["inputs"]],
@@ -114,20 +108,53 @@ def graph_from_plan(plan: dict, fast_reserve: int = 0) -> AnalyzedGraph:
             stages.append(stage)
         inputs = [names[i] for i in graph_range["inputs"]]
         outputs = [names[i] for i in graph_range["outputs"]]
+        ports = []
         if not graphs:
-            # Variables are model inputs and outputs to the analysis; the plan
-            # lists them in its state section instead.
+            # Variables are model I/O to the analysis; the plan lists them, with initial values, as state.
             for entry in plan["state"]["entries"]:
                 inputs.append(names[entry["input"]])
+                output = None
                 if entry["output"] is not None:
                     outputs.append(names[entry["output"]])
+                    output = len(outputs) - 1
+                ports.append(StatePort(input=len(inputs) - 1, output=output,
+                                       initial=np.frombuffer(entry["initial"], np.uint8)))
         graphs.append(AnalyzedGraph(
             model_name=plan["model_name"], ops=ops, tensors=tensors,
-            model_inputs=inputs, model_outputs=outputs, stages=stages, budget=budget))
+            model_inputs=inputs, model_outputs=outputs, stages=stages, budget=budget,
+            state_ports=ports, schema_version=plan["version"]))
     # Every graph names the graphs it runs by their place in the plan.
     for graph in graphs:
         graph.subgraphs = graphs
     return graphs[0]
+
+
+def _tile_fields(entry: dict) -> dict:
+    """The TilePlan fields a tile record states; any other keeps its default."""
+    if "input_band_extent" not in entry:
+        return {key: entry[key] for key in (
+            "tile_height", "tile_width", "num_tiles", "halo", "receptive_field",
+            "original_height", "overhead_bytes")}
+    grouped = entry["input_channel_group"] != 0
+    fields = {"tile_width": entry["output_width_extent"],
+              "input_channel_group": entry["input_channel_group"],
+              "input_spatial_interval": entry["input_spatial_interval"]}
+    if entry["tile_extent"] is None:
+        # A schema 10 record states its scheduling choices only.
+        fields["tile_height"] = 0 if grouped else (
+            entry["input_band_extent"] or entry["output_band_extent"])
+        return fields
+    # A grouped reduction's tile_extent is its interval, which TilePlan keeps apart from tile_height.
+    fields.update(tile_height=0 if grouped else entry["tile_extent"], num_tiles=entry["num_tiles"],
+                  original_height=entry["original_extent"], halo=entry["halo"],
+                  band_axis=entry["band_axis"])
+    return fields
+
+
+def fast_activation_bytes(plan: dict) -> int:
+    """Fast-arena bytes the plan's activations need: the scheduled peak the
+    plan states from schema 11 on, its budget before."""
+    return plan["budget"] if plan["scheduled_peak"] is None else plan["scheduled_peak"]
 
 
 def slow_arena_required(plan: dict) -> int:

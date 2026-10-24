@@ -580,7 +580,7 @@ def _transpose_band_extents(
 ) -> tuple[int, int, int] | None:
     """The batch and the two extents a banded transpose swaps.
 
-    Mirrors transpose_extents in the executor, which reads the stored
+    Mirrors tigris_transpose_extents in the runtime, which reads the stored
     permutation and nothing else. The tensor's layout does not decide the
     split: the same stored shape is banded differently depending on which way
     the permutation runs, and a transpose that is not a layout conversion has
@@ -603,8 +603,8 @@ def _transpose_band_extents(
 
 # Operators that keep a rank-2 matrix's rows independent: a matrix product
 # against a constant reads one row to write one row, and the pointwise
-# operators beside it preserve rows outright. Mirrors is_row_tiling_op in the
-# loader and the executor.
+# operators beside it preserve rows outright. Mirrors tigris_row_tiling_op in the
+# runtime.
 _ROW_TILING_OPS = frozenset({
     "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
     "And", "Or", "Not", "Where", "Cast", "Sum", "Quantize", "Dequantize",
@@ -719,7 +719,7 @@ def _height_view(info) -> tuple[int, int, int] | None:
 
 
 def _reshape_band(ag: AnalyzedGraph, stage: Stage):
-    """Stored (blocks, input rows, input width, output rows, output width)."""
+    """Stored (blocks, input rows, input width, output rows, output width, input axis)."""
     if (len(stage.op_indices) != 1 or stage.chain_len or
             len(stage.input_tensors) != 1 or len(stage.output_tensors) != 1):
         return None
@@ -747,12 +747,12 @@ def _reshape_band(ag: AnalyzedGraph, stage: Stage):
         if min(blocks, other, ri, ci, ro, co) <= 0 or max(blocks, other, ci, co) > 0x7FFFFFFF:
             return None
         if blocks == other and ri * ci == ro * co and ri > 1:
-            return blocks, ri, ci, ro, co
+            return blocks, ri, ci, ro, co, ia
     return None
 
 
 def _reshape_tile_for_bytes(mapping, budget: int, alignment: int, element: int) -> TilePlan:
-    blocks, rows, width, _, output_width = mapping
+    blocks, rows, width, _, output_width, axis = mapping
     step = output_width // math.gcd(width, output_width)
     # One buffer holds both views of exactly the same interval of bytes.
     alignment = max(alignment, _CONSERVATIVE_TENSOR_ALIGN)
@@ -763,7 +763,8 @@ def _reshape_tile_for_bytes(mapping, budget: int, alignment: int, element: int) 
         return TilePlan(tileable=False, min_tile_bytes=minimum)
     return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
                     tile_height=band, num_tiles=math.ceil(rows / band), original_height=rows,
-                    tiled_peak_bytes=_align_up(blocks * band * width * element, alignment))
+                    tiled_peak_bytes=_align_up(blocks * band * width * element, alignment),
+                    band_axis=axis)
 
 
 def _leading_view(info, trailing=False, axis=None) -> tuple[int, int, int] | None:
@@ -937,6 +938,34 @@ def _independent_mode(ag: AnalyzedGraph, op: OpNode) -> int:
     return next((mode for mode in (1, 2) if _independent_band(ag, op, leading=mode)), 0)
 
 
+def _row_band_axis(ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]) -> int:
+    """The matrix-row axis of the first stage input a row band cuts."""
+    batch, rows, _ = _row_view(ag.tensors[stage_ops[0].outputs[0]])
+    whole = _whole_band_operands(stage_ops)
+    for name in stage.input_tensors:
+        view = _row_view(ag.tensors[name])
+        if name not in whole and view is not None and view[:2] == (batch, rows):
+            return len(ag.tensors[name].shape) - 2
+    return 0
+
+
+def _leading_band_axis(ag: AnalyzedGraph, op: OpNode, mode: int) -> int:
+    """The serialized axis of the operator's first input that a mode bands.
+
+    Mirrors tigris_band_axis in the runtime's loader, whose operand list
+    holds no constants.
+    """
+    source = next(ag.tensors[n] for n in op.inputs if n and not ag.tensors[n].is_constant)
+    shape = serialized_shape(source.shape, source.layout)
+    if op.op_type in {"Svdf", "Lstm"}:
+        return int(bool(op.attrs.get("time_major", False)) and len(shape) == 3)
+    if mode == 1:
+        return next((i for i in range(len(shape) - 1) if shape[i] != 1), len(shape) - 1)
+    if mode == 2:
+        return len(shape) - 1
+    return mode - 3
+
+
 def _stage_is_row_tiled(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -1008,7 +1037,7 @@ def _stage_is_row_tiled(
 
 def _solve_row_tile(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int, view_of=_row_view,
-    independent: bool = False,
+    independent: bool = False, *, band_axis: int,
 ) -> TilePlan:
     """Size the band of rows a matrix pipeline takes at a time.
 
@@ -1085,6 +1114,7 @@ def _solve_row_tile(
         tiled_peak_bytes=working_set(band),
         overhead_bytes=0,
         warnings=[],
+        band_axis=band_axis,
     )
 
 
@@ -1098,7 +1128,7 @@ def _stage_is_global_reduction(
     a stage along its input, a band of rows at a time, carrying one partial
     per channel between bands. That only works when the reduction is the
     whole stage: with another op present there would be a height to carry.
-    Mirrors stage_is_input_driven_reduction in the executor.
+    Mirrors tigris_stage_input_driven_reduction in the runtime.
     """
     if len(stage_ops) != 1 or stage_ops[0].op_type != "GlobalAveragePool":
         return False
@@ -1154,10 +1184,11 @@ def _solve_grouped_global_reduction(ag: AnalyzedGraph, stage: Stage, budget: int
             ],
         )
     cost, group, interval, peak = best
+    # The intervals run over the positions of both spatial axes.
     return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
-                    num_tiles=cost[0], original_height=height,
+                    num_tiles=cost[0], original_height=spatial,
                     tiled_peak_bytes=peak, input_channel_group=group,
-                    input_spatial_interval=interval)
+                    input_spatial_interval=interval, band_axis=1)
 
 
 def _solve_global_reduction(
@@ -1217,6 +1248,7 @@ def _solve_global_reduction(
         tiled_peak_bytes=working_set(rows),
         overhead_bytes=0,
         warnings=[],
+        band_axis=1,
     )
 
 def _stage_is_tiled_transpose(
@@ -1291,6 +1323,7 @@ def _solve_layout_conversion(
             ],
         )
     batch, rows, cols = extents
+    prefix, split, _ = _transpose_band_groups(stored_perm)
     band_on_columns = cols >= rows
     banded = cols if band_on_columns else rows
     other = rows if band_on_columns else cols
@@ -1343,6 +1376,7 @@ def _solve_layout_conversion(
         overhead_bytes=0,
         band_on_columns=band_on_columns,
         warnings=[],
+        band_axis=prefix + split if band_on_columns else prefix,
     )
 
 
@@ -1532,6 +1566,7 @@ def _solve_output_tile_2d(
         tiled_peak_bytes=working_set(best_th, best_tw),
         overhead_bytes=0,
         warnings=[],
+        band_axis=1,
     )
 
 
@@ -1718,7 +1753,8 @@ def _solve_resize_height(ag: AnalyzedGraph, stage: Stage, ops: list[OpNode], bud
             high = rows - 1
     return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
                     tile_height=best, num_tiles=math.ceil(oh / best), original_height=oh,
-                    receptive_field=taps, halo=taps - 1, tiled_peak_bytes=working_set(best))
+                    receptive_field=taps, halo=taps - 1, tiled_peak_bytes=working_set(best),
+                    band_axis=1)
 
 
 def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -1758,11 +1794,13 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         # Rank 2 has no axis the stripe contract names, but a matrix
         # pipeline's rows are independent, so it bands along them.
         if _stage_is_row_tiled(ag, stage, stage_ops):
-            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget)
+            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget,
+                                              band_axis=_row_band_axis(ag, stage, stage_ops))
             continue
 
         if len(stage_ops) == 1 and _independent_band(ag, stage_ops[0], row_tiled=False):
-            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, _height_view)
+            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, _height_view,
+                                              band_axis=1)
             continue
 
         if (len(stage_ops) == 1 and not stage.chain_len and
@@ -1772,7 +1810,8 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             view = (lambda info: _batch_view(info, op.attrs.get("time_major", False))) \
                 if op.op_type in {"Svdf", "Lstm"} else \
                 (lambda info: _leading_view(info, mode == 2, mode - 3 if mode >= 3 else None))
-            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, view, independent=True)
+            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, view, independent=True,
+                                              band_axis=_leading_band_axis(ag, op, mode))
             continue
 
         # A global reduction has no output axis to tile, so the runtime walks
@@ -1904,6 +1943,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         stage.tile_plan = TilePlan(
             tileable=True,
             axis=tile_axis,
+            band_axis=1,
             tile_height=tile_h,
             num_tiles=num_tiles,
             halo=halo,

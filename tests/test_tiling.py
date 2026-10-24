@@ -451,13 +451,13 @@ def test_band_cannot_cut_a_reduced_indexed_or_modified_axis(kind):
 
 
 @pytest.mark.parametrize("source,target,expected", [
-    ((2, 11, 12), (2, 33, 4), (2, 11, 12, 33, 4)),
-    ((2, 33, 4), (2, 11, 12), (2, 33, 4, 11, 12)),
-    ((1, 3, 3, 8), (1, 3, 3, 2, 2, 2), (1, 3, 24, 3, 24)),
-    ((1, 6, 6, 4), (1, 36, 4), (1, 6, 24, 36, 4)),
-    ((1, 6, 6, 4), (36, 1, 4), (1, 6, 24, 36, 4)),
-    ((36, 1, 4), (1, 6, 6, 4), (1, 36, 4, 6, 24)),
-    ((1, 1, 6, 6, 4), (36, 1, 4), (1, 6, 24, 36, 4)),
+    ((2, 11, 12), (2, 33, 4), (2, 11, 12, 33, 4, 1)),
+    ((2, 33, 4), (2, 11, 12), (2, 33, 4, 11, 12, 1)),
+    ((1, 3, 3, 8), (1, 3, 3, 2, 2, 2), (1, 3, 24, 3, 24, 1)),
+    ((1, 6, 6, 4), (1, 36, 4), (1, 6, 24, 36, 4, 1)),
+    ((1, 6, 6, 4), (36, 1, 4), (1, 6, 24, 36, 4, 1)),
+    ((36, 1, 4), (1, 6, 6, 4), (1, 36, 4, 6, 24, 0)),
+    ((1, 1, 6, 6, 4), (36, 1, 4), (1, 6, 24, 36, 4, 2)),
 ])
 def test_reshape_band_mapping(source, target, expected):
     from tigris.analysis.partition_spatial import _reshape_band
@@ -479,9 +479,10 @@ def test_reshape_band_mapping(source, target, expected):
 def test_reshape_band_solver_preserves_integral_endpoints():
     from tigris.analysis.partition_spatial import _reshape_tile_for_bytes
 
-    mapping = (2, 33, 4, 11, 12)
+    mapping = (2, 33, 4, 11, 12, 1)
     plan = _reshape_tile_for_bytes(mapping, 256, 32, 4)
     assert plan.tileable and plan.tile_height == 6 and plan.num_tiles == 6
+    assert plan.original_height == 33 and plan.band_axis == 1
     assert plan.tiled_peak_bytes == 192
     for start in range(0, 33, plan.tile_height):
         end = min(33, start + plan.tile_height)
@@ -491,8 +492,8 @@ def test_reshape_band_solver_preserves_integral_endpoints():
 
 
 @pytest.mark.parametrize("source,target,expected", [
-    ((2, 3, 4), (3, 2, 4), (1, 2, 12, 3, 8)),
-    ((3, 2, 4), (2, 3, 4), (1, 3, 8, 2, 12)),
+    ((2, 3, 4), (3, 2, 4), (1, 2, 12, 3, 8, 0)),
+    ((3, 2, 4), (2, 3, 4), (1, 3, 8, 2, 12, 0)),
 ])
 def test_reshape_refuses_strided_intervals_as_contiguous(source, target, expected):
     from tigris.analysis.partition_spatial import _reshape_band, _reshape_tile_for_bytes
@@ -511,7 +512,7 @@ def test_reshape_refuses_strided_intervals_as_contiguous(source, target, expecte
 def test_contiguous_reshape_rounds_bands_to_integral_endpoints():
     from tigris.analysis.partition_spatial import _reshape_tile_for_bytes
 
-    mapping = (1, 36, 4, 6, 24)
+    mapping = (1, 36, 4, 6, 24, 0)
     plan = _reshape_tile_for_bytes(mapping, 255, 32, 4)
     assert plan.tileable and plan.tile_height == 12 and plan.num_tiles == 3
     for start in range(0, 36, plan.tile_height):
@@ -524,7 +525,8 @@ def test_contiguous_reshape_rounds_bands_to_integral_endpoints():
                                   "CumSum", "ArgMax", "ArgMin", "Gather", "GatherND", "EmbeddingLookup",
                                   "StridedSlice", "MirrorPad", "ReverseV2", "DynamicUpdateSlice"])
 def test_leading_independent_operator_band(kind):
-    from tigris.analysis.partition_spatial import _independent_band, _leading_view, _solve_row_tile
+    from tigris.analysis.partition_spatial import (
+        _independent_band, _leading_band_axis, _leading_view, _solve_row_tile)
     from tigris.graph.ir import Layout, Stage
 
     shape = (1, 1, 37, 1, 4) if kind in {"GatherND", "EmbeddingLookup"} else (37, 1, 4)
@@ -551,8 +553,10 @@ def test_leading_independent_operator_band(kind):
     graph = AnalyzedGraph(tensors=tensors, ops=[op])
     assert _independent_band(graph, op, leading=True)
     stage = Stage(0, [0], [n for n in inputs if n != "indices"], ["y"])
-    tile = _solve_row_tile(graph, stage, [op], 256, _leading_view)
+    tile = _solve_row_tile(graph, stage, [op], 256, _leading_view,
+                           band_axis=_leading_band_axis(graph, op, 1))
     assert tile.tileable and tile.original_height == 37 and tile.num_tiles > 1
+    assert tile.band_axis == rank - 3
     assert tile.tiled_peak_bytes <= 256
     tensors["y"].shape = (2, *shape[1:])
     assert not _independent_band(graph, op, leading=True)

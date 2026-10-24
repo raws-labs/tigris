@@ -294,7 +294,7 @@ def test_contiguous_reshape_and_leading_operator_fit_tight_budget(name, kind, co
     assert stage.tile_plan.original_height == 36 and stage.tile_plan.num_tiles > 1
     assert stage.tile_plan.tiled_peak_bytes <= 256
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
-    assert read_binary_plan((tmp_path / "model.tgrs").read_bytes())["version"] == 9
+    assert read_binary_plan((tmp_path / "model.tgrs").read_bytes())["version"] == 11
 
 
 
@@ -750,7 +750,7 @@ def test_a_variable_is_kept_across_runs_and_reset(tmp_path):
     plan = tmp_path / "window.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(plan)])
     assert result.exit_code == 0, result.output
-    assert read_binary_plan(plan.read_bytes())["version"] == 10
+    assert read_binary_plan(plan.read_bytes())["version"] == 11
     with Session(plan) as session:
         assert [i["name"] for i in session.inputs] == ["serving_default_x:0"]
         assert len(session.outputs) == 1
@@ -773,12 +773,15 @@ def test_grouped_pool_preserves_recorded_outputs(name, tmp_path):
     graph, _ = _run_pipeline(str(source), ("96", "16K"))
     stage = next(stage for stage in graph.stages if
                  len(stage.op_indices) == 1 and graph.ops[stage.op_indices[0]].op_type == "GlobalAveragePool")
+    batch, channels, height, width = graph.tensors[stage.input_tensors[0]].shape
     stage.tile_plan = replace(stage.tile_plan, tile_height=0, input_channel_group=3,
-                              input_spatial_interval=1, tiled_peak_bytes=96)
+                              input_spatial_interval=1, tiled_peak_bytes=96,
+                              num_tiles=batch * -(-channels // 3) * height * width,
+                              original_height=height * width, band_axis=1)
     path = tmp_path / "grouped.tgrs"
     path.write_bytes(emit_binary_bytes(graph))
     plan = read_binary_plan(path.read_bytes())
-    assert plan["version"] == 10
+    assert plan["version"] == 11
     Session = _session()
     golden = np.load(source.with_suffix(".npz"))
     with Session(path, slow_capacity=slow_arena_required(plan)) as session:

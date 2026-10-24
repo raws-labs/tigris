@@ -236,6 +236,7 @@ def _plan_requirements(plan: dict) -> dict:
     from tigris.emitters.binary.writer import (
         RUNTIME_MAX_CHAIN_STAGES, RUNTIME_MAX_STAGE_INPUTS, RUNTIME_MAX_STAGE_OUTPUTS,
         RUNTIME_MAX_TENSORS)
+    from tigris.analysis.plan_graph import fast_activation_bytes
     from tigris.emitters.codegen import _executor_workspace_limits
 
     def aligned(size):
@@ -261,7 +262,7 @@ def _plan_requirements(plan: dict) -> dict:
                 "TIGRIS_MAX_SPATIAL_OPS_PER_STAGE": _RUNTIME_MAX_SPATIAL_OPS}
     needed = dict(zip(defaults, (tensors, inputs, outputs, chain, spatial)))
     return {
-        "fast_arena_bytes": plan["budget"] + decompression,
+        "fast_arena_bytes": fast_activation_bytes(plan) + decompression,
         "decompression_bytes": decompression,
         "state_bytes": plan["state"]["bytes"],
         "build_limits": [{"name": name, "needed": needed[name], "default": default}
@@ -278,7 +279,7 @@ _RUNTIME_MAX_SPATIAL_OPS = 8
 def inspect_file(path: str | Path) -> dict:
     """Return JSON-safe metadata; never load external ONNX tensor data."""
     data = Path(path).read_bytes()
-    report = {"inspection_version": 1, "file_size_bytes": len(data)}
+    report = {"inspection_version": 2, "file_size_bytes": len(data)}
     if data.startswith(defs.MAGIC):
         try:
             plan = _plan(data)
