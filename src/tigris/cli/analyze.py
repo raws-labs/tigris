@@ -37,6 +37,7 @@ def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, sour
             "outputs": [{"name": n, "shape": list(source_shape(ag, ag.tensors[n].shape))}
                         for n in ag.model_outputs],
             "unsupported_operators": list(f.unsupported_operators),
+            "output_errors": list(f.output_errors),
             "dtype_errors": list(f.dtype_errors),
         },
         "tflite_micro": None if tflm_arena is None else {
@@ -166,8 +167,8 @@ def verdict_lines(findings, budget: int, slow_budget: int, stages=()) -> list[st
         lines = [text.bad("cannot compile") +
                  f": {count} unsupported operator{'s' if count != 1 else ''}"]
         return lines + text.columns([[issue] for issue in f.unsupported_operators[:_CAUSES_SHOWN]])
-    if f.dtype_errors:
-        return [text.bad("cannot compile") + f": {f.dtype_errors[0]}"]
+    if f.output_errors or f.dtype_errors:
+        return [text.bad("cannot compile") + f": {(f.output_errors + f.dtype_errors)[0]}"]
     if budget <= 0:
         return [text.dim("no budget given; memory figures only")]
     tiled = sum(runs_tiled(s) for s in stages)
@@ -217,7 +218,7 @@ def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budge
     if f.largest_tensor_bytes:
         memory.append(["largest tensor", fmt_bytes(f.largest_tensor_bytes),
                        text.dim(f.largest_tensor_shape)])
-    supported = not (f.unsupported_operators or f.dtype_errors)
+    supported = not (f.unsupported_operators or f.output_errors or f.dtype_errors)
     if budget > 0 and supported and f.scheduled_peak_bytes > 0 and not f.blocking_stages:
         memory.append(["this plan", fmt_bytes(f.scheduled_peak_bytes),
                        text.dim(f"{fmt_bytes(budget - f.scheduled_peak_bytes)} headroom")])
@@ -320,7 +321,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     tflite = is_tflite(data)
     tflm_arena = tflm_tensor_arena(data) if tflite else None
     findings = compute_findings(ag, flash_budget=flash_budget)
-    supported = not (findings.unsupported_operators or findings.dtype_errors)
+    supported = not (findings.unsupported_operators or findings.output_errors or findings.dtype_errors)
     tried = (_tried(model, budget, not findings.blocking_stages, input_shape)
              if budget > 0 and supported else [])
     if findings.lz4_plan_size_bytes and not (

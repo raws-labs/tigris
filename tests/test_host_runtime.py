@@ -694,3 +694,223 @@ def test_a_layout_step_before_the_first_quantize_matches_onnx_runtime(tmp_path, 
         actual = session.run({"input": feed})["output"].transpose(0, 3, 1, 2)
     # One output step: the int8 kernels round as TFLite does, ONNX Runtime in float.
     np.testing.assert_allclose(actual, expected, rtol=0, atol=0.1 + 1e-6)
+
+
+def _fold_case(kind, rng):
+    from onnx import TensorProto, helper, numpy_helper
+
+    f = lambda name, v: numpy_helper.from_array(np.asarray(v, dtype=np.float32), name)  # noqa: E731
+    node = helper.make_node
+    conv = [f("w", rng.normal(size=(4, 3, 3, 3)))]
+    if kind == "add_relu":
+        return ([node("Add", ["x", "s"], ["y"]), node("Relu", ["y"], ["s_next"])],
+                {"x": [1, 8], "s": [1, 8]}, {"y": [1, 8], "s_next": [1, 8]}, [])
+    if kind == "conv_relu":
+        return ([node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]), node("Relu", ["c"], ["y"])],
+                {"x": [1, 3, 6, 5]}, {"c": [1, 4, 6, 5], "y": [1, 4, 6, 5]}, conv)
+    if kind == "conv_bn":
+        params = [f(n, v) for n, v in (("g", rng.uniform(0.5, 2, 4)), ("b", rng.normal(size=4)),
+                                       ("m", rng.normal(size=4)), ("v", rng.uniform(0.5, 2, 4)))]
+        return ([node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]),
+                 node("BatchNormalization", ["c", "g", "b", "m", "v"], ["y"])],
+                {"x": [1, 3, 6, 5]}, {"c": [1, 4, 6, 5], "y": [1, 4, 6, 5]}, conv + params)
+    if kind == "conv_channel_add":
+        return ([node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]), node("Add", ["c", "bias"], ["y"])],
+                {"x": [1, 3, 6, 5]}, {"c": [1, 4, 6, 5], "y": [1, 4, 6, 5]},
+                conv + [f("bias", rng.normal(size=(1, 4, 1, 1)))])
+    if kind == "pad_conv":
+        return ([node("Pad", ["x", "pads"], ["p"]), node("Conv", ["p", "w"], ["y"])],
+                {"x": [1, 3, 6, 5]}, {"p": [1, 3, 8, 7], "y": [1, 4, 6, 5]},
+                conv + [numpy_helper.from_array(np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64), "pads")])
+    if kind == "matmul_split":
+        return ([node("MatMul", ["x", "w"], ["qkv"]), node("Split", ["qkv", "parts"], ["q", "k", "v"], axis=2)],
+                {"x": [1, 5, 8]}, {"qkv": [1, 5, 12], "q": [1, 5, 4], "k": [1, 5, 4], "v": [1, 5, 4]},
+                [f("w", rng.normal(size=(8, 12))), numpy_helper.from_array(np.array([4, 4, 4], np.int64), "parts")])
+    if kind == "split_parts_out":
+        return ([node("MatMul", ["x", "w"], ["qkv"]), node("Split", ["qkv", "parts"], ["q", "k", "v"], axis=2)],
+                {"x": [1, 5, 8]}, {"q": [1, 5, 4], "k": [1, 5, 4], "v": [1, 5, 4]},
+                [f("w", rng.normal(size=(8, 12))), numpy_helper.from_array(np.array([4, 4, 4], np.int64), "parts")])
+    if kind == "split_parts_read":
+        return ([node("MatMul", ["x", "w"], ["product"]), node("Add", ["product", "b"], ["qkv"]),
+                 node("Split", ["qkv", "parts"], ["q", "k", "v"], axis=2),
+                 *(node("Relu", [n], [f"r{n}"]) for n in "qkv")],
+                {"x": [1, 5, 8]}, {"rq": [1, 5, 4], "rk": [1, 5, 4], "rv": [1, 5, 4]},
+                [f("w", rng.normal(size=(8, 12))), f("b", rng.normal(size=12)),
+                 numpy_helper.from_array(np.array([4, 4, 4], np.int64), "parts")])
+    if kind == "identity_of_output":
+        return ([node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]), node("Identity", ["c"], ["y"])],
+                {"x": [1, 3, 6, 5]}, {"c": [1, 4, 6, 5], "y": [1, 4, 6, 5]}, conv)
+    if kind == "identity_of_tiled_output":
+        return ([node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]), node("Identity", ["c"], ["y"])],
+                {"x": [1, 3, 64, 64]}, {"c": [1, 8, 64, 64], "y": [1, 8, 64, 64]},
+                [f("w", rng.normal(size=(8, 3, 3, 3)))])
+    head = [node("Relu", ["c"], ["r"]), node("GlobalAveragePool", ["r"], ["gp"]), node("Flatten", ["gp"], ["fl"]),
+            node("MatMul", ["fl", "fw"], ["g"])]
+    if kind == "identity_of_last_stage_output":
+        return ([node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]), *head, node("Identity", ["g"], ["y"])],
+                {"x": [1, 3, 64, 64]}, {"g": [1, 10], "y": [1, 10]},
+                [f("w", rng.normal(size=(8, 3, 3, 3))), f("fw", rng.normal(size=(8, 10)))])
+    if kind == "identity_of_earlier_stage_output":
+        return ([node("Relu", ["x"], ["s"]), node("Conv", ["s", "w"], ["c"], pads=[1, 1, 1, 1]), *head,
+                 node("Identity", ["s"], ["y"])],
+                {"x": [1, 3, 32, 32]}, {"s": [1, 3, 32, 32], "g": [1, 10], "y": [1, 3, 32, 32]},
+                [f("w", rng.normal(size=(32, 3, 3, 3))), f("fw", rng.normal(size=(32, 10)))])
+    if kind == "identity_of_input_the_last_stage_reads":
+        return ([node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]), *head, node("Add", ["g", "v"], ["s"]),
+                 node("Identity", ["v"], ["y"])],
+                {"x": [1, 3, 64, 64], "v": [1, 10]}, {"s": [1, 10], "y": [1, 10]},
+                [f("w", rng.normal(size=(8, 3, 3, 3))), f("fw", rng.normal(size=(8, 10)))])
+    if kind == "identity_of_input":
+        return ([node("Identity", ["x"], ["y"]), node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1])],
+                {"x": [1, 3, 6, 5]}, {"y": [1, 3, 6, 5], "c": [1, 4, 6, 5]}, conv)
+    if kind == "two_identities":
+        return ([node("MatMul", ["x", "w"], ["p"]), node("Identity", ["p"], ["y1"]), node("Dropout", ["p"], ["y2"])],
+                {"x": [1, 5, 8]}, {"y1": [1, 5, 8], "y2": [1, 5, 8]}, [f("w", rng.normal(size=(8, 8)))])
+    z = lambda name, v: numpy_helper.from_array(np.array(v, dtype=np.int8), name)  # noqa: E731
+    nodes = [node("QuantizeLinear", ["x", "xs", "xz"], ["xq"]), node("DequantizeLinear", ["xq", "xs", "xz"], ["xd"]),
+             node("Add", ["xd", "bias"], ["summed"]), node("Relu", ["summed"], ["relu"]),
+             node("QuantizeLinear", ["relu", "ys", "yz"], ["yq"]), node("DequantizeLinear", ["yq", "ys", "yz"], ["y"])]
+    params = [f("xs", 0.05), z("xz", 0), f("ys", 0.1), z("yz", -8), f("bias", rng.normal(size=(1, 16)))]
+    if kind == "quantized_add_relu":
+        return nodes, {"x": [1, 16]}, {"summed": [1, 16], "y": [1, 16]}, params
+    # Both ends of the output's QuantizeLinear and DequantizeLinear pair, in either order.
+    outputs = {"yq": (TensorProto.INT8, [1, 16]), "y": [1, 16]}
+    return nodes, {"x": [1, 16]}, dict(reversed(outputs.items())) if kind.endswith("dq_q") else outputs, params
+
+
+def _check_fold_case(tmp_path, kind, without_copy=False):
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper
+
+    rng = np.random.default_rng(15)
+    nodes, inputs, outputs, params = _fold_case(kind, rng)
+    if without_copy:
+        # The same model without its last node, the Identity that writes y.
+        nodes, outputs, kind = nodes[:-1], {n: s for n, s in outputs.items() if n != "y"}, f"{kind}_without_copy"
+    model = helper.make_model(helper.make_graph(
+        nodes, kind, [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in inputs.items()],
+        [helper.make_tensor_value_info(n, *(s if isinstance(s, tuple) else (TensorProto.FLOAT, s)))
+         for n, s in outputs.items()], params),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    source = tmp_path / f"{kind}.onnx"
+    onnx.save(model, source)
+    plan = tmp_path / f"{kind}.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    feed = {n: rng.uniform(-1, 1, s).astype(np.float32) for n, s in inputs.items()}
+    expected = dict(zip(outputs, ort.InferenceSession(str(source), providers=["CPUExecutionProvider"])
+                        .run(None, feed)))
+    with Session(plan) as session:
+        assert [item["name"] for item in session.outputs] == list(outputs)
+        actual = session.run({n: v if v.ndim < 3 else np.moveaxis(v, 1, -1) for n, v in feed.items()})
+    # One output step for the int8 case: its kernels round as TFLite does.
+    atol = 0.1 + 1e-6 if kind.startswith("quantized") else 1e-5
+    for name, value in expected.items():
+        got = actual[name] if value.ndim < 3 else np.moveaxis(actual[name], -1, 1)
+        assert got.dtype == value.dtype, name
+        np.testing.assert_allclose(got, value, rtol=1e-5, atol=1 if value.dtype == np.int8 else atol)
+    return plan
+
+
+@pytest.mark.parametrize("kind", ["add_relu", "conv_relu", "conv_bn", "conv_channel_add", "pad_conv",
+                                  "matmul_split", "quantized_add_relu"])
+def test_a_fused_intermediate_the_model_returns_matches_onnx_runtime(tmp_path, kind):
+    """A fold that would absorb the operator writing a model output leaves it in place."""
+    _check_fold_case(tmp_path, kind)
+
+
+@pytest.mark.parametrize("kind", ["split_parts_out", "split_parts_read"])
+def test_a_split_folded_into_its_weight_matches_onnx_runtime(tmp_path, kind):
+    """Each part of a split read straight off a product is written by its own product."""
+    _check_fold_case(tmp_path, kind)
+
+
+@pytest.mark.parametrize("kind", ["identity_of_output", "identity_of_input", "two_identities",
+                                  "quantized_q_dq", "quantized_dq_q"])
+def test_every_declared_output_gets_its_own_tensor(tmp_path, kind):
+    """An output the model also returns under another name, or passes an input through to, is lowered to a copy."""
+    _check_fold_case(tmp_path, kind)
+
+
+@pytest.mark.parametrize("kind, own_stage, reload", [
+    ("identity_of_tiled_output", True, True),
+    ("identity_of_last_stage_output", False, False),
+    ("identity_of_earlier_stage_output", False, True),
+    ("identity_of_input_the_last_stage_reads", False, False),
+])
+def test_an_output_copy_shares_the_last_stage_when_it_has_room(tmp_path, kind, own_stage, reload):
+    """In a plan of several stages the copy has a slow buffer of its own, gets a
+    stage of its own only when the last stage cannot take it, and loads its
+    source again unless its stage computes it or already reads it."""
+    runs = []
+    for without_copy in (True, False):
+        plan = _check_fold_case(tmp_path, kind, without_copy=without_copy)
+        with Session(plan) as session:
+            sizes = {item["name"]: int(np.prod(item["shape"])) * 4 for item in session.outputs}
+            _, events, counters = session.trace(
+                {item["name"]: np.zeros(item["shape"], np.float32) for item in session.inputs})
+        runs.append(([event["path"] for event in events if event["kind"] == "stage_begin"], counters))
+    (paths, before), (paths_with_copy, after) = runs
+    assert paths_with_copy[:len(paths)] == paths
+    assert len(paths_with_copy) - len(paths) == own_stage
+    assert after["spill_bytes"] - before["spill_bytes"] == sizes["y"]
+    assert after["load_bytes"] - before["load_bytes"] == (sizes["y"] if reload else 0)
+
+
+# Each case: nodes, outputs, the variable's next value, one step (x, s) -> (outputs, next s).
+_STATE_CASES = {
+    "next_returned": (
+        [("Add", ["x", "s"], ["y"]), ("Identity", ["y"], ["s_out"])], ["y", "s_out"], "s_out",
+        lambda x, s: ({"y": x + s}, x + s)),
+    "next_declared_first": (
+        [("Add", ["x", "s"], ["y"]), ("Identity", ["y"], ["s_out"])], ["s_out", "y"], "s_out",
+        lambda x, s: ({"y": x + s}, x + s)),
+    "old_and_next_returned": (
+        [("Identity", ["s"], ["old"]), ("Add", ["x", "s"], ["y"]), ("Identity", ["y"], ["s_out"])],
+        ["old", "y", "s_out"], "s_out", lambda x, s: ({"old": s, "y": x + s}, x + s)),
+    "next_is_an_input": (
+        [("Add", ["x", "s"], ["y"]), ("Identity", ["x"], ["s_out"])], ["y", "s_out"], "s_out",
+        lambda x, s: ({"y": x + s}, x)),
+    "unchanged": (
+        [("Add", ["x", "s"], ["y"]), ("Identity", ["s"], ["s_out"])], ["y", "s_out"], "s_out",
+        lambda x, s: ({"y": x + s}, s)),
+    "unchanged_by_name": (
+        [("Add", ["x", "s"], ["y"])], ["y", "s"], "s", lambda x, s: ({"y": x + s}, s)),
+}
+
+
+@pytest.mark.parametrize("kind", list(_STATE_CASES))
+def test_a_variable_the_model_also_returns_keeps_every_output(tmp_path, kind):
+    """A variable's next value can be a tensor the model also returns, an
+    input, or the variable itself; the variable and every declared output
+    still get their values."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    nodes, outputs, following, step = _STATE_CASES[kind]
+    info = lambda name: helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 8])  # noqa: E731
+    initial = np.linspace(-1, 1, 8, dtype=np.float32).reshape(1, 8)
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node(*node) for node in nodes], kind, [info("x"), info("s")],
+        [info(name) for name in outputs], [numpy_helper.from_array(initial, "s_initial")]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    helper.set_model_props(model, {"tigris.state": json.dumps(
+        [{"input": "s", "output": following, "initial": "s_initial"}])})
+    source, plan = tmp_path / f"{kind}.onnx", tmp_path / f"{kind}.tgrs"
+    onnx.save(model, source)
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    rng = np.random.default_rng(16)
+    state = initial
+    with Session(plan) as session:
+        assert [item["name"] for item in session.inputs] == ["x"]
+        assert [item["name"] for item in session.outputs] == [n for n in outputs if n != following]
+        for _ in range(3):
+            x = rng.uniform(-1, 1, (1, 8)).astype(np.float32)
+            expected, state = step(x, state)
+            actual = session.run({"x": x})
+            for name, value in expected.items():
+                np.testing.assert_array_equal(actual[name], value, err_msg=name)

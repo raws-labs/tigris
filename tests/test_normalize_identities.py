@@ -47,8 +47,8 @@ def test_removed_identity_keeps_the_declared_output_name(tmp_path):
     assert "activation" not in ag.tensors
 
 
-def test_output_that_is_also_an_input_keeps_the_input_name(tmp_path):
-    """One tensor cannot carry two names, so an input passed through stays."""
+def test_output_that_passes_an_input_through_gets_its_own_tensor(tmp_path):
+    """One tensor cannot carry two names, so the output is lowered to a same-shape copy of the input."""
     ag = _compile_graph(
         tmp_path, "passthrough",
         [
@@ -57,7 +57,8 @@ def test_output_that_is_also_an_input_keeps_the_input_name(tmp_path):
         ],
         [vi("x", [1, 8])], [vi("y", [1, 8]), vi("z", [1, 8])])
 
-    assert ag.model_outputs == ["x", "z"]
+    assert ag.model_outputs == ["y", "z"]
+    assert [(op.name, op.op_type, op.inputs) for op in ag.ops if "y" in op.outputs] == [("y_copy", "Reshape", ["x"])]
 
 
 def test_dropout_keeping_its_mask_is_left_alone(tmp_path):

@@ -1694,6 +1694,7 @@ def _emit(
     from tigris.analysis.validation import (
         validate_execution_dtype,
         validate_memory_plan,
+        validate_model_outputs,
         validate_operator_support,
     )
 
@@ -1701,6 +1702,12 @@ def _emit(
         raise ValueError("Fast-memory budget exceeds the uint32 plan-format limit")
     if not 0 <= ag.peak_memory_bytes <= 0xFFFFFFFF:
         raise ValueError("Peak activation memory exceeds the uint32 plan-format limit")
+
+    output_validation = validate_model_outputs(ag) if validate else None
+    if output_validation is not None and not output_validation.supported:
+        raise ValueError(
+            "Cannot emit a plan that omits a declared output: " + output_validation.describe()
+        )
 
     dtype_validation = validate_execution_dtype(ag) if validate else None
     if dtype_validation is not None and not dtype_validation.supported:

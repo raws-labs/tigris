@@ -338,6 +338,49 @@ def _reshape_alias_case(*, spatial: bool) -> ContractCase:
     )
 
 
+def _reshape_group_case() -> ContractCase:
+    """Three reshapes of one matrix product, each read at a different step.
+
+    All three share the product's buffer, and releasing one of them releases
+    it for all. The buffer has to stay until the last read of any of them,
+    including a member the stage walks before the others.
+    """
+    tokens, width = 16, 32
+    rng = np.random.default_rng(0)
+    nodes = [
+        helper.make_node("MatMul", ["x", "wm"], ["p"]),
+        helper.make_node("Reshape", ["p", "h1"], ["q1"]),
+        helper.make_node("Reshape", ["p", "h2"], ["q2"]),
+        helper.make_node("Reshape", ["p", "h3"], ["q3"]),
+        helper.make_node("Erf", ["q3"], ["e3"]),
+        helper.make_node("Reshape", ["e3", "back"], ["b3"]),
+        helper.make_node("Relu", ["q1"], ["e1"]),
+        helper.make_node("Reshape", ["e1", "back"], ["b1"]),
+        helper.make_node("Reshape", ["q2", "back"], ["b2"]),
+        helper.make_node("Add", ["b1", "b3"], ["s"]),
+        helper.make_node("Mul", ["s", "b2"], ["s2"]),
+        helper.make_node("MatMul", ["s2", "wo"], ["y"]),
+    ]
+    shapes = {"h1": [1, tokens, 4, width // 4], "h2": [1, tokens * width],
+              "h3": [1, tokens // 2, 2 * width], "back": [1, tokens, width]}
+    model = _model(
+        "reshape_group",
+        nodes,
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, tokens, width])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, tokens, width])],
+        [numpy_helper.from_array((rng.normal(size=(width, width)) * 0.3).astype(np.float32), name)
+         for name in ("wm", "wo")]
+        + [numpy_helper.from_array(np.array(shape, np.int64), name) for name, shape in shapes.items()],
+    )
+    data = np.linspace(-1.5, 1.5, tokens * width, dtype=np.float32).reshape(1, tokens, width)
+    return ContractCase(
+        "float_reshape_group", model, model, {"x": data},
+        ("Transpose", "Reshape", "Gemm", "Reshape", "Reshape", "Relu", "Reshape", "Reshape", "Reshape",
+         "Reshape", "Erf", "Reshape", "Add", "Mul", "Reshape", "Gemm", "Reshape", "Transpose"),
+        mem_budget="8K", slow_budget="1M",
+    )
+
+
 def _token_bias_case() -> ContractCase:
     """A bias added onto a batched matrix product over a token sequence.
 
@@ -7877,6 +7920,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _head_permutation_case(),
         _reshape_alias_case(spatial=False),
         _reshape_alias_case(spatial=True),
+        _reshape_group_case(),
         _token_bias_case(),
         _flattened_token_head_case(),
         _constant_divisor_case(),

@@ -162,12 +162,13 @@ def render(model: str, plan: dict, events: list[dict], counters: dict[str, int],
 def _plan_bytes(ag) -> bytes | None:
     """The plan analyze would compile at this budget, or None when there is none."""
     from tigris.analysis.validation import (
-        validate_budget, validate_execution_dtype, validate_operator_support)
+        validate_budget, validate_execution_dtype, validate_model_outputs, validate_operator_support)
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     if ag.mem_budget <= 0:
         return None
-    usable = validate_execution_dtype(ag).supported and validate_operator_support(ag).supported
+    usable = (validate_model_outputs(ag).supported and validate_execution_dtype(ag).supported
+              and validate_operator_support(ag).supported)
     result = validate_budget(ag) if usable else None
     if result is None or not result.fast.feasible:
         return None

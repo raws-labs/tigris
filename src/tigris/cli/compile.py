@@ -89,6 +89,7 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     from tigris.analysis.validation import (
         validate_budget,
         validate_execution_dtype,
+        validate_model_outputs,
         validate_operator_support,
     )
     from tigris.emitters.binary.writer import emit_binary_bytes
@@ -120,7 +121,8 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     findings = compute_findings(ag, flash_budget=ag.budget.flash, names=keep_names)
     summary(model, ag, findings, budget, ag.budget.slow, ag.budget.flash,
             tflm_tensor_arena(data) if is_tflite(data) else None)
-    usable = (validate_execution_dtype(ag).supported and validate_operator_support(ag).supported)
+    usable = (validate_model_outputs(ag).supported and validate_execution_dtype(ag).supported
+              and validate_operator_support(ag).supported)
     result = validate_budget(ag) if usable else None
     if result is None or not result.fast.feasible or not result.slow.fits:
         raise click.ClickException("no plan written")

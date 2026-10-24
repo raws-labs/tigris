@@ -88,6 +88,33 @@ class ExecutionDTypeValidation:
         return "; ".join(self.issues)
 
 
+@dataclass(frozen=True)
+class ModelOutputValidation:
+    """Result of checking that the plan computes every declared output."""
+
+    issues: tuple[str, ...]
+
+    @property
+    def supported(self) -> bool:
+        return not self.issues
+
+    def describe(self) -> str:
+        return "; ".join(self.issues)
+
+
+def validate_model_outputs(ag: AnalyzedGraph) -> ModelOutputValidation:
+    """Validate that an operator computes each declared output.
+
+    A declared output folded into a constant has no tensor in the plan, so a
+    plan written anyway would return fewer outputs than the model declares.
+    """
+    written = {name for op in ag.ops for name in op.outputs}
+    return ModelOutputValidation(issues=tuple(
+        f"output '{name}' is not computed by any operator"
+        for name in dict.fromkeys(ag.model_outputs)
+        if name not in written and name not in ag.model_inputs))
+
+
 def validate_execution_dtype(ag: AnalyzedGraph) -> ExecutionDTypeValidation:
     """Validate operator slots and explicit float sections in an int8 plan."""
     by_dtype, signature_issues = check_dtype_signatures(
