@@ -202,6 +202,7 @@ RANGES = {
     "cumsum_offset": [(0.0, 3.0)], "cumsum_offset_exclusive_reverse": [(0.0, 3.0)],
     "float_while": [(0.5, 3.0)], "float_while_two_variables": [(0.5, 3.0), (0.5, 3.0)],
     "float_while_feature_map": [(0.5, 3.0)],
+    "float_while_through": [(0.5, 3.0), (0.5, 3.0)], "float_while_if_through": [(0.5, 3.0), (0.5, 3.0)],
     "float_if_if": [(-2.8, 2.5)],
     # Scales where TFLite's 16-bit fixed point and a float formula part by one
     # unit on two or three codes; 8192 inputs per sample reach every code.
@@ -925,6 +926,25 @@ FLOAT_MODELS["float_while_countdown"] = _unary(
 FLOAT_MODELS["float_if_int32"] = ([(1, 4), (1,)], lambda x, k: tf.cond(
     tf.reduce_sum(x) > 0.0, lambda: x * tf.cast(k + 1, tf.float32),
     lambda: x - tf.cast(k, tf.float32)))
+# Subgraph outputs that a stage of the same subgraph also reads, the last one tiled at 256 B.
+FLOAT_MODELS["float_if_through"] = _unary(
+    lambda x: tf.cond(tf.reduce_sum(x) > 0.0, lambda: (x, tf.tanh(x)),
+                      lambda: (tf.sigmoid(x), x * 2.0)),
+    (1, 4))
+FLOAT_MODELS["float_while_through"] = _binary(
+    lambda x, w: tf.while_loop(lambda v, k: tf.reduce_sum(v) < 30.0,
+                               lambda v, k: [v + k, k], [x, w])[0],
+    (1, 4), (1, 4))
+FLOAT_MODELS["float_while_if_through"] = _binary(
+    lambda x, w: tf.while_loop(
+        lambda v, k: tf.reduce_sum(v) < 30.0,
+        lambda v, k: [tf.cond(tf.reduce_sum(k) > 0.0, lambda: v + k, lambda: v - k), k],
+        [x, w])[0],
+    (1, 4), (1, 4))
+FLOAT_MODELS["float_while_through_tiled"] = _binary(
+    lambda x, w: tf.while_loop(lambda i, v, k: i < 3,
+                               lambda i, v, k: [i + 1, v + tf.nn.relu(k), k], [0, x, w])[1],
+    (1, 4, 4, 4), (1, 4, 4, 4))
 # int8 control flow: the converter keeps each subgraph boundary in float32, with
 # QUANTIZE and DEQUANTIZE on either side; loops count in int32 so they end.
 _CF_FILTER = _weights(93, 3, 3, 4, 4)
