@@ -69,6 +69,7 @@ class Findings:
     min_fast_for_partition: int = 0
     feasibility_errors: list[str] = field(default_factory=list)
     unsupported_operators: list[str] = field(default_factory=list)
+    output_errors: list[str] = field(default_factory=list)
     dtype_errors: list[str] = field(default_factory=list)
 
     # quantization
@@ -187,6 +188,7 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = Fal
 
     from tigris.analysis.validation import (
         validate_execution_dtype,
+        validate_model_outputs,
         validate_operator_support,
     )
 
@@ -194,18 +196,19 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = Fal
     f.unsupported_operators = [
         issue.describe() for issue in operator_validation.issues
     ]
+    f.output_errors = list(validate_model_outputs(ag).issues)
     dtype_validation = validate_execution_dtype(ag)
     f.dtype_errors = list(dtype_validation.issues)
 
     if not ag.lifetimes:
-        if f.unsupported_operators or f.dtype_errors:
+        if f.unsupported_operators or f.output_errors or f.dtype_errors:
             f.verdict = "needs_work"
             if f.unsupported_operators:
                 f.verdict_text = (
                     "Unsupported operators: " + ", ".join(f.unsupported_operators)
                 )
             else:
-                f.verdict_text = f.dtype_errors[0]
+                f.verdict_text = (f.output_errors + f.dtype_errors)[0]
         return f
 
     # Largest tensor
@@ -309,9 +312,9 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = Fal
         f.verdict_text = (
             "Unsupported operators: " + ", ".join(f.unsupported_operators)
         )
-    elif f.dtype_errors:
+    elif f.output_errors or f.dtype_errors:
         f.verdict = "needs_work"
-        f.verdict_text = f.dtype_errors[0]
+        f.verdict_text = (f.output_errors + f.dtype_errors)[0]
 
     # Spill/reload cost
     if ag.stages and len(ag.stages) > 1:

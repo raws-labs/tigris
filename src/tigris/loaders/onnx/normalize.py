@@ -311,19 +311,32 @@ def _restore_output_names(ag: AnalyzedGraph, declared: list[str]) -> AnalyzedGra
 
     Removing an Identity, or the Q/DQ pair behind an output, makes the tensor
     that produced it the output under its own name. The interface keeps the
-    declared name instead, unless that tensor is also a model input or another
-    output, where one tensor cannot carry both names.
+    declared name instead. One tensor cannot carry two names, so where that
+    tensor is also a model input or an earlier output, the declared output is
+    lowered to a same-shape copy: a Reshape that writes the tensor into a new
+    one under the declared name. The copy runs after every other operator. It
+    shares the last stage when that stage can take it within the fast budget,
+    and runs in a stage of its own otherwise, as when the last stage tiles. In
+    a plan whose outputs go to slow memory, the copy has a slow buffer of its
+    own, and its stage loads the source from slow memory unless it computes
+    the source or already reads it. A variable whose next value is its own
+    input gets no next value at all.
     """
     if len(declared) != len(ag.model_outputs):
         return ag
-    for current, name in zip(list(ag.model_outputs), declared):
-        if (
-            current == name
-            or name in ag.tensors
-            or current not in ag.tensors
-            or current in ag.model_inputs
-            or ag.model_outputs.count(current) != 1
-        ):
+    declared = _drop_unchanged_state_outputs(ag, declared)
+    taken = set(ag.model_inputs)
+    for position, name in enumerate(declared):
+        current = ag.model_outputs[position]
+        if current == name or name in ag.tensors or current not in ag.tensors:
+            taken.add(current)
+            continue
+        if current in taken:
+            ag.tensors[name] = replace(ag.tensors[current], name=name)
+            ag.ops.append(OpNode(name=f"{name}_copy", op_type="Reshape", inputs=[current],
+                                 outputs=[name], step=len(ag.ops)))
+            ag.model_outputs[position] = name
+            taken.add(name)
             continue
         info = ag.tensors.pop(current)
         info.name = name
@@ -332,7 +345,29 @@ def _restore_output_names(ag: AnalyzedGraph, declared: list[str]) -> AnalyzedGra
             op.inputs = [name if n == current else n for n in op.inputs]
             op.outputs = [name if n == current else n for n in op.outputs]
         ag.model_outputs = [name if n == current else n for n in ag.model_outputs]
+        taken.add(name)
     return ag
+
+
+def _drop_unchanged_state_outputs(ag: AnalyzedGraph, declared: list[str]) -> list[str]:
+    """A variable whose next value is its own input keeps its value.
+
+    A plan states that by giving the variable no next value, since one tensor
+    cannot hold the variable both on entry and on exit. Returns the declared
+    names of the outputs that remain, in order.
+    """
+    unchanged = {port.output for port in ag.state_ports if port.output is not None
+                 and ag.model_outputs[port.output] == ag.model_inputs[port.input]}
+    if not unchanged:
+        return declared
+    kept = [position for position in range(len(ag.model_outputs)) if position not in unchanged]
+    moved = {old: new for new, old in enumerate(kept)}
+    for port in ag.state_ports:
+        port.output = moved.get(port.output)
+    if len(ag.model_output_dtypes) == len(ag.model_outputs):
+        ag.model_output_dtypes = [ag.model_output_dtypes[position] for position in kept]
+    ag.model_outputs = [ag.model_outputs[position] for position in kept]
+    return [declared[position] for position in kept]
 
 
 # Operand positions that carry shape or bound metadata rather than tensor data.
@@ -873,7 +908,7 @@ def _fold_one_split(ag: AnalyzedGraph) -> bool:
         chain: list[int] = []
         while True:
             index = producer_of.get(name)
-            if index is None or readers.get(name, 0) != 1:
+            if index is None or readers.get(name, 0) != 1 or name in ag.model_outputs:
                 break
             op = ag.ops[index]
             current = ag.tensors.get(name)
@@ -962,11 +997,12 @@ def _fold_split_onto(
                 dtype=ag.tensors[product.inputs[2]].dtype, is_constant=True)
             inputs.append(bias_name)
 
-        carried = f"{tag}_product"
-        ag.tensors[carried] = TensorInfo(
-            name=carried,
-            shape=(*tuple(result.shape[:-1]), block),
-            dtype=result.dtype, quant=result.quant, layout=result.layout)
+        carried = f"{tag}_product" if chain else split.outputs[position]
+        if chain:
+            ag.tensors[carried] = TensorInfo(
+                name=carried,
+                shape=(*tuple(result.shape[:-1]), block),
+                dtype=result.dtype, quant=result.quant, layout=result.layout)
         rebuilt.append(OpNode(
             name=tag, op_type=product.op_type, inputs=inputs,
             outputs=[carried], attrs=dict(product.attrs)))
@@ -2325,9 +2361,9 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
         if conv_op.op_type not in ("Conv",):
             continue
 
-        # Conv must have exactly one consumer (the BN)
+        # Exactly one consumer (the BN), and not a model output.
         consumers = input_to_consumers.get(bn_input, [])
-        if len(consumers) != 1:
+        if len(consumers) != 1 or bn_input in ag.model_outputs:
             continue
 
         # Get BN parameters from weight_data
@@ -2830,8 +2866,8 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
         if len(producer.inputs) not in (2, 3):
             continue
-        # Folding past another consumer would change what that consumer reads.
-        if consumers.get(product, []) != [i]:
+        # Another consumer or a model output still reads the product.
+        if consumers.get(product, []) != [i] or product in ag.model_outputs:
             continue
 
         product_info = ag.tensors.get(product)
@@ -3096,7 +3132,7 @@ def _fold_pad_into_conv(ag: AnalyzedGraph) -> AnalyzedGraph:
         if op.attrs.get("mode", "constant") != "constant":
             continue
         consumers = readers.get(op.outputs[0], [])
-        if len(consumers) != 1:
+        if len(consumers) != 1 or op.outputs[0] in ag.model_outputs:
             continue
         target = ag.ops[consumers[0]]
         if target.op_type not in ("Conv", "DepthwiseConv"):
@@ -4302,9 +4338,9 @@ def _absorb_activations(ag: AnalyzedGraph) -> AnalyzedGraph:
         if producer.op_type not in _FUSABLE_PRODUCERS:
             continue
 
-        # Producer must have exactly one consumer (the activation op)
+        # Exactly one consumer (the activation), and not a model output.
         consumers = input_to_consumers.get(act_input, [])
-        if len(consumers) != 1:
+        if len(consumers) != 1 or act_input in ag.model_outputs:
             continue
 
         # An intermediate carrying its own scale is a quantization step of its

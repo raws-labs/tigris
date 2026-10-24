@@ -1,5 +1,6 @@
 """Fail-closed validation for operators outside the binary plan schema."""
 
+import json
 import numpy as np
 import onnx
 import pytest
@@ -10,6 +11,7 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.analysis.findings import compute_findings
 from tigris.analysis.validation import (
     validate_execution_dtype,
+    validate_model_outputs,
     validate_operator_support,
 )
 from tigris.inspection import inspect_file
@@ -191,6 +193,66 @@ def test_compile_preserves_existing_output_on_dtype_rejection(
     assert result.exit_code != 0
     assert "cannot compile" in result.output
     assert output.read_bytes() == b"sentinel"
+
+
+def _constant_output_model(tmp_path, source):
+    """A model that also returns a tensor normalization folds into a constant."""
+    n = helper.make_node
+    f32 = lambda name, value: numpy_helper.from_array(np.asarray(value, np.float32), name)  # noqa: E731
+    x, y = (helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 8]) for name in ("x", "y"))
+    if source == "constant":
+        nodes = [n("Constant", [], ["k"], value=f32("v", np.full((1, 8), 0.5))), n("Add", ["x", "k"], ["y"])]
+        returned, init = helper.make_tensor_value_info("k", TensorProto.FLOAT, [1, 8]), []
+    elif source == "shape":
+        nodes = [n("Shape", ["x"], ["k"]), n("Relu", ["x"], ["r"]), n("Reshape", ["r", "k"], ["y"])]
+        returned, init = helper.make_tensor_value_info("k", TensorProto.INT64, [2]), []
+    else:
+        int8 = lambda name, value: numpy_helper.from_array(np.asarray(value, np.int8), name)  # noqa: E731
+        nodes = [n("QuantizeLinear", ["x", "s", "z"], ["xq"]), n("DequantizeLinear", ["xq", "s", "z"], ["xd"]),
+                 n("DequantizeLinear", ["wq", "ws", "z"], ["k"]), n("Gemm", ["xd", "k"], ["g"], transB=1),
+                 n("QuantizeLinear", ["g", "s", "z"], ["gq"]), n("DequantizeLinear", ["gq", "s", "z"], ["y"])]
+        returned = helper.make_tensor_value_info("k", TensorProto.FLOAT, [8, 8])
+        init = [f32("s", 0.05), int8("z", 0), int8("wq", np.arange(64).reshape(8, 8) - 32), f32("ws", 0.01)]
+    model = helper.make_model(helper.make_graph(nodes, source, [x], [returned, y], init),
+                              opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / f"{source}.onnx"
+    onnx.save(model, path)
+    return path
+
+
+@pytest.mark.parametrize("source", ["constant", "shape", "dequantized_weight"])
+def test_compile_refuses_an_output_no_operator_computes(tmp_path, source):
+    """The plan holds no constant as an output, so it would return one output fewer."""
+    path = _constant_output_model(tmp_path, source)
+    graph, _ = _run_pipeline(str(path), ("4K",))
+    issue = "output 'k' is not computed by any operator"
+    assert validate_model_outputs(graph).issues == (issue,)
+    assert validate_execution_dtype(graph).supported
+    findings = compute_findings(graph)
+    assert (findings.output_errors, findings.dtype_errors) == ([issue], [])
+    with pytest.raises(ValueError, match=f"Cannot emit a plan that omits a declared output: {issue}"):
+        emit_binary_bytes(graph)
+
+    report = CliRunner().invoke(cli, ["analyze", str(path), "-m", "4K", "--json"])
+    model = json.loads(report.output)["model"]
+    assert (model["output_errors"], model["dtype_errors"]) == ([issue], [])
+    output = tmp_path / "should-not-exist.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(path), "-m", "4K", "-o", str(output)])
+    assert result.exit_code != 0
+    assert f"cannot compile: {issue}" in result.output
+    assert not output.exists()
+
+
+def test_an_output_no_operator_computes_leaves_dtype_errors_reported(mixed_dtype_model_path):
+    graph, _ = _run_pipeline(str(mixed_dtype_model_path), ("4K",))
+    graph.model_outputs.append("scale")
+    findings = compute_findings(graph)
+    assert findings.output_errors == ["output 'scale' is not computed by any operator"]
+    assert findings.dtype_errors == [
+        "float32 activations in an int8 plan must follow a Dequantize, If or While: "
+        "float_input, float_output"]
+    assert findings.verdict_text == findings.output_errors[0]
 
 
 def test_ceil_mode_whose_last_window_lies_in_the_padding_is_rejected(tmp_path):
