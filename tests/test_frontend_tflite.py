@@ -392,8 +392,9 @@ class _Constant:
 def test_every_strided_slice_path_takes_one_rule():
     """One axis of extent 0-5, begin and end -7..7, strides +-1..3 and every
     begin, end and shrink mask: the folded constant, the stride-1 bounds and
-    the dropped-axis refusal follow _strided_slice_axes, which is Python's
-    slice of the axis, or the element TFLite Micro takes from a dropped axis."""
+    the shape check follow _strided_slice_axes, which is Python's slice of the
+    axis, or the element TFLite Micro takes from a dropped axis; it writes none
+    for a dropped axis with a negative stride."""
     for extent, begin, end, stride, begin_mask, end_mask, shrink in itertools.product(
             range(6), range(-7, 8), range(-7, 8), (-3, -2, -1, 1, 2, 3), (0, 1), (0, 1), (0, 1)):
         op, x = _StridedSlice(begin_mask, end_mask, shrink), np.arange(extent, dtype=np.int32)
@@ -402,7 +403,7 @@ def test_every_strided_slice_path_takes_one_rule():
         if shrink:
             index = ((0 if stride > 0 else extent - 1) if begin_mask
                      else begin + extent if begin < 0 else begin)
-            expected = [index] if 0 <= index < extent else None
+            expected = [index] if 0 <= index < extent and stride > 0 else None
         else:
             expected = list(range(*slice(None if begin_mask else begin, None if end_mask else end,
                                          stride).indices(extent)))
@@ -416,15 +417,20 @@ def test_every_strided_slice_path_takes_one_rule():
             assert bounds == (None if not expected else
                               [(expected[0], len(expected), bool(shrink))]), case
         if not (shrink and stride < 0):
-            reason = tflite._data_movement_reason(op, ins, [_Constant(0)])
-            assert (reason == "a dropped axis at an index outside the axis") == (expected is None), case
+            out = _Constant(np.zeros(() if shrink else len(expected or ()), np.int32))
+            reason = tflite._option_shape_reason(op, ins, [out])
+            assert reason == ("" if expected is not None
+                              else "a dropped axis at an index outside the axis"), case
 
 
-def test_a_constant_strided_slice_folds_the_axes_begin_names_and_adds_the_offset():
-    """Axes past the length of begin are kept whole, and with offset set the
-    end of an axis is begin + end."""
+def test_a_constant_strided_slice_reads_one_entry_per_axis_and_adds_the_offset():
+    """TFLite Micro reads begin, end and strides at each input axis: with fewer
+    entries the slice does not fold, entries past the last axis are not read,
+    and with offset set the end of an axis is begin + end."""
     x = np.arange(6, dtype=np.int32).reshape(2, 3)
     ins = [_Constant(x), _Constant([1]), _Constant([2]), _Constant([1])]
+    assert tflite._constant_move(_StridedSlice(0, 0, 0), ins) is None
+    ins = [_Constant(x), _Constant([1, 0, 9]), _Constant([2, 3, 9]), _Constant([1, 1, 0])]
     assert tflite._constant_move(_StridedSlice(0, 0, 0), ins).tolist() == [[3, 4, 5]]
     ins = [_Constant(np.arange(6, dtype=np.int32)), _Constant([1]), _Constant([2]), _Constant([1])]
     assert tflite._constant_move(_StridedSlice(0, 0, 0), ins).tolist() == [1]

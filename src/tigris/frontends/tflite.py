@@ -229,6 +229,8 @@ def _constant_result(op: "_Operator", tensors) -> "np.ndarray | None":
         return np.asarray(np.broadcast_shapes(*(tuple(t.array().reshape(-1)) for t in ins)),
                           _NUMPY[out.type])
     if op.kind in _CONSTANT_MOVES and _same_quantization([ins[0], out]):
+        if op.kind in _OPTION_SHAPED and _option_shape_reason(op, ins, [out]):
+            return None  # kept, so that the operator check refuses the shape
         return _constant_move(op, ins)
     if (op.kind in _CONSTANT_MATH and all(t.type in ("INT32", "INT64") and not len(t.scale)
                                           for t in (*ins, out))
@@ -273,14 +275,20 @@ class _StridedSliceOptions(NamedTuple):
 def _strided_slice_axes(options: _StridedSliceOptions, shape, begins, ends, strides):
     """Per axis of `shape`, (start, stop, step, dropped) of a STRIDED_SLICE, with
     TensorFlow's clamping as slice().indices() gives it; a dropped axis is
-    (index, index + 1, 1, True). None for a zero stride or a dropped index
-    outside its axis."""
+    (index, index + 1, 1, True). None where TFLite Micro gives no result: begin,
+    end or strides with fewer entries than `shape` has axes (it reads one per
+    axis), a zero stride, a dropped axis with a negative stride (it writes
+    nothing) or a dropped index outside its axis."""
+    if min(len(begins), len(ends), len(strides)) < len(shape):
+        return None
     axes = []
     for axis, extent in enumerate(shape):
         step, begin_masked = strides[axis], bool(options.begin_mask >> axis & 1)
         if step == 0:
             return None
         if options.shrink_axis_mask >> axis & 1:
+            if step < 0:
+                return None
             index = _dropped_index(begins[axis], extent, step, begin_masked)
             if index is None:
                 return None
@@ -308,21 +316,23 @@ def _constant_move(op: "_Operator", ins) -> "np.ndarray | None":
     if op.kind == "SLICE":
         begin = [int(v) for v in ins[1].array().reshape(-1)]
         size = [int(v) for v in ins[2].array().reshape(-1)]
+        if min(len(begin), len(size)) < x.ndim:
+            return None  # TFLite Micro reads one entry per input axis from each
         ends = [extent if s == -1 else b + s for b, s, extent in zip(begin, size, x.shape)]
         if any(not 0 <= b <= e <= extent for b, e, extent in zip(begin, ends, x.shape)):
             return None
         return x[tuple(slice(b, e) for b, e in zip(begin, ends))]
-    # STRIDED_SLICE over the axes begin names; ellipsis and new axes are not folded.
+    # STRIDED_SLICE; ellipsis and new axes are not folded.
     options = _StridedSliceOptions.of(op)
     if options.ellipsis_mask or options.new_axis_mask:
         return None
     begins, ends, strides = ([int(v) for v in ins[i].array().reshape(-1)] for i in (1, 2, 3))
-    axes = _strided_slice_axes(options, x.shape[:len(begins)], begins, ends, strides)
+    axes = _strided_slice_axes(options, x.shape, begins, ends, strides)
     if axes is None:
         return None
     for axis, (start, stop, step, _) in enumerate(axes):
         x = np.take(x, list(range(start, stop, step)), axis=axis)
-    return x.reshape([n for axis, n in enumerate(x.shape) if not (axis < len(axes) and axes[axis][3])])
+    return x.reshape([n for n, (_, _, _, dropped) in zip(x.shape, axes) if not dropped])
 
 
 def _fold_constants(graph):
@@ -622,6 +632,8 @@ _FC_QUANT_SPEC = 5
 _WINDOWED = {"CONV_2D": (1, 2, 4, 5), "DEPTHWISE_CONV_2D": (1, 2, 5, 6),
              "TRANSPOSE_CONV": (1, 2, None, None), "MAX_POOL_2D": (1, 2, None, None),
              "AVERAGE_POOL_2D": (1, 2, None, None), "L2_POOL_2D": (1, 2, None, None)}
+# Operators whose options set their output shapes from the input shapes.
+_OPTION_SHAPED = ("PACK", "UNPACK", "CONCATENATION", "GATHER", "BATCH_MATMUL", "STRIDED_SLICE")
 # The Padding enum of the windowed operators' options.
 _SAME, _VALID = 0, 1
 # Positions of the data, weights and bias operands of the weighted operators.
@@ -713,6 +725,12 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         if any(t.type not in ("FLOAT32", "INT32") for t in [*ins, *outs]):
             return "loop variables other than float32 or int32"
         return ""
+    if op.kind in _CONSTANT_MOVES and all(t is not None and _is_constant(t) for t in ins):
+        # The fold kept it: its operands or options are the cause, not its dtype.
+        reason = ((op.kind in _DATA_MOVEMENT and _data_movement_reason(op, ins, outs))
+                  or (op.kind in _OPTION_SHAPED and _option_shape_reason(op, ins, outs)))
+        if reason:
+            return reason
     if any(t is not None and t.type == "INT32" for t in [*ins, *outs]):
         reason = _int32_reason(op, ins, outs)
         if reason is not None:
@@ -809,6 +827,10 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
             return reason
     if op.kind == "BATCH_MATMUL" and len(ins[0].shape) != len(ins[1].shape):
         return "operands of different rank"
+    if op.kind in _OPTION_SHAPED:
+        reason = _option_shape_reason(op, ins, outs)
+        if reason:
+            return reason
     if op.kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
         align, half_pixel = ((op.option(2, "?", False), op.option(3, "?", False))
                              if op.kind == "RESIZE_BILINEAR" else
@@ -883,8 +905,14 @@ def _svdf_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
     if bias is None:
         # TFLite Micro's Prepare reads the bias whether or not it is there.
         return "no bias, which TFLite Micro requires"
-    if len(x.shape) != 2 or op.option(0, "i") <= 0:
+    if len(x.shape) != 2:
         return "input of rank other than 2"
+    rank, filters = op.option(0, "i"), feature.shape[0] if feature.shape else 0
+    if rank <= 0 or filters % rank:
+        return f"rank {rank} for {filters} filters"
+    reason = _shape_reason(f"rank {rank}", y.shape, [x.shape[0], filters // rank])
+    if reason:
+        return reason
     if x.type == "FLOAT32":
         if any(t.type != "FLOAT32" for t in (feature, time, bias, state, y)):
             return "float32 input with operands of another dtype"
@@ -921,6 +949,13 @@ def _lstm_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
         return f"cell activation {_activation(op.option(0, 'b'))}"
     if any(not _is_constant(ins[i]) for i in _LSTM_CONSTANTS):
         return "weights and biases must be constant"
+    # time_major picks the batch axis of the input, which the states are sized by.
+    time_major = op.option(3, "?", False)
+    given = [ins[0].shape[1 if time_major else 0], ins[18].shape[-1] if ins[18].shape else 0]
+    for role, state in (("hidden state", ins[18]), ("cell state", ins[19])):
+        reason = _shape_reason(f"time_major {str(time_major).lower()}", state.shape, given, role)
+        if reason:
+            return reason
     tensors = [ins[i] for i in (0, *_LSTM_CONSTANTS, 18, 19)] + outs
     if all(t.type == "FLOAT32" for t in tensors):
         return ""
@@ -1018,13 +1053,10 @@ def _window_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> st
     # A transposed convolution's input is what a convolution of its output gives.
     source, target = (outs[0], ins[2]) if op.kind == "TRANSPOSE_CONV" else (ins[0], outs[0])
     given = win.outputs(source.shape[1:3])
-    if given == list(target.shape[1:3]):
-        return ""
-    stated, found = ("x".join(map(str, dims)) for dims in (target.shape[1:3], given))
     name = ("SAME", "VALID")[win.padding]
     if op.kind == "TRANSPOSE_CONV":
-        return f"a {stated} input where {name} padding of the output gives {found}"
-    return f"a {stated} output where {name} padding gives {found}"
+        return _shape_reason(f"{name} padding of the output", target.shape[1:3], given, "input")
+    return _shape_reason(f"{name} padding", target.shape[1:3], given)
 
 
 def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> str:
@@ -1032,23 +1064,25 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
     data = [t for i, t in enumerate(ins) if not _is_constant(t) and i != slot]
     if not _same_quantization([*data, *outs]):
         return "inputs and outputs quantized differently"
+    if op.kind == "SLICE" and any(t.array().size < len(ins[0].shape) for t in ins[1:3]):
+        # TFLite Micro reads one entry per input axis from each.
+        return "begin or size with fewer entries than the input has axes"
     if op.kind == "STRIDED_SLICE":
         options = _StridedSliceOptions.of(op)
         if options.ellipsis_mask or options.new_axis_mask or options.offset:
             return "ellipsis, new axes or offset slices"
-        if len(ins[0].shape) > 4:
+        rank = len(ins[0].shape)
+        if rank > 4:
             return "slices of rank above 4"
-        steps = [int(v) for v in ins[3].array().reshape(-1)]
+        if any(ins[i].array().size < rank for i in (1, 2, 3)):
+            # TFLite Micro reads one entry per input axis from each, and no more.
+            return "begin, end or strides with fewer entries than the input has axes"
+        steps = [int(v) for v in ins[3].array().reshape(-1)[:rank]]
         if any(step == 0 for step in steps):
             return "a zero stride"
         if any(options.shrink_axis_mask >> axis & 1 and step < 0 for axis, step in enumerate(steps)):
             # TFLite Micro leaves such an output unwritten.
             return "a dropped axis with a negative stride"
-        begins = [int(v) for v in ins[1].array().reshape(-1)]
-        if any(options.shrink_axis_mask >> axis & 1
-               and _dropped_index(begin, extent, step, bool(options.begin_mask >> axis & 1)) is None
-               for axis, (begin, extent, step) in enumerate(zip(begins, ins[0].shape, steps))):
-            return "a dropped axis at an index outside the axis"
     if op.kind == "REVERSE_V2":
         axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
         if not axes or axes != list(range(axes[0], axes[-1] + 1)):
@@ -1072,10 +1106,77 @@ def _block_reason(op: _Operator, source: _Tensor, target: _Tensor) -> str:
         valid = block > 0 and c % (block * block) == 0
         given = [n, h * block, w * block, c // (block * block)] if valid else []
     if not valid:
-        return f"block_size {block} for a {'x'.join(map(str, source.shape))} input"
-    if given != list(target.shape):
-        stated, found = ("x".join(map(str, dims)) for dims in (target.shape, given))
-        return f"a {stated} output where block_size {block} gives {found}"
+        return f"block_size {block} for a {_dims(source.shape)} input"
+    return _shape_reason(f"block_size {block}", target.shape, given)
+
+
+def _dims(shape) -> str:
+    return "x".join(map(str, shape)) or "scalar"
+
+
+def _shape_reason(setting: str, stated, given, role: str = "output") -> str:
+    """Why a stated shape is not the one `setting` gives, or "" when it is."""
+    if list(stated) == list(given):
+        return ""
+    return f"a {_dims(stated)} {role} where {setting} gives {_dims(given)}"
+
+
+def _option_shape_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    """The options give the output shapes from the input shapes, and TFLite
+    Micro computes by them; the conversion takes the stated shapes, so both
+    must agree."""
+    shapes = [list(t.shape) for t in ins if t is not None]
+    first, inputs = shapes[0], ", ".join(_dims(s) for s in shapes)
+    if op.kind == "STRIDED_SLICE":
+        axes = _strided_slice_axes(_StridedSliceOptions.of(op), first,
+                                   *([int(v) for v in t.array().reshape(-1)] for t in ins[1:4]))
+        if axes is None:
+            # The operator check refuses every other cause before this one.
+            return "a dropped axis at an index outside the axis"
+        given = [[len(range(start, stop, step)) for start, stop, step, dropped in axes if not dropped]]
+        setting = "the slice"
+    elif op.kind in ("PACK", "UNPACK", "CONCATENATION"):
+        axis = op.option(0 if op.kind == "CONCATENATION" else 1, "i")
+        setting, rank = f"axis {axis}", len(first) + (op.kind == "PACK")
+        a = axis + rank if axis < 0 else axis
+        if op.kind == "UNPACK":
+            if not 0 <= a < rank or first[a] != len(outs):
+                count = f"{len(outs)} output{'s' if len(outs) != 1 else ''}"
+                return f"{setting} for a {_dims(first)} input and {count}"
+            given = [first[:a] + first[a + 1:]] * len(outs)
+        elif op.kind == "PACK":
+            if not 0 <= a < rank or any(s != first for s in shapes):
+                return f"{setting} for inputs {inputs}"
+            given = [first[:a] + [len(shapes)] + first[a:]]
+        else:
+            if not 0 <= a < rank or any(len(s) != rank or s[:a] + s[a + 1:] != first[:a] + first[a + 1:]
+                                        for s in shapes):
+                return f"{setting} for inputs {inputs}"
+            given = [first[:a] + [sum(s[a] for s in shapes)] + first[a + 1:]]
+    elif op.kind == "GATHER":
+        axis, batch = op.option(0, "i"), op.option(1, "i")
+        setting, data, indices = f"axis {axis}, batch_dims {batch}", shapes[0], shapes[1]
+        a = axis + len(data) if axis < 0 else axis
+        b = batch + len(indices) if batch < 0 else batch
+        if not (0 <= b <= a < len(data) and b <= len(indices) and data[:b] == indices[:b]):
+            return f"{setting} for inputs {inputs}"
+        given = [data[:a] + indices[b:] + data[a + 1:]]
+    else:
+        adj_x, adj_y = op.option(0, "?", False), op.option(1, "?", False)
+        setting = f"adj_x {str(adj_x).lower()}, adj_y {str(adj_y).lower()}"
+        rank = max(len(s) for s in shapes[:2])
+        lhs, rhs = ([1] * (rank - len(s)) + s for s in shapes[:2])
+        batches = list(zip(lhs[:-2], rhs[:-2]))
+        if (min(len(s) for s in shapes[:2]) < 2
+                or (lhs[-2] if adj_x else lhs[-1]) != (rhs[-1] if adj_y else rhs[-2])
+                or any(left != right and 1 not in (left, right) for left, right in batches)):
+            return f"{setting} for inputs {inputs}"
+        given = [[right if left == 1 else left for left, right in batches]
+                 + [lhs[-1] if adj_x else lhs[-2], rhs[-2] if adj_y else rhs[-1]]]
+    for out, shape in zip(outs, given):
+        reason = _shape_reason(setting, out.shape, shape)
+        if reason:
+            return reason
     return ""
 
 
