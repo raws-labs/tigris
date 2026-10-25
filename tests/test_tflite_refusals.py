@@ -2,6 +2,7 @@
 the checks that give them, each from a model the writer builds, and the reader
 paths no fixture reaches."""
 
+import random
 import re
 import struct
 from pathlib import Path
@@ -627,6 +628,171 @@ def test_a_malformed_vtable_is_an_error(size):
 def test_a_buffer_shorter_than_a_flatbuffer_is_an_error():
     with pytest.raises(ValueError, match="buffer too short for a FlatBuffer"):
         Table.root(b"\x08\0\0\0TFL")
+
+
+def _in_subgraph(position: int, op: int, **fields):
+    def edit(graph, model):
+        for key, value in fields.items():
+            setattr(model.subgraphs[position].operators[op], key, value)
+    return edit
+
+
+OUT_OF_RANGE = [
+    pytest.param("float_conv_bias", [_operator(0, inputs=[0, 1, -2])],
+                 "operator 0 CONV_2D: tensor index -2 is out of range for 4 tensors", id="input"),
+    pytest.param("float_conv_bias", [_operator(0, outputs=[4])],
+                 "operator 0 CONV_2D: tensor index 4 is out of range for 4 tensors", id="output"),
+    pytest.param("float_conv_bias", [_operator(0, outputs=[-1])],
+                 "operator 0 CONV_2D: tensor index -1 is out of range for 4 tensors",
+                 id="output-left-out"),
+    pytest.param("float_conv_bias", [lambda graph, model: setattr(graph, "inputs", [7])],
+                 "model inputs: tensor index 7 is out of range for 4 tensors", id="model-input"),
+    pytest.param("if_conv", [_in_subgraph(2, 3, outputs=[9])],
+                 "subgraph 2 operator 3 CONV_2D: tensor index 9 is out of range for 9 tensors",
+                 id="branch-operator"),
+    pytest.param("if_conv", [lambda graph, model: setattr(model.subgraphs[1], "outputs", [6])],
+                 "subgraph 1 outputs: tensor index 6 is out of range for 6 tensors",
+                 id="branch-output"),
+    pytest.param("if_conv", [_option(3, 1, "i", 3)],
+                 "operator 3 IF: subgraph index 3 is out of range for 3 subgraphs", id="if"),
+    pytest.param("float_while", [_option(0, 0, "i", -1)],
+                 "operator 0 WHILE: subgraph index -1 is out of range for 3 subgraphs",
+                 id="while"),
+    pytest.param("float_variable_window", [_option(0, 0, "i", 99)],
+                 "operator 0 CALL_ONCE: subgraph index 99 is out of range for 2 subgraphs",
+                 id="call-once"),
+]
+
+
+def _operand_left_out(op: int, position: int):
+    def edit(graph, model):
+        graph.operators[op].inputs[position] = -1
+    return edit
+
+
+OPERAND_LEFT_OUT = [
+    pytest.param("float_conv_bias", [_operand_left_out(0, 0)],
+                 "operator 0 CONV_2D: input 0 is missing", id="conv-data"),
+    pytest.param("conv_bias", [_operand_left_out(0, 1)],
+                 "operator 0 CONV_2D: input 1 is missing", id="conv-weights"),
+    pytest.param("float_transpose_conv", [_operand_left_out(0, 2)],
+                 "operator 0 TRANSPOSE_CONV: input 2 is missing", id="transpose-conv-data"),
+    pytest.param("float_mean_channels", [_operand_left_out(0, 1)],
+                 "operator 0 MEAN: input 1 is missing", id="mean-axes"),
+    pytest.param("strided_slice", [_operand_left_out(0, 3)],
+                 "operator 0 STRIDED_SLICE: input 3 is missing", id="strided-slice-strides"),
+    pytest.param("float_strided_slice", [_operand_left_out(0, 0)],
+                 "operator 0 STRIDED_SLICE: input 0 is missing", id="strided-slice-data"),
+    pytest.param("float_relu", [_operand_left_out(0, 0)],
+                 "operator 0 RELU: input 0 is missing", id="relu"),
+    pytest.param("float_gather", [_operand_left_out(0, 0)],
+                 "operator 0 GATHER: input 0 is missing", id="gather"),
+    pytest.param("float_svdf", [_operand_left_out(0, 4)],
+                 "operator 0 SVDF: input 4 is missing", id="svdf-state"),
+    pytest.param("float_concat_channels", [_operand_left_out(0, 1)],
+                 "operator 0 CONCATENATION: input 1 is missing", id="concatenation"),
+    pytest.param("float_mean_channels", [_operator(0, inputs=[0])],
+                 "operator 0 MEAN: input 1 is missing", id="past-the-end"),
+    pytest.param("float_conv_bias", [_operator(0, inputs=[])],
+                 "operator 0 CONV_2D: input 0 is missing", id="no-inputs"),
+    pytest.param("float_max_pool_valid", [_operator(0, inputs=[])],
+                 "operator 0 MAX_POOL_2D: input 0 is missing", id="pool-no-inputs"),
+    pytest.param("float_variable_window", [_operator(7, inputs=[8])],
+                 "operator 7 ASSIGN_VARIABLE: input 1 is missing", id="assign-variable"),
+    pytest.param("float_conv_bias", [_operator(0, outputs=[])],
+                 "operator 0 CONV_2D: output 0 is missing", id="no-outputs"),
+    pytest.param("float_if", [_operator(2, outputs=[])],
+                 "operator 2 IF: output 0 is missing", id="if-no-outputs"),
+    pytest.param("if_conv", [_in_subgraph(2, 3, outputs=[])],
+                 "subgraph 2 operator 3 CONV_2D: output 0 is missing", id="branch"),
+]
+
+
+@pytest.mark.parametrize(("name", "edits", "message"), OUT_OF_RANGE + OPERAND_LEFT_OUT)
+def test_an_index_outside_its_table_or_an_operand_left_out_is_an_error(name, edits, message,
+                                                                       tmp_path):
+    data = _edited(name, *edits)
+    with pytest.raises(ValueError, match=re.escape(message)):
+        tflite.unsupported(data)
+    model = tmp_path / "model.tflite"
+    model.write_bytes(data)
+    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(tmp_path / "model.tgrs")])
+    assert result.exit_code != 0 and isinstance(result.exception, SystemExit), result.output
+    assert f"Error: {message}" in result.output
+
+
+def test_every_kind_the_importer_converts_or_folds_has_its_operand_counts():
+    assert set(tflite._SUPPORTED) - set(tflite._OPERANDS) == {tflite._DETECTION}
+
+
+def _first_of_each_kind():
+    """(fixture, subgraph, operator) of the first operator of each kind in the ops fixtures."""
+    seen, found = set(), []
+    for path in sorted(OPS.glob("*.tflite")):
+        model = tflite._Model(path.read_bytes())
+        for position, subgraph in enumerate(model.subgraphs):
+            for index, table in enumerate(subgraph.tables(tflite._SG_OPERATORS)):
+                kind = tflite._Operator(model, table, index).kind
+                if kind not in seen:
+                    seen.add(kind)
+                    found.append((path.stem, position, index))
+    return found
+
+
+def test_any_operand_left_out_raises_nothing_but_value_errors():
+    """Each input of the first operator of each kind given as -1 or cut from the
+    list, and its outputs emptied: the importer refuses with ValueError, returns
+    reasons or converts."""
+    for name, position, index in _first_of_each_kind():
+        op = tw.read((OPS / f"{name}.tflite").read_bytes()).subgraphs[position].operators[index]
+        inputs = list(op.inputs)
+        variants = [{"inputs": [*inputs[:k], -1, *inputs[k + 1:]]} for k in range(len(inputs))]
+        variants += [{"inputs": inputs[:k]} for k in range(len(inputs))]
+        variants += [{"outputs": []}] if op.outputs else []
+        for fields in variants:
+            if fields.get("inputs") == inputs:
+                continue
+            data = _edited(name, _in_subgraph(position, index, **fields))
+            try:
+                if not tflite.unsupported(data):
+                    tflite.to_onnx(data, "model")
+            except ValueError:
+                pass
+
+
+@pytest.mark.parametrize(("name", "position"), [
+    ("float_reshape", 1), ("float_split_v", 1), ("float_transpose_conv", 0)])
+def test_an_operand_the_conversion_takes_from_the_stated_shapes_may_be_left_out(name, position):
+    stated = tflite.to_onnx(_edited(name), "model").graph
+    left_out = tflite.to_onnx(_edited(name, _operand_left_out(0, position)), "model").graph
+    assert left_out.node == stated.node and left_out.output == stated.output
+
+
+@pytest.mark.parametrize("name", ["padv2", "float_padv2"])
+def test_a_padv2_value_given_as_minus_one_pads_as_one_left_out(name):
+    left_out = tflite.to_onnx(_edited(name, _operand_left_out(0, 2)), "model").graph
+    def first_two(graph, model):
+        graph.operators[0].inputs = graph.operators[0].inputs[:2]
+    two_inputs = tflite.to_onnx(_edited(name, first_two), "model").graph
+    assert left_out.node == two_inputs.node and left_out.initializer == two_inputs.initializer
+
+
+def test_one_corrupted_word_raises_nothing_but_value_errors():
+    """One 4-byte word in the tables at the front of the file overwritten, 3000
+    times; the reader and the importer refuse with ValueError or return reasons."""
+    data = (OPS / "conv_bias.tflite").read_bytes()
+    rng = random.Random(1)
+    limit = min(len(data), 4096)
+    for _ in range(3000):
+        corrupted = bytearray(data)
+        position = rng.randrange(8, limit - 4)
+        struct.pack_into("<I", corrupted, position, rng.choice(
+            [0, 1, 0xFFFF, 0x7FFFFFFF, 0xFFFFFFFF, rng.getrandbits(32)]))
+        for entry in (tw.read, tflite.unsupported):
+            try:
+                entry(bytes(corrupted))
+            except ValueError:
+                pass
 
 
 def _run(data: bytes, feed: dict, tmp_path: Path) -> list[np.ndarray]:

@@ -28,6 +28,7 @@ from tigris.frontends.tflite import (
     _VALID,
     TFLM_TARGETS,
     TflmTarget,
+    _check_indices,
     tflm_arena,
     tflm_persistent,
     tflm_tensor_bytes,
@@ -628,6 +629,38 @@ def _regions(model: tw.Model, nodes: list):
                 yield a, b
 
 
+def _check_operands(model: tw.Model) -> None:
+    """Raise ValueError for an operator code or a tensor index of an operator
+    or the graph boundary outside its table; the arena model reads them."""
+    sg = model.subgraphs[0]
+    _check_indices("model inputs", "tensor", sg.inputs, len(sg.tensors))
+    _check_indices("model outputs", "tensor", sg.outputs, len(sg.tensors))
+    for k, op in enumerate(sg.operators):
+        _check_indices(f"operator {k}", "operator code", (op.opcode,), len(model.operator_codes))
+        # -1 is an operand left out.
+        _check_indices(f"operator {k}", "tensor", (*op.inputs, *(op.intermediates or ())),
+                       len(sg.tensors), -1)
+        _check_indices(f"operator {k}", "tensor", op.outputs, len(sg.tensors))
+
+
+def _check_references(model: tw.Model) -> None:
+    """Raise ValueError for a buffer index of a tensor or the metadata, or a
+    subgraph or tensor index of a signature, outside its table; only a
+    rewrite reads them."""
+    sg = model.subgraphs[0]
+    buffers = len(model.buffers)
+    for t, tensor in enumerate(sg.tensors):
+        _check_indices(f"tensor {t}", "buffer", (tensor.buffer,), buffers)
+    for s, signature in enumerate(model.signatures or ()):
+        _check_indices(f"signature {s}", "subgraph", (signature.subgraph_index,), 1)
+        _check_indices(f"signature {s}", "tensor",
+                       [index for _, index in (*signature.inputs, *signature.outputs)],
+                       len(sg.tensors))
+    for name, buffer in model.metadata or ():
+        _check_indices(f"metadata {name.decode(errors='replace')}", "buffer", (buffer,), buffers)
+    _check_indices("metadata_buffer", "buffer", model.metadata_buffer or (), buffers)
+
+
 def export(data: bytes, target: str = DEFAULT_TARGET) -> Export:
     """The model rewritten for a smaller TFLite Micro arena on `target`, a key
     of TFLM_TARGETS, or the reason there is none."""
@@ -639,6 +672,7 @@ def export(data: bytes, target: str = DEFAULT_TARGET) -> Export:
         for name, _ in model.metadata or ():
             if name not in _METADATA:
                 raise ValueError(f"metadata {name.decode(errors='replace')} is not supported")
+        _check_operands(model)
         before = arena(model)
         if before is None:
             raise ValueError("a tensor type TFLite Micro's arena model does not know")
@@ -649,7 +683,8 @@ def export(data: bytes, target: str = DEFAULT_TARGET) -> Export:
         for kind in kinds:
             if kind not in _TFLM_KERNELS:
                 raise ValueError(f"TFLite Micro's persistent allocations for {kind} are not "
-                                 "modelled")
+                                 "modeled")
+        _check_references(model)
     except ValueError as exc:
         return Export(None, reason=str(exc), target=target)
     tail = persistent(model, abi)
