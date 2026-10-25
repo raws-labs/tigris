@@ -1,5 +1,6 @@
 """TFLite models reach the compiler through their QDQ ONNX expression."""
 
+import itertools
 import json
 import re
 import os
@@ -363,6 +364,71 @@ def test_a_strided_slice_with_a_zero_stride_is_refused():
     offset = model.index(strides.data)
     data[offset + 4:offset + 8] = np.array([0], np.int32).tobytes()
     assert any("a zero stride" in reason for reason in tflite.unsupported(bytes(data)))
+
+
+class _StridedSlice:
+    """A STRIDED_SLICE operator that sets only its begin, end and shrink masks
+    and its offset flag."""
+    kind = "STRIDED_SLICE"
+
+    def __init__(self, begin_mask: int, end_mask: int, shrink: int, offset: bool = False):
+        self.masks = {0: begin_mask, 1: end_mask, 4: shrink, 5: offset}
+
+    def option(self, slot, fmt, default=0):
+        return self.masks.get(slot, default)
+
+
+class _Constant:
+    type, scale, zero_point, buffer = "INT32", None, None, 1
+
+    def __init__(self, values):
+        self.values = np.asarray(values, np.int32)
+        self.shape, self.data = list(self.values.shape), self.values.tobytes()
+
+    def array(self):
+        return self.values
+
+
+def test_every_strided_slice_path_takes_one_rule():
+    """One axis of extent 0-5, begin and end -7..7, strides +-1..3 and every
+    begin, end and shrink mask: the folded constant, the stride-1 bounds and
+    the dropped-axis refusal follow _strided_slice_axes, which is Python's
+    slice of the axis, or the element TFLite Micro takes from a dropped axis."""
+    for extent, begin, end, stride, begin_mask, end_mask, shrink in itertools.product(
+            range(6), range(-7, 8), range(-7, 8), (-3, -2, -1, 1, 2, 3), (0, 1), (0, 1), (0, 1)):
+        op, x = _StridedSlice(begin_mask, end_mask, shrink), np.arange(extent, dtype=np.int32)
+        ins = [_Constant(x), _Constant([begin]), _Constant([end]), _Constant([stride])]
+        case = (extent, begin, end, stride, begin_mask, end_mask, shrink)
+        if shrink:
+            index = ((0 if stride > 0 else extent - 1) if begin_mask
+                     else begin + extent if begin < 0 else begin)
+            expected = [index] if 0 <= index < extent else None
+        else:
+            expected = list(range(*slice(None if begin_mask else begin, None if end_mask else end,
+                                         stride).indices(extent)))
+        axes = tflite._strided_slice_axes(tflite._StridedSliceOptions.of(op), [extent],
+                                          [begin], [end], [stride])
+        assert (None if axes is None else list(range(*axes[0][:3]))) == expected, case
+        folded = tflite._constant_move(op, ins)
+        assert (None if folded is None else folded.reshape(-1).tolist()) == expected, case
+        if stride == 1:
+            bounds = tflite._strided_slice_bounds(op, ins)
+            assert bounds == (None if not expected else
+                              [(expected[0], len(expected), bool(shrink))]), case
+        if not (shrink and stride < 0):
+            reason = tflite._data_movement_reason(op, ins, [_Constant(0)])
+            assert (reason == "a dropped axis at an index outside the axis") == (expected is None), case
+
+
+def test_a_constant_strided_slice_folds_the_axes_begin_names_and_adds_the_offset():
+    """Axes past the length of begin are kept whole, and with offset set the
+    end of an axis is begin + end."""
+    x = np.arange(6, dtype=np.int32).reshape(2, 3)
+    ins = [_Constant(x), _Constant([1]), _Constant([2]), _Constant([1])]
+    assert tflite._constant_move(_StridedSlice(0, 0, 0), ins).tolist() == [[3, 4, 5]]
+    ins = [_Constant(np.arange(6, dtype=np.int32)), _Constant([1]), _Constant([2]), _Constant([1])]
+    assert tflite._constant_move(_StridedSlice(0, 0, 0), ins).tolist() == [1]
+    assert tflite._constant_move(_StridedSlice(0, 0, 0, offset=True), ins).tolist() == [1, 2]
 
 
 def test_an_int8_l2_pool_is_refused():

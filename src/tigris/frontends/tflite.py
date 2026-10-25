@@ -256,6 +256,43 @@ def _dropped_index(begin: int, extent: int, stride: int, masked: bool) -> "int |
     return index if 0 <= index < extent else None
 
 
+class _StridedSliceOptions(NamedTuple):
+    """The StridedSliceOptions table of a STRIDED_SLICE."""
+    begin_mask: int
+    end_mask: int
+    ellipsis_mask: int
+    new_axis_mask: int
+    shrink_axis_mask: int
+    offset: bool
+
+    @classmethod
+    def of(cls, op: "_Operator") -> "_StridedSliceOptions":
+        return cls(*(op.option(slot, "i") for slot in range(5)), op.option(5, "?", False))
+
+
+def _strided_slice_axes(options: _StridedSliceOptions, shape, begins, ends, strides):
+    """Per axis of `shape`, (start, stop, step, dropped) of a STRIDED_SLICE, with
+    TensorFlow's clamping as slice().indices() gives it; a dropped axis is
+    (index, index + 1, 1, True). None for a zero stride or a dropped index
+    outside its axis."""
+    axes = []
+    for axis, extent in enumerate(shape):
+        step, begin_masked = strides[axis], bool(options.begin_mask >> axis & 1)
+        if step == 0:
+            return None
+        if options.shrink_axis_mask >> axis & 1:
+            index = _dropped_index(begins[axis], extent, step, begin_masked)
+            if index is None:
+                return None
+            axes.append((index, index + 1, 1, True))
+            continue
+        begin = None if begin_masked else begins[axis]
+        end = (None if options.end_mask >> axis & 1
+               else ends[axis] + (begins[axis] if options.offset else 0))
+        axes.append((*slice(begin, end, step).indices(extent), False))
+    return axes
+
+
 def _constant_move(op: "_Operator", ins) -> "np.ndarray | None":
     x = ins[0].array()
     if op.kind in ("RESHAPE", "SQUEEZE", "EXPAND_DIMS"):
@@ -275,32 +312,17 @@ def _constant_move(op: "_Operator", ins) -> "np.ndarray | None":
         if any(not 0 <= b <= e <= extent for b, e, extent in zip(begin, ends, x.shape)):
             return None
         return x[tuple(slice(b, e) for b, e in zip(begin, ends))]
-    # STRIDED_SLICE with TensorFlow's clamping; ellipsis and new axes are not folded.
-    if op.option(2, "i") or op.option(3, "i"):
+    # STRIDED_SLICE over the axes begin names; ellipsis and new axes are not folded.
+    options = _StridedSliceOptions.of(op)
+    if options.ellipsis_mask or options.new_axis_mask:
         return None
     begins, ends, strides = ([int(v) for v in ins[i].array().reshape(-1)] for i in (1, 2, 3))
-    begin_mask, end_mask, shrink_mask = op.option(0, "i"), op.option(1, "i"), op.option(4, "i")
-    offset = op.option(5, "?", False)
-    for axis in range(len(begins)):
-        extent, stride = x.shape[axis], strides[axis]
-        if stride == 0:
-            return None
-        begin, end = begins[axis], ends[axis] + (begins[axis] if offset else 0)
-        if shrink_mask >> axis & 1:
-            begin = _dropped_index(begin, extent, stride, bool(begin_mask >> axis & 1))
-            if begin is None:
-                return None
-            index = [begin]
-        else:
-            low, high = (0, extent) if stride > 0 else (-1, extent - 1)
-            begin = (low if stride > 0 else high) if begin_mask >> axis & 1 else \
-                min(max(begin + extent if begin < 0 else begin, low), high)
-            end = (high if stride > 0 else low) if end_mask >> axis & 1 else \
-                min(max(end + extent if end < 0 else end, low), high)
-            index = list(range(begin, end, stride))
-        x = np.take(x, index, axis=axis)
-    return x.reshape([n for axis, n in enumerate(x.shape)
-                      if not (axis < len(begins) and shrink_mask >> axis & 1)])
+    axes = _strided_slice_axes(options, x.shape[:len(begins)], begins, ends, strides)
+    if axes is None:
+        return None
+    for axis, (start, stop, step, _) in enumerate(axes):
+        x = np.take(x, list(range(start, stop, step)), axis=axis)
+    return x.reshape([n for axis, n in enumerate(x.shape) if not (axis < len(axes) and axes[axis][3])])
 
 
 def _fold_constants(graph):
@@ -831,29 +853,15 @@ def _same_quantization(tensors) -> bool:
 
 def _strided_slice_bounds(op: _Operator, ins: list[_Tensor]):
     """Per axis (begin, size, shrink) of a stride-1 STRIDED_SLICE, or None."""
-    shape = ins[0].shape
-    begins, ends, strides = (list(ins[i].array().reshape(-1)) for i in (1, 2, 3))
-    begin_mask, end_mask = op.option(0, "i"), op.option(1, "i")
-    shrink_mask = op.option(4, "i")
-    if (op.option(2, "i") or op.option(3, "i") or op.option(5, "?", False)
-            or len(begins) != len(shape) or any(int(v) != 1 for v in strides)):
+    shape, options = ins[0].shape, _StridedSliceOptions.of(op)
+    begins, ends, strides = ([int(v) for v in ins[i].array().reshape(-1)] for i in (1, 2, 3))
+    if (options.ellipsis_mask or options.new_axis_mask or options.offset
+            or len(begins) != len(shape) or any(v != 1 for v in strides)):
         return None
-    bounds = []
-    for axis, extent in enumerate(shape):
-        if shrink_mask >> axis & 1:
-            begin = _dropped_index(int(begins[axis]), extent, 1, bool(begin_mask >> axis & 1))
-            if begin is None:
-                return None
-            bounds.append((begin, 1, True))
-            continue
-        begin = 0 if begin_mask >> axis & 1 else int(begins[axis])
-        end = extent if end_mask >> axis & 1 else int(ends[axis])
-        begin = min(max(begin + extent if begin < 0 else begin, 0), extent)
-        end = min(max(end + extent if end < 0 else end, 0), extent)
-        if end <= begin:
-            return None
-        bounds.append((begin, end - begin, False))
-    return bounds
+    axes = _strided_slice_axes(options, shape, begins, ends, [1] * len(shape))
+    if axes is None or any(stop <= start for start, stop, _, _ in axes):
+        return None
+    return [(start, stop - start, dropped) for start, stop, _, dropped in axes]
 
 
 def _gather_run(op: _Operator, ins: list[_Tensor]):
@@ -1025,19 +1033,20 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
     if not _same_quantization([*data, *outs]):
         return "inputs and outputs quantized differently"
     if op.kind == "STRIDED_SLICE":
-        if op.option(2, "i") or op.option(3, "i") or op.option(5, "?", False):
+        options = _StridedSliceOptions.of(op)
+        if options.ellipsis_mask or options.new_axis_mask or options.offset:
             return "ellipsis, new axes or offset slices"
         if len(ins[0].shape) > 4:
             return "slices of rank above 4"
         steps = [int(v) for v in ins[3].array().reshape(-1)]
         if any(step == 0 for step in steps):
             return "a zero stride"
-        if any(op.option(4, "i") >> axis & 1 and step < 0 for axis, step in enumerate(steps)):
+        if any(options.shrink_axis_mask >> axis & 1 and step < 0 for axis, step in enumerate(steps)):
             # TFLite Micro leaves such an output unwritten.
             return "a dropped axis with a negative stride"
         begins = [int(v) for v in ins[1].array().reshape(-1)]
-        if any(op.option(4, "i") >> axis & 1
-               and _dropped_index(begin, extent, step, bool(op.option(0, "i") >> axis & 1)) is None
+        if any(options.shrink_axis_mask >> axis & 1
+               and _dropped_index(begin, extent, step, bool(options.begin_mask >> axis & 1)) is None
                for axis, (begin, extent, step) in enumerate(zip(begins, ins[0].shape, steps))):
             return "a dropped axis at an index outside the axis"
     if op.kind == "REVERSE_V2":
@@ -1865,23 +1874,16 @@ class _Converter:
         order; a dropped axis is a slice of one, reshaped away."""
         b = self.b
         ins, source = op.inputs, self.tensors[op.inputs[0]]
-        shape, rank = list(source.shape), len(source.shape)
-        begins, ends, steps = (self.ints(i) for i in ins[1:4])
-        begin_mask, end_mask, shrink = op.option(0, "i"), op.option(1, "i"), op.option(4, "i")
-        starts, stops, sliced = [], [], []
-        for axis, extent in enumerate(shape):
-            if shrink >> axis & 1:
-                start = _dropped_index(begins[axis], extent, steps[axis], bool(begin_mask >> axis & 1))
-                stop, step = start + 1, 1
-                steps[axis] = 1
-            else:
-                start, stop, step = slice(None if begin_mask >> axis & 1 else begins[axis],
-                                          None if end_mask >> axis & 1 else ends[axis],
-                                          steps[axis]).indices(extent)
+        rank = len(source.shape)
+        axes = _strided_slice_axes(_StridedSliceOptions.of(op), source.shape,
+                                   *(self.ints(i) for i in ins[1:4]))
+        starts, stops, steps, sliced = [], [], [], []
+        for start, stop, step, _ in axes:
             sliced.append(len(range(start, stop, step)))
             starts.append(start)
             # Below zero, a reverse slice runs past the first element.
             stops.append(stop if stop >= 0 else -(2**63))
+            steps.append(step)
         x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
         y = b.node("Slice", [x, b.constant(np.asarray(starts, np.int64), tag + "_starts"),
                              b.constant(np.asarray(stops, np.int64), tag + "_ends"),
