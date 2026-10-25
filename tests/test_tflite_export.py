@@ -1,6 +1,8 @@
 """TFLite export: row geometry, the FlatBuffer writer, and exported models run
 on TFLite Micro bit for bit in the arena the planner model predicts."""
 
+import functools
+import itertools
 import json
 import os
 import re
@@ -17,9 +19,19 @@ from onnx import TensorProto, helper, numpy_helper
 
 from tigris.cli import cli
 from tigris.cli.export import export_report
+from tigris.frontends import tflite
 from tigris.frontends import tflite_writer as tw
-from tigris.frontends.tflite import _BUILTIN_OPERATORS, TFLM_TARGETS, tflm_tensor_arena
-from tigris.frontends.tflite_export import Export, arena, export, input_rows, persistent
+from tigris.frontends.tflite import _BUILTIN_OPERATORS, TFLM_TARGETS, Window, tflm_tensor_arena, window
+from tigris.frontends.tflite_export import (
+    Export,
+    _conv_geometry,
+    _kind,
+    _option,
+    arena,
+    export,
+    input_rows,
+    persistent,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tflite"
 _FLOAT32, _INT32, _INT16, _INT8 = 0, 2, 7, 9
@@ -559,6 +571,70 @@ def test_a_pad_other_than_same_padding_is_kept():
     x = b.activation([1, 16, 16, 8], 0.04, -5)
     result = export(b.model(x, b.conv(b.pad(x, 2, 0, 1, 1), 0, 3, padding=1, depthwise=True)))
     assert result.data is None and result.folded == 0
+
+
+@pytest.mark.parametrize(("kind", "fields", "weights", "expected"), [
+    pytest.param("CONV_2D", {0: 1, 1: 2, 2: 3, 3: 1, 4: 4, 5: 5}, [8, 3, 2, 4],
+                 Window(1, (3, 2), (3, 2), (5, 4)), id="conv"),
+    pytest.param("DEPTHWISE_CONV_2D", {1: 2, 2: 3, 3: 1, 4: 1, 5: 4, 6: 5}, [1, 3, 2, 4],
+                 Window(0, (3, 2), (3, 2), (5, 4)), id="depthwise"),
+    pytest.param("TRANSPOSE_CONV", {0: 1, 1: 2, 2: 3, 4: 4, 5: 5}, [8, 3, 2, 4],
+                 Window(1, (3, 2), (3, 2), (1, 1)), id="transpose-conv"),
+    pytest.param("MAX_POOL_2D", {1: 2, 2: 3, 3: 4, 4: 5}, None, Window(0, (5, 4), (3, 2), (1, 1)),
+                 id="max-pool"),
+    pytest.param("AVERAGE_POOL_2D", {0: 1, 3: 4, 4: 5}, None, Window(1, (5, 4), (0, 0), (1, 1)),
+                 id="average-pool"),
+    pytest.param("L2_POOL_2D", {}, None, Window(0, (0, 0), (0, 0), (1, 1)), id="l2-pool"),
+    pytest.param("CONV_2D", {}, [8, 3, 2, 4], Window(0, (3, 2), (0, 0), (1, 1)), id="conv-defaults"),
+])
+def test_a_window_reads_its_kinds_slots_with_the_schema_defaults(kind, fields, weights, expected):
+    assert window(kind, lambda slot, fmt, default: fields.get(slot, default), weights) == expected
+
+
+@pytest.mark.parametrize("padding", [0, 1])
+def test_a_windows_pads_give_its_output_size_under_onnx_arithmetic(padding):
+    for extent, kernel, stride, dilation in itertools.product(range(1, 10), range(1, 5),
+                                                              range(1, 4), range(1, 3)):
+        win = Window(padding, (kernel, 1), (stride, 1), (dilation, 1))
+        span = win.spans[0]
+        if padding == 1 and extent < span:
+            continue
+        out = win.outputs((extent, 1))[0]
+        begin, end = win.pads((extent, 1), (out, 1))[0]
+        assert out == (-(-extent // stride) if padding == 0 else (extent - span) // stride + 1)
+        assert (extent + begin + end - span) // stride + 1 == out
+        assert 0 <= end - begin <= 1 and (padding == 0 or begin == end == 0)
+
+
+def test_the_importer_and_export_read_the_same_window_from_a_file():
+    seen = 0
+    for path in sorted(FIXTURES.glob("**/*.tflite")):
+        data = path.read_bytes()
+        model, written = tflite._Model(data), tw.read(data)
+        for table, graph in zip(model.subgraphs, written.subgraphs):
+            tensors = [tflite._Tensor(model, t) for t in table.tables(tflite._SG_TENSORS)]
+            for i, op_table in enumerate(table.tables(tflite._SG_OPERATORS)):
+                op, kind = tflite._Operator(model, op_table, i), _kind(written, graph.operators[i])
+                if op.kind not in tflite._WINDOWED:
+                    continue
+                assert kind == op.kind
+                weights = tensors[op.inputs[1]].shape if kind in tflite._WEIGHTED else None
+                assert window(kind, op.option, weights) == window(
+                    kind, functools.partial(_option, graph.operators[i]), weights), (path.name, i)
+                seen += 1
+    assert seen > 50
+
+
+def test_export_keeps_no_geometry_for_an_input_smaller_than_a_valid_filter():
+    for kernel, rows in [(3, 0), (2, 1)]:
+        b = _Builder(9)
+        x = b.activation([1, 2, 2, 4])
+        model = tw.read(b.model(x, b.max_pool(x, kernel, 2, padding=1)))
+        graph = model.subgraphs[0]
+        assert graph.tensors[graph.operators[0].outputs[0]].shape[1] == rows
+        # A 2x2 input under a 3x3 VALID filter: the output formula gives the stated 0 rows.
+        geometry = _conv_geometry(model, graph, graph.operators[0], "MAX_POOL_2D")
+        assert (geometry is None) == (kernel == 3)
 
 
 def test_export_declines_when_no_rewrite_lowers_the_arena():

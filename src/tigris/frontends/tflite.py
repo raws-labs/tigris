@@ -592,6 +592,8 @@ _FC_QUANT_SPEC = 5
 _WINDOWED = {"CONV_2D": (1, 2, 4, 5), "DEPTHWISE_CONV_2D": (1, 2, 5, 6),
              "TRANSPOSE_CONV": (1, 2, None, None), "MAX_POOL_2D": (1, 2, None, None),
              "AVERAGE_POOL_2D": (1, 2, None, None), "L2_POOL_2D": (1, 2, None, None)}
+# The Padding enum of the windowed operators' options.
+_SAME, _VALID = 0, 1
 # Positions of the data, weights and bias operands of the weighted operators.
 _WEIGHTED = {"CONV_2D": (0, 1, 2), "DEPTHWISE_CONV_2D": (0, 1, 2), "FULLY_CONNECTED": (0, 1, 2),
              "TRANSPOSE_CONV": (2, 1, 3)}
@@ -605,6 +607,39 @@ _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V":
                       "MIRROR_PAD": (1,), "REVERSE_V2": (1,), "EMBEDDING_LOOKUP": (0,),
                       "DYNAMIC_UPDATE_SLICE": (2,), "ARG_MAX": (1,), "ARG_MIN": (1,),
                       "REDUCE_ALL": (1,), "SVDF": (1, 2, 3)}
+
+
+class Window(NamedTuple):
+    """The padding, filter, strides and dilations of a windowed operator, height first."""
+    padding: int
+    kernel: tuple
+    strides: tuple
+    dilations: tuple
+
+    @property
+    def spans(self) -> tuple:
+        """The rows and columns the filter covers with its dilation."""
+        return tuple((k - 1) * d + 1 for k, d in zip(self.kernel, self.dilations))
+
+    def outputs(self, extents) -> list[int]:
+        """The output height and width the padding gives an input of `extents`."""
+        return [(e + s - 1) // s if self.padding == _SAME else (e - span + s) // s
+                for e, span, s in zip(extents, self.spans, self.strides)]
+
+    def pads(self, extents, outputs) -> list[tuple[int, int]]:
+        """Per axis (begin, end) padding that turns `extents` into `outputs`."""
+        return [same_padding(e, o, span, s)
+                for e, o, span, s in zip(extents, outputs, self.spans, self.strides)]
+
+
+def window(kind: str, option, weights=None) -> Window:
+    """The window of a `_WINDOWED` operator. `option(slot, fmt, default)` reads
+    its options table; a weighted operator's filter is `weights`' dimensions 1 and 2."""
+    slot_w, slot_h, *dilations = _WINDOWED[kind]
+    kernel = tuple(weights[1:3]) if kind in _WEIGHTED else (option(4, "i", 0), option(3, "i", 0))
+    dilation_w, dilation_h = (1 if slot is None else option(slot, "i", 1) for slot in dilations)
+    return Window(option(0, "b", _SAME), kernel, (option(slot_h, "i", 0), option(slot_w, "i", 0)),
+                  (dilation_h, dilation_w))
 
 
 def _is_constant(tensor: _Tensor) -> bool:
@@ -954,32 +989,20 @@ def _window_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> st
         multiplier, channels, produced = op.option(3, "i"), ins[0].shape[3], outs[0].shape[3]
         if multiplier * channels != produced:
             return f"depth_multiplier {multiplier} for {channels} input and {produced} output channels"
-    padding = op.option(0, "b")
-    if padding not in (0, 1):
-        return f"padding {padding}, neither SAME nor VALID"
-    if op.kind in _WEIGHTED:
-        kernel = ins[1].shape[1:3]
-    else:
-        kernel = [op.option(4, "i"), op.option(3, "i")]
-    slot_w, slot_h, *dilations = _WINDOWED[op.kind]
-    stride_w, stride_h = op.option(slot_w, "i"), op.option(slot_h, "i")
-    dilation_w, dilation_h = (1 if slot is None else op.option(slot, "i", 1) for slot in dilations)
-    if min(stride_h, stride_w) < 1:
-        return f"a {stride_h}x{stride_w} stride; strides must be at least 1"
-    if min(kernel) < 1:
-        return f"a {kernel[0]}x{kernel[1]} filter; filter sizes must be at least 1"
+    win = window(op.kind, op.option, ins[1].shape if op.kind in _WEIGHTED else None)
+    if win.padding not in (_SAME, _VALID):
+        return f"padding {win.padding}, neither SAME nor VALID"
+    if min(win.strides) < 1:
+        return f"a {win.strides[0]}x{win.strides[1]} stride; strides must be at least 1"
+    if min(win.kernel) < 1:
+        return f"a {win.kernel[0]}x{win.kernel[1]} filter; filter sizes must be at least 1"
     # A transposed convolution's input is what a convolution of its output gives.
     source, target = (outs[0], ins[2]) if op.kind == "TRANSPOSE_CONV" else (ins[0], outs[0])
-    given = []
-    for extent, size, stride, dilation in zip(source.shape[1:3], kernel, (stride_h, stride_w),
-                                              (dilation_h, dilation_w)):
-        span = (size - 1) * dilation + 1
-        given.append((extent + stride - 1) // stride if padding == 0
-                     else (extent - span + stride) // stride)
+    given = win.outputs(source.shape[1:3])
     if given == list(target.shape[1:3]):
         return ""
     stated, found = ("x".join(map(str, dims)) for dims in (target.shape[1:3], given))
-    name = ("SAME", "VALID")[padding]
+    name = ("SAME", "VALID")[win.padding]
     if op.kind == "TRANSPOSE_CONV":
         return f"a {stated} input where {name} padding of the output gives {found}"
     return f"a {stated} output where {name} padding gives {found}"
@@ -1280,14 +1303,11 @@ class _Converter:
         elif kind == "FULLY_CONNECTED":
             y = self._fully_connected(op, tag)
         elif kind in ("MAX_POOL_2D", "AVERAGE_POOL_2D"):
-            source = self.tensors[ins[0]]
-            kh, kw = op.option(4, "i"), op.option(3, "i")
-            sh, sw = op.option(2, "i"), op.option(1, "i")
-            top, bottom = same_padding(source.shape[1], out.shape[1], kh, sh)
-            left, right = same_padding(source.shape[2], out.shape[2], kw, sw)
+            win = window(kind, op.option)
+            (top, bottom), (left, right) = win.pads(self.tensors[ins[0]].shape[1:3], out.shape[1:3])
             attributes = {"count_include_pad": 0} if kind == "AVERAGE_POOL_2D" else {}
             y = b.node("MaxPool" if kind == "MAX_POOL_2D" else "AveragePool", [self.value(ins[0])],
-                       tag, kernel_shape=[kh, kw], strides=[sh, sw],
+                       tag, kernel_shape=list(win.kernel), strides=list(win.strides),
                        pads=[top, left, bottom, right], **attributes)
         elif kind in ("ADD", "SUB", "MUL"):
             y = b.node({"ADD": "Add", "SUB": "Sub", "MUL": "Mul"}[kind], self.operands(op), tag)
@@ -1342,14 +1362,11 @@ class _Converter:
         elif kind == "L2_NORMALIZATION":
             y = self._l2_normalization(op, tag)
         elif kind == "L2_POOL_2D":
-            source = self.tensors[ins[0]]
-            kh, kw = op.option(4, "i"), op.option(3, "i")
-            sh, sw = op.option(2, "i"), op.option(1, "i")
-            top, bottom = same_padding(source.shape[1], out.shape[1], kh, sh)
-            left, right = same_padding(source.shape[2], out.shape[2], kw, sw)
+            win = window(kind, op.option)
+            (top, bottom), (left, right) = win.pads(self.tensors[ins[0]].shape[1:3], out.shape[1:3])
             x = self.value(ins[0])
             pooled = b.node("AveragePool", [b.node("Mul", [x, x], tag + "_square")], tag + "_mean",
-                            kernel_shape=[kh, kw], strides=[sh, sw],
+                            kernel_shape=list(win.kernel), strides=list(win.strides),
                             pads=[top, left, bottom, right], count_include_pad=0)
             y = b.node("Sqrt", [pooled], tag)
         elif kind in _REDUCTIONS or kind == "CUMSUM":
@@ -1948,36 +1965,31 @@ class _Converter:
         source, weights_tensor = self.tensors[op.inputs[0]], self.tensors[op.inputs[1]]
         out = self.tensors[op.outputs[0]]
         weights = np.transpose(weights_tensor.array(), (3, 0, 1, 2) if depthwise else (0, 3, 1, 2))
-        kh, kw = weights.shape[2], weights.shape[3]
-        sw, sh = op.option(1, "i"), op.option(2, "i")
-        dw, dh = (op.option(5, "i", 1), op.option(6, "i", 1)) if depthwise else (
-            op.option(4, "i", 1), op.option(5, "i", 1))
-        top, bottom = same_padding(source.shape[1], out.shape[1], (kh - 1) * dh + 1, sh)
-        left, right = same_padding(source.shape[2], out.shape[2], (kw - 1) * dw + 1, sw)
+        win = window(op.kind, op.option, weights_tensor.shape)
+        (top, bottom), (left, right) = win.pads(source.shape[1:3], out.shape[1:3])
         w = self.weights(weights_tensor, weights, 0)
         operands = [self.value(op.inputs[0]), w]
         bias = self._bias(op, 2, tag)
         if bias:
             operands.append(bias)
-        return self.b.node("Conv", operands, tag, kernel_shape=[kh, kw], strides=[sh, sw],
-                           dilations=[dh, dw], pads=[top, left, bottom, right],
+        return self.b.node("Conv", operands, tag, kernel_shape=list(win.kernel),
+                           strides=list(win.strides), dilations=list(win.dilations),
+                           pads=[top, left, bottom, right],
                            group=source.shape[3] if depthwise else 1)
 
     def _transpose_conv(self, op: _Operator, tag: str) -> str:
         source, weights_tensor = self.tensors[op.inputs[2]], self.tensors[op.inputs[1]]
         out = self.tensors[op.outputs[0]]
         weights = np.transpose(weights_tensor.array(), (3, 0, 1, 2))
-        kh, kw = weights.shape[2], weights.shape[3]
-        sw, sh = op.option(1, "i"), op.option(2, "i")
-        top, bottom = same_padding(out.shape[1], source.shape[1], kh, sh)
-        left, right = same_padding(out.shape[2], source.shape[2], kw, sw)
+        win = window(op.kind, op.option, weights_tensor.shape)
+        (top, bottom), (left, right) = win.pads(out.shape[1:3], source.shape[1:3])
         w = self.weights(weights_tensor, weights, 1)
         operands = [self.value(op.inputs[2]), w]
         bias = self._bias(op, 3, tag)
         if bias:
             operands.append(bias)
-        return self.b.node("ConvTranspose", operands, tag, kernel_shape=[kh, kw],
-                           strides=[sh, sw], pads=[top, left, bottom, right])
+        return self.b.node("ConvTranspose", operands, tag, kernel_shape=list(win.kernel),
+                           strides=list(win.strides), pads=[top, left, bottom, right])
 
     def _fully_connected(self, op: _Operator, tag: str) -> str:
         source, weights_tensor = self.tensors[op.inputs[0]], self.tensors[op.inputs[1]]

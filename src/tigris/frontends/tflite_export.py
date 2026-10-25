@@ -13,22 +13,25 @@ allocations grow by on the target; the best one is written only when it lowers
 that total.
 """
 
+import functools
 import itertools
 from dataclasses import dataclass, replace
 
 import numpy as np
 
 from tigris.frontends import tflite_writer as tw
-from tigris.frontends.qdq import same_padding
 from tigris.frontends.tflite import (
     _BUILTIN_OPERATORS,
+    _SAME,
     _TENSOR_TYPES,
     _TFLM_KERNELS,
+    _VALID,
     TFLM_TARGETS,
     TflmTarget,
     tflm_arena,
     tflm_persistent,
     tflm_tensor_bytes,
+    window,
 )
 
 # CONCATENATION takes at most this many inputs in TFLite Micro.
@@ -39,7 +42,6 @@ MAX_REGION = 12
 DEFAULT_TARGET = "arm-none-eabi"
 
 _INT8, _INT32 = _TENSOR_TYPES.index("INT8"), _TENSOR_TYPES.index("INT32")
-_SAME, _VALID = 0, 1
 _CODES = {name: code for code, name in enumerate(_BUILTIN_OPERATORS)}
 # BuiltinOptions union types of the operators the rewrite adds.
 _OPTION_TYPES = {"CONCATENATION": 10, "PAD": 22, "PADV2": 43, "SLICE": 48}
@@ -167,34 +169,22 @@ def _band_tensor(tensor: tw.Tensor) -> bool:
 
 def _conv_geometry(model: tw.Model, sg: tw.Subgraph, op: tw.Operator, kind: str):
     x, y = sg.tensors[op.inputs[0]], sg.tensors[op.outputs[0]]
+    weights = None
     if kind in _CONVS:
         w = sg.tensors[op.inputs[1]]
         if not _is_constant(model, w) or len(w.shape or []) != 4:
             return None
-        kh, kw = w.shape[1], w.shape[2]
-        slots = (4, 5) if kind == "CONV_2D" else (5, 6)
-        dw, dh = _option(op, slots[0], "i", 1), _option(op, slots[1], "i", 1)
-    else:
-        kh, kw = _option(op, 4, "i", 0), _option(op, 3, "i", 0)
-        dw = dh = 1
-    padding = _option(op, 0, "b", _SAME)
-    sw, sh = _option(op, 1, "i", 0), _option(op, 2, "i", 0)
-    if min(kh, kw, sw, sh, dw, dh) < 1:
+        weights = w.shape
+    win = window(kind, functools.partial(_option, op), weights)
+    if win.padding not in (_SAME, _VALID) or min(*win.kernel, *win.strides, *win.dilations) < 1:
         return None
-    eh, ew = (kh - 1) * dh + 1, (kw - 1) * dw + 1
     (h, w_), (oh, ow) = x.shape[1:3], y.shape[1:3]
-    if padding == _SAME:
-        if (oh, ow) != (-(-h // sh), -(-w_ // sw)):
-            return None
-        top, bottom = same_padding(h, oh, eh, sh)
-        left, right = same_padding(w_, ow, ew, sw)
-    elif padding == _VALID:
-        if h < eh or w_ < ew or (oh, ow) != ((h - eh) // sh + 1, (w_ - ew) // sw + 1):
-            return None
-        top = bottom = left = right = 0
-    else:
+    if win.padding == _VALID and (h < win.spans[0] or w_ < win.spans[1]):
         return None
-    return _Geometry(sh, eh, top, bottom, left, right)
+    if [oh, ow] != win.outputs((h, w_)):
+        return None
+    (top, bottom), (left, right) = win.pads((h, w_), (oh, ow))
+    return _Geometry(win.strides[0], win.spans[0], top, bottom, left, right)
 
 
 def _node(model: tw.Model, sg: tw.Subgraph, op: tw.Operator) -> _Node | None:
@@ -470,14 +460,11 @@ def _fold_pads(model: tw.Model) -> tuple[tw.Model, list[int]]:
         y = sg.tensors[conv.outputs[0]]
         h, w = x.shape[1:3]
         oh, ow = y.shape[1:3]
-        weights = sg.tensors[conv.inputs[1]].shape
-        slots = (4, 5) if kind == "CONV_2D" else (5, 6)
-        ew = (weights[2] - 1) * _option(conv, slots[0], "i", 1) + 1
-        sw = _option(conv, 1, "i", 0)
-        if (oh, ow) != (-(-h // g.stride), -(-w // sw)):
+        same = window(kind, functools.partial(_option, conv),
+                      sg.tensors[conv.inputs[1]].shape)._replace(padding=_SAME)
+        if [oh, ow] != same.outputs((h, w)):
             continue
-        if ([tuple(int(v) for v in pads[1]), tuple(int(v) for v in pads[2])]
-                != [same_padding(h, oh, g.kernel, g.stride), same_padding(w, ow, ew, sw)]):
+        if [tuple(int(v) for v in pads[1]), tuple(int(v) for v in pads[2])] != same.pads((h, w), (oh, ow)):
             continue
         folded.add(k)
         changed[users[0]] = replace(conv, inputs=[op.inputs[0], *conv.inputs[1:]],
