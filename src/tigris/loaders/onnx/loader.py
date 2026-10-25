@@ -13,7 +13,7 @@ from tigris.frontends.tflite import BOUNDARY_LAYOUT_KEY, STATE_KEY
 from tigris.graph.ir import AnalyzedGraph, OpNode, StatePort, TensorInfo
 from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.loaders.onnx.shapes import (
-    bind_free_dims, bodies, body_reads, fold_shape_subgraph, outer_reads)
+    bind_free_dims, bodies, body_reads, constant_value, fold_shape_subgraph, outer_reads)
 
 # One binding pass plus one fold usually resolves a stock export.  A fold can
 # expose shapes that let the next fold proceed, so iterate a few times and stop
@@ -222,7 +222,22 @@ def _graph_to_ag(graph: onnx.GraphProto, opset_import) -> AnalyzedGraph:
         raw_nodes.append(op)
 
     # --- DFS topological sort (prefer early consumption) ------------------
-    ag.ops = [raw_nodes[i] for i in _topo_sort(graph)]
+    # A Constant becomes a constant after the sort, which it takes part in, so
+    # the other operators keep their order.
+    ag.ops = []
+    for op in (raw_nodes[i] for i in _topo_sort(graph)):
+        value = constant_value(op.attrs) if op.op_type == "Constant" else None
+        if value is None:
+            ag.ops.append(op)
+            continue
+        ag.weight_data[op.outputs[0]] = value
+        info = ag.tensors.get(op.outputs[0])
+        if info is None:
+            ag.tensors[op.outputs[0]] = TensorInfo(
+                name=op.outputs[0], shape=tuple(value.shape),
+                dtype=onnx_helper.np_dtype_to_tensor_dtype(value.dtype), is_constant=True)
+        else:
+            info.is_constant = True
     for step, op in enumerate(ag.ops):
         op.step = step
 
