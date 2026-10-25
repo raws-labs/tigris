@@ -248,6 +248,14 @@ _CONSTANT_MOVES = ("STRIDED_SLICE", "SLICE", "PACK", "CONCATENATION", "RESHAPE",
 _CONSTANT_MATH = {"ADD": np.add, "SUB": np.subtract, "MUL": np.multiply}
 
 
+def _dropped_index(begin: int, extent: int, stride: int, masked: bool) -> "int | None":
+    """The element a STRIDED_SLICE takes from an axis it drops, as TFLite Micro
+    picks it (its begin_mask bit selects the first or last element), or None
+    when that index is outside the axis."""
+    index = (0 if stride > 0 else extent - 1) if masked else begin + extent if begin < 0 else begin
+    return index if 0 <= index < extent else None
+
+
 def _constant_move(op: "_Operator", ins) -> "np.ndarray | None":
     x = ins[0].array()
     if op.kind in ("RESHAPE", "SQUEEZE", "EXPAND_DIMS"):
@@ -279,8 +287,8 @@ def _constant_move(op: "_Operator", ins) -> "np.ndarray | None":
             return None
         begin, end = begins[axis], ends[axis] + (begins[axis] if offset else 0)
         if shrink_mask >> axis & 1:
-            begin = begin + extent if begin < 0 else begin
-            if not 0 <= begin < extent:
+            begin = _dropped_index(begin, extent, stride, bool(begin_mask >> axis & 1))
+            if begin is None:
                 return None
             index = [begin]
         else:
@@ -832,16 +840,19 @@ def _strided_slice_bounds(op: _Operator, ins: list[_Tensor]):
         return None
     bounds = []
     for axis, extent in enumerate(shape):
+        if shrink_mask >> axis & 1:
+            begin = _dropped_index(int(begins[axis]), extent, 1, bool(begin_mask >> axis & 1))
+            if begin is None:
+                return None
+            bounds.append((begin, 1, True))
+            continue
         begin = 0 if begin_mask >> axis & 1 else int(begins[axis])
         end = extent if end_mask >> axis & 1 else int(ends[axis])
         begin = min(max(begin + extent if begin < 0 else begin, 0), extent)
         end = min(max(end + extent if end < 0 else end, 0), extent)
-        shrink = bool(shrink_mask >> axis & 1)
-        if shrink:
-            end = begin + 1
         if end <= begin:
             return None
-        bounds.append((begin, end - begin, shrink))
+        bounds.append((begin, end - begin, False))
     return bounds
 
 
@@ -1024,6 +1035,11 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
         if any(op.option(4, "i") >> axis & 1 and step < 0 for axis, step in enumerate(steps)):
             # TFLite Micro leaves such an output unwritten.
             return "a dropped axis with a negative stride"
+        begins = [int(v) for v in ins[1].array().reshape(-1)]
+        if any(op.option(4, "i") >> axis & 1
+               and _dropped_index(begin, extent, step, bool(op.option(0, "i") >> axis & 1)) is None
+               for axis, (begin, extent, step) in enumerate(zip(begins, ins[0].shape, steps))):
+            return "a dropped axis at an index outside the axis"
     if op.kind == "REVERSE_V2":
         axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
         if not axes or axes != list(range(axes[0], axes[-1] + 1)):
@@ -1855,7 +1871,7 @@ class _Converter:
         starts, stops, sliced = [], [], []
         for axis, extent in enumerate(shape):
             if shrink >> axis & 1:
-                start = begins[axis] + extent if begins[axis] < 0 else begins[axis]
+                start = _dropped_index(begins[axis], extent, steps[axis], bool(begin_mask >> axis & 1))
                 stop, step = start + 1, 1
                 steps[axis] = 1
             else:
