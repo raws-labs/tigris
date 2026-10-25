@@ -322,7 +322,7 @@ def test_unrepresentable_pool_attributes_are_rejected(
         ("Concat", {"axis": 0}, ([1, 2, 3, 4], [1, 2, 3, 4], [2, 2, 3, 4]),
          "does not concatenate on the batch axis"),
         ("Resize", {"mode": "cubic", "coordinate_transformation_mode": "asymmetric"},
-         ([1, 1, 2, 2], [1, 1, 4, 4]), "must state a TFLite sampling convention"),
+         ([1, 1, 2, 2], [1, 1, 4, 4]), "Resize mode=cubic is not encoded"),
     ],
 )
 def test_onnx_operator_variants_outside_the_encoding_are_not_emitted(
@@ -396,7 +396,7 @@ def test_onnx_operator_variants_outside_the_encoding_are_not_emitted(
                 "input": TensorInfo("input", (1, 3, 4, 4), TensorProto.FLOAT),
                 "output": TensorInfo("output", (1, 3, 8, 8), TensorProto.FLOAT),
             },
-            "must state a TFLite sampling convention",
+            "Resize mode=linear is not encoded",
         ),
         (
             OpNode(
@@ -457,6 +457,26 @@ def test_unencoded_operator_variants_are_rejected(op, tensors, message):
 
     assert not validation.supported
     assert message in validation.describe()
+
+
+@pytest.mark.parametrize("nearest_mode", ["floor", "round_prefer_floor"])
+def test_non_nearest_resize_is_refused_for_its_mode_alone(nearest_mode):
+    resize = OpNode(
+        name="cubic_resize",
+        op_type="Resize",
+        inputs=["input"],
+        outputs=["output"],
+        attrs={"mode": "cubic", "coordinate_transformation_mode": "asymmetric",
+               "nearest_mode": nearest_mode},
+    )
+    tensors = {
+        "input": TensorInfo("input", (1, 3, 4, 4), TensorProto.FLOAT),
+        "output": TensorInfo("output", (1, 3, 8, 8), TensorProto.FLOAT),
+    }
+
+    validation = validate_operator_support(AnalyzedGraph(ops=[resize], tensors=tensors))
+
+    assert validation.describe() == "cubic_resize (Resize: Resize mode=cubic is not encoded)"
 
 
 def test_representable_operator_variants_are_supported():
