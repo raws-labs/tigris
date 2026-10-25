@@ -803,7 +803,7 @@ def test_attribute_payloads_start_four_byte_aligned(tmp_path):
     from tigris.cli import _run_pipeline
     from tigris.emitters.binary.defs import (OP_ATTR_PADS, OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
                                              OP_ATTRIBUTE_STRUCT)
-    from tigris.emitters.binary.writer import _build_op_attributes
+    from tigris.emitters.binary.writer import _build_op_attributes, _op_attribute_records
 
     model = helper.make_model(helper.make_graph(
         [helper.make_node("Transpose", ["input"], ["moved"], perm=[0, 2, 1]),
@@ -817,13 +817,84 @@ def test_attribute_payloads_start_four_byte_aligned(tmp_path):
     onnx.save(model, path)
     graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
     tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
-    section = _build_op_attributes(graph, tensor_idx)
+    section = _build_op_attributes(_op_attribute_records(graph, tensor_idx))
     count, _ = OP_ATTRIBUTE_SECTION_HEADER_STRUCT.unpack_from(section)
     entries = [OP_ATTRIBUTE_STRUCT.unpack_from(section, OP_ATTRIBUTE_SECTION_HEADER_STRUCT.size
                                                + k * OP_ATTRIBUTE_STRUCT.size) for k in range(count)]
     assert any(entry[1] == OP_ATTR_PADS for entry in entries)
     assert any(entry[2] % 4 for entry in entries), "the case needs a payload of odd length"
     assert all(entry[3] % 4 == 0 for entry in entries)
+
+
+def _restore_matmul(graph):
+    gemm = next(op for op in graph.ops if op.op_type == "Gemm")
+    gemm.op_type = "MatMul"
+    return "product (MatMul: 1 runtime input, the runtime takes 2)"
+
+
+def _fuse_into_softmax(graph):
+    next(op for op in graph.ops if op.op_type == "Softmax").attrs["fused_activation"] = "Relu"
+    return "scores (Softmax: fused activation Relu is not accepted)"
+
+
+def _softmax_over_a_constant(graph):
+    next(op for op in graph.ops if op.op_type == "Softmax").inputs = ["w"]
+    return "scores (Softmax: reads no runtime tensor)"
+
+
+def _contract_graph(tmp_path):
+    from tigris.cli import _run_pipeline
+
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node("MatMul", ["input", "w"], ["h"], name="product"),
+         helper.make_node("Softmax", ["h"], ["output"], axis=-1, name="scores")],
+        "contract", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 8])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 8])],
+        [numpy_helper.from_array(np.eye(8, dtype=np.float32), "w")]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    path = tmp_path / "contract.onnx"
+    onnx.save(model, path)
+    graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
+    return graph
+
+
+@pytest.mark.parametrize("violate", [_restore_matmul, _fuse_into_softmax, _softmax_over_a_constant])
+def test_an_operator_outside_its_contract_row_is_refused_by_name(tmp_path, violate):
+    """The writer refuses what the loader's contract table refuses, naming the operator."""
+    graph = _contract_graph(tmp_path)
+    emit_binary_bytes(graph)
+    reason = violate(graph)
+
+    with pytest.raises(ValueError) as refusal:
+        emit_binary_bytes(graph)
+    assert str(refusal.value) == (
+        "Cannot emit a plan with operators outside their runtime contract: " + reason)
+
+
+def test_a_tensor_outside_its_operator_dtype_slots_is_named(tmp_path):
+    """Dtype validation refuses this first; the contract check states the same slots."""
+    from tigris.emitters.binary.writer import _contract_violations, _op_attribute_records
+
+    graph = _contract_graph(tmp_path)
+    graph.tensors["h"].dtype = 6
+    tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
+
+    assert _contract_violations(graph, tensor_idx, {}, _op_attribute_records(graph, tensor_idx)) == [
+        "product (Gemm: output 0 has ONNX dtype 6, which its slot does not take)",
+        "scores (Softmax: input 0 has ONNX dtype 6, which its slot does not take)"]
+
+
+def test_an_operator_writing_no_runtime_tensor_is_named(tmp_path):
+    """The declared-output check refuses this first; the contract check names it alone."""
+    from tigris.emitters.binary.writer import _contract_violations, _op_attribute_records
+
+    graph = _contract_graph(tmp_path)
+    next(op for op in graph.ops if op.op_type == "Softmax").outputs = ["w"]
+    tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
+
+    assert _contract_violations(graph, tensor_idx, {}, _op_attribute_records(graph, tensor_idx)) == [
+        "scores (Softmax: writes no runtime tensor)"]
 
 
 @pytest.mark.parametrize("state", [False, True])

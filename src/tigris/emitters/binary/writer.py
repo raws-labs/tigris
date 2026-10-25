@@ -23,6 +23,17 @@ from tigris.graph.ir import (
     serialized_transpose_perm,
     state_tensor_names,
 )
+from tigris.operator_contract import (
+    ATTRIBUTES,
+    BOOL_OR_INT32,
+    CONTROL_FLOW_VALUE,
+    DATA,
+    DATA_OR_BOOL,
+    DATA_OR_INT32,
+    FLOAT_OR_DATA,
+    OPERATOR_CONTRACT,
+    STATE,
+)
 
 from .defs import (
     ACT_NONE,
@@ -921,17 +932,12 @@ def _lstm_payload(ag: AnalyzedGraph, op: OpNode) -> bytes:
         *pairs)
 
 
-def _build_op_attributes(
+def _op_attribute_records(
     ag: AnalyzedGraph, tensor_idx: dict[str, int],
     quant_idx_map: dict[str, int] | None = None,
     weight_idx: dict[str, int] | None = None,
-) -> bytes:
-    """Build optional, typed per-operator attributes.
-
-    The section is intentionally omitted when no operator needs metadata.
-    Its fixed-width records keep the loader zero-copy while the data pool
-    carries variable-sized payloads such as a Transpose permutation.
-    """
+) -> list[tuple[int, int, bytes]]:
+    """The optional, typed per-operator attributes as (operator, kind, payload)."""
     records: list[tuple[int, int, bytes]] = []
     for op_index, op in enumerate(ag.ops):
         constant = _constant_operand_payload(ag, op, quant_idx_map or {})
@@ -1053,10 +1059,19 @@ def _build_op_attributes(
             output_info.layout,
         ))
         records.append((op_index, OP_ATTR_TRANSPOSE_PERM, serialized_perm))
+    return records
 
+
+def _build_op_attributes(records: list[tuple[int, int, bytes]]) -> bytes:
+    """Build the operator-attribute section from its records.
+
+    The section is intentionally omitted when no operator needs metadata.
+    Its fixed-width records keep the loader zero-copy while the data pool
+    carries variable-sized payloads such as a Transpose permutation.
+    """
     if not records:
         return b""
-    records.sort(key=lambda record: (record[0], record[1]))
+    records = sorted(records, key=lambda record: (record[0], record[1]))
     if len(records) > 0xFFFF:
         raise ValueError("operator-attribute count exceeds uint16 plan limit")
 
@@ -1156,6 +1171,90 @@ def _compute_act_bounds(
     return act_min, act_max
 
 
+def _fused_activation(op: OpNode) -> int:
+    return {"Relu": ACT_RELU, "Relu6": ACT_RELU6}.get(op.attrs.get("fused_activation"), ACT_NONE)
+
+
+def _slot_takes(dtype: int, role: int, data_dtype: int) -> bool:
+    """Whether a tensor of ``dtype`` fits a contract dtype slot, as the loader decides."""
+    accepted = {FLOAT_OR_DATA: (1, data_dtype), DATA_OR_INT32: (data_dtype, 6),
+                BOOL_OR_INT32: (9, 6), CONTROL_FLOW_VALUE: (data_dtype, 6, 1),
+                STATE: (data_dtype, 5), DATA_OR_BOOL: (data_dtype, 6, 9)}
+    return dtype in accepted.get(role, (data_dtype if role == DATA else role,))
+
+
+def _count_reason(label: str, count: int, bounds: tuple[int, int]) -> str | None:
+    """Why ``count`` operands fall outside ``bounds``, or None when they fit."""
+    if bounds[0] <= count <= bounds[1]:
+        return None
+    span = str(bounds[0]) if bounds[0] == bounds[1] else f"{bounds[0]} to {bounds[1]}"
+    return f"{count} runtime {label}{'' if count == 1 else 's'}, the runtime takes {span}"
+
+
+def _contract_violations(
+    ag: AnalyzedGraph, tensor_idx: dict[str, int], weight_idx: dict[str, int],
+    records: list[tuple[int, int, bytes]],
+) -> list[str]:
+    """Each emitted operator the loader would refuse by its contract row, with the reasons.
+
+    Checks the fields the runtime's generated contract table carries: operand
+    counts, the fused activation, attribute kinds and dtype slots. The weight
+    and bias columns are not in that table; the per-operator validators
+    enforce them.
+    """
+    attributes: dict[int, dict[int, bytes]] = {}
+    for op_index, kind, payload in records:
+        attributes.setdefault(op_index, {})[kind] = payload
+    data_dtype = 3 if any(ag.tensors[name].dtype == 3 for name in tensor_idx) else 1
+    issues = []
+    for op_index, op in enumerate(ag.ops):
+        row = OPERATOR_CONTRACT[op.op_type]
+        present = attributes.get(op_index, {})
+        inputs = [ag.tensors[n].dtype for n in op.inputs if n in tensor_idx]
+        outputs = [ag.tensors[n].dtype for n in op.outputs if n in tensor_idx]
+        reasons = []
+        # The loader refuses an operator without operands before it counts them.
+        if not inputs and OP_ATTR_TABLE_SHAPE not in present:
+            reasons.append("reads no runtime tensor")
+        elif reason := _count_reason("input", len(inputs), row.inputs):
+            reasons.append(reason)
+        if not outputs:
+            reasons.append("writes no runtime tensor")
+        elif reason := _count_reason("output", len(outputs), row.outputs):
+            reasons.append(reason)
+        dtype = (inputs or outputs or [data_dtype])[0]
+        if _fused_activation(op) != ACT_NONE and not (
+                "fused" in row.modes or ("fused_float" in row.modes and dtype == 1)):
+            reasons.append(f"fused activation {op.attrs['fused_activation']} is not accepted")
+        reasons.extend(f"attribute {ATTRIBUTES[kind].name} is not accepted"
+                       for kind in sorted(set(present) - set(row.attributes)))
+        reasons.extend(f"attribute {ATTRIBUTES[kind].name} is missing"
+                       for kind in row.required_attributes if kind not in present)
+        floating = op.op_type not in {"Quantize", "Dequantize", "If", "While",
+                                      "DetectionPostProcess"} and 1 in inputs
+        op_dtype = 1 if data_dtype == 3 and floating else data_dtype
+        constant_slot = present.get(OP_ATTR_CONSTANT_OPERAND)
+        weighted = op.op_type == "DynamicUpdateSlice" and any(n in weight_idx for n in op.inputs)
+        for position, tensor_dtype in enumerate(inputs):
+            slot = position
+            if constant_slot is not None and constant_slot[0] <= slot:
+                slot += 1
+            elif weighted and slot >= 1:
+                slot += 1
+            if OP_ATTR_TABLE_SHAPE in present:
+                slot += 1
+            if not _slot_takes(tensor_dtype, row.signature.inputs[min(slot, 2)], op_dtype):
+                reasons.append(f"input {position} has ONNX dtype {tensor_dtype}, "
+                               "which its slot does not take")
+        for position, tensor_dtype in enumerate(outputs):
+            if not _slot_takes(tensor_dtype, row.signature.outputs[0], op_dtype):
+                reasons.append(f"output {position} has ONNX dtype {tensor_dtype}, "
+                               "which its slot does not take")
+        if reasons:
+            issues.append(f"{op.name} ({op.op_type}: {'; '.join(reasons)})")
+    return issues
+
+
 def _build_ops(
     ag: AnalyzedGraph,
     tensor_idx: dict[str, int],
@@ -1189,9 +1288,7 @@ def _build_ops(
         w_idx, b_idx = ((NO_WEIGHT, NO_WEIGHT) if op.op_type in _MANY_CONSTANTS | {"While"}
                         else _resolve_weight_bias(op, weight_idx))
 
-        # Determine fused activation
-        fused_act_str = op.attrs.get("fused_activation")
-        fused_act = {"Relu": ACT_RELU, "Relu6": ACT_RELU6}.get(fused_act_str, ACT_NONE)
+        fused_act = _fused_activation(op)
         act_min, act_max = _compute_act_bounds(ag, op, fused_act)
 
         # tigris_op_t: 38 bytes (layout retained by schema v3)
@@ -1737,9 +1834,14 @@ def _emit(
     model_io_off, model_io_count = index_pool.add(model_inp_indices + model_out_indices)
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
-    op_attributes_data = _build_op_attributes(
-        ag, tensor_idx, quant_idx_map, weight_idx
-    )
+    attribute_records = _op_attribute_records(ag, tensor_idx, quant_idx_map, weight_idx)
+    violations = _contract_violations(ag, tensor_idx, weight_idx, attribute_records)
+    if violations:
+        raise ValueError(
+            "Cannot emit a plan with operators outside their runtime contract: "
+            + ", ".join(violations)
+        )
+    op_attributes_data = _build_op_attributes(attribute_records)
     stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
     version = SCHEMA_VERSION
     tile_data, stage_to_tile = _build_tile_plans(ag)
