@@ -5,8 +5,6 @@ from pathlib import Path
 
 import click
 
-from tigris.emitters.binary.writer import RUNTIME_MAX_TENSORS
-
 from tigris.cli import (
     cli,
     text,
@@ -135,18 +133,7 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
             f"the flash budget is {fmt_bytes(ag.budget.flash)}")
     out.write_bytes(plan_data)
 
-    # The count follows from the model, so it is not something to set; what it
-    # decides is how the target has to be built. A target built for fewer
-    # refuses the plan and says so, which is why this is a note and not a
-    # failure.
-    runtime_tensors = sum(
-        1 for info in ag.tensors.values() if not info.is_constant)
     text.echo()
-    if runtime_tensors > RUNTIME_MAX_TENSORS:
-        text.echo(text.warn("warning: ") +
-                  f"the plan holds {runtime_tensors} tensors, more than the "
-                  f"{RUNTIME_MAX_TENSORS} a runtime carries by default; build the "
-                  f"runtime with -DTIGRIS_MAX_TENSORS={runtime_tensors}")
     note = ""
     if compress_arg:
         note = (f", LZ4, {fmt_bytes(weight_reserve)} of the {fmt_bytes(budget)} fast memory "
