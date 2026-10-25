@@ -97,7 +97,7 @@ def run(plan: Path, input_files: tuple[str, ...], output: Path, as_json: bool):
                       "output": str(output), "memory": session.memory,
                       "tensors": [{"name": name, "dtype": str(value.dtype), "shape": list(value.shape)}
                                   for name, value in outputs.items()]}
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     if as_json:
         click.echo(json.dumps(report, indent=2))

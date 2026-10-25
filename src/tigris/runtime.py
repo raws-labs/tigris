@@ -140,23 +140,31 @@ class Session:
         manifest_path = path.with_name("manifest.json")
         if not manifest_path.exists():
             return
-        from tigris.zoo import runtime_matches, validate_runtime
+        from tigris.zoo import runtime_matches, validate_artifact, validate_runtime
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        files = manifest.get("files", [])
-        entry = next((item for item in files if item.get("path") == path.name), None)
-        if entry is None:
+        files = manifest.get("files") if isinstance(manifest, dict) else None
+        if not isinstance(files, list) or not any(
+                isinstance(item, dict) and item.get("path") == path.name for item in files):
             return
-        if entry.get("sha256") != hashlib.sha256(data).hexdigest():
+        try:
+            validate_artifact(manifest)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid zoo manifest: {exc}") from exc
+        entry = next(item for item in manifest["files"] if item["path"] == path.name)
+        if entry["sha256"] != hashlib.sha256(data).hexdigest():
             raise RuntimeError("Plan checksum differs from the zoo manifest")
         dependency = manifest["runtime"]
         receipt_path = path.with_name("download.json")
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            if receipt.get("artifact_id") != manifest.get("id"):
+            try:
+                validate_runtime(receipt.get("runtime") if isinstance(receipt, dict) else None)
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid zoo download record: {exc}") from exc
+            if receipt.get("artifact_id") != manifest["id"]:
                 raise RuntimeError("Zoo download record belongs to another artifact")
             dependency = receipt["runtime"]
-        validate_runtime(dependency)
         if not runtime_matches(dependency, Version(self.runtime_version)):
             raise RuntimeError(f"Model requires runtime {dependency['min']} through "
                                f"{dependency['max'] or 'no known upper limit'}; "
