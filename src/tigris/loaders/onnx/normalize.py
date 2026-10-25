@@ -2,8 +2,6 @@
 
 Passes applied in sequence (matches ``normalize()`` call order):
 
- 0. **Constant folding**: Convert ONNX Constant ops to weight_data so
-    downstream passes can read values directly.
  1. **QDQ fold**: For quantized (QDQ) models, fold QuantizeLinear /
     DequantizeLinear ops -- extract scale/zero-point, store as
     ``QuantParam`` on tensors, keep int8 weight data, remove Q/DQ ops.
@@ -39,6 +37,7 @@ import math
 from dataclasses import replace
 
 import numpy as np
+from onnx.helper import np_dtype_to_tensor_dtype
 
 from tigris.capabilities import effective_operators
 from tigris.analysis.broadcast import DENSE, GENERAL, PERIODIC, stored_operands
@@ -51,6 +50,7 @@ from tigris.graph.ir import (
     serialized_axis_map,
     serialized_shape,
 )
+from tigris.loaders.onnx.shapes import static_value
 
 
 def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
@@ -69,7 +69,6 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _narrow_index_casts(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
-    ag = _fold_constant_ops(ag)
     ag = _fold_static_subgraphs(ag)
     ag = _fold_gelu(ag)
     ag = _fold_elementwise_patterns(ag)
@@ -1278,159 +1277,7 @@ def _relabel_shape_ops_to_reshape(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-# Constant folding
-
-
-def _fold_constant_ops(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Fold ONNX Constant ops into weight_data.
-
-    ONNX Constant nodes produce a tensor from an attribute value rather
-    than from a graph initializer.  This pass converts them into weight
-    data entries so downstream passes (QDQ fold, Resize scale extraction)
-    can find them in ``ag.weight_data``.
-    """
-    from onnx import numpy_helper
-
-    removed: set[int] = set()
-    for i, op in enumerate(ag.ops):
-        if op.op_type != "Constant":
-            continue
-        val = op.attrs.get("value")
-        if val is None:
-            continue
-        out_name = op.outputs[0]
-        arr = numpy_helper.to_array(val)
-        ag.weight_data[out_name] = arr
-        if out_name in ag.tensors:
-            ag.tensors[out_name].is_constant = True
-        else:
-            ag.tensors[out_name] = TensorInfo(
-                name=out_name,
-                shape=tuple(arr.shape),
-                dtype=1,  # FLOAT
-                is_constant=True,
-            )
-        removed.add(i)
-
-    if removed:
-        ag.ops = [op for i, op in enumerate(ag.ops) if i not in removed]
-        for step, op in enumerate(ag.ops):
-            op.step = step
-
-    return ag
-
-
-# Quantization
-
-
-# A folded value stands in for an operator, so it has to stay the size of a
-# shape rather than of an activation.
-_STATIC_FOLD_LIMIT = 4096
-
-_ONNX_DTYPE_OF: dict[type, int] = {
-    np.float32: 1,
-    np.int32: 6,
-    np.int64: 7,
-    np.bool_: 9,
-    np.float64: 11,
-}
-
-# ONNX TensorProto dtypes this evaluator can materialize, and their numpy
-# equivalents. Anything else leaves its operator in the graph.
-_STATIC_DTYPES: dict[int, type] = {
-    1: np.float32,
-    6: np.int32,
-    7: np.int64,
-    9: np.bool_,
-    11: np.float64,
-}
-
-
-def _static_operand(
-    ag: AnalyzedGraph, name: str, known: dict[str, np.ndarray]
-) -> np.ndarray | None:
-    """The value of *name* when the graph settles it before it runs."""
-    if name in known:
-        return known[name]
-    return ag.weight_data.get(name)
-
-
-def _evaluate_static(
-    op: OpNode, values: list[np.ndarray]
-) -> np.ndarray | None:
-    """Compute an operator whose operands the graph already settles.
-
-    Only the shape arithmetic an exporter leaves behind is covered: enough to
-    resolve a scale stated as ``1 / sqrt(Shape(q)[-1])``, which is how an
-    attention block writes its scale when the exporter traces it instead of
-    folding it. An operator outside this set keeps its place in the graph.
-    """
-    kind = op.op_type
-    if kind == "Cast":
-        target = _STATIC_DTYPES.get(int(op.attrs.get("to", 0)))
-        return None if target is None else values[0].astype(target)
-    if kind == "Sqrt":
-        return np.sqrt(values[0])
-    if kind == "Reciprocal":
-        return np.reciprocal(values[0])
-    if kind == "Neg":
-        return -values[0]
-    if kind in ("Add", "Sub", "Mul", "Div", "Pow", "Min", "Max"):
-        left, right = values[0], values[1]
-        if kind == "Add":
-            return left + right
-        if kind == "Sub":
-            return left - right
-        if kind == "Mul":
-            return left * right
-        if kind == "Pow":
-            return np.power(left, right)
-        if kind == "Min":
-            return np.minimum(left, right)
-        if kind == "Max":
-            return np.maximum(left, right)
-        if np.any(right == 0):
-            return None
-        return left / right
-    if kind == "Concat":
-        return np.concatenate(
-            [np.atleast_1d(v) for v in values], axis=int(op.attrs.get("axis", 0))
-        )
-    if kind == "Gather":
-        return np.take(values[0], values[1], axis=int(op.attrs.get("axis", 0)))
-    if kind == "Unsqueeze":
-        axes = op.attrs.get("axes")
-        if axes is None and len(values) > 1:
-            axes = values[1]
-        return None if axes is None else np.expand_dims(
-            values[0], tuple(int(a) for a in np.atleast_1d(axes))
-        )
-    if kind == "Squeeze":
-        axes = op.attrs.get("axes")
-        if axes is None and len(values) > 1:
-            axes = values[1]
-        if axes is None:
-            return np.squeeze(values[0])
-        return np.squeeze(values[0], tuple(int(a) for a in np.atleast_1d(axes)))
-    if kind == "Reshape":
-        return values[0].reshape([int(d) for d in np.atleast_1d(values[1])])
-    if kind == "Slice":
-        data = values[0]
-        starts = [int(v) for v in np.atleast_1d(values[1])]
-        ends = [int(v) for v in np.atleast_1d(values[2])]
-        axes = ([int(v) for v in np.atleast_1d(values[3])] if len(values) > 3
-                else list(range(len(starts))))
-        steps = ([int(v) for v in np.atleast_1d(values[4])] if len(values) > 4
-                 else [1] * len(starts))
-        if len(starts) != len(ends) or len(axes) != len(starts):
-            return None
-        index: list[slice] = [slice(None)] * data.ndim
-        for axis, start, end, step in zip(axes, starts, ends, steps):
-            if step == 0 or not -data.ndim <= axis < data.ndim:
-                return None
-            index[axis] = slice(start, end, step)
-        return data[tuple(index)]
-    return None
+# Static folding
 
 
 def _fold_static_subgraphs(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -1450,6 +1297,15 @@ def _fold_static_subgraphs(ag: AnalyzedGraph) -> AnalyzedGraph:
     produced_outputs = set(ag.model_outputs)
     removed: set[int] = set()
 
+    def value_of(name: str) -> np.ndarray | None:
+        return known[name] if name in known else ag.weight_data.get(name)
+
+    def shape_of(name: str) -> tuple[int, ...] | None:
+        info = ag.tensors.get(name)
+        if info is None or any(int(extent) <= 0 for extent in info.shape):
+            return None
+        return tuple(int(extent) for extent in info.shape)
+
     progressed = True
     while progressed:
         progressed = False
@@ -1459,28 +1315,8 @@ def _fold_static_subgraphs(ag: AnalyzedGraph) -> AnalyzedGraph:
             result_name = op.outputs[0]
             if result_name in produced_outputs or result_name in known:
                 continue
-            if op.op_type == "Shape":
-                source = ag.tensors.get(op.inputs[0])
-                if source is None or not source.shape:
-                    continue
-                if any(int(extent) <= 0 for extent in source.shape):
-                    continue
-                value = np.array(
-                    [int(extent) for extent in source.shape], dtype=np.int64)
-            else:
-                operands = [
-                    _static_operand(ag, name, known) for name in op.inputs if name
-                ]
-                if not operands or any(v is None for v in operands):
-                    continue
-                try:
-                    value = _evaluate_static(op, operands)
-                except (ValueError, IndexError, TypeError):
-                    value = None
-                if value is None:
-                    continue
-            value = np.ascontiguousarray(value)
-            if value.size > _STATIC_FOLD_LIMIT:
+            value = static_value(op.op_type, op.attrs, op.inputs, value_of, shape_of)
+            if value is None:
                 continue
             known[result_name] = value
             removed.add(index)
@@ -1495,7 +1331,7 @@ def _fold_static_subgraphs(ag: AnalyzedGraph) -> AnalyzedGraph:
         if info is None:
             ag.tensors[name] = TensorInfo(
                 name=name, shape=tuple(value.shape),
-                dtype=_ONNX_DTYPE_OF.get(value.dtype.type, 1), is_constant=True)
+                dtype=np_dtype_to_tensor_dtype(value.dtype), is_constant=True)
         else:
             info.shape = tuple(value.shape)
             info.is_constant = True
