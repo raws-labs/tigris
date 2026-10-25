@@ -13,7 +13,11 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.cli import cli
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
-from tigris.loaders.onnx.normalize import _adopt_detection, _decompose_silu
+from tigris.loaders.onnx.normalize import (
+    _adopt_detection,
+    _decompose_silu,
+    _transpose_product_weights,
+)
 
 
 def _f32(name, value):
@@ -160,6 +164,33 @@ def _split_part():
                   [_f32("w", np.arange(64).reshape(8, 8) / 64), _f32("w_part0", [[1, 2, 3, 4]])])
 
 
+def _matmul_weight_mixed():
+    """One weight read as stored by a Gemm and transposed by a MatMul."""
+    nodes = [_gemm("x", "w", out="y1"), helper.make_node("MatMul", ["x", "w"], ["y2"])]
+    return _model(nodes, [("x", [3, 4])], [("y1", [3, 4]), ("y2", [3, 4])],
+                  [_f32("w", np.arange(16).reshape(4, 4) / 16)])
+
+
+def _matmul_weight_shared_rows():
+    """Two batched products read one weight."""
+    nodes = [helper.make_node("MatMul", ["x", "w"], ["h"]), helper.make_node("Relu", ["h"], ["r"]),
+             helper.make_node("MatMul", ["r", "w"], ["y"])]
+    return _model(nodes, [("x", [1, 8, 8])], [("y", [1, 8, 8])],
+                  [_f32("w", np.arange(64).reshape(8, 8) / 64 - 0.5)])
+
+
+def _matmul_weight_across_passes(other_reader=False):
+    """A rank-2 and a batched product read one weight, optionally next to an Add."""
+    nodes = [helper.make_node("MatMul", ["a", "w"], ["ya"]),
+             helper.make_node("MatMul", ["b", "w"], ["yb"])]
+    inputs, outputs = [("a", [4, 8]), ("b", [1, 4, 8])], [("ya", [4, 8]), ("yb", [1, 4, 8])]
+    if other_reader:
+        nodes.append(helper.make_node("Add", ["d", "w"], ["yd"]))
+        inputs.append(("d", [8, 8]))
+        outputs.append(("yd", [8, 8]))
+    return _model(nodes, inputs, outputs, [_f32("w", np.arange(64).reshape(8, 8) / 64 - 0.5)])
+
+
 CASES = {
     "bias_name_taken": _bias_name_taken,
     "conv_weight_shared": _conv_weight_shared,
@@ -175,18 +206,25 @@ CASES = {
     "layout_output": _layout_output,
     "product_rows": _product_rows,
     "split_part": _split_part,
+    "matmul_weight_mixed": _matmul_weight_mixed,
+    "matmul_weight_shared_rows": _matmul_weight_shared_rows,
+    "matmul_weight_across_passes": _matmul_weight_across_passes,
+    "matmul_weight_across_passes_and_add": lambda: _matmul_weight_across_passes(other_reader=True),
 }
 
 
 @pytest.mark.usefixtures("require_host_library")
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_normalized_model_matches_onnx_runtime(tmp_path, case):
+    _assert_matches_onnx_runtime(tmp_path, CASES[case](), "256K")
+
+
+def _assert_matches_onnx_runtime(tmp_path, model, budget):
     from tigris.runtime import Session
 
-    model = CASES[case]()
-    source, plan = tmp_path / f"{case}.onnx", tmp_path / f"{case}.tgrs"
+    source, plan = tmp_path / "model.onnx", tmp_path / "model.tgrs"
     onnx.save(model, source)
-    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "256K", "-o", str(plan)])
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", budget, "-o", str(plan)])
     assert result.exit_code == 0, result.output
     rng = np.random.default_rng(5)
     feed = {i.name: rng.uniform(-2, 2, [d.dim_value for d in i.type.tensor_type.shape.dim]).astype(np.float32)
@@ -199,6 +237,57 @@ def test_normalized_model_matches_onnx_runtime(tmp_path, case):
         got = actual[output.name]
         np.testing.assert_allclose(got if value.ndim < 3 else np.moveaxis(got, -1, 1), value,
                                    rtol=1e-5, atol=1e-5, err_msg=output.name)
+
+
+@pytest.mark.usefixtures("require_host_library")
+@pytest.mark.parametrize("budget", ["64K", "1M"])
+@pytest.mark.parametrize("softmax", [False, True])
+def test_products_sharing_a_weight_transpose_it_once(tmp_path, softmax, budget):
+    weight = np.random.default_rng(1).standard_normal((128, 128)) * 0.05
+    nodes = [helper.make_node("MatMul", ["x", "w"], ["h"])]
+    if softmax:
+        nodes.append(helper.make_node("Softmax", ["h"], ["p"], axis=-1))
+    nodes.append(helper.make_node("MatMul", ["p" if softmax else "h", "w"], ["y"]))
+    model = _model(nodes, [("x", [512, 128])], [("y", [512, 128])], [_f32("w", weight)])
+
+    ag = load_model(_save(tmp_path, model))
+
+    assert [op.inputs[1] for op in ag.ops if op.op_type == "Gemm"] == ["w", "w"]
+    np.testing.assert_array_equal(ag.weight_data["w"], weight.astype(np.float32).T)
+    _assert_matches_onnx_runtime(tmp_path, model, budget)
+
+
+@pytest.mark.parametrize("other_reader", [False, True])
+def test_products_before_and_after_layouts_read_one_transposed_copy(tmp_path, other_reader):
+    """The rank-2 product is relabeled before layouts and the batched one is
+    lowered after them; both read the copy the first pass made."""
+    ag = load_model(_save(tmp_path, _matmul_weight_across_passes(other_reader)))
+
+    weight = np.arange(64, dtype=np.float32).reshape(8, 8) / 64 - 0.5
+    copies = {op.inputs[1] for op in ag.ops if op.op_type == "Gemm"}
+    assert len(copies) == 1
+    np.testing.assert_array_equal(ag.weight_data[copies.pop()], weight.T)
+    assert len(ag.weight_data) == (2 if other_reader else 1)
+    if other_reader:
+        add = next(op for op in ag.ops if op.op_type == "Add")
+        np.testing.assert_array_equal(ag.weight_data[add.inputs[1]], weight)
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_a_recorded_copy_is_read_only_while_it_holds_the_transpose(stale):
+    weight = np.arange(6, dtype=np.float32).reshape(2, 3)
+    graph = AnalyzedGraph(
+        ops=[OpNode(name="product", op_type="MatMul", inputs=["x", "w"], outputs=["y"])],
+        tensors={"w": TensorInfo("w", (2, 3), 1, is_constant=True),
+                 "w_1": TensorInfo("w_1", (3, 2), 1, is_constant=True)},
+        weight_data={"w": weight, "w_1": weight.T + (1 if stale else 0)})
+
+    _transpose_product_weights(graph, {"w": graph.ops}, {"w": "w_1"})
+
+    read = graph.ops[0].inputs[1]
+    assert read == ("w" if stale else "w_1")
+    np.testing.assert_array_equal(graph.weight_data[read], weight.T)
+    assert graph.tensors[read].shape == (3, 2)
 
 
 def _producers(ag):

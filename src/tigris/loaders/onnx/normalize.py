@@ -59,6 +59,7 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     """Apply all normalization passes in sequence; ``subgraph`` for a graph an
     If or While runs."""
     declared_outputs = list(ag.model_outputs)
+    transposed: dict[str, str] = {}
     ag = _adopt_tflite_gelu(ag)
     ag = _adopt_tflite_cumsum(ag)
     ag = _adopt_svdf(ag)
@@ -80,7 +81,7 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _quantize_float_biases(ag)
     ag = _fold_float_square(ag)
     ag = _fold_gemm_scalars(ag)
-    ag = _relabel_matmul_to_gemm(ag)
+    ag = _relabel_matmul_to_gemm(ag, transposed)
     ag = _fold_bn(ag)
     ag = _standalone_bn_as_affine(ag)
     ag = _fold_sub_constant_to_add(ag)
@@ -114,7 +115,7 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _mark_untileable_broadcasts(ag)
     ag = _gather_one_index_to_split(ag)
     ag = _relabel_shape_ops_to_reshape(ag)
-    ag = _lower_linear_matmul(ag)
+    ag = _lower_linear_matmul(ag, transposed)
     ag = _drop_unreferenced_weights(ag)
     ag = _restore_output_names(ag, declared_outputs)
     return ag
@@ -1092,7 +1093,7 @@ def _quant_of_blocks(
             for start, size in blocks]
 
 
-def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
+def _lower_linear_matmul(ag: AnalyzedGraph, transposed: dict[str, str]) -> AnalyzedGraph:
     """Express a batched constant-weight matrix product with the FC kernel.
 
     ONNX MatMul reduces over the last axis and batches over everything before
@@ -1105,40 +1106,41 @@ def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
     linear tensor; on a spatial one the rows are interleaved. A product whose
     second operand is not a constant matrix is left alone: it needs a kernel
     that multiplies two activations, which the runtime does not have.
+    ``transposed`` is the record ``_transpose_product_weights`` keeps.
     """
-    consumers: dict[str, int] = {}
+    products: dict[str, list[OpNode]] = {}
     for op in ag.ops:
-        for name in op.inputs:
-            consumers[name] = consumers.get(name, 0) + 1
+        if (op.op_type != "MatMul" or len(op.inputs) not in (2, 3)
+                or len(op.outputs) != 1):
+            continue
+        weight = ag.weight_data.get(op.inputs[1])
+        data_info = ag.tensors.get(op.inputs[0])
+        if (weight is None or weight.ndim != 2 or data_info is None
+                or op.outputs[0] not in ag.tensors or len(data_info.shape) < 3
+                or data_info.layout is not Layout.LINEAR
+                or int(data_info.shape[-1]) != int(weight.shape[0])):
+            continue
+        products.setdefault(op.inputs[1], []).append(op)
+    # The FC kernel indexes the weight as W[oc * IC + ic], which is Gemm
+    # with transB=1; ONNX MatMul states it the other way round.
+    _transpose_product_weights(ag, products, transposed)
+    lowered = {id(op) for readers in products.values() for op in readers}
 
     rewritten: list[OpNode] = []
     counter = 0
 
     for op in ag.ops:
-        if (op.op_type != "MatMul" or len(op.inputs) not in (2, 3)
-                or len(op.outputs) != 1):
+        if id(op) not in lowered:
             rewritten.append(op)
             continue
 
-        weight_name = op.inputs[1]
-        weight = ag.weight_data.get(weight_name)
-        data_info = ag.tensors.get(op.inputs[0])
-        out_info = ag.tensors.get(op.outputs[0])
-        if (weight is None or weight.ndim != 2 or data_info is None
-                or out_info is None or len(data_info.shape) < 3
-                or data_info.layout is not Layout.LINEAR
-                or consumers.get(weight_name, 0) != 1):
-            rewritten.append(op)
-            continue
-
+        data_info = ag.tensors[op.inputs[0]]
+        out_info = ag.tensors[op.outputs[0]]
         reduction = int(data_info.shape[-1])
-        if reduction != int(weight.shape[0]):
-            rewritten.append(op)
-            continue
         rows = 1
         for extent in data_info.shape[:-1]:
             rows *= int(extent)
-        columns = int(weight.shape[1])
+        columns = int(ag.weight_data[op.inputs[1]].shape[0])
 
         counter += 1
         flat_in = _fresh_name(ag, f"{op.inputs[0]}_rows_{counter}")
@@ -1150,20 +1152,6 @@ def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
             name=flat_out, shape=(rows, columns), dtype=out_info.dtype,
             quant=out_info.quant, layout=Layout.LINEAR)
 
-        # The FC kernel indexes the weight as W[oc * IC + ic], which is Gemm
-        # with transB=1; ONNX MatMul states it the other way round.
-        ag.weight_data[weight_name] = np.ascontiguousarray(weight.T)
-        weight_info = ag.tensors.get(weight_name)
-        if weight_info is not None:
-            weight_info.shape = tuple(reversed(weight_info.shape))
-            quant = weight_info.quant
-            if quant is not None and quant.axis in (0, 1):
-                weight_info.quant = QuantParam(
-                    scale=quant.scale,
-                    zero_point=quant.zero_point,
-                    axis=1 - quant.axis,
-                )
-
         rewritten.append(OpNode(
             name=f"{op.name}_rows", op_type="Reshape",
             inputs=[op.inputs[0]], outputs=[flat_in]))
@@ -1172,7 +1160,7 @@ def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
         # in place.
         rewritten.append(OpNode(
             name=op.name, op_type="Gemm",
-            inputs=[flat_in, weight_name, *op.inputs[2:]], outputs=[flat_out],
+            inputs=[flat_in, *op.inputs[1:]], outputs=[flat_out],
             attrs={"transB": 1}))
         rewritten.append(OpNode(
             name=f"{op.name}_shape", op_type="Reshape",
@@ -2415,7 +2403,7 @@ def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
+def _relabel_matmul_to_gemm(ag: AnalyzedGraph, transposed: dict[str, str]) -> AnalyzedGraph:
     """Put a constant-weight matrix product in the layout the kernels read.
 
     The fully-connected kernels index the weight as ``W[oc * IC + ic]``, which
@@ -2426,12 +2414,9 @@ def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     A product whose second operand is not a constant matrix is left alone: the
     runtime has no kernel for it and rejects the plan rather than guessing.
+    ``transposed`` is the record ``_transpose_product_weights`` keeps.
     """
-    consumers: dict[str, int] = {}
-    for op in ag.ops:
-        for name in op.inputs:
-            consumers[name] = consumers.get(name, 0) + 1
-
+    products: dict[str, list[OpNode]] = {}
     for op in ag.ops:
         if op.op_type == "MatMul":
             pass
@@ -2448,33 +2433,76 @@ def _relabel_matmul_to_gemm(ag: AnalyzedGraph) -> AnalyzedGraph:
         if len(op.inputs) < 2:
             continue
 
-        weight_name = op.inputs[1]
-        weight = ag.weight_data.get(weight_name)
+        weight = ag.weight_data.get(op.inputs[1])
         if weight is None or weight.ndim != 2:
-            continue
-        # Transposing in place would misstate the weight for any other reader.
-        if consumers.get(weight_name, 0) != 1:
             continue
         data_info = ag.tensors.get(op.inputs[0])
         if data_info is None or len(data_info.shape) != 2:
             continue
+        products.setdefault(op.inputs[1], []).append(op)
 
-        ag.weight_data[weight_name] = np.ascontiguousarray(weight.T)
-        info = ag.tensors.get(weight_name)
-        if info is not None:
-            info.shape = tuple(reversed(info.shape))
-            quant = info.quant
-            if quant is not None and quant.axis in (0, 1):
-                info.quant = QuantParam(
-                    scale=quant.scale,
-                    zero_point=quant.zero_point,
-                    axis=1 - quant.axis,
-                )
+    _transpose_product_weights(ag, products, transposed)
+    for op in (op for readers in products.values() for op in readers):
         op.op_type = "Gemm"
         op.attrs["transB"] = 1
     return ag
 
 
+def _transpose_product_weights(
+    ag: AnalyzedGraph, products: dict[str, list[OpNode]], transposed: dict[str, str],
+) -> None:
+    """Transpose each constant matrix for the products that read it as their weight.
+
+    ``products`` maps a constant to the products that need it transposed. When
+    they are all its readers it is transposed in place, once; otherwise they
+    read one transposed copy and every other reader keeps the original.
+    ``transposed`` maps a constant to the copy an earlier call made of it, so
+    products relabelled before layouts and products lowered after them read
+    one copy, as long as it still holds the transpose.
+    """
+    reads = _read_counts(ag)
+    for name, readers in products.items():
+        copy = transposed.get(name)
+        if copy is not None and _holds_transpose(ag, copy, name):
+            for op in readers:
+                op.inputs[1] = copy
+            continue
+        target = name
+        if reads[name] != len(readers):
+            target = _fresh_name(ag, name)
+            transposed[name] = target
+            for op in readers:
+                op.inputs[1] = target
+        ag.weight_data[target] = np.ascontiguousarray(ag.weight_data[name].T)
+        info = ag.tensors.get(name)
+        if info is not None:
+            ag.tensors[target] = _transposed_info(info, target)
+
+
+def _transposed_info(info: TensorInfo, name: str) -> TensorInfo:
+    """``info`` for the transpose of its matrix, under ``name``."""
+    quant = info.quant
+    if quant is not None and quant.axis in (0, 1):
+        quant = QuantParam(scale=quant.scale, zero_point=quant.zero_point, axis=1 - quant.axis)
+    return replace(info, name=name, shape=tuple(reversed(info.shape)), quant=quant)
+
+
+def _holds_transpose(ag: AnalyzedGraph, copy: str, name: str) -> bool:
+    """Whether constant ``copy`` reads as the transpose of constant ``name``."""
+    if copy not in ag.weight_data or name not in ag.weight_data:
+        return False
+    value, held = ag.weight_data[name].T, ag.weight_data[copy]
+    if (held.dtype, held.shape) != (value.dtype, value.shape) or (
+            held.tobytes() != value.tobytes()):
+        return False
+    info, copy_info = ag.tensors.get(name), ag.tensors.get(copy)
+    if info is None or copy_info is None:
+        return info is copy_info
+    expected = _transposed_info(info, copy).quant
+    if copy_info.dtype != info.dtype or (expected is None) != (copy_info.quant is None):
+        return False
+    return expected is None or (expected.axis == copy_info.quant.axis
+                                and _same_quant(expected, copy_info.quant))
 
 
 def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:

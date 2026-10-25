@@ -358,11 +358,11 @@ def test_matmul_with_a_dynamic_operand_is_left_alone(tmp_path):
     assert [op.op_type for op in ag.ops] == ["MatMul"]
 
 
-def test_matmul_weight_shared_with_another_op_is_left_alone(tmp_path):
+def test_matmul_weight_shared_with_another_op_gets_a_transposed_copy(tmp_path):
     """Transposing in place would misstate the weight for the other reader."""
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 3])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 3])
-    values = np.arange(12, dtype=np.float32).reshape(4, 3)
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [3, 3])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [3, 3])
+    values = np.arange(9, dtype=np.float32).reshape(3, 3)
     nodes = [
         helper.make_node("MatMul", ["input", "weight"], ["product"]),
         helper.make_node("Add", ["product", "weight"], ["output"]),
@@ -374,8 +374,11 @@ def test_matmul_weight_shared_with_another_op_is_left_alone(tmp_path):
 
     ag = load_model(path)
 
-    assert [op.op_type for op in ag.ops][0] == "MatMul"
-    assert np.array_equal(ag.weight_data["weight"], values)
+    product = next(op for op in ag.ops if op.outputs == ["product"])
+    add = next(op for op in ag.ops if op.op_type == "Add")
+    assert product.op_type == "Gemm" and product.inputs[1] != "weight"
+    assert np.array_equal(ag.weight_data[product.inputs[1]], values.T)
+    assert "weight" in add.inputs and np.array_equal(ag.weight_data["weight"], values)
 
 
 def test_quantized_matmul_weight_keeps_its_channel_axis(tmp_path):
