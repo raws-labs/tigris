@@ -347,6 +347,29 @@ def test_analyze_reports_measured_slow_traffic(conv_relu_chain_path):
     assert report["slow"]["traffic"]["written"] > 0 and report["slow"]["traffic"]["read"] > 0
 
 
+def test_analyze_measures_a_loop_with_a_fixed_iteration_count():
+    model = str(Path(__file__).parent / "fixtures" / "tflite" / "ops" / "float_while_counter.tflite")
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "64K"])
+    assert result.exit_code == 0, result.output
+    row = next(line for line in result.output.splitlines() if "slow traffic" in line)
+    assert "per inference:" in row
+    report = json.loads(CliRunner().invoke(cli, ["analyze", model, "-m", "64K", "--json"]).output)
+    assert report["slow"]["traffic"]["written"] > 0 and report["slow"]["traffic"]["read"] > 0
+
+
+def test_trace_runs_an_input_dependent_loop_on_the_given_input(tmp_path):
+    ops = Path(__file__).parent / "fixtures" / "tflite" / "ops"
+    recorded = np.load(ops / "float_while_two_variables.npz")
+    for name, key in (("x", "input_0"), ("y", "input_1")):
+        np.save(tmp_path / f"{name}.npy", recorded[key][0])
+    result = CliRunner().invoke(cli, ["analyze", str(ops / "float_while_two_variables.tflite"), "-m", "64K",
+                                      "--trace", "--input", f"x={tmp_path / 'x.npy'}",
+                                      "--input", f"y={tmp_path / 'y.npy'}"])
+    assert result.exit_code == 0, result.output
+    assert "traced on runtime" in result.output and "given input" in result.output
+    assert "mismatch" not in result.output
+
+
 def test_session_trace_reports_events_in_order(linear_plan):
     with Session(linear_plan) as session:
         outputs, events, counters = session.trace({"input": np.ones((1, 64), np.float32)})

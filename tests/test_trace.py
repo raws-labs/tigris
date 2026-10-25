@@ -1,11 +1,20 @@
 """The execution trace groups and checks runtime events without a host library."""
 
 import json
+from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
-from tigris.cli import cli
+from tigris.cli import _run_pipeline, cli
 from tigris.cli.trace import check, render, units
+from tigris.graph.ir import AnalyzedGraph, OpNode
+from tigris.graph.subgraphs import input_dependent_loop
+
+OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
+# Loops whose condition reads a value that starts from, or is updated from, a model input.
+INPUT_DEPENDENT = {"float_while", "float_while_feature_map", "float_while_if_through",
+                   "float_while_through", "float_while_two_variables"}
 
 
 def _event(kind, **fields):
@@ -105,3 +114,99 @@ def test_analyze_says_when_traffic_is_not_measured(conv_relu_chain_path, monkeyp
     assert "not measured: no host runtime in this install" in result.output
     result = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "8K", "--json"])
     assert json.loads(result.output)["slow"]["traffic"] is None
+
+
+@pytest.mark.parametrize("name", sorted(path.stem for path in OPS.glob("*.tflite")
+                                        if {"if", "while"} & set(path.stem.split("_"))))
+def test_input_dependent_loops_are_told_from_fixed_ones(name):
+    ag, _ = _run_pipeline(str(OPS / f"{name}.tflite"), ("64K",), report_bindings=False)
+    assert input_dependent_loop(ag) is (name in INPUT_DEPENDENT)
+
+
+def _graph(inputs, ops, outputs, subgraphs=()):
+    return AnalyzedGraph(ops=ops, model_inputs=inputs, model_outputs=outputs, subgraphs=list(subgraphs))
+
+
+def _counting(body, ops=(), subgraphs=()):
+    """x carried as `v` through a While whose condition runs `ops` and then
+    compares the counter `i`, which starts from a constant, with a limit."""
+    names = body.model_inputs
+    condition = _graph(names, [*ops, OpNode("less", "Less", ["i", "limit"], ["going"])], ["going"], subgraphs)
+    loop = OpNode("loop", "While", ["x" if name == "v" else "zero" for name in names],
+                  [f"out_{name}" for name in names], {"cond_branch": 0, "body_branch": 1})
+    return _graph(["x"], [loop], ["out_v"], [condition, body])
+
+
+def _up_to(bound):
+    """A While that counts from zero to `bound`, and its two subgraphs."""
+    condition = _graph(["a", "b"], [OpNode("less", "Less", ["a", "b"], ["going"])], ["going"])
+    body = _graph(["a", "b"], [OpNode("step", "Add", ["a", "one"], ["a2"])], ["a2", "b"])
+    loop = OpNode("inner", "While", ["zero", bound], ["steps", "bound"], {"cond_branch": 0, "body_branch": 1})
+    return loop, [condition, body]
+
+
+def _counter_steps_by(source):
+    return _counting(_graph(["i", "v"], [OpNode("add", "Add", ["i", source], ["i2"])], ["i2", "v"]))
+
+
+def _counter_steps_by_a_variable_set_from(source):
+    # The counter reads `source` only through j, one body pass later.
+    return _counting(_graph(["i", "j", "v"], [OpNode("add", "Add", ["i", "j"], ["i2"]),
+                                              OpNode("copy", "Identity", [source], ["j2"])], ["i2", "j2", "v"]))
+
+
+def _if_on(source):
+    step = _graph(["i"], [OpNode("add", "Add", ["i", "one"], ["r"])], ["r"])
+    stay = _graph(["i"], [OpNode("copy", "Identity", ["i"], ["r"])], ["r"])
+    return _counting(_graph(["i", "v"], [OpNode("test", "Greater", [source, "half"], ["p"]),
+                                         OpNode("if", "If", ["p", "i"], ["i2"],
+                                                {"then_branch": 0, "else_branch": 1})],
+                            ["i2", "v"], [step, stay]))
+
+
+def _while_in_body_up_to(source):
+    inner, subgraphs = _up_to(source)
+    return _counting(_graph(["i", "v"], [OpNode("add", "Add", ["i", "one"], ["i2"]), inner],
+                            ["i2", "v"], subgraphs))
+
+
+def _while_in_condition_up_to(source):
+    inner, subgraphs = _up_to(source)
+    return _counting(_graph(["i", "v"], [OpNode("add", "Add", ["i", "one"], ["i2"])], ["i2", "v"]),
+                     [inner], subgraphs)
+
+
+def _while_in_if_branch_up_to(source):
+    inner, subgraphs = _up_to(source)
+    loops = _graph(["v"], [inner], ["bound"], subgraphs)
+    plain = _graph(["v"], [OpNode("copy", "Identity", ["v"], ["bound"])], ["bound"])
+    choice = OpNode("if", "If", ["flag", "x"], ["y"], {"then_branch": 0, "else_branch": 1})
+    return _graph(["x"], [choice], ["y"], [loops, plain])
+
+
+@pytest.mark.parametrize("model", [_counter_steps_by, _counter_steps_by_a_variable_set_from, _if_on,
+                                   _while_in_body_up_to, _while_in_condition_up_to,
+                                   _while_in_if_branch_up_to])
+@pytest.mark.parametrize("source, dependent", [("v", True), ("one", False)])
+def test_a_loop_count_that_reads_an_input_makes_the_model_input_dependent(model, source, dependent):
+    assert input_dependent_loop(model(source)) is dependent
+
+
+def test_analyze_does_not_run_an_input_dependent_loop_on_zeros(monkeypatch):
+    import tigris.cli.trace
+
+    def never(*args, **kwargs):
+        raise AssertionError("the plan ran")
+
+    monkeypatch.setattr(tigris.cli.trace, "_run", never)
+    model = str(OPS / "float_while_two_variables.tflite")
+    reason = "the number of While iterations depends on the input values"
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "64K"])
+    assert result.exit_code == 0, result.output
+    assert f"not measured: {reason}" in result.output
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "64K", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["slow"]["traffic"] is None
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "64K", "--trace"])
+    assert result.exit_code == 2, result.output
+    assert f"--trace needs --input here: {reason}" in result.output

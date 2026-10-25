@@ -9,6 +9,8 @@ _PATHS = {"normal": "untiled", "tiled": "1D tile", "tiled_2d": "2D tile", "by_in
 # report ranges in their own iteration order.
 _SPATIAL = {"tiled", "tiled_2d", "chain"}
 _NAME_WIDTH = 32
+# Zero inputs can keep such a loop running forever.
+_ZERO_INPUT_LOOP = "the number of While iterations depends on the input values"
 
 
 def units(plan: dict, events: list[dict]) -> list[dict]:
@@ -215,12 +217,15 @@ def traffic(ag) -> dict[str, int] | str | None:
     """Bytes one inference writes to and reads from slow memory, measured on
     the host runtime: {"written", "read"}, a reason it was not measured, or
     None when there is no plan at this budget."""
+    from tigris.graph.subgraphs import input_dependent_loop
     from tigris.runtime import RuntimeError as HostError
     from tigris.runtime import runtime_info
 
     data = _plan_bytes(ag)
     if data is None:
         return None
+    if input_dependent_loop(ag):
+        return _ZERO_INPUT_LOOP
     try:
         runtime_info()
     except HostError:
@@ -240,6 +245,7 @@ def trace_model(model: str, ag, input_files: tuple[str, ...], verbose: bool) -> 
     import click
 
     from tigris.emitters.binary.reader import read_binary_plan
+    from tigris.graph.subgraphs import input_dependent_loop
     from tigris.runtime import RuntimeError as HostError
 
     if ag.mem_budget <= 0:
@@ -247,6 +253,8 @@ def trace_model(model: str, ag, input_files: tuple[str, ...], verbose: bool) -> 
     data = _plan_bytes(ag)
     if data is None:
         raise click.ClickException("no plan to trace: run analyze without --trace to see why")
+    if not input_files and input_dependent_loop(ag):
+        raise click.UsageError(f"--trace needs --input here: {_ZERO_INPUT_LOOP}")
     plan = read_binary_plan(data, decompress_weights=False)
     try:
         events, counters, memory, info = _run(data, input_files, traced=True)
