@@ -336,6 +336,75 @@ def test_metadata_that_may_hold_tensor_indices_is_not_exported():
     assert result.reason == "metadata OfflineMemoryAllocation is not supported"
 
 
+def _signature(model: tw.Model, output: int, subgraph: int = 0) -> tw.Signature:
+    sg = model.subgraphs[0]
+    return tw.Signature([(b"input", sg.inputs[0])], [(b"output", output)], b"serving_default",
+                        subgraph_index=subgraph)
+
+
+def _op(model: tw.Model, index: int) -> tw.Operator:
+    return model.subgraphs[0].operators[index]
+
+
+DANGLING = [
+    pytest.param(lambda m: setattr(_op(m, 0), "opcode", 4),
+                 "operator 0: operator code index 4 is out of range for 4 operator codes",
+                 id="opcode"),
+    pytest.param(lambda m: setattr(_op(m, 1), "inputs", [-2, 5]),
+                 "operator 1: tensor index -2 is out of range for 17 tensors", id="input"),
+    pytest.param(lambda m: setattr(_op(m, 1), "outputs", [17]),
+                 "operator 1: tensor index 17 is out of range for 17 tensors", id="output"),
+    pytest.param(lambda m: setattr(_op(m, 1), "intermediates", [20]),
+                 "operator 1: tensor index 20 is out of range for 17 tensors", id="intermediate"),
+    pytest.param(lambda m: setattr(m.subgraphs[0], "outputs", [-1]),
+                 "model outputs: tensor index -1 is out of range for 17 tensors", id="boundary"),
+    pytest.param(lambda m: setattr(m.subgraphs[0].tensors[3], "buffer", 11),
+                 "tensor 3: buffer index 11 is out of range for 11 buffers", id="tensor-buffer"),
+    pytest.param(lambda m: setattr(m, "signatures", [_signature(m, 22)]),
+                 "signature 0: tensor index 22 is out of range for 17 tensors", id="signature"),
+    pytest.param(lambda m: setattr(m, "signatures", [_signature(m, 16, subgraph=1)]),
+                 "signature 0: subgraph index 1 is out of range for 1 subgraph",
+                 id="signature-subgraph"),
+    pytest.param(lambda m: setattr(m, "metadata", [(b"min_runtime_version", 12)]),
+                 "metadata min_runtime_version: buffer index 12 is out of range for 11 buffers",
+                 id="metadata"),
+    pytest.param(lambda m: setattr(m, "metadata_buffer", [11]),
+                 "metadata_buffer: buffer index 11 is out of range for 11 buffers",
+                 id="metadata-buffer"),
+]
+
+
+@pytest.mark.parametrize(("edit", "reason"), DANGLING)
+def test_an_index_outside_its_table_is_not_exported(edit, reason):
+    model = tw.read(_inverted_residual())
+    edit(model)
+    result = export(tw.write(model))
+    assert (result.data, result.reason) == (None, reason)
+
+
+def test_a_dangling_signature_keeps_the_reason_found_first():
+    b = _Builder(9)
+    x = b.activation([1, 8, 8, 4])
+    paddings = b.constant(np.array([[0, 0], [1, 1], [1, 1], [0, 0]], np.int32), _INT32)
+    y = b.operator("MIRROR_PAD", [x, paddings], b.activation([1, 10, 10, 4]), 77, {0: ("b", 0)})
+    model = tw.read(b.model(x, b.max_pool(y, 2, 2)))
+    model.signatures = [_signature(model, len(model.subgraphs[0].tensors) + 5)]
+    result = export(tw.write(model))
+    assert result.reason == "TFLite Micro's scratch buffers for MIRROR_PAD are not modeled"
+
+
+def test_analyze_reports_a_dangling_signature_as_the_export_reason(tmp_path):
+    model = tw.read((FIXTURES / "vww_96_int8.tflite").read_bytes())
+    model.signatures = [_signature(model, 94)]
+    path = tmp_path / "dangling.tflite"
+    path.write_bytes(tw.write(model))
+    result = CliRunner().invoke(cli, ["analyze", str(path), "-m", "256K"])
+    assert result.exit_code == 0, result.output
+    row = next(line for line in result.output.splitlines() if "TFLite Micro export" in line)
+    assert row.rstrip().endswith("none   signature 0: tensor index 94 is out of range for 89 "
+                                 "tensors")
+
+
 def test_the_arena_counts_the_scratch_buffers_of_a_reduction(tflite_micro, tmp_path):
     b = _Builder(9)
     x = b.activation([1, 8, 8, 64])
@@ -519,7 +588,7 @@ def test_the_target_sets_the_persistent_growth(tmp_path):
 def test_a_kind_without_a_persistent_model_is_not_exported():
     result = export((FIXTURES / "ops" / "gelu.tflite").read_bytes())
     assert result.data is None and result.arena_before is None
-    assert result.reason == "TFLite Micro's persistent allocations for GELU are not modelled"
+    assert result.reason == "TFLite Micro's persistent allocations for GELU are not modeled"
 
 
 def test_a_model_with_scratch_buffers_the_arena_model_does_not_size_is_not_exported():
@@ -826,7 +895,7 @@ def test_analyze_reports_the_tflite_micro_arena_after_export():
     unmodeled = CliRunner().invoke(cli, ["analyze", str(FIXTURES / "ops" / "gelu.tflite"), "-m", "64K"])
     row = next(line for line in unmodeled.output.splitlines() if "TFLite Micro export" in line)
     assert row.rstrip().endswith("none   TFLite Micro's persistent allocations for GELU are not "
-                                 "modelled")
+                                 "modeled")
     reduction = CliRunner().invoke(cli, ["analyze", str(FIXTURES / "ops" / "mean_channels.tflite"),
                                          "-m", "64K"])
     assert ("TFLite Micro arena        368 B   its planner and reduction scratch; persistent "

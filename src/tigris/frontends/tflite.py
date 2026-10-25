@@ -175,6 +175,27 @@ class _Operator:
         return self.options.scalar(slot, fmt, default) if self.options else default
 
 
+def _check_indices(owner: str, item: str, indices, count: int, lowest: int = 0) -> None:
+    """Raise ValueError when one of `indices` lies outside [lowest, count)."""
+    for index in indices:
+        if not lowest <= index < count:
+            raise ValueError(f"{owner}: {item} index {index} is out of range for {count} "
+                             f"{item}{'s' if count != 1 else ''}")
+
+
+def _missing_operand(op: _Operator) -> str:
+    """The first operand `op` reads that the file leaves out, as -1 or past the
+    end of the list; "" when there is none or the kind is not in _OPERANDS."""
+    if op.kind not in _OPERANDS:
+        return ""
+    inputs, outputs = _OPERANDS[op.kind]
+    optional = _OPTIONAL_OPERANDS.get(op.kind, ())
+    for position in range(max(inputs, len(op.inputs))):
+        if (position >= len(op.inputs) or op.inputs[position] < 0) and position not in optional:
+            return f"input {position} is missing"
+    return f"output {len(op.outputs)} is missing" if len(op.outputs) < outputs else ""
+
+
 def _read(data: bytes):
     model = _Model(data)
     graphs = []
@@ -183,6 +204,21 @@ def _read(data: bytes):
         operators = [_Operator(model, op, i) for i, op in enumerate(subgraph.tables(_SG_OPERATORS))]
         graphs.append((subgraph.string(_SG_NAME), tensors, subgraph.scalars(_SG_INPUTS, "i"),
                        subgraph.scalars(_SG_OUTPUTS, "i"), operators))
+    for position, (_, tensors, inputs, outputs, operators) in enumerate(graphs):
+        prefix = f"subgraph {position} " if position else ""
+        _check_indices(f"{prefix or 'model '}inputs", "tensor", inputs, len(tensors))
+        _check_indices(f"{prefix or 'model '}outputs", "tensor", outputs, len(tensors))
+        for op in operators:
+            owner = f"{prefix}operator {op.index} {op.kind}"
+            # -1 is an operand left out.
+            _check_indices(owner, "tensor", op.inputs, len(tensors), -1)
+            _check_indices(owner, "tensor", op.outputs, len(tensors))
+            slots = {"IF": (0, 1), "WHILE": (0, 1), "CALL_ONCE": (0,)}.get(op.kind, ())
+            _check_indices(owner, "subgraph", [op.option(slot, "i") for slot in slots],
+                           len(graphs))
+            reason = _missing_operand(op)
+            if reason:
+                raise ValueError(f"{owner}: {reason}")
     # The converter passes a constant an IF branch reads as one of its
     # operands; inside the branch it is that constant, from the same buffer.
     # Each graph is folded before the constants it passes on are read.
@@ -649,6 +685,33 @@ _CONSTANT_OPERANDS = {"MEAN": (1,), "TRANSPOSE": (1,), "SPLIT": (0,), "SPLIT_V":
                       "MIRROR_PAD": (1,), "REVERSE_V2": (1,), "EMBEDDING_LOOKUP": (0,),
                       "DYNAMIC_UPDATE_SLICE": (2,), "ARG_MAX": (1,), "ARG_MIN": (1,),
                       "REDUCE_ALL": (1,), "SVDF": (1, 2, 3)}
+# Operands each kind the importer converts or folds reads, (inputs, outputs); for a
+# variadic kind the fewest. The detection operator checks its own.
+_OPERANDS = {
+    **dict.fromkeys((*_UNARY, *_ELEMENTWISE_UNARY, "RSQRT", "SQUARE", "RELU6", "SOFTMAX",
+                     "LOG_SOFTMAX", "LEAKY_RELU", "L2_NORMALIZATION", "GELU", "QUANTIZE",
+                     "DEQUANTIZE", "CAST", "LOGICAL_NOT", "SQUEEZE", "SPACE_TO_DEPTH",
+                     "DEPTH_TO_SPACE", "AVERAGE_POOL_2D", "MAX_POOL_2D", "L2_POOL_2D",
+                     "READ_VARIABLE", "CONCATENATION", "PACK", "ADD_N", "UNPACK", "IF", "WHILE",
+                     "SHAPE", "ZEROS_LIKE"), (1, 1)),
+    **dict.fromkeys((*_CONSTANT_MATH, *_ELEMENTWISE_BINARY, *_COMPARISONS, "LOGICAL_AND",
+                     "LOGICAL_OR", "PRELU", "BATCH_MATMUL", "MEAN", *_REDUCTIONS, *_INDEX,
+                     "TRANSPOSE", "RESHAPE", "EXPAND_DIMS", "GATHER", "GATHER_ND",
+                     "BROADCAST_TO", "MIRROR_PAD", "REVERSE_V2", "EMBEDDING_LOOKUP", "PAD",
+                     "SPLIT", "RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR", "CUMSUM", "FILL",
+                     "BROADCAST_ARGS"), (2, 1)),
+    **dict.fromkeys(("SLICE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND", "DYNAMIC_UPDATE_SLICE",
+                     "SELECT_V2", "PADV2", "SPLIT_V", "CONV_2D", "DEPTHWISE_CONV_2D",
+                     "FULLY_CONNECTED"), (3, 1)),
+    "STRIDED_SLICE": (4, 1), "TRANSPOSE_CONV": (4, 1), "SVDF": (5, 1),
+    "UNIDIRECTIONAL_SEQUENCE_LSTM": (24, 1), "CALL_ONCE": (0, 0), "VAR_HANDLE": (0, 1), "ASSIGN_VARIABLE": (2, 0)}
+# Operands that may be left out: biases, the constants the conversion takes from the
+# stated shapes or pads with zero, and what _svdf_reason and _lstm_reason check.
+_OPTIONAL_OPERANDS = {"CONV_2D": (2,), "DEPTHWISE_CONV_2D": (2,), "FULLY_CONNECTED": (2,),
+                      "TRANSPOSE_CONV": (0, 3), "RESHAPE": (1,), "SPLIT_V": (1,),
+                      "PADV2": (2,), "SVDF": (3,),
+                      "UNIDIRECTIONAL_SEQUENCE_LSTM": (1, 5, 9, 10, 11, 12, 16, 17, 20, 21,
+                                                       22, 23)}
 
 
 class Window(NamedTuple):
@@ -1536,7 +1599,7 @@ class _Converter:
             pads = b.constant(np.asarray([pairs[a, 0] for a in order] + [pairs[a, 1] for a in order],
                                          np.int64), tag + "_pads")
             source = self.tensors[ins[0]]
-            if kind != "PADV2" or len(ins) < 3:
+            if kind != "PADV2" or len(ins) < 3 or ins[2] < 0:
                 fill = 0.0
             elif source.type == "FLOAT32":
                 fill = float(self.tensors[ins[2]].array().reshape(-1)[0])
