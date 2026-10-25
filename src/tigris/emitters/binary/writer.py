@@ -2,6 +2,7 @@
 
 import math
 import struct
+from collections.abc import Container
 from pathlib import Path
 
 import numpy as np
@@ -530,20 +531,22 @@ def _group_weights_by_stage(
     Returns list of (stage_idx, sorted list of global weight indices)
     for stages that have weights. Each weight belongs to exactly one stage.
     """
+    tensors = {name for name, info in ag.tensors.items() if not info.is_constant}
     # Map each weight index to its stage
     widx_to_stage: dict[int, int] = {}
     for stage in ag.stages:
         for op_i in stage.op_indices:
-            op = ag.ops[op_i]
-            w_idx, b_idx = _resolve_weight_bias(op, weight_idx)
-            if w_idx != NO_WEIGHT:
-                if w_idx in widx_to_stage and widx_to_stage[w_idx] != stage.stage_id:
-                    raise ValueError(f"Weight {w_idx} shared across stages")
-                widx_to_stage[w_idx] = stage.stage_id
-            if b_idx != NO_WEIGHT:
-                if b_idx in widx_to_stage and widx_to_stage[b_idx] != stage.stage_id:
-                    raise ValueError(f"Bias {b_idx} shared across stages")
-                widx_to_stage[b_idx] = stage.stage_id
+            w_idx, b_idx, constants = _operator_weights(ag.ops[op_i], weight_idx, tensors)
+            for kind, idx in (("Weight", w_idx), ("Bias", b_idx),
+                              *(("Weight", idx) for idx in constants or ())):
+                if idx == NO_WEIGHT:
+                    continue
+                if idx in widx_to_stage and widx_to_stage[idx] != stage.stage_id:
+                    raise ValueError(f"{kind} {idx} shared across stages")
+                widx_to_stage[idx] = stage.stage_id
+    for widx in sorted(weight_idx.values()):
+        if widx not in widx_to_stage:
+            raise ValueError(f"weight {widx} belongs to no stage")
 
     # Build per-stage groups
     stage_groups: dict[int, list[int]] = {}
@@ -601,7 +604,6 @@ def _build_weights_compressed(
     block_entries = bytearray()
     blob_parts: list[bytes] = []
     blob_offset = 0
-    assigned: set[int] = set()
     for stage_idx, members, offsets, data in blocks:
         for widx, offset in zip(members, offsets):
             raw, name_off = weights[widx]
@@ -617,13 +619,6 @@ def _build_weights_compressed(
         ))
         blob_offset += len(compressed)
         blob_parts.append(compressed)
-        assigned.update(members)
-
-    # Handle weights not assigned to any stage (shouldn't happen but be safe)
-    for widx, (raw, name_off) in enumerate(weights):
-        if widx not in assigned:
-            WEIGHT_ENTRY_STRUCT.pack_into(
-                entries_buf, widx * WEIGHT_ENTRY_SIZE, name_off, 0, len(raw))
 
     weight_blocks_section = (
         WEIGHT_BLOCK_SECTION_HEADER_STRUCT.pack(len(blocks), compress_type)
@@ -945,15 +940,8 @@ def _op_attribute_records(
         constant = _constant_operand_payload(ag, op, quant_idx_map or {})
         if constant is not None:
             records.append((op_index, OP_ATTR_CONSTANT_OPERAND, constant))
-        if op.op_type in _MANY_CONSTANTS:
-            indices = [(weight_idx or {}).get(name, NO_WEIGHT) for name in op.inputs
-                       if name not in tensor_idx]
-            records.append((op_index, OP_ATTR_CONSTANTS, struct.pack(f"<{len(indices)}H", *indices)))
-        elif op.op_type == "While" and any(name not in tensor_idx for name in op.inputs):
-            # Per loop variable, the constant it starts from, or none where
-            # the next input supplies it.
-            indices = [(weight_idx or {}).get(name, NO_WEIGHT) if name not in tensor_idx
-                       else NO_WEIGHT for name in op.inputs]
+        _, _, indices = _operator_weights(op, weight_idx or {}, tensor_idx)
+        if indices is not None:
             records.append((op_index, OP_ATTR_CONSTANTS, struct.pack(f"<{len(indices)}H", *indices)))
         if op.op_type == "Svdf":
             records.append((op_index, OP_ATTR_SVDF, _svdf_payload(ag, op)))
@@ -1105,6 +1093,25 @@ def _build_op_attributes(records: list[tuple[int, int, bytes]]) -> bytes:
 
 # Operators whose constants are listed by OP_ATTR_CONSTANTS, not weight and bias.
 _MANY_CONSTANTS = {"Svdf", "Lstm", "DetectionPostProcess"}
+
+
+def _operator_weights(
+    op: OpNode, weight_idx: dict[str, int], tensors: Container[str],
+) -> tuple[int, int, list[int] | None]:
+    """The weights the plan says an operator reads: its weight and bias
+    fields, and its OP_ATTR_CONSTANTS list, or None when it has none.
+    ``tensors`` holds the names of the plan's non-constant tensors."""
+    if op.op_type in _MANY_CONSTANTS:
+        return NO_WEIGHT, NO_WEIGHT, [weight_idx.get(name, NO_WEIGHT) for name in op.inputs
+                                      if name not in tensors]
+    if op.op_type == "While":
+        if all(name in tensors for name in op.inputs):
+            return NO_WEIGHT, NO_WEIGHT, None
+        # Per loop variable, the constant it starts from, or none where
+        # the next input supplies it.
+        return NO_WEIGHT, NO_WEIGHT, [NO_WEIGHT if name in tensors
+                                      else weight_idx.get(name, NO_WEIGHT) for name in op.inputs]
+    return (*_resolve_weight_bias(op, weight_idx), None)
 
 
 def _resolve_weight_bias(op: OpNode, weight_idx: dict[str, int]) -> tuple[int, int]:
@@ -1286,9 +1293,7 @@ def _build_ops(
 
         spatial = _pack_spatial_attrs(op, ag.weight_data)
 
-        # Resolve weight/bias indices from op's constant inputs
-        w_idx, b_idx = ((NO_WEIGHT, NO_WEIGHT) if op.op_type in _MANY_CONSTANTS | {"While"}
-                        else _resolve_weight_bias(op, weight_idx))
+        w_idx, b_idx, _ = _operator_weights(op, weight_idx, tensor_idx)
 
         fused_act = _fused_activation(op)
         act_min, act_max = _compute_act_bounds(ag, op, fused_act)
