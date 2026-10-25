@@ -35,6 +35,7 @@ Passes applied in sequence (matches ``normalize()`` call order):
 
 import math
 from collections import Counter
+from collections.abc import Collection
 from dataclasses import replace
 
 import numpy as np
@@ -903,7 +904,8 @@ def _fold_one_split(ag: AnalyzedGraph) -> bool:
 
         axis = int(split.attrs.get("axis", 0))
         name = split.inputs[0]
-        chain: list[int] = []
+        # Each entry: the op, and the axis its output stacks the parts on, with that axis' extent.
+        chain: list[tuple[int, int, int]] = []
         while True:
             index = producer_of.get(name)
             if index is None or readers.get(name, 0) != 1 or name in ag.model_outputs:
@@ -913,6 +915,7 @@ def _fold_one_split(ag: AnalyzedGraph) -> bool:
             source = ag.tensors.get(op.inputs[0]) if op.inputs else None
             if current is None or source is None:
                 break
+            stacked = axis
             if op.op_type == "Transpose":
                 perm = [int(a) for a in op.attrs.get("perm", [])]
                 if len(perm) != len(current.shape):
@@ -934,7 +937,7 @@ def _fold_one_split(ag: AnalyzedGraph) -> bool:
                 break
             if op.op_type not in _SPLIT_TRANSPARENT:
                 break
-            chain.append(index)
+            chain.append((index, stacked, int(current.shape[stacked])))
             name = op.inputs[0]
     return False
 
@@ -942,11 +945,15 @@ def _fold_one_split(ag: AnalyzedGraph) -> bool:
 def _fold_split_onto(
     ag: AnalyzedGraph,
     split_index: int,
-    chain: list[int],
+    chain: list[tuple[int, int, int]],
     product_index: int,
     parts: list,
 ) -> bool:
-    """Rebuild the chain once per part, over a block of the weight."""
+    """Rebuild the chain once per part, over a block of the weight.
+
+    Every part is built before the graph is changed, so a fold that does not
+    go through leaves the graph as it was.
+    """
     product = ag.ops[product_index]
     if len(product.inputs) not in (2, 3):
         return False
@@ -963,7 +970,8 @@ def _fold_split_onto(
     split = ag.ops[split_index]
     axis = int(split.attrs.get("axis", 0))
     widths = [int(part.shape[axis]) for part in parts]
-    stride, remainder = divmod(features, sum(widths))
+    total = sum(widths)
+    stride, remainder = divmod(features, total)
     if remainder or stride <= 0:
         return False
 
@@ -974,30 +982,49 @@ def _fold_split_onto(
             return False
         bias = bias.reshape(-1)
 
+    starts = np.cumsum([0, *widths[:-1]]) * stride
+    blocks = [(int(start), width * stride) for start, width in zip(starts, widths)]
+    weight_quants = _quant_of_blocks(ag.tensors[product.inputs[1]].quant, 2, 1, features, blocks)
+    bias_quants = (_quant_of_blocks(ag.tensors[product.inputs[2]].quant, 1, 0, features, blocks)
+                   if bias is not None else [None] * len(blocks))
+    if weight_quants is None or bias_quants is None:
+        return False
+    # Every part's activations take the stacked tensors' quantization, which holds only per tensor.
+    stacked_quants = [result.quant, *(ag.tensors[ag.ops[index].outputs[0]].quant for index, _, _ in chain)]
+    if any(quant is not None and np.asarray(quant.scale).size > 1 for quant in stacked_quants):
+        return False
+
+    taken: set[str] = set()
+
+    def fresh(base: str) -> str:
+        name = _fresh_name(ag, base, taken)
+        taken.add(name)
+        return name
+
+    weights: dict[str, np.ndarray] = {}
+    tensors: dict[str, TensorInfo] = {}
     rebuilt: list[OpNode] = []
-    offset = 0
-    for position, part in enumerate(parts):
-        block = widths[position] * stride
+    for position, (offset, block) in enumerate(blocks):
         tag = f"{product.name}_part{position}"
-        weight_name = _fresh_name(ag, f"{product.inputs[1]}_part{position}")
-        ag.weight_data[weight_name] = np.ascontiguousarray(
-            weight[:, offset:offset + block])
-        ag.tensors[weight_name] = TensorInfo(
+        weight_name = fresh(f"{product.inputs[1]}_part{position}")
+        weights[weight_name] = np.ascontiguousarray(weight[:, offset:offset + block])
+        tensors[weight_name] = TensorInfo(
             name=weight_name, shape=(int(weight.shape[0]), block),
-            dtype=ag.tensors[product.inputs[1]].dtype, is_constant=True)
+            dtype=ag.tensors[product.inputs[1]].dtype, is_constant=True,
+            quant=weight_quants[position])
         inputs = [product.inputs[0], weight_name]
         if bias is not None:
-            bias_name = _fresh_name(ag, f"{product.inputs[2]}_part{position}")
-            ag.weight_data[bias_name] = np.ascontiguousarray(
-                bias[offset:offset + block])
-            ag.tensors[bias_name] = TensorInfo(
+            bias_name = fresh(f"{product.inputs[2]}_part{position}")
+            weights[bias_name] = np.ascontiguousarray(bias[offset:offset + block])
+            tensors[bias_name] = TensorInfo(
                 name=bias_name, shape=(block,),
-                dtype=ag.tensors[product.inputs[2]].dtype, is_constant=True)
+                dtype=ag.tensors[product.inputs[2]].dtype, is_constant=True,
+                quant=bias_quants[position])
             inputs.append(bias_name)
 
-        carried = _fresh_name(ag, f"{tag}_product") if chain else split.outputs[position]
+        carried = fresh(f"{tag}_product") if chain else split.outputs[position]
         if chain:
-            ag.tensors[carried] = TensorInfo(
+            tensors[carried] = TensorInfo(
                 name=carried,
                 shape=(*tuple(result.shape[:-1]), block),
                 dtype=result.dtype, quant=result.quant, layout=result.layout)
@@ -1006,20 +1033,18 @@ def _fold_split_onto(
             outputs=[carried], attrs=dict(product.attrs)))
 
         # The chain is walked from the split back to the product, so replaying
-        # it forwards means reversing it. Every shape it states loses the
-        # stacked axis, which this part no longer spans.
-        for depth, index in enumerate(reversed(chain)):
+        # it forwards means reversing it. Every shape it states carries this
+        # part's share of the stacked axis instead of all of it.
+        for depth, (index, stacked, extent) in enumerate(reversed(chain)):
             step = ag.ops[index]
             last = depth == len(chain) - 1
-            output = split.outputs[position] if last else _fresh_name(ag, f"{tag}_step{depth}")
+            output = split.outputs[position] if last else fresh(f"{tag}_step{depth}")
             if not last:
-                shape = _part_shape(ag, step.outputs[0], widths[position],
-                                    len(parts))
-                if shape is None:
-                    return False
                 reference = ag.tensors[step.outputs[0]]
-                ag.tensors[output] = TensorInfo(
-                    name=output, shape=shape, dtype=reference.dtype,
+                shape = [int(dim) for dim in reference.shape]
+                shape[stacked] = widths[position] * extent // total
+                tensors[output] = TensorInfo(
+                    name=output, shape=tuple(shape), dtype=reference.dtype,
                     quant=reference.quant, layout=reference.layout)
             rebuilt.append(OpNode(
                 name=f"{tag}_{step.name.split('/')[-1]}",
@@ -1028,9 +1053,10 @@ def _fold_split_onto(
                 outputs=[output],
                 attrs=dict(step.attrs)))
             carried = output
-        offset += block
 
-    replaced = {split_index, product_index, *chain}
+    ag.weight_data.update(weights)
+    ag.tensors.update(tensors)
+    replaced = {split_index, product_index, *(index for index, _, _ in chain)}
     ops: list[OpNode] = []
     for index, op in enumerate(ag.ops):
         if index == product_index:
@@ -1045,20 +1071,25 @@ def _fold_split_onto(
     return True
 
 
-def _part_shape(
-    ag: AnalyzedGraph, name: str, width: int, parts: int
-) -> tuple[int, ...] | None:
-    """A chain tensor's shape once it carries one part instead of all of them."""
-    info = ag.tensors.get(name)
-    if info is None:
+def _quant_of_blocks(
+    quant: QuantParam | None, rank: int, axis: int, extent: int,
+    blocks: list[tuple[int, int]],
+) -> list[QuantParam | None] | None:
+    """Each block's quantization when a tensor is cut along ``axis`` into ``(start, size)`` blocks.
+
+    A per-tensor quantization holds for every block. A per-channel one is cut
+    with the blocks when it runs along ``axis`` with one entry per index;
+    otherwise the blocks have none of their own and None is returned.
+    """
+    if quant is None or np.asarray(quant.scale).size == 1:
+        return [quant] * len(blocks)
+    scale = np.asarray(quant.scale).reshape(-1)
+    zero = np.asarray(quant.zero_point).reshape(-1)
+    if quant.axis % rank != axis or scale.size != extent or zero.size != extent:
         return None
-    shape = [int(extent) for extent in info.shape]
-    total = width * parts
-    for position, extent in enumerate(shape):
-        if extent == total:
-            shape[position] = width
-            return tuple(shape)
-    return None
+    return [QuantParam(scale=scale[start:start + size].copy(),
+                       zero_point=zero[start:start + size].copy(), axis=axis)
+            for start, size in blocks]
 
 
 def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -2551,11 +2582,11 @@ def _gather_one_index_to_split(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _fresh_name(ag: AnalyzedGraph, base: str) -> str:
-    """A tensor name the graph does not already carry."""
+def _fresh_name(ag: AnalyzedGraph, base: str, taken: Collection[str] = ()) -> str:
+    """A tensor name the graph does not already carry and ``taken`` does not hold."""
     name = base
     suffix = 0
-    while name in ag.tensors or name in ag.weight_data:
+    while name in ag.tensors or name in ag.weight_data or name in taken:
         suffix += 1
         name = f"{base}_{suffix}"
     return name
