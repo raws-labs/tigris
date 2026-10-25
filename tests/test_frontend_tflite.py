@@ -17,6 +17,7 @@ from tigris.cli import cli
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.frontends import tflite
 from tigris.frontends.flatbuffer import Table
+from tigris.frontends.tflite_export import tflm_tensor_arena
 from tigris.inspection import inspect_file
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tflite"
@@ -608,11 +609,11 @@ def test_int64_run_time_indices_with_an_excessive_range_are_refused(monkeypatch)
     ("ops/reduce_min_rows.tflite", 208),
 ])
 def test_tflm_tensor_arena_reproduces_its_planner(name, arena):
-    assert tflite.tflm_tensor_arena((FIXTURES / name).read_bytes()) == arena
+    assert tflm_tensor_arena((FIXTURES / name).read_bytes()) == arena
 
 
 def test_tflm_tensor_arena_declines_several_subgraphs():
-    assert tflite.tflm_tensor_arena((FIXTURES / "ops" / "while_conv.tflite").read_bytes()) is None
+    assert tflm_tensor_arena((FIXTURES / "ops" / "while_conv.tflite").read_bytes()) is None
 
 
 def test_analyze_reports_json_with_tflite_micro_arena_and_exact_plan_size(tmp_path):

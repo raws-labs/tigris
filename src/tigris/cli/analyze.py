@@ -306,7 +306,8 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
             input_files: tuple[str, ...]):
     """Check whether a model fits a memory budget, and why not."""
     from tigris.analysis.findings import compute_findings
-    from tigris.frontends.tflite import is_tflite, tflm_tensor_arena
+    from tigris.frontends.tflite import is_tflite
+    from tigris.frontends.tflite_export import export, tflm_tensor_arena
 
     if as_json and trace:
         raise click.UsageError("--json and --trace are two different outputs; choose one")
@@ -326,8 +327,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
         return
 
     data = Path(model).read_bytes()
-    tflite = is_tflite(data)
-    tflm_arena = tflm_tensor_arena(data) if tflite else None
+    tflm_arena = tflm_tensor_arena(data)
     findings = compute_findings(ag, flash_budget=flash_budget)
     supported = not (findings.unsupported_operators or findings.output_errors or findings.dtype_errors)
     tried = (_tried(model, budget, not findings.blocking_stages, input_shape)
@@ -337,14 +337,11 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
         findings.lz4_plan_size_bytes = 0
     from tigris.cli.trace import traffic as measure_traffic
     traffic = measure_traffic(ag) if supported else None
-    tflm_export = None
-    if tflm_arena is not None:
-        from tigris.frontends.tflite_export import export
-        tflm_export = export(data)
+    tflm_export = None if tflm_arena is None else export(data)
     if as_json:
         click.echo(json.dumps(_report(ag, findings, budget, slow_budget, flash_budget,
-                                      "tflite" if tflite else "onnx", tflm_arena, tried, traffic,
-                                      tflm_export),
+                                      "tflite" if is_tflite(data) else "onnx", tflm_arena,
+                                      tried, traffic, tflm_export),
                               indent=2, ensure_ascii=True, allow_nan=False))
         return
     summary(model, ag, findings, budget, slow_budget, flash_budget, tflm_arena, tried, traffic,

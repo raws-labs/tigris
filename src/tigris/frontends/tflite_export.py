@@ -539,6 +539,17 @@ def arena(model: tw.Model, referenced: bool = False) -> int | None:
                       sg.inputs, sg.outputs)
 
 
+def tflm_tensor_arena(data: bytes) -> int | None:
+    """TFLite Micro's arena head for the model in `data`, as `arena` plans it.
+    None for a file `tw.read` refuses, a model with more than one subgraph, or
+    a tensor of a storage type the planner model does not know."""
+    try:
+        model = tw.read(data)
+    except ValueError:
+        return None
+    return arena(model) if len(model.subgraphs) == 1 else None
+
+
 def persistent(model: tw.Model, target: TflmTarget, compression: bool = False,
                recording: bool = False, referenced: bool = False) -> int | None:
     """TFLite Micro's persistent bytes for a single-subgraph model, as
