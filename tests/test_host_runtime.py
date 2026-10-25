@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,7 +14,7 @@ from click.testing import CliRunner
 from tigris.cli import cli, _run_pipeline
 from tigris.cli.compile import _run_compressed_pipeline
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris import runtime
+from tigris import SCHEMA_VERSION, runtime
 from tigris.runtime import Session, runtime_info, runtime_version
 
 
@@ -213,16 +214,109 @@ def test_incompatible_schema(linear_plan):
         Session(linear_plan)
 
 
-def test_zoo_dependency_record(linear_plan):
-    manifest = {"id": "example", "runtime": {"min": "0.0.1", "max": None},
-                "files": [{"path": linear_plan.name, "sha256": hashlib.sha256(linear_plan.read_bytes()).hexdigest()}]}
-    linear_plan.with_name("manifest.json").write_text(json.dumps(manifest))
-    with Session(linear_plan):
+@pytest.fixture
+def zoo_plan(linear_plan):
+    """The linear plan as a fetched zoo artifact would hold it, with its manifest and receipt."""
+    plan = linear_plan.rename(linear_plan.with_name("model.tgrs"))
+    data = plan.read_bytes()
+    manifest = {
+        "format_version": 1, "id": "example", "model": "example", "category": "classification",
+        "quantization": "float32", "published_at": "2026-01-01T00:00:00Z", "schema": SCHEMA_VERSION,
+        "runtime": {"min": "0.0.1", "max": None}, "backends": ["reference"],
+        "memory": {"fast_bytes": 65536, "slow_bytes": 0, "flash_bytes": len(data)},
+        "inputs": [{"name": "input", "shape": [1, 64], "dtype": "float32"}],
+        "outputs": [{"name": "output", "shape": [1, 64], "dtype": "float32"}],
+        "license": "apache-2.0", "compiler": {"version": "0.0.1"}, "source": {"model": "example"},
+        "evaluation": {"test_cases": 1},
+        "files": [{"path": "model.tgrs", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}],
+    }
+    receipt = {"artifact_id": "example", "runtime": {"min": "0.0.1", "max": None}}
+    return plan, manifest, receipt
+
+
+def _write(plan, name, value):
+    plan.with_name(name).write_text(json.dumps(value))
+
+
+def _cli_run(plan):
+    np.save(plan.with_name("input.npy"), np.zeros((1, 64), np.float32))
+    output = plan.with_name("output.npy")
+    result = CliRunner().invoke(cli, ["run", str(plan), "--input", str(plan.with_name("input.npy")),
+                                      "--output", str(output)])
+    return result, output.exists()
+
+
+def test_zoo_dependency_record(zoo_plan):
+    plan, manifest, receipt = zoo_plan
+    _write(plan, "manifest.json", manifest)
+    with Session(plan):
         pass
-    receipt = {"artifact_id": "example", "runtime": {"min": "999.0.0", "max": None}}
-    linear_plan.with_name("download.json").write_text(json.dumps(receipt))
+    _write(plan, "download.json", receipt)
+    with Session(plan):
+        pass
+    _write(plan, "download.json", dict(receipt, runtime={"min": "999.0.0", "max": None}))
     with pytest.raises(ValueError, match="requires runtime"):
-        Session(linear_plan)
+        Session(plan)
+    _write(plan, "download.json", dict(receipt, artifact_id="other"))
+    with pytest.raises(ValueError, match="belongs to another artifact"):
+        Session(plan)
+    plan.with_name("download.json").unlink()
+    _write(plan, "manifest.json", dict(manifest, files=[dict(manifest["files"][0], sha256="0" * 64)]))
+    with pytest.raises(ValueError, match="checksum differs"):
+        Session(plan)
+
+
+@pytest.mark.parametrize("manifest", [
+    {"id": "other", "files": [{"path": "other.tgrs", "sha256": "0" * 64}]},
+    {}, [], "model.tgrs", {"files": "model.tgrs"}, {"files": ["model.tgrs"]}, {"files": None},
+], ids=["other-plan", "empty", "list", "string", "files-string", "files-names", "files-null"])
+def test_manifest_not_listing_the_plan_is_ignored(zoo_plan, manifest):
+    plan, _, _ = zoo_plan
+    _write(plan, "manifest.json", manifest)
+    _write(plan, "download.json", {})
+    with Session(plan):
+        pass
+    result, written = _cli_run(plan)
+    assert result.exit_code == 0, result.output
+    assert written
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("runtime", None, "Invalid zoo manifest: malformed artifact metadata: 'runtime'"),
+    ("runtime", {"min": "0.0.1"}, "Invalid zoo manifest: runtime requires min and max"),
+    ("format_version", None, "Invalid zoo manifest: malformed artifact metadata: 'format_version'"),
+])
+def test_malformed_zoo_manifest_is_named(zoo_plan, field, value, message):
+    plan, manifest, receipt = zoo_plan
+    manifest = dict(manifest, **{field: value}) if value is not None else \
+        {key: item for key, item in manifest.items() if key != field}
+    _write(plan, "manifest.json", manifest)
+    _write(plan, "download.json", receipt)
+    with pytest.raises(ValueError, match=re.escape(message)):
+        Session(plan)
+    result, written = _cli_run(plan)
+    assert result.exit_code == 1
+    assert f"Error: {message}" in result.output
+    assert isinstance(result.exception, SystemExit) and not written
+
+
+@pytest.mark.parametrize("receipt, message", [
+    ({"artifact_id": "example"}, "runtime requires min and max (null when no upper bound is known)"),
+    ([], "runtime requires min and max (null when no upper bound is known)"),
+    ({"artifact_id": "example", "runtime": {"min": "latest", "max": None}},
+     "runtime versions must be release versions such as 0.9.1"),
+])
+def test_malformed_download_record_is_named(zoo_plan, receipt, message):
+    plan, manifest, _ = zoo_plan
+    _write(plan, "manifest.json", manifest)
+    _write(plan, "download.json", receipt)
+    message = f"Invalid zoo download record: {message}"
+    with pytest.raises(ValueError, match=re.escape(message)):
+        Session(plan)
+    result, written = _cli_run(plan)
+    assert result.exit_code == 1
+    assert f"Error: {message}" in result.output
+    assert isinstance(result.exception, SystemExit) and not written
 
 
 @pytest.mark.parametrize("suffix", [".bin", ".npy", ".npz"])
