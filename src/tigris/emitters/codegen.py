@@ -1,9 +1,9 @@
-"""C code generator — emits a deployment harness from a .tgrs plan.
+"""C code generator: emits a deployment harness from a .tgrs plan.
 
 Backend selection implies the target platform:
-- reference  → POSIX (float reference or s8_ref, selected by plan dtype)
-- esp-nn     → ESP-IDF (ESP-NN int8 with s8_ref fallback; float reference)
-- cmsis-nn   → Cortex-M (CMSIS-NN int8 with s8_ref fallback; float reference)
+- reference  -> POSIX (float reference or s8_ref, selected by plan dtype)
+- esp-nn     -> ESP-IDF (ESP-NN int8 with s8_ref fallback; float reference)
+- cmsis-nn   -> Cortex-M (CMSIS-NN int8 with s8_ref fallback; float reference)
 """
 
 from __future__ import annotations
@@ -1109,7 +1109,7 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
 
 {scratch_declaration}
 
-/* Plan binary linked into flash — symbol provided by linker */
+/* Plan binary linked into flash: symbol provided by linker */
 extern const uint8_t _binary_model_tgrs_start[];
 extern const uint8_t _binary_model_tgrs_end[];
 
