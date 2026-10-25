@@ -6,6 +6,7 @@ import itertools
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 from dataclasses import replace
@@ -21,7 +22,8 @@ from tigris.cli import cli
 from tigris.cli.export import export_report
 from tigris.frontends import tflite
 from tigris.frontends import tflite_writer as tw
-from tigris.frontends.tflite import _BUILTIN_OPERATORS, TFLM_TARGETS, Window, tflm_tensor_arena, window
+from tigris.frontends.flatbuffer import Table
+from tigris.frontends.tflite import _BUILTIN_OPERATORS, TFLM_TARGETS, Window, window
 from tigris.frontends.tflite_export import (
     Export,
     _conv_geometry,
@@ -31,6 +33,7 @@ from tigris.frontends.tflite_export import (
     export,
     input_rows,
     persistent,
+    tflm_tensor_arena,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tflite"
@@ -435,6 +438,55 @@ def test_analyze_reports_a_dangling_signature_as_the_export_reason(tmp_path):
     row = next(line for line in result.output.splitlines() if "TFLite Micro export" in line)
     assert row.rstrip().endswith("none   signature 0: tensor index 94 is out of range for 89 "
                                  "tensors")
+
+
+def _external_buffers(data: bytes) -> bytes:
+    """`data` with the bytes of every buffer stored after the FlatBuffer, each
+    buffer table naming their offset and size."""
+    model = tw.read(data)
+    contents, model.buffers = model.buffers, [None] * len(model.buffers)
+    out = bytearray(tw.write(model))
+    vector, _ = Table.root(bytes(out))._vector(tflite._MODEL_BUFFERS)
+    for index, content in enumerate(contents):
+        if not content:
+            continue
+        out += bytes(-len(out) % 16)
+        offset = len(out)
+        out += content
+        out += bytes(-len(out) % 8)
+        # A vtable with slots 1 and 2 (offset, size), then the table 12 bytes on.
+        out += struct.pack("<5H2x", 10, 20, 0, 4, 12)
+        table = len(out)
+        out += struct.pack("<iQQ", 12, offset, len(content))
+        entry = vector + 4 * index
+        struct.pack_into("<I", out, entry, table - entry)
+    return bytes(out)
+
+
+def test_analyze_and_compile_report_no_tflite_micro_rows_for_external_buffers(tmp_path):
+    source = FIXTURES / "ops" / "conv_bias.tflite"
+    path = tmp_path / "conv_bias.tflite"
+    path.write_bytes(_external_buffers(source.read_bytes()))
+    reports, plans = [], []
+    for model in (source, path):
+        result = CliRunner().invoke(cli, ["analyze", str(model), "-m", "256K"])
+        assert result.exit_code == 0, result.output
+        rows = [line.split()[2] for line in result.output.splitlines() if "TFLite Micro" in line]
+        assert rows == (["arena", "export"] if model == source else [])
+        result = CliRunner().invoke(cli, ["analyze", str(model), "-m", "256K", "--json"])
+        assert result.exit_code == 0, result.output
+        reports.append(json.loads(result.output))
+        out = tmp_path / f"{len(plans)}.tgrs"
+        result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(out)])
+        assert result.exit_code == 0, result.output
+        assert ("TFLite Micro" in result.output) == (model == source)
+        plans.append(out.read_bytes())
+    with pytest.raises(ValueError, match="buffers stored outside the FlatBuffer"):
+        tw.read(path.read_bytes())
+    assert tflm_tensor_arena(path.read_bytes()) is None
+    assert reports[0].pop("tflite_micro")["tensor_arena_bytes"] == 512
+    assert reports[1].pop("tflite_micro") is None
+    assert reports[0] == reports[1] and plans[0] == plans[1]
 
 
 def test_the_arena_counts_the_scratch_buffers_of_a_reduction(tflite_micro, tmp_path):

@@ -113,14 +113,13 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
 
     from tigris.analysis.findings import compute_findings
     from tigris.cli.analyze import summary
-    from tigris.frontends.tflite import is_tflite, tflm_tensor_arena
+    from tigris.frontends.tflite_export import tflm_tensor_arena
 
     # The same summary analyze prints: what was decided, and why not when it
     # was not. A plan is written only when everything holds.
     data = Path(model).read_bytes()
     findings = compute_findings(ag, flash_budget=ag.budget.flash, names=keep_names)
-    summary(model, ag, findings, budget, ag.budget.slow, ag.budget.flash,
-            tflm_tensor_arena(data) if is_tflite(data) else None)
+    summary(model, ag, findings, budget, ag.budget.slow, ag.budget.flash, tflm_tensor_arena(data))
     usable = (validate_model_outputs(ag).supported and validate_execution_dtype(ag).supported
               and validate_operator_support(ag).supported)
     result = validate_budget(ag) if usable else None

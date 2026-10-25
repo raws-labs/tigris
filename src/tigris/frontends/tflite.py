@@ -2328,20 +2328,6 @@ _ELEMENT_BYTES = {"FLOAT32": 4, "INT32": 4, "UINT32": 4, "INT8": 1, "UINT8": 1, 
 _TFLM_REDUCTIONS = ("MEAN", "SUM", "REDUCE_MAX", "REDUCE_MIN", "REDUCE_ALL")
 
 
-def tflm_tensor_arena(data: bytes) -> int | None:
-    """TFLite Micro's arena head for the model as tflm_arena plans it. None for
-    a model with more than one subgraph or a tensor of another storage type."""
-    model = _Model(data)
-    if len(model.subgraphs) != 1:
-        return None
-    subgraph = model.subgraphs[0]
-    tensors = [_Tensor(model, t) for t in subgraph.tables(_SG_TENSORS)]
-    operators = [_Operator(model, op, i) for i, op in enumerate(subgraph.tables(_SG_OPERATORS))]
-    return tflm_arena([(t.type, t.shape, not (t.data or t.variable)) for t in tensors],
-                      [(op.kind, op.inputs, op.outputs) for op in operators],
-                      subgraph.scalars(_SG_INPUTS, "i"), subgraph.scalars(_SG_OUTPUTS, "i"))
-
-
 def tflm_tensor_bytes(tensors: list, operators: list = ()) -> list[int] | None:
     """The bytes TFLite Micro's planner places for each (storage type, shape,
     placed) tensor, 0 for one not placed, once each RESHAPE among `operators`,
