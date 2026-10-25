@@ -455,13 +455,11 @@ def test_a_one_stage_output_that_overflows_counts_in_slow():
     assert slow_pool_usage(ag).slow_peak_bytes == 64
 
 
-@pytest.mark.parametrize("name", ["schema-v2-linear", "schema-v3-qdq-conv",
-                                  "schema-v4-transpose"])
-def test_a_plan_before_schema_5_keeps_its_slow_requirement(name):
+def test_a_plan_before_schema_5_keeps_its_slow_requirement():
     """The runtime copies model inputs and outputs of a plan older than schema
     5 through slow memory, so its one stage does not keep them in fast."""
     plan = read_binary_plan((Path(__file__).parent / "schema_compat"
-                             / f"{name}.tgrs").read_bytes())
+                             / "schema-v4-transpose.tgrs").read_bytes())
     graph = graph_from_plan(plan)
     assert len(graph.stages) == 1 and graph.schema_version < SCHEMA_VERSION_TILE_AXIS
     assert not io_in_fast(graph)

@@ -9,7 +9,7 @@ from tigris.operator_contract import ATTRIBUTES, OPERATOR_CONTRACT
 
 
 FLAGS = (
-    "legacy", "binary", "axis_unary", "axis_binary", "row", "height",
+    "binary", "axis_unary", "axis_binary", "row", "height",
     "spatial", "resample", "whole_operand", "fused", "fused_float",
 )
 

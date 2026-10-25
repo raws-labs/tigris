@@ -212,7 +212,7 @@ def test_unsupported_schema(tmp_path):
 
 
 def test_bad_tensor_reference(tmp_path):
-    data = bytearray((FIXTURES / "schema-v2-linear.tgrs").read_bytes())
+    data = bytearray((FIXTURES / "schema-v4-transpose.tgrs").read_bytes())
     header = defs.HEADER_STRUCT.unpack_from(data)
     offset = header[3]
     while True:
@@ -281,7 +281,7 @@ def test_nonfinite_attributes_produce_standard_json(tmp_path):
     (defs.SEC_WEIGHTS, 1, 0xFFFFFFFF),
 ])
 def test_pool_and_weight_bounds(tmp_path, kind, field, value):
-    data = bytearray((FIXTURES / "schema-v3-qdq-conv.tgrs").read_bytes())
+    data = bytearray((FIXTURES / "schema-v6-interface-dtype.tgrs").read_bytes())
     offset = defs.HEADER_STRUCT.unpack_from(data)[3]
     while True:
         section, start = defs.SECTION_ENTRY_STRUCT.unpack_from(data, offset)

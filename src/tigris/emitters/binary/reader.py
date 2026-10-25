@@ -321,7 +321,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         decoded_axis = (
             axis
             if version >= SCHEMA_VERSION_TILE_AXIS
-            # Schema v2-v4 used zero here and implicitly meant NHWC height.
+            # Schema v4 used zero here and implicitly meant NHWC height.
             else (TILE_AXIS_HEIGHT_OR_LENGTH if tileable else TILE_AXIS_NONE)
         )
         tile_plans.append({
@@ -370,14 +370,13 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         entries_start = qp_base + QUANT_SECTION_HEADER_STRUCT.size
         _check_range(SEC_QUANT_PARAMS, entries_start, nqp * QUANT_PARAM_SIZE)
         data_start = entries_start + nqp * QUANT_PARAM_SIZE
-        if version != 2:
-            quant_end = min(
-                (offset for offset in sections.values() if offset > qp_base),
-                default=len(data),
-            )
-            qd_bytes = quant_end - data_start
-            if qd_bytes < 0 or qd_bytes % 4:
-                raise ValueError("Malformed v3 quant-data section")
+        quant_end = min(
+            (offset for offset in sections.values() if offset > qp_base),
+            default=len(data),
+        )
+        qd_bytes = quant_end - data_start
+        if qd_bytes < 0 or qd_bytes % 4:
+            raise ValueError("Malformed quant-data section")
         for i in range(nqp):
             pos = entries_start + i * QUANT_PARAM_SIZE
             scale, zp, num_ch, mult_off, shift_off, page = (
@@ -392,7 +391,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
             }
             if num_ch > 1:
                 # Read per-channel multipliers and shifts
-                page_base = 0 if version == 2 else page * (1 << 16)
+                page_base = page * (1 << 16)
                 m_pos = data_start + (page_base + mult_off) * 4
                 s_pos = data_start + (page_base + shift_off) * 4
                 _check_range(SEC_QUANT_PARAMS, m_pos, num_ch * 4)
