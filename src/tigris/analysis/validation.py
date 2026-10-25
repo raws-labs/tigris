@@ -682,6 +682,8 @@ class MemoryPlanIssue:
     required_bytes: int
     budget: int
     reason: str
+    # 0 for a unit of the validated graph, else the position (from 1) of its subgraph that holds it.
+    subgraph: int = 0
 
     def describe(self) -> str:
         return (
@@ -750,7 +752,8 @@ def validate_memory_plan(
     for position, sub in enumerate(ag.subgraphs, start=1):
         nested = validate_memory_plan(sub, fast_reserve_bytes=fast_reserve_bytes)
         scheduled_peak = max(scheduled_peak, nested.scheduled_peak_bytes)
-        issues.extend(replace(issue, reason=f"{issue.reason} (subgraph {position})")
+        issues.extend(replace(issue, reason=f"{issue.reason} (subgraph {position})",
+                              subgraph=position)
                       for issue in nested.issues)
 
     return MemoryPlanValidation(

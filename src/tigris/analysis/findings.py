@@ -204,18 +204,23 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = Fal
         (s.live_bytes for s in ag.timeline), default=peak
     )
 
-    # Tiling results (computed before verdict)
+    # Analysis and deployment share one execution-unit validator, so a CLI
+    # PASS cannot disagree with `tigris compile` about memory feasibility.
+    from tigris.analysis.validation import validate_memory_plan
+
+    validation = validate_memory_plan(ag)
+    blocked_units = {issue.stage_id for issue in validation.issues if not issue.subgraph}
+
+    # Tileable: a tile plan the validator accepts. Untileable: an operator that cannot tile.
     untileable_ops: set[str] = set()
     for s in ag.stages:
         if s.tile_plan is not None:
-            if s.tile_plan.tileable:
+            if s.tile_plan.tileable and s.stage_id not in blocked_units:
                 f.stages_tileable += 1
                 f.total_tiles += s.tile_plan.num_tiles
                 if s.tile_plan.halo > f.max_halo:
                     f.max_halo = s.tile_plan.halo
             elif s.tile_plan.untileable_ops:
-                # Only an operator that cannot tile makes a stage untileable;
-                # a stage whose smallest tile is too large is still tileable.
                 f.stages_untileable += 1
                 for op_desc in s.tile_plan.untileable_ops:
                     # op_desc is "name (OpType)" - extract the type
@@ -224,15 +229,8 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = Fal
                     else:
                         op_type = op_desc
                     untileable_ops.add(op_type)
-            else:
-                f.stages_tileable += 1
     f.untileable_op_types = sorted(untileable_ops)
 
-    # Analysis and deployment share one execution-unit validator, so a CLI
-    # PASS cannot disagree with `tigris compile` about memory feasibility.
-    from tigris.analysis.validation import validate_memory_plan
-
-    validation = validate_memory_plan(ag)
     f.scheduled_peak_bytes = validation.scheduled_peak_bytes
     f.feasibility_errors = [issue.describe() for issue in validation.issues]
     # The same requirements compile checks, so the report cannot name a
