@@ -1,8 +1,11 @@
 """Regression tests for schema-derived plan-size accounting."""
 
+from pathlib import Path
+
+import numpy as np
 import pytest
 import onnx
-from onnx import TensorProto, helper
+from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.findings import compute_findings
 from tigris.analysis.lifetime import compute_lifetimes
@@ -32,8 +35,13 @@ from tigris.emitters.binary.defs import (
     WEIGHT_ENTRY_SIZE,
     WEIGHT_ENTRY_STRUCT,
 )
+from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.loaders import load_model
+
+from conftest import save_onnx
+
+OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
 
 
 def _analyze(path, budget=65536):
@@ -124,3 +132,52 @@ def test_plan_estimate_includes_typed_attributes(transpose_path):
     findings = compute_findings(graph)
 
     assert findings.plan_size_bytes == len(emit_binary_bytes(graph))
+
+
+def _assert_weights_sized_as_stored(graph, weight_bytes):
+    findings = compute_findings(graph)
+    plan = emit_binary_bytes(graph)
+
+    assert sum(w["size_bytes"] for w in read_binary_plan(plan)["weights"]) == weight_bytes
+    assert findings.total_weight_bytes == weight_bytes
+    assert findings.plan_overhead_bytes == len(plan) - weight_bytes
+    # Without a float weight the int8 profile is the plan as written.
+    assert findings.int8_weight_bytes == weight_bytes
+    assert findings.int8_plan_size_bytes == len(plan)
+
+
+@pytest.mark.parametrize(("name", "weight_bytes"), [("svdf", 160), ("svdf_batch", 54)])
+def test_int16_weights_are_sized_as_the_plan_stores_them(name, weight_bytes):
+    _assert_weights_sized_as_stored(_analyze(OPS / f"{name}.tflite", budget=262144), weight_bytes)
+
+
+def test_bool_weights_are_sized_as_the_plan_stores_them(tmp_path):
+    mask = numpy_helper.from_array(np.array([[True, False, True, True, False, False, True, False]]), "mask")
+    path = save_onnx(
+        tmp_path, "bool_mask",
+        [helper.make_node("Neg", ["x"], ["negated"]),
+         helper.make_node("Where", ["mask", "x", "negated"], ["y"])],
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8])], [mask])
+    graph = _analyze(path, budget=4096)
+
+    assert graph.weight_data["mask"].dtype == np.bool_
+    _assert_weights_sized_as_stored(graph, 8)
+
+
+def test_no_lz4_estimate_when_the_writer_cannot_group_weights_by_stage(tmp_path):
+    weight = numpy_helper.from_array(
+        np.random.default_rng(0).standard_normal((8, 8, 3, 3)).astype(np.float32), "w")
+    path = save_onnx(
+        tmp_path, "shared_weight",
+        [helper.make_node("Conv", ["x", "w"], ["a"], pads=[1, 1, 1, 1]),
+         helper.make_node("Relu", ["a"], ["b"]),
+         helper.make_node("Conv", ["b", "w"], ["y"], pads=[1, 1, 1, 1])],
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 16, 16])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 16, 16])], [weight])
+    graph = _analyze(path, budget=12288)
+
+    assert len(graph.stages) == 2
+    with pytest.raises(ValueError, match="shared across stages"):
+        emit_binary_bytes(graph, compress="lz4")
+    assert compute_findings(graph).lz4_plan_size_bytes == 0
