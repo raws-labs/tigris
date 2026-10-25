@@ -316,20 +316,6 @@ def test_immutable_supported_schema_fixtures():
     # corresponding schema and exercises a version-specific wire feature.
     fixtures = (
         (
-            2,
-            "schema-v2-linear.tgrs",
-            "54597dd75d14c54fcb3c6abb3c6cb3a8c2f18a4bc2fa54ea78d9762f75cb96c5",
-            0,
-            0,
-        ),  # b47664926e7a484d6638ecd0fd372da477236619
-        (
-            3,
-            "schema-v3-qdq-conv.tgrs",
-            "fe300785de7401dcc30f05e3c859943a74f02da83df40a0047d1fb637a46b9bb",
-            3,
-            0,
-        ),  # 0fe37d3a53292cf532ba8628d2284c00a896fbb2
-        (
             4,
             "schema-v4-transpose.tgrs",
             "c6892a319b4ca319dfca2f44cbaf6f0f36fca502cdbd493c52b67f2d2aa03e93",
@@ -472,6 +458,20 @@ def test_schema_version_validation(linear_3op_path, version):
         )
 
 
+@pytest.mark.parametrize("version", [2, 3])
+def test_schemas_before_4_are_refused(version):
+    """Schemas 2 and 3 left operators outside their table unvalidated, and no
+    release emitted either, so the reader refuses them as the runtime does."""
+    data = bytearray((Path(__file__).parent / "schema_compat" / "schema-v4-transpose.tgrs").read_bytes())
+    struct.pack_into("<I", data, 4, version)
+    supported = ", ".join(str(item) for item in range(4, SCHEMA_VERSION + 1))
+    with pytest.raises(ValueError) as exc_info:
+        read_binary_plan(bytes(data))
+    assert str(exc_info.value) == (
+        f"Unsupported schema version: {version} (expected one of: {supported})"
+    )
+
+
 @pytest.mark.parametrize("compress", [None, "lz4"])
 def test_plan_states_its_scheduled_fast_peak(conv_relu_chain_path, compress):
     """The memory section holds the figure the compiler validated against the
@@ -527,7 +527,7 @@ def test_missing_required_section_is_rejected_cleanly(linear_3op_path):
 
 @pytest.fixture
 def reader_plan():
-    data = bytearray((Path(__file__).parent / "schema_compat" / "schema-v3-qdq-conv.tgrs").read_bytes())
+    data = bytearray((Path(__file__).parent / "schema_compat" / "schema-v6-interface-dtype.tgrs").read_bytes())
     header = list(defs.HEADER_STRUCT.unpack_from(data))
     sections = {}
     for offset in range(header[3], len(data), defs.SECTION_ENTRY_SIZE):

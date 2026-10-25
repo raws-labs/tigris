@@ -183,11 +183,12 @@ def test_conv_matches_onnx_runtime(conv_relu_chain_path, qdq_conv_path, tmp_path
 
 
 def test_fixed_int8_reference():
-    path = Path(__file__).parent / "schema_compat" / "schema-v3-qdq-conv.tgrs"
+    # A 1x1 int8 Conv of weight 2 at scale 0.25 between float boundaries at scale 0.25.
+    path = Path(__file__).parent / "schema_compat" / "schema-v6-interface-dtype.tgrs"
+    x = (np.arange(16, dtype=np.float32) * 2 - 16).reshape(1, 4, 4, 1) * 0.25
     with Session(path) as session:
-        actual = session.run({"input": np.arange(16, dtype=np.int8).reshape(1, 4, 4, 1)})
-    expected = np.array([1, 0, 1, 0, 2, 0, 2, 0], dtype=np.int8).reshape(1, 2, 2, 2)
-    np.testing.assert_array_equal(actual["relu_out"], expected)
+        actual = session.run({"input": x})
+    np.testing.assert_array_equal(actual["conv"], x * 0.5)
 
 
 def test_input_validation_and_recovery(linear_plan):

@@ -16,8 +16,6 @@
     "runtime_branch": "develop",
     "compiler_emits_schema": 11,
     "runtime_accepts_schemas": [
-      2,
-      3,
       4,
       5,
       6,
