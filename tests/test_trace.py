@@ -1,13 +1,14 @@
 """The execution trace groups and checks runtime events without a host library."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from tigris.cli import _run_pipeline, cli
-from tigris.cli.trace import check, render, units
+from tigris.cli.trace import _plan_bytes, check, render, units
 from tigris.graph.ir import AnalyzedGraph, OpNode
 from tigris.graph.subgraphs import input_dependent_loop
 
@@ -114,6 +115,32 @@ def test_analyze_says_when_traffic_is_not_measured(conv_relu_chain_path, monkeyp
     assert "not measured: no host runtime in this install" in result.output
     result = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "8K", "--json"])
     assert json.loads(result.output)["slow"]["traffic"] is None
+
+
+def test_trace_refuses_a_plan_compile_refuses_for_slow_overflow(conv_relu_chain_path, tmp_path, monkeypatch):
+    import tigris.cli.trace
+
+    def never(*args, **kwargs):
+        raise AssertionError("the plan ran")
+
+    model = str(conv_relu_chain_path)
+    ag, _ = _run_pipeline(model, ("16K",), report_bindings=False)
+    assert _plan_bytes(ag) is not None
+    assert _plan_bytes(replace(ag, budget=replace(ag.budget, slow=64 * 1024))) is not None
+    ag.budget = replace(ag.budget, slow=1024)
+    assert _plan_bytes(ag) is None
+    result = CliRunner().invoke(cli, ["compile", model, "-m", "16K", "-m", "1K", "-o", str(tmp_path / "x.tgrs")])
+    assert result.exit_code == 1 and "no plan written" in result.output
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "16K", "-m", "64K"])
+    assert result.exit_code == 0, result.output
+    assert "slow traffic" in result.output
+    monkeypatch.setattr(tigris.cli.trace, "_run", never)
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "16K", "-m", "1K", "--trace"])
+    assert result.exit_code == 1, result.output
+    assert "no plan to trace" in result.output
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "16K", "-m", "1K"])
+    assert result.exit_code == 0, result.output
+    assert "slow traffic" not in result.output
 
 
 @pytest.mark.parametrize("name", sorted(path.stem for path in OPS.glob("*.tflite")
