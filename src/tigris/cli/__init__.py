@@ -8,31 +8,55 @@ import click
 
 
 def _parse_size(s: str) -> int:
-    s = s.strip().upper()
+    """Bytes in ``s``: a byte count, or a number with a K, KB, M or MB suffix."""
+    text = s.strip().upper()
     multipliers = {"K": 1024, "KB": 1024, "M": 1024**2, "MB": 1024**2}
-    for suffix, mult in sorted(multipliers.items(), key=lambda x: -len(x[0])):
-        if s.endswith(suffix):
-            return int(float(s[: -len(suffix)]) * mult)
-    return int(s)
+    try:
+        for suffix, mult in sorted(multipliers.items(), key=lambda x: -len(x[0])):
+            if text.endswith(suffix):
+                size = int(float(text[: -len(suffix)]) * mult)
+                break
+        else:
+            size = int(text)
+    except (ValueError, OverflowError):
+        raise ValueError(
+            f"invalid memory size {s!r}: expected bytes or a number with a K, KB, M "
+            "or MB suffix (e.g. 256K)"
+        ) from None
+    if size <= 0:
+        raise ValueError(f"invalid memory size {s!r}: must be greater than zero")
+    return size
 
 
-def _expand_mem(ctx, param, value: tuple[str, ...]) -> tuple[str, ...]:
-    """Expand ``-m 256K+4M`` into separate pools. Sugar for repeated ``-m``."""
-    expanded: list[str] = []
-    for token in value:
-        parts = token.split("+")
-        for part in parts:
-            if not part.strip():
-                raise click.BadParameter(
-                    f"invalid memory budget {token!r}: empty memory pool"
-                )
-            expanded.append(part.strip())
-    if len(expanded) > 2:
-        raise click.BadParameter(
-            f"{len(expanded)} memory pools given; the planner supports a fast "
-            "and a slow pool"
-        )
-    return tuple(expanded)
+def _memory_sizes(ctx, param, value):
+    """Check the sizes of ``-m`` and ``-f``, which stay text.
+
+    ``-m 256K+4M`` is sugar for repeated ``-m`` and expands into separate pools.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        tokens = [value]
+    else:
+        tokens = []
+        for token in value:
+            for part in token.split("+"):
+                if not part.strip():
+                    raise click.BadParameter(
+                        f"invalid memory budget {token!r}: empty memory pool"
+                    )
+                tokens.append(part.strip())
+        if len(tokens) > 2:
+            raise click.BadParameter(
+                f"{len(tokens)} memory pools given; the planner supports a fast "
+                "and a slow pool"
+            )
+    for token in tokens:
+        try:
+            _parse_size(token)
+        except ValueError as exc:
+            raise click.BadParameter(str(exc)) from None
+    return value if isinstance(value, str) else tuple(tokens)
 
 
 def _parse_input_shape(ctx, param, value: tuple[str, ...]):
@@ -147,8 +171,6 @@ def _run_pipeline(
     ag = planned(planned_below(ag))
 
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
-    if len(mem) > 1 and slow_budget <= 0:
-        raise click.ClickException("Slow-memory budget must be greater than zero")
     for graph in (*ag.subgraphs, ag):
         graph.budget = replace(graph.budget, slow=slow_budget)
 

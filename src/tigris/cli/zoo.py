@@ -5,28 +5,18 @@ from pathlib import Path
 
 import click
 
-from tigris.cli import _expand_mem, _parse_size, cli, text
+from tigris.cli import _memory_sizes, _parse_size, cli, text
 from tigris.utils import fmt_bytes
 from tigris.zoo import REPOSITORY, Zoo, select, version
-
-
-def _size(value):
-    try:
-        result = _parse_size(value)
-        if result < 0:
-            raise ValueError()
-        return result
-    except (ValueError, OverflowError):
-        raise click.BadParameter(f"invalid nonnegative memory size: {value}") from None
 
 
 def _filters(function):
     options = [
         click.option("--category"), click.option("--runtime", help="Compatible runtime release, e.g. 0.9.1."),
         click.option("--backend"), click.option("--quantization", "--quant"),
-        click.option("-m", "--mem", multiple=True, callback=_expand_mem,
+        click.option("-m", "--mem", multiple=True, callback=_memory_sizes,
                      help="Maximum fast arena; repeat for slow arena. Omitted pools are unconstrained."),
-        click.option("-f", "--flash", help="Maximum compiled plan bytes."),
+        click.option("-f", "--flash", callback=_memory_sizes, help="Maximum compiled plan size, e.g. 4M."),
     ]
     for option in reversed(options):
         function = option(function)
@@ -38,11 +28,11 @@ def _matches(config, *, mem, flash, **filters):
         raise click.UsageError("At most two memory pools are supported")
     if filters.get("runtime") is not None:
         version(filters["runtime"])
-    pools = [_size(value) for value in mem]
+    pools = [_parse_size(value) for value in mem]
     zoo = Zoo(**config)
     return zoo, select(zoo.artifacts, fast=pools[0] if pools else None,
                        slow=pools[1] if len(pools) > 1 else None,
-                       flash=_size(flash) if flash is not None else None, **filters)
+                       flash=_parse_size(flash) if flash is not None else None, **filters)
 
 
 @cli.group()

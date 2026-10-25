@@ -6,7 +6,7 @@ from pathlib import Path
 
 import click
 
-from tigris.cli import _expand_mem, _parse_input_shape, _parse_size, _run_pipeline, cli, text
+from tigris.cli import _memory_sizes, _parse_input_shape, _parse_size, _run_pipeline, cli, text
 from tigris.utils import describe_interface, fmt_bytes, source_shape
 
 # Causes listed under a verdict; --json lists all.
@@ -289,9 +289,10 @@ def _stages(ag) -> None:
 
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
-@click.option("--mem", "-m", multiple=True, callback=_expand_mem,
+@click.option("--mem", "-m", multiple=True, callback=_memory_sizes,
               help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
-@click.option("--flash", "-f", default=None, help="Flash size for plan fit check (e.g. 4M)")
+@click.option("--flash", "-f", default=None, callback=_memory_sizes,
+              help="Flash size for plan fit check (e.g. 4M)")
 @click.option("--verbose", "-v", is_flag=True, help="Add the per-stage table")
 @click.option("--input-shape", "input_shape", multiple=True,
               callback=_parse_input_shape,
@@ -317,8 +318,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     flash_budget = _parse_size(flash) if flash else 0
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
     # Only forward the fast tier to _run_pipeline: analyze interprets the slow
-    # tier itself and stays display-only, so a non-positive slow tier is
-    # reported as unconstrained rather than raised.
+    # tier itself and stays display-only.
     ag, budget = _run_pipeline(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json)
     ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
     if trace:

@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import re
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -241,7 +242,7 @@ def test_cli_filtering_and_download(tmp_path):
     assert result.output.startswith("model") and "Classification" in result.output
     assert "1.00 KiB" in result.output
     assert "example-a" not in result.output and "published=" not in result.output
-    result = runner.invoke(cli, prefix + ["list", "--runtime", "0.9.1", "-m", "1K+0", "--json"])
+    result = runner.invoke(cli, prefix + ["list", "--runtime", "0.9.1", "-m", "1K+1K", "--json"])
     assert result.exit_code == 0, result.output
     assert [item["id"] for item in json.loads(result.output)] == ["example-a"]
     output = tmp_path / "download"
@@ -255,3 +256,20 @@ def test_cli_filtering_and_download(tmp_path):
                  ["list", "-m", "-1"], ["list", "--runtime", "broken"],
                  ["list", "-m", "1K+2K+3K"]):
         assert runner.invoke(cli, prefix + args).exit_code != 0
+
+
+@pytest.mark.parametrize("command", [["list"], ["fetch", "example", "-o", "download"]])
+@pytest.mark.parametrize("sizes, reason", [
+    (["-m", "64Q"], "suffix"), (["-f", "4X"], "suffix"), (["-m", "5G"], "suffix"),
+    (["-m", "-5"], "greater than zero"), (["-m", "0"], "greater than zero"),
+    (["-m", "1K+0"], "greater than zero"), (["-f", "0"], "greater than zero"),
+])
+def test_cli_rejects_a_malformed_memory_size_as_usage_error(tmp_path, command, sizes, reason):
+    catalog = snapshot(tmp_path / "source", [artifact()])
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli, ["zoo", "--catalog", str(catalog), *command, *sizes])
+        assert not Path("download").exists()
+    assert result.exit_code == 2, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "invalid memory size" in result.output and reason in result.output

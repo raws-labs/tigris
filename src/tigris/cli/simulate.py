@@ -2,12 +2,12 @@
 
 import click
 
-from tigris.cli import _expand_mem, _parse_input_shape, _run_pipeline, cli
+from tigris.cli import _memory_sizes, _parse_input_shape, _run_pipeline, cli
 
 
 @cli.command(hidden=True)
 @click.argument("model", type=click.Path(exists=True))
-@click.option("--mem", "-m", multiple=True, callback=_expand_mem,
+@click.option("--mem", "-m", multiple=True, callback=_memory_sizes,
               help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 @click.option("--input-shape", "input_shape", multiple=True,
               callback=_parse_input_shape,
