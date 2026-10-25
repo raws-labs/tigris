@@ -99,6 +99,8 @@ class ContractCase:
     exact: bool = False
     # The plan reads its inputs in place, so the gate also runs it without a slow arena.
     expect_inputs_in_fast: bool = False
+    # The compiler's slow figure is the runtime's slow peak, so the gate also runs the plan in it.
+    exact_slow: bool = False
 
 
 def _model(
@@ -2715,6 +2717,47 @@ def _row_band_alias_case() -> ContractCase:
         mem_budget="32K",
         slow_budget="96K",
         expect_tiled=True,
+    )
+
+
+def _row_band_onto_output_case() -> ContractCase:
+    """A banded stage whose input is also a model output.
+
+    The Softmax is the last stage to read the scores, but the runtime keeps a
+    model output until the run ends, so it never writes the Softmax result
+    over them. The compiler has to count both buffers: 768 KiB, where sharing
+    one would be 640 KiB. The plan runs in exactly the figure the compiler
+    states.
+    """
+    rows, depth, width, out = 512, 16, 128, 64
+    rng = np.random.default_rng(7)
+    first = (rng.standard_normal((depth, width)) * 0.1).astype(np.float32)
+    second = (rng.standard_normal((width, out)) * 0.1).astype(np.float32)
+    model = _model(
+        "row_band_onto_output",
+        [
+            helper.make_node("MatMul", ["input", "first"], ["scores"]),
+            helper.make_node("Softmax", ["scores"], ["probs"], axis=-1),
+            helper.make_node("MatMul", ["probs", "second"], ["mixed"]),
+            helper.make_node("Add", ["mixed", "skip"], ["output"]),
+        ],
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [rows, depth]),
+         helper.make_tensor_value_info("skip", TensorProto.FLOAT, [rows, out])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [rows, out]),
+         helper.make_tensor_value_info("scores", TensorProto.FLOAT, [rows, width])],
+        [numpy_helper.from_array(first, "first"), numpy_helper.from_array(second, "second")],
+    )
+    inputs = {"input": rng.standard_normal((rows, depth)).astype(np.float32),
+              "skip": rng.standard_normal((rows, out)).astype(np.float32)}
+    return ContractCase(
+        "float_row_band_onto_output",
+        model,
+        model,
+        inputs,
+        ("Gemm", "Softmax", "Gemm", "Add"),
+        mem_budget="32K",
+        expect_tiled=True,
+        exact_slow=True,
     )
 
 
@@ -7181,6 +7224,27 @@ def _assert_memory_contract(
         )
 
 
+def _assert_runs_in_slow_figure(
+    case_name: str, plan: dict, runner: Path, plan_path: Path, inputs_path: Path,
+    outputs_path: Path, runtime_stdout: str,
+) -> None:
+    """The runtime's slow peak is the compiler's slow figure, and the plan runs
+    in a slow arena of exactly that size, to the same bytes."""
+    figure = int(plan["_compiler_slow_peak"])
+    slow_peak = int(_MEMORY_REPORT.search(runtime_stdout).group(7))
+    if slow_peak != figure:
+        raise AssertionError(
+            f"{case_name}: runtime slow peak {slow_peak} != the compiler's slow "
+            f"requirement {figure}")
+    exact = outputs_path.with_name("exact-slow.bin")
+    completed = _run([str(runner), str(plan_path), str(inputs_path), str(exact),
+                      str(plan["_compiler_scheduled_peak"]), f"--slow-arena={figure}"],
+                     f"{case_name} run in the compiler's slow figure")
+    _assert_memory_contract(case_name, plan, completed.stdout)
+    if exact.read_bytes() != outputs_path.read_bytes():
+        raise AssertionError(f"{case_name}: the run in the compiler's slow figure changed the outputs")
+
+
 def _assert_runs_without_slow(
     case_name: str, plan: dict, runner: Path, plan_path: Path, inputs_path: Path,
     outputs_path: Path, limit: int,
@@ -7568,6 +7632,9 @@ def _run_case(
         plan["_compiler_scheduled_peak"])
     if case.expect_inputs_in_fast and not without_slow:
         raise AssertionError(f"{case.name}: the plan does not read its inputs in place")
+    if case.exact_slow:
+        _assert_runs_in_slow_figure(case.name, plan, runner, plan_path, inputs_path,
+                                    outputs_path, completed.stdout)
     actual_outputs = _decode_outputs(
         plan, outputs_path.read_bytes(), reference_outputs
     )
@@ -8148,6 +8215,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _chain_pointwise_before_spatial_case(),
         _chain_skip_out_of_a_stage_case(),
         _row_band_alias_case(),
+        _row_band_onto_output_case(),
         _cotiled_gate_chain_case(),
         _reshape_alias_release_case(),
         _qdq_max_pool_rescale_case(),

@@ -242,6 +242,98 @@ def test_a_banded_stage_shares_one_buffer_with_its_input(tmp_path):
     assert slow_pool_usage(ag).slow_peak_bytes == 98304
 
 
+def _value(name, shape):
+    return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+
+
+def _banded_softmax_graph(prefix, keep_scores):
+    """x @ w1 gives 512x128 float scores that a row-banded Softmax reads last;
+    its result feeds a second product added to a second input."""
+    rng = np.random.default_rng(7)
+    weights = [numpy_helper.from_array((rng.standard_normal(shape) * 0.1).astype(np.float32),
+                                       prefix + name)
+               for name, shape in (("w1", (16, 128)), ("w2", (128, 64)))]
+    nodes = [helper.make_node("MatMul", [prefix + "x", prefix + "w1"], [prefix + "h"]),
+             helper.make_node("Softmax", [prefix + "h"], [prefix + "p"], axis=-1),
+             helper.make_node("MatMul", [prefix + "p", prefix + "w2"], [prefix + "y"]),
+             helper.make_node("Add", [prefix + "y", prefix + "u"], [prefix + "z"])]
+    outputs = [_value(prefix + "z", [512, 64])]
+    if keep_scores:
+        outputs.append(_value(prefix + "h", [512, 128]))
+    return helper.make_graph(nodes, prefix + "graph",
+                             [_value(prefix + "x", [512, 16]), _value(prefix + "u", [512, 64])],
+                             outputs, weights)
+
+
+def _banded_softmax_model(path, kept):
+    """The scores are freed after the Softmax ("none"), or kept as a model
+    output, as the next value of a variable, or as an output of the If
+    branches that compute all of it."""
+    if kept == "branch":
+        constants = [numpy_helper.from_array(np.asarray([2], np.int64), "axes"),
+                     numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), "rows"),
+                     numpy_helper.from_array(np.asarray(0.0, np.float32), "zero")]
+        nodes = [helper.make_node("Reshape", ["c", "rows"], ["row"]),
+                 helper.make_node("ReduceSum", ["row", "axes"], ["sum"], keepdims=0),
+                 helper.make_node("Greater", ["sum", "zero"], ["positive"]),
+                 helper.make_node("If", ["positive", "x", "u"], ["z", "h"], domain="tigris",
+                                  then_branch=_banded_softmax_graph("then_", True),
+                                  else_branch=_banded_softmax_graph("else_", True))]
+        graph = helper.make_graph(
+            nodes, "if", [_value("x", [512, 16]), _value("u", [512, 64]), _value("c", [1, 4])],
+            [_value("z", [512, 64])], constants, value_info=[_value("h", [512, 128])])
+        model = helper.make_model(graph, opset_imports=[
+            helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
+        model.ir_version = 9
+    else:
+        graph = _banded_softmax_graph("", kept != "none")
+        if kept == "state":
+            graph.input.append(_value("s", [512, 128]))
+            graph.initializer.append(
+                numpy_helper.from_array(np.zeros((512, 128), np.float32), "s_initial"))
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        if kept == "state":
+            helper.set_model_props(model, {"tigris.state": json.dumps(
+                [{"input": "s", "output": "h", "initial": "s_initial"}])})
+    onnx.save(model, str(path))
+
+
+@pytest.mark.parametrize("kept, aliases, figure", [
+    ("none", [{"p": "h"}], 524288),
+    ("output", [{}], 786432),
+    ("state", [{}], 786432),
+    ("branch", [{}, {}, {}], None),
+])
+def test_a_banded_stage_never_writes_over_an_output(tmp_path, require_host_library,
+                                                    kept, aliases, figure):
+    """The runtime keeps a model, state or subgraph output until the run or
+    the subgraph ends, so a row band never writes its result over one. Kept,
+    the scores and the Softmax result take two buffers, and the plan runs in
+    the slow memory the compiler states: 768 KiB, against 512 KiB when the
+    scores are freed and share one buffer with the result."""
+    from tigris.runtime import Session
+
+    path = tmp_path / "model.onnx"
+    _banded_softmax_model(path, kept)
+    ag, _ = _run_pipeline(str(path), ("32K", "8M"))
+    fast_total = ag.budget.fast + ag.budget.fast_reserve
+    assert [row_band_aliases(graph, fast_total) for graph in (ag, *ag.subgraphs)] == aliases
+    required = slow_pool_usage(ag).slow_peak_bytes
+    plan = tmp_path / "model.tgrs"
+    plan.write_bytes(emit_binary_bytes(ag))
+    with Session(plan, slow_capacity=required) as session:
+        rng = np.random.default_rng(0)
+        session.run({item["name"]: np.abs(rng.standard_normal(item["shape"])).astype(np.float32)
+                     for item in session.inputs})
+        peak = session.memory["slow_peak_bytes"]
+    if figure is None:
+        # A control-flow stage is sized with its subgraph's peak beside its own tensors, an upper bound.
+        assert peak <= required
+    else:
+        assert peak == required == figure
+
+
 def _softmax_model(path, shape):
     model = helper.make_model(helper.make_graph(
         [helper.make_node("Softmax", ["input"], ["output"], axis=-1)], "softmax",

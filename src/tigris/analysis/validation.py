@@ -1032,8 +1032,12 @@ def row_band_aliases(ag: AnalyzedGraph, fast_total: int) -> dict[str, str]:
     scatters the result back to the same rows, so one buffer can carry both
     tensors. The runtime does that whenever the two agree on size and on row
     view, nothing after the stage reads the input, and the input is not a
-    model input, whose buffer belongs to the caller. Mirrored here so the slow
-    pool is not sized for a pair that never coexists.
+    model input, whose buffer belongs to the caller. Nor is it an output: the
+    runtime keeps a model, state or subgraph output until the run or the
+    subgraph ends, so nothing is written over it. To the analysis a state
+    output is a model output, and so is a control-flow body's output in the
+    body's own graph. Mirrored here so the slow pool is not sized for a pair
+    that never coexists.
 
     The rule is deliberately the narrower of the two: every condition the
     runtime tests is tested here, plus the same total-I/O threshold that sends
@@ -1044,14 +1048,14 @@ def row_band_aliases(ag: AnalyzedGraph, fast_total: int) -> dict[str, str]:
     for stage in ag.stages:
         for name in stage.input_tensors:
             last_reader[name] = stage.stage_id
-    model_inputs = set(ag.model_inputs)
+    pinned = set(ag.model_inputs) | set(ag.model_outputs)
 
     aliases: dict[str, str] = {}
     for stage in ag.stages:
         if len(stage.input_tensors) != 1 or len(stage.output_tensors) != 1:
             continue
         src, dst = stage.input_tensors[0], stage.output_tensors[0]
-        if src in model_inputs or last_reader.get(src) != stage.stage_id:
+        if src in pinned or last_reader.get(src) != stage.stage_id:
             continue
         plan = stage.tile_plan
         if plan is None or not plan.tileable or plan.axis != TILE_AXIS_HEIGHT_OR_LENGTH:
