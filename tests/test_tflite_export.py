@@ -382,6 +382,38 @@ def test_an_index_outside_its_table_is_not_exported(edit, reason):
     assert (result.data, result.reason) == (None, reason)
 
 
+def _signature_keeps(model: tw.Model, index: int) -> None:
+    output = model.subgraphs[0].outputs[0]
+    model.signatures = [replace(_signature(model, output),
+                                outputs=[(b"output", output), (b"unread", index)])]
+
+
+def _export_with_unread(keep) -> Export:
+    """The inverted residual export with a tensor no operator reads, kept by `keep`."""
+    model = tw.read(_inverted_residual())
+    sg = model.subgraphs[0]
+    sg.tensors.append(tw.Tensor([1, 40, 40, 24], _INT8, 0, b"unread",
+                                tw.Quantization([0.05], [0])))
+    keep(model, len(sg.tensors) - 1)
+    return export(tw.write(model))
+
+
+@pytest.mark.parametrize("keep", [
+    pytest.param(_signature_keeps, id="signature"),
+    pytest.param(lambda m, t: setattr(_op(m, 5), "intermediates", [t]), id="intermediate"),
+])
+def test_the_planned_arena_counts_every_tensor_the_written_model_keeps(keep):
+    result = _export_with_unread(keep)
+    assert result.data is not None
+    assert result.arena_after == arena(tw.read(result.data)) == 40 * 40 * 24
+
+
+def test_tflite_micro_places_a_tensor_only_a_signature_names(tflite_micro, tmp_path):
+    result = _export_with_unread(_signature_keeps)
+    head, _, _ = _tflm(result.data, [np.zeros((1, 32, 32, 8), np.int8)], tmp_path, "unread")
+    assert head == result.arena_after == 40 * 40 * 24
+
+
 def test_a_dangling_signature_keeps_the_reason_found_first():
     b = _Builder(9)
     x = b.activation([1, 8, 8, 4])
