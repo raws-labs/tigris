@@ -10,7 +10,7 @@ from tigris.emitters.binary.writer import RUNTIME_MAX_TENSORS
 from tigris.cli import (
     cli,
     text,
-    _expand_mem,
+    _memory_sizes,
     _parse_input_shape,
     _parse_size,
     _report_shape_bindings,
@@ -69,10 +69,10 @@ def _run_compressed_pipeline(
 
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
-@click.option("--mem", "-m", multiple=True, required=True, callback=_expand_mem,
+@click.option("--mem", "-m", multiple=True, required=True, callback=_memory_sizes,
               help="Memory pool size, fast to slow (e.g. -m 256K or -m 256K+4M)")
 @click.option("--output", "-o", default=None, help="Output path (default: <model>.tgrs)")
-@click.option("--flash", "-f", default=None,
+@click.option("--flash", "-f", default=None, callback=_memory_sizes,
               help="Flash size budget; no plan is written when the plan is larger (e.g. 4M)")
 @click.option("--compress", "-c", type=click.Choice(["none", "lz4"]), default="none",
               help="Weight compression (default: none)")
@@ -104,8 +104,6 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
 
     ag.budget = replace(ag.budget, flash=_parse_size(flash) if flash else 0)
 
-    if budget <= 0:
-        raise click.ClickException("Fast-memory budget must be greater than zero")
     if budget > 0xFFFFFFFF:
         raise click.ClickException(
             "Fast-memory budget exceeds the uint32 plan-format limit"

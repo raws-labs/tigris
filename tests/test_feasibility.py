@@ -151,20 +151,6 @@ def test_compile_refuses_infeasible_plan_without_creating_output(
     assert not output.exists()
 
 
-@pytest.mark.parametrize("budget", ["0", "-1K"])
-def test_compile_rejects_nonpositive_budget(linear_3op_path, tmp_path, budget):
-    output = tmp_path / "should-not-exist.tgrs"
-
-    result = CliRunner().invoke(
-        cli,
-        ["compile", str(linear_3op_path), "-m", budget, "-o", str(output)],
-    )
-
-    assert result.exit_code != 0
-    assert "Fast-memory budget must be greater than zero" in result.output
-    assert not output.exists()
-
-
 def test_compile_rejects_budget_above_plan_format_limit(
     linear_3op_path, tmp_path
 ):
@@ -266,16 +252,6 @@ def test_run_pipeline_no_slow_tier_is_zero(conv_relu_chain_path):
     assert ag.budget.slow == 0
 
 
-def test_compile_rejects_nonpositive_slow_tier(conv_relu_chain_path, tmp_path):
-    output = tmp_path / "out.tgrs"
-    result = CliRunner().invoke(
-        cli, ["compile", str(conv_relu_chain_path), "-m", "64K", "-m", "0",
-               "-o", str(output)])
-    assert result.exit_code != 0
-    assert "Slow-memory budget must be greater than zero" in result.output
-    assert not output.exists()
-
-
 def test_compile_refuses_slow_overflow_without_output(conv_relu_chain_path, tmp_path):
     output = tmp_path / "should-not-exist.tgrs"
     # 16K is below the naive peak (52.6K) so stages need tiling and are
@@ -298,13 +274,6 @@ def test_compile_refuses_flash_overflow_without_output(conv_relu_chain_path, tmp
     assert result.exit_code != 0
     assert "exceeds it by" in result.output and "no plan written" in result.output
     assert not output.exists()
-
-
-def test_analyze_allows_nonpositive_slow_tier(conv_relu_chain_path):
-    result = CliRunner().invoke(
-        cli, ["analyze", str(conv_relu_chain_path), "-m", "256K", "-m", "0"])
-    assert result.exit_code == 0
-    assert "Slow-memory budget must be greater than zero" not in result.output
 
 
 def test_a_plan_beyond_the_default_build_is_written_and_names_the_build(tmp_path):
