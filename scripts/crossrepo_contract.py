@@ -93,6 +93,8 @@ class ContractCase:
     # whose result depends on the host CPU.
     reference_unoptimized: bool = False
     exact_untiled: bool = False
+    # Compare outputs byte for byte with the same model compiled without compression.
+    exact_uncompressed: bool = False
     tiled_operators: tuple[str, ...] = ()
     expect_grouped: bool = False
     # Compare outputs byte for byte instead of within one quantization step.
@@ -1031,9 +1033,10 @@ def _leading_index_case(kind: str, quantized: bool) -> ContractCase:
                         slow_budget="16K", expect_tiled=True, exact_untiled=True, reference_unoptimized=True)
 
 
-def _svdf_case() -> ContractCase:
+def _svdf_case(projected: bool = False) -> ContractCase:
     """A float SVDF with a fused Relu, run once from its zero initial state, so
-    each filter's time projection sees only the newest slot of its memory."""
+    each filter's time projection sees only the newest slot of its memory.
+    With ``projected``, a MatMul by a constant feeds the SVDF."""
     rng = np.random.default_rng(85)
     batch, features, units, rank, memory = 2, 6, 3, 2, 4
     filters = units * rank
@@ -1042,12 +1045,18 @@ def _svdf_case() -> ContractCase:
     bias = rng.normal(0.0, 0.3, (units,)).astype(np.float32)
     x = rng.uniform(-2.0, 2.0, (batch, features)).astype(np.float32)
     shape_x, shape_y, shape_s = [batch, features], [batch, units], [batch, filters * memory]
+    head, source, head_weights = [], "x", []
+    if projected:
+        head = [helper.make_node("MatMul", ["x", "w_in"], ["x_in"])]
+        source = "x_in"
+        head_weights = [numpy_helper.from_array(
+            rng.normal(0.0, 0.5, (features, features)).astype(np.float32), "w_in")]
     weights = [numpy_helper.from_array(feature, "feature"), numpy_helper.from_array(time, "time"),
                numpy_helper.from_array(bias, "bias"),
-               numpy_helper.from_array(np.zeros(shape_s, np.float32), "state_initial")]
+               numpy_helper.from_array(np.zeros(shape_s, np.float32), "state_initial"), *head_weights]
     compile_graph = helper.make_graph(
-        [helper.make_node("Svdf", ["x", "feature", "time", "bias", "state_in"], ["y", "state_out"],
-                          domain="tigris", rank=rank, activation="relu")],
+        [*head, helper.make_node("Svdf", [source, "feature", "time", "bias", "state_in"], ["y", "state_out"],
+                                 domain="tigris", rank=rank, activation="relu")],
         "svdf",
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape_x),
          helper.make_tensor_value_info("state_in", TensorProto.FLOAT, shape_s)],
@@ -1055,7 +1064,8 @@ def _svdf_case() -> ContractCase:
          helper.make_tensor_value_info("state_out", TensorProto.FLOAT, shape_s)],
         weights,
         value_info=[helper.make_tensor_value_info("y", TensorProto.FLOAT, shape_y),
-                    helper.make_tensor_value_info("state_out", TensorProto.FLOAT, shape_s)])
+                    helper.make_tensor_value_info("state_out", TensorProto.FLOAT, shape_s),
+                    *([helper.make_tensor_value_info(source, TensorProto.FLOAT, shape_x)] if projected else [])])
     compile_model = helper.make_model(compile_graph, opset_imports=[
         helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)])
     compile_model.ir_version = 9
@@ -1063,7 +1073,7 @@ def _svdf_case() -> ContractCase:
         [{"input": "state_in", "output": "state_out", "initial": "state_initial"}])})
     reference = _model(
         "svdf_reference",
-        [helper.make_node("MatMul", ["x", "feature_t"], ["projection"]),
+        [*head, helper.make_node("MatMul", [source, "feature_t"], ["projection"]),
          helper.make_node("Mul", ["projection", "newest"], ["weighted"]),
          helper.make_node("Reshape", ["weighted", "grouped_shape"], ["grouped"]),
          helper.make_node("ReduceSum", ["grouped", "rank_axis"], ["summed"], keepdims=0),
@@ -1075,9 +1085,10 @@ def _svdf_case() -> ContractCase:
          numpy_helper.from_array(np.ascontiguousarray(time[:, -1]), "newest"),
          numpy_helper.from_array(np.asarray([batch, units, rank], np.int64), "grouped_shape"),
          numpy_helper.from_array(np.asarray([2], np.int64), "rank_axis"),
-         numpy_helper.from_array(bias, "bias")])
-    return ContractCase(name="svdf_relu", compile_model=compile_model, reference_model=reference,
-                        inputs={"x": x}, expected_operators=("Svdf",))
+         numpy_helper.from_array(bias, "bias"), *head_weights])
+    return ContractCase(name="projected_svdf_relu" if projected else "svdf_relu", compile_model=compile_model,
+                        reference_model=reference, inputs={"x": x},
+                        expected_operators=("Gemm", "Svdf") if projected else ("Svdf",))
 
 
 def _detection_case() -> ContractCase:
@@ -7673,6 +7684,16 @@ def _run_case(
         _run([str(runner), str(untiled_path), str(inputs_path), str(untiled_outputs),
               str(untiled["_compiler_scheduled_peak"])], f"{case.name} untiled execution")
         assert outputs_path.read_bytes() == untiled_outputs.read_bytes()
+    if case.exact_uncompressed:
+        plain_path = case_dir / "uncompressed.tgrs"
+        plain = _compile_plan(compile_path, plain_path, mem_budget=case.mem_budget,
+                              slow_budget=case.slow_budget, compression=None, xip=case.xip,
+                              force_one_op_stages=case.force_one_op_stages)
+        plain_outputs = case_dir / "uncompressed.bin"
+        _run([str(runner), str(plain_path), str(inputs_path), str(plain_outputs),
+              str(plain["_compiler_scheduled_peak"])], f"{case.name} uncompressed execution")
+        if outputs_path.read_bytes() != plain_outputs.read_bytes():
+            raise AssertionError(f"{case.name}: outputs differ from the uncompressed plan")
     print(f"PASS {case.name} memory-contract" + (" no-slow" if without_slow else ""))
     return plan_path
 
@@ -8234,6 +8255,11 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _convtranspose_2d_partial_edge_case(),
         _svdf_case(),
         _lstm_case(),
+        *[replace(case, name=case.name + "_lz4", compression="lz4", exact_uncompressed=True)
+          for case in (_svdf_case(), _lstm_case())],
+        # One operator per stage, so the SVDF reads its constants from the second stage's block.
+        replace(_svdf_case(projected=True), name="projected_svdf_relu_lz4", compression="lz4",
+                exact_uncompressed=True, force_one_op_stages=True),
         _detection_case(),
         _if_case(True),
         _if_case(False),
