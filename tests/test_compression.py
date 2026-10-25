@@ -61,6 +61,21 @@ def test_compressed_weight_data_matches(conv_relu_chain_path):
         assert block["uncompressed_size"] > 0
 
 
+def test_stored_weight_blocks_hold_the_lz4_blocks_decompressed(conv_relu_chain_path):
+    ag, _, _, _ = _compressed_pipeline(conv_relu_chain_path)
+    stored = read_binary_plan(emit_binary_bytes(ag, compress="none"))
+    lz4 = read_binary_plan(emit_binary_bytes(ag, compress="lz4"))
+
+    def layout(plan):
+        return [(b["stage_idx"], b["first_weight_idx"], b["num_weights"], b["uncompressed_size"],
+                 b["decompressed"]) for b in plan["weight_blocks"]]
+
+    assert stored["weight_blocks_compression"] == 0
+    assert all(b["compressed_size"] == b["uncompressed_size"] for b in stored["weight_blocks"])
+    assert layout(stored) == layout(lz4)
+    assert stored["weights"] == lz4["weights"]
+
+
 # Uncompressed plan unchanged
 
 
