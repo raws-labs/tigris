@@ -188,8 +188,14 @@ REASONS = [
     pytest.param("float_less", [_tensor(1, type=_INT32)],
                  ["operator 0 LESS: int32 compared with another dtype"], id="int32-compare"),
     # _svdf_reason
-    pytest.param("float_svdf", [_option(0, 0, "i", 0)],
+    pytest.param("float_svdf", [_tensor(0, shape=[1, 1, 8])],
                  ["operator 0 SVDF: input of rank other than 2"], id="svdf-rank"),
+    pytest.param("float_svdf", [_option(0, 0, "i", 0)],
+                 ["operator 0 SVDF: rank 0 for 4 filters"], id="svdf-rank-option"),
+    pytest.param("float_svdf", [_option(0, 0, "i", 3)],
+                 ["operator 0 SVDF: rank 3 for 4 filters"], id="svdf-rank-filters"),
+    pytest.param("float_svdf", [_option(0, 0, "i", 2)],
+                 ["operator 0 SVDF: a 1x4 output where rank 2 gives 1x2"], id="svdf-output"),
     pytest.param("float_svdf", [_tensor(3, type=_INT32)],
                  ["operator 0 SVDF: float32 input with operands of another dtype"],
                  id="svdf-float-operands"),
@@ -207,6 +213,12 @@ REASONS = [
     pytest.param("float_lstm", [_tensor(1, buffer=0)],
                  ["operator 0 UNIDIRECTIONAL_SEQUENCE_LSTM: weights and biases must be constant"],
                  id="lstm-constant"),
+    pytest.param("float_lstm", [_option(0, 3, "?", True)],
+                 ["operator 0 UNIDIRECTIONAL_SEQUENCE_LSTM: a 1x5 hidden state where time_major "
+                  "true gives 3x5"], id="lstm-time-major"),
+    pytest.param("float_lstm", [_tensor(14, shape=[1, 4])],
+                 ["operator 0 UNIDIRECTIONAL_SEQUENCE_LSTM: a 1x4 cell state where time_major "
+                  "false gives 1x5"], id="lstm-cell-state"),
     pytest.param("lstm", [_tensor(1, type=_INT16)],
                  ["operator 0 UNIDIRECTIONAL_SEQUENCE_LSTM: activations must be all int8 or all "
                   "float32"], id="lstm-int8-operands"),
@@ -247,6 +259,12 @@ REASONS = [
                  id="strided-ellipsis"),
     pytest.param("strided_slice", [_tensor(0, shape=[1, 1, 6, 6, 4])],
                  ["operator 0 STRIDED_SLICE: slices of rank above 4"], id="strided-rank"),
+    pytest.param("strided_slice", [_data(3, [0, 1, 0], np.int32), _tensor(3, shape=[3])],
+                 ["operator 0 STRIDED_SLICE: begin, end or strides with fewer entries than the "
+                  "input has axes"], id="strided-short"),
+    pytest.param("float_slice", [_data(1, [0, 1, 2], np.int32), _tensor(1, shape=[3])],
+                 ["operator 0 SLICE: begin or size with fewer entries than the input has axes"],
+                 id="slice-short"),
     pytest.param("strided_slice", [_data(1, [-1, 1, 1, 1], np.int32), _option(0, 4, "i", 1)],
                  ["operator 0 STRIDED_SLICE: a dropped axis with a negative stride"],
                  id="strided-shrink-negative"),
@@ -262,6 +280,38 @@ REASONS = [
                  ["operator 0 REVERSE_V2: axes that are not adjacent"], id="reverse-axes"),
     pytest.param("space_to_batch", [_tensor(0, shape=[1, 4, 12])],
                  ["operator 0 SPACE_TO_BATCH_ND: only rank-4 inputs convert"], id="space-rank"),
+    # _option_shape_reason
+    pytest.param("float_pack", [_option(0, 1, "i", 2)],
+                 ["operator 0 PACK: a 1x2x4x6 output where axis 2 gives 1x4x2x6"], id="pack-axis"),
+    pytest.param("float_pack", [_option(0, 1, "i", 4)],
+                 ["operator 0 PACK: axis 4 for inputs 1x4x6, 1x4x6"], id="pack-axis-range"),
+    pytest.param("float_unpack", [_tensor(1, shape=[1, 6, 4])],
+                 ["operator 0 UNPACK: a 1x6x4 output where axis 1 gives 1x4x6"], id="unpack-output"),
+    pytest.param("float_unpack", [_option(0, 1, "i", 2)],
+                 ["operator 0 UNPACK: axis 2 for a 1x3x4x6 input and 3 outputs"], id="unpack-axis"),
+    pytest.param("float_concat_channels", [_tensor(2, shape=[1, 6, 6, 9])],
+                 ["operator 0 CONCATENATION: a 1x6x6x9 output where axis -1 gives 1x6x6x8"],
+                 id="concat-output"),
+    pytest.param("float_concat_channels", [_option(0, 0, "i", 1)],
+                 ["operator 0 CONCATENATION: axis 1 for inputs 1x6x6x3, 1x6x6x5"], id="concat-axis"),
+    pytest.param("float_gather_indices", [_option(0, 0, "i", 0)],
+                 ["operator 0 GATHER: a 1x6x4x4 output where axis 0, batch_dims 0 gives 4x6x6x4"],
+                 id="gather-axis"),
+    pytest.param("float_gather_batch", [_option(0, 1, "i", 0)],
+                 ["operator 0 GATHER: a 2x3x4 output where axis 1, batch_dims 0 gives 2x2x3x4"],
+                 id="gather-batch-dims"),
+    pytest.param("float_gather_indices", [_option(0, 0, "i", 4)],
+                 ["operator 0 GATHER: axis 4, batch_dims 0 for inputs 1x6x6x4, 4"],
+                 id="gather-axis-range"),
+    pytest.param("float_batch_matmul", [_option(0, 1, "?", True), _tensor(0, shape=[1, 6, 5])],
+                 ["operator 0 BATCH_MATMUL: a 1x6x5 output where adj_x false, adj_y true gives "
+                  "1x6x8"], id="matmul-adjoint"),
+    pytest.param("float_batch_matmul", [_option(0, 0, "?", True)],
+                 ["operator 0 BATCH_MATMUL: adj_x true, adj_y false for inputs 1x6x8, 1x8x5"],
+                 id="matmul-adjoint-inputs"),
+    pytest.param("strided_slice", [_tensor(4, shape=[1, 4, 2, 6])],
+                 ["operator 0 STRIDED_SLICE: a 1x4x2x6 output where the slice gives 1x4x6x2"],
+                 id="strided-output"),
 ]
 
 
@@ -295,6 +345,11 @@ ORDER = [
     pytest.param("svdf", [_tensor(5, type=_FLOAT32)],
                  [_quantization(0, scale=SCALES_2, zero_point=[2, 2])],
                  ["operator 0 SVDF: activations must be all int8 or all float32"], id="svdf"),
+    pytest.param("svdf", [_option(0, 0, "i", 3)], [_tensor(5, type=_FLOAT32)],
+                 ["operator 0 SVDF: rank 3 for 8 filters"], id="svdf-rank-option"),
+    pytest.param("lstm", [_option(0, 3, "?", True)], [_tensor(1, type=_INT16)],
+                 ["operator 0 UNIDIRECTIONAL_SEQUENCE_LSTM: a 1x5 hidden state where time_major "
+                  "true gives 3x5"], id="lstm-time-major"),
     pytest.param("float_conv_bias", [_tensor(2, type=_INT32)],
                  [_tensor(3, type=_INT8, quantization=INT8_OUTPUT)],
                  ["operator 0 CONV_2D: bias of a float32 operator must be float32"],
@@ -331,6 +386,12 @@ ORDER = [
     pytest.param("strided_slice", [_tensor(0, shape=[1, 1, 6, 6, 4])], PER_TENSOR,
                  ["operator 0 STRIDED_SLICE: activations must be quantized per tensor"],
                  id="strided-rank"),
+    pytest.param("strided_slice", [_data(3, [0, 1, 0], np.int32), _tensor(3, shape=[3])],
+                 PER_TENSOR,
+                 ["operator 0 STRIDED_SLICE: activations must be quantized per tensor"],
+                 id="strided-short"),
+    pytest.param("slice", [_data(2, [0, 1, 2], np.int32), _tensor(2, shape=[3])], PER_TENSOR,
+                 ["operator 0 SLICE: activations must be quantized per tensor"], id="slice-short"),
     pytest.param("strided_slice", [_data(1, [1, 0, 1, 1], np.int32)], PER_TENSOR,
                  ["operator 0 STRIDED_SLICE: activations must be quantized per tensor"],
                  id="strided-zero"),
@@ -388,6 +449,13 @@ ORDER = [
     pytest.param("float_batch_matmul", [_tensor(1, shape=[8, 5])], [_tensor(1, type=_INT8)],
                  ["operator 0 BATCH_MATMUL: activations must be all int8 or all float32"],
                  id="matmul-rank"),
+    pytest.param("float_batch_matmul", [_tensor(1, shape=[8, 5])], [_option(0, 0, "?", True)],
+                 ["operator 0 BATCH_MATMUL: operands of different rank"], id="matmul-rank-adjoint"),
+    pytest.param("pack", [_option(0, 1, "i", 2)], PER_TENSOR,
+                 ["operator 0 PACK: activations must be quantized per tensor"], id="pack-axis"),
+    pytest.param("strided_slice", [_tensor(4, shape=[1, 4, 2, 6])], PER_TENSOR,
+                 ["operator 0 STRIDED_SLICE: activations must be quantized per tensor"],
+                 id="strided-output"),
     pytest.param("resize_bilinear", [_option(0, 2, "?", True), _option(0, 3, "?", True)],
                  PER_TENSOR,
                  ["operator 0 RESIZE_BILINEAR: activations must be quantized per tensor"],
@@ -472,6 +540,32 @@ def test_a_zero_stride_is_refused_by_every_entry_point(name, reason, tmp_path):
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(tmp_path / "model.tgrs")])
     assert result.exit_code != 0 and isinstance(result.exception, SystemExit), result.output
     assert reason in result.output
+
+
+def _past_the_last_axis(begin: int, end: int, stride: int, shrink: bool):
+    """Operator 0's begin, end and strides each get a fifth entry, and with
+    `shrink` its shrink_axis_mask bit 4."""
+    def edit(graph, model):
+        op = graph.operators[0]
+        for slot, value in zip((1, 2, 3), (begin, end, stride)):
+            tensor = graph.tensors[op.inputs[slot]]
+            values = [*np.frombuffer(model.buffers[tensor.buffer], np.int32), value]
+            model.buffers[tensor.buffer] = np.asarray(values, np.int32).tobytes()
+            tensor.shape = [5]
+        if shrink:
+            op.options.fields[4] = ("i", 16)
+    return edit
+
+
+@pytest.mark.parametrize(("begin", "end", "stride", "shrink"), [
+    pytest.param(0, 1, 0, False, id="zero-stride"),
+    pytest.param(0, 1, -1, True, id="negative-drop"),
+    pytest.param(7, -9, 0, True, id="zero-stride-drop"),
+])
+def test_strided_slice_entries_past_the_last_axis_are_not_read(begin, end, stride, shrink):
+    """TFLite Micro reads begin, end and strides at each input axis only, so a
+    fifth entry on a rank-4 input changes neither its result nor the checks."""
+    assert tflite.unsupported(_edited("strided_slice", _past_the_last_axis(begin, end, stride, shrink))) == []
 
 
 def _with_external_buffer(model: tw.Model, index: int, overstated: int = 0) -> bytes:
@@ -579,6 +673,70 @@ def test_a_shape_operator_on_a_constant_is_folded(kind, tmp_path, require_host_l
     x = np.random.default_rng(0).standard_normal((1, 5, 5, 4)).astype(np.float32)
     [y] = _run(data, {"x": x}, tmp_path)
     np.testing.assert_array_equal(y, x * values.reshape(1, 5, 5, 4))
+
+
+_VALUES = (np.arange(100, dtype=np.float32) / 7 - 5).reshape(1, 5, 5, 4)
+_OPTIONS_TYPE = {"PACK": 59, "CONCATENATION": 10, "STRIDED_SLICE": 32}  # SLICE has none
+# An operator of constants whose options give another shape than the stated one,
+# or no result in TFLite Micro: its operands, options, stated shape and reason.
+KEPT = [
+    pytest.param("PACK", [_VALUES[0, ..., k] for k in range(4)], {0: ("i", 4)}, [1, 5, 5, 4],
+                 "PACK: a 1x5x5x4 output where axis 0 gives 4x5x5", id="pack-axis"),
+    pytest.param("CONCATENATION", [_VALUES[..., :1], _VALUES[..., 1:]], {0: ("i", 2)},
+                 [1, 5, 5, 4], "CONCATENATION: axis 2 for inputs 1x5x5x1, 1x5x5x3",
+                 id="concatenation-axis"),
+    pytest.param("STRIDED_SLICE", [_VALUES.reshape(1, 5, 4, 5), [0, 0, 0, 0], [1, 5, 4, 5],
+                                   [1, 1, 1, 1]], {}, [1, 5, 5, 4],
+                 "STRIDED_SLICE: a 1x5x5x4 output where the slice gives 1x5x4x5",
+                 id="strided-slice-output"),
+    pytest.param("STRIDED_SLICE", [_VALUES, [0], [1], [1]], {}, [1, 5, 5, 4],
+                 "STRIDED_SLICE: begin, end or strides with fewer entries than the input has axes",
+                 id="strided-slice-short"),
+    pytest.param("STRIDED_SLICE", [_VALUES, [0, 0, 0, 0], [1, 5, 5, 4], [-1, 1, 1, 1]],
+                 {4: ("i", 1)}, [5, 5, 4], "STRIDED_SLICE: a dropped axis with a negative stride",
+                 id="strided-slice-negative-drop"),
+    pytest.param("SLICE", [_VALUES, [0], [1]], {}, [1, 5, 5, 4],
+                 "SLICE: begin or size with fewer entries than the input has axes", id="slice-short"),
+]
+
+
+@pytest.mark.parametrize(("kind", "operands", "fields", "shape", "reason"), KEPT)
+def test_a_constant_operator_without_the_stated_result_is_kept_and_refused(kind, operands, fields,
+                                                                            shape, reason):
+    """float_mul with its second operand computed by `kind` from constants; the
+    fold leaves the operator, so the operator check refuses it."""
+    def through(graph, model):
+        y = graph.inputs[1]
+        graph.tensors[y].shape = shape
+        inputs = [_constant(graph, model, np.asarray(v, np.float32), _FLOAT32)
+                  if np.asarray(v).dtype.kind == "f"
+                  else _constant(graph, model, np.asarray(v, np.int32), _INT32) for v in operands]
+        options = (tw.Options(_OPTIONS_TYPE[kind], None, {0: ("i", len(operands)), **fields}
+                              if kind == "PACK" else fields) if kind in _OPTIONS_TYPE else None)
+        graph.operators.insert(0, tw.Operator(_code(model, kind), inputs, [y], options))
+        graph.inputs = graph.inputs[:1]
+    data = _edited("float_mul", through)
+    _, graphs = tflite._read(data)
+    assert [op.kind for op in graphs[0][4]] == [kind, "MUL"]
+    assert f"operator 0 {reason}" in tflite.unsupported(data)
+
+
+@pytest.mark.parametrize(("edits", "reasons"), [
+    pytest.param([_option(2, 1, "i", 1)], ["operator 2 PACK: axis 1 for inputs scalar, scalar"],
+                 id="pack-axis"),
+    pytest.param([_tensor(7, shape=[1, 2])], ["operator 2 PACK: a 1x2 output where axis 0 gives 2"],
+                 id="pack-output"),
+    pytest.param([_tensor(5, shape=[1]), _tensor(7, shape=[2, 1])],
+                 ["operator 1 STRIDED_SLICE: a 1 output where the slice gives scalar",
+                  "operator 2 PACK: activations must be all int8 or all float32"],
+                 id="strided-slice-output"),
+])
+def test_int32_shape_arithmetic_of_constants_is_kept_with_its_shape_reason(edits, reasons):
+    """float_shape_pack_reshape computes the RESHAPE shape with SHAPE, STRIDED_SLICE
+    and PACK in int32; an operator of that chain the fold keeps is refused for
+    its shape, and the operators after it no longer read constants."""
+    assert tflite.unsupported(_edited("float_shape_pack_reshape", *edits)) == [
+        *reasons, "operator 3 RESHAPE: input 1 must be a constant"]
 
 
 def test_custom_quantization_details_are_written_back():
