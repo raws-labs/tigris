@@ -473,13 +473,15 @@ def _serialized_weights(
         # Preserve ONNX flatten/reshape order across the internal layout change.
         if name in fc_layout_shapes:
             arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
-        # Preserve the integer dtypes of quantized weights
-        if arr.dtype in (np.int8, np.int16, np.int32, np.bool_):
-            raw = arr.tobytes()
-        else:
-            raw = arr.astype(np.float32).tobytes()
-        weights.append((raw, strings.add(name)))
+        weights.append((serialized_weight_bytes(arr), strings.add(name)))
     return weight_idx, weights
+
+
+def serialized_weight_bytes(arr: np.ndarray) -> bytes:
+    """A weight's stored bytes: int8, int16, int32 and bool as they are, any other dtype as float32."""
+    if arr.dtype in (np.int8, np.int16, np.int32, np.bool_):
+        return arr.tobytes()
+    return arr.astype(np.float32).tobytes()
 
 
 def _aligned_blob(raws) -> tuple[bytes, list[int]]:

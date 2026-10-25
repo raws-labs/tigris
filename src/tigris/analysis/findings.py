@@ -102,46 +102,26 @@ class Findings:
     slow_fits: bool = True
 
 
-def _estimate_weight_sizes(ag: AnalyzedGraph) -> tuple[int, int, int]:
-    """Return serialized (current, hypothetical int8, LZ4) weight bytes."""
-    raw_parts: list[bytes] = []
-    int8_total = 0
-    for arr in ag.weight_data.values():
-        if arr.dtype in (np.int8, np.int32):
-            raw = arr.tobytes()
-        else:
-            # The writer normalizes every other initializer to float32.
-            raw = arr.astype(np.float32).tobytes()
-        raw_parts.append(raw)
-        if np.issubdtype(arr.dtype, np.floating):
-            int8_total += arr.size  # 1 byte per element
-        else:
-            int8_total += len(raw)
+def _weight_sizes(ag: AnalyzedGraph) -> tuple[list[int], list[int], int]:
+    """Per-weight stored sizes, as written and with float weights as int8, and
+    the LZ4 size of the stored weights."""
+    from tigris.emitters.binary.writer import serialized_weight_bytes
+
+    raws = [serialized_weight_bytes(arr) for arr in ag.weight_data.values()]
+    int8_sizes = [arr.size if np.issubdtype(arr.dtype, np.floating) else len(raw)
+                  for arr, raw in zip(ag.weight_data.values(), raws)]
 
     # LZ4 on the actual weight data (meaningful for the current dtype only)
     lz4_total = 0
     try:
         import lz4.block
-        blob = b"".join(raw_parts)
+        blob = b"".join(raws)
         if blob:
             lz4_total = len(lz4.block.compress(blob, store_size=False))
     except ImportError:
         pass
 
-    return sum(map(len, raw_parts)), int8_total, lz4_total
-
-
-def _serialized_weight_sizes(ag: AnalyzedGraph, *, int8: bool) -> list[int]:
-    """Return per-entry blob sizes for one plan-size profile."""
-    sizes = []
-    for arr in ag.weight_data.values():
-        if int8 and np.issubdtype(arr.dtype, np.floating):
-            sizes.append(int(arr.size))
-        elif arr.dtype in (np.int8, np.int32):
-            sizes.append(int(arr.nbytes))
-        else:
-            sizes.append(int(arr.size) * np.dtype(np.float32).itemsize)
-    return sizes
+    return [len(raw) for raw in raws], int8_sizes, lz4_total
 
 
 def _aligned_weight_blob_size(sizes: list[int], alignment: int) -> int:
@@ -153,16 +133,15 @@ def _aligned_weight_blob_size(sizes: list[int], alignment: int) -> int:
     return size
 
 
-def _compressed_weight_block_count(ag: AnalyzedGraph) -> int:
-    """Count stage-local blocks created by compressed serialization."""
-    weight_names = set(ag.weight_data)
-    stages_with_weights: set[int] = set()
-    for stage in ag.stages:
-        for op_index in stage.op_indices:
-            if any(name in weight_names for name in ag.ops[op_index].inputs):
-                stages_with_weights.add(stage.stage_id)
-                break
-    return len(stages_with_weights)
+def _compressed_weight_block_count(ag: AnalyzedGraph) -> int | None:
+    """The stage weight blocks a compressed plan holds, or None when the
+    writer cannot group the weights by stage."""
+    from tigris.emitters.binary.writer import _group_weights_by_stage
+
+    try:
+        return len(_group_weights_by_stage(ag, {name: idx for idx, name in enumerate(ag.weight_data)}))
+    except ValueError:
+        return None
 
 
 def _measure_plan(ag: AnalyzedGraph, names: bool) -> bytes:
@@ -352,9 +331,9 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = Fal
     from tigris.graph.subgraphs import flatten_subgraphs
 
     whole = flatten_subgraphs(ag)[0] if ag.subgraphs else ag
-    f.total_weight_bytes, f.int8_weight_bytes, f.lz4_weight_bytes = _estimate_weight_sizes(whole)
-    current_blob = _aligned_weight_blob_size(_serialized_weight_sizes(whole, int8=False),
-                                             PLAN_SECTION_ALIGNMENT)
+    sizes, int8_sizes, f.lz4_weight_bytes = _weight_sizes(whole)
+    f.total_weight_bytes, f.int8_weight_bytes = sum(sizes), sum(int8_sizes)
+    current_blob = _aligned_weight_blob_size(sizes, PLAN_SECTION_ALIGNMENT)
     plan = _measure_plan(ag, names)
     f.plan_size_bytes = len(plan)
     if plan:
@@ -364,11 +343,12 @@ def compute_findings(ag: AnalyzedGraph, flash_budget: int = 0, names: bool = Fal
                           if limit["needed"] > limit["default"]]
         f.plan_overhead_bytes = f.plan_size_bytes - f.total_weight_bytes
         f.int8_plan_size_bytes = f.plan_size_bytes - current_blob + _aligned_weight_blob_size(
-            _serialized_weight_sizes(whole, int8=True), PLAN_SECTION_ALIGNMENT)
-        if f.lz4_weight_bytes > 0:
+            int8_sizes, PLAN_SECTION_ALIGNMENT)
+        blocks = _compressed_weight_block_count(whole) if f.lz4_weight_bytes > 0 else None
+        if blocks is not None:
             f.lz4_plan_size_bytes = (f.plan_size_bytes - current_blob
                                      + WEIGHT_BLOCK_SECTION_HEADER_STRUCT.size
-                                     + _compressed_weight_block_count(whole) * WEIGHT_BLOCK_SIZE
+                                     + blocks * WEIGHT_BLOCK_SIZE
                                      + f.lz4_weight_bytes)
     if flash_budget > 0 and f.plan_size_bytes:
         f.plan_fits_flash = f.plan_size_bytes <= flash_budget
