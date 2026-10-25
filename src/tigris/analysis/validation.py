@@ -555,14 +555,16 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             linear = op.op_type == "ResizeLinear"
             coordinate = op.attrs.get("coordinate_transformation_mode", "half_pixel")
             nearest = op.attrs.get("nearest_mode", "round_prefer_floor")
+            mode = op.attrs.get("mode", "nearest")
             if linear:
                 if coordinate not in {"half_pixel", "asymmetric", "align_corners"}:
                     reasons.append("bilinear Resize requires half_pixel, asymmetric or align_corners coordinates")
-            elif (op.attrs.get("mode", "nearest") != "nearest" or
-                  (coordinate, nearest) not in {
-                      ("asymmetric", "floor"), ("align_corners", "round_prefer_ceil"),
-                      ("tf_half_pixel_for_nn", "floor"), ("half_pixel", "round_prefer_ceil"),
-                  }):
+            elif mode != "nearest":
+                reasons.append(f"Resize mode={mode} is not encoded")
+            elif (coordinate, nearest) not in {
+                ("asymmetric", "floor"), ("align_corners", "round_prefer_ceil"),
+                ("tf_half_pixel_for_nn", "floor"), ("half_pixel", "round_prefer_ceil"),
+            }:
                 reasons.append("Resize nearest_mode and coordinate_transformation_mode must state a TFLite sampling convention")
             if "axes" in op.attrs:
                 reasons.append("Resize axes is not encoded")

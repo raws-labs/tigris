@@ -7870,82 +7870,34 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
 
 
 def _assert_compile_rejected(work_dir: Path) -> None:
+    def value(name: str, shape: list[int]) -> onnx.ValueInfoProto:
+        return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+
     resize_scales = numpy_helper.from_array(
         np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), "scales"
     )
     cases = [
-        _model(
-            "unsupported_acos",
-            [helper.make_node("Acos", ["input"], ["output"])],
-            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
-            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
-        ),
-        _model(
-            "unsupported_softmax_axis",
-            [
-                helper.make_node(
-                    "Softmax", ["input"], ["output"], axis=0
-                )
-            ],
-            [
-                helper.make_tensor_value_info(
-                    "input", TensorProto.FLOAT, [2, 4]
-                )
-            ],
-            [
-                helper.make_tensor_value_info(
-                    "output", TensorProto.FLOAT, [2, 4]
-                )
-            ],
-        ),
-        _model(
-            "unsupported_concat_axis",
-            [
-                helper.make_node(
-                    "Concat", ["left", "right"], ["output"], axis=0
-                )
-            ],
-            [
-                helper.make_tensor_value_info(
-                    "left", TensorProto.FLOAT, [1, 2, 3, 4]
-                ),
-                helper.make_tensor_value_info(
-                    "right", TensorProto.FLOAT, [1, 2, 3, 4]
-                ),
-            ],
-            [
-                helper.make_tensor_value_info(
-                    "output", TensorProto.FLOAT, [2, 2, 3, 4]
-                )
-            ],
-        ),
-        _model(
-            # Nearest and bilinear both execute. Cubic resampling reads a
-            # four-by-four neighbourhood and has no kernel, so it is the mode
-            # that still has to be refused.
-            "unsupported_resize_mode",
-            [
-                helper.make_node(
-                    "Resize",
-                    ["input", "", "scales"],
-                    ["output"],
-                    coordinate_transformation_mode="asymmetric",
-                    mode="cubic",
-                )
-            ],
-            [
-                helper.make_tensor_value_info(
-                    "input", TensorProto.FLOAT, [1, 1, 2, 2]
-                )
-            ],
-            [
-                helper.make_tensor_value_info(
-                    "output", TensorProto.FLOAT, [1, 1, 4, 4]
-                )
-            ],
-            [resize_scales],
-        ),
-        helper.make_model(
+        (_model("unsupported_acos", [helper.make_node("Acos", ["input"], ["output"])],
+                [value("input", [1])], [value("output", [1])]),
+         "Acos_0 (Acos)"),
+        (_model("unsupported_softmax_axis",
+                [helper.make_node("Softmax", ["input"], ["output"], axis=0)],
+                [value("input", [2, 4])], [value("output", [2, 4])]),
+         "Softmax axis must map to the runtime's final dimension"),
+        (_model("unsupported_concat_axis",
+                [helper.make_node("Concat", ["left", "right"], ["output"], axis=0)],
+                [value("left", [1, 2, 3, 4]), value("right", [1, 2, 3, 4])],
+                [value("output", [2, 2, 3, 4])]),
+         "runtime does not concatenate on the batch axis"),
+        # Nearest and bilinear both execute. Cubic resampling reads a
+        # four-by-four neighborhood and has no kernel, so it is refused.
+        # The nearest convention is valid, so the mode is the only cause.
+        (_model("unsupported_resize_mode",
+                [helper.make_node("Resize", ["input", "", "scales"], ["output"], mode="cubic",
+                                  coordinate_transformation_mode="asymmetric", nearest_mode="floor")],
+                [value("input", [1, 1, 2, 2])], [value("output", [1, 1, 4, 4])], [resize_scales]),
+         "Resize mode=cubic is not encoded"),
+        (helper.make_model(
             # The body reads w from the main graph instead of taking it as a loop variable.
             helper.make_graph(
                 [
@@ -7981,34 +7933,16 @@ def _assert_compile_rejected(work_dir: Path) -> None:
             ),
             opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("tigris", 1)],
             ir_version=9,
-        ),
-        _model(
-            # Rounding up adds a window that starts past the input, which no
-            # end padding states.
-            "unsupported_pool_ceil",
-            [
-                helper.make_node(
-                    "MaxPool",
-                    ["input"],
-                    ["output"],
-                    ceil_mode=1,
-                    kernel_shape=[1, 1],
-                    strides=[3, 3],
-                )
-            ],
-            [
-                helper.make_tensor_value_info(
-                    "input", TensorProto.FLOAT, [1, 1, 5, 5]
-                )
-            ],
-            [
-                helper.make_tensor_value_info(
-                    "output", TensorProto.FLOAT, [1, 1, 3, 3]
-                )
-            ],
-        ),
+        ), "reads w from an enclosing graph in its body_branch"),
+        # Rounding up adds a window that starts past the input, which no
+        # end padding states.
+        (_model("unsupported_pool_ceil",
+                [helper.make_node("MaxPool", ["input"], ["output"], ceil_mode=1,
+                                  kernel_shape=[1, 1], strides=[3, 3])],
+                [value("input", [1, 1, 5, 5])], [value("output", [1, 1, 3, 3])]),
+         "ceil_mode=1 is not encoded"),
     ]
-    for index, model in enumerate(cases):
+    for index, (model, reason) in enumerate(cases):
         path = work_dir / f"rejected-{index}.onnx"
         onnx.save(model, path)
         try:
@@ -8020,7 +7954,11 @@ def _assert_compile_rejected(work_dir: Path) -> None:
                 compression=None,
                 xip=False,
             )
-        except (ClickException, ValueError):
+        except (ClickException, ValueError) as exc:
+            if reason not in str(exc):
+                raise AssertionError(
+                    f"{model.graph.name} was refused for another reason: {exc}"
+                ) from exc
             continue
         raise AssertionError(f"{model.graph.name} unexpectedly compiled")
     print("PASS compiler_rejections")
