@@ -2,6 +2,7 @@
 the checks that give them, each from a model the writer builds, and the reader
 paths no fixture reaches."""
 
+import re
 import struct
 from pathlib import Path
 
@@ -230,6 +231,13 @@ REASONS = [
                  ["operator 0 CUSTOM:TFLite_Detection_PostProcess: outputs other than "
                   "[1, detections, 4], [1, detections], [1, detections] and [1]"],
                  id="detection-outputs"),
+    # _window_reason
+    pytest.param("max_pool_same", [_option(0, 1, "i", 0)],
+                 ["operator 0 MAX_POOL_2D: a 2x0 stride; strides must be at least 1"],
+                 id="window-stride"),
+    pytest.param("max_pool_same", [_option(0, 3, "i", 0)],
+                 ["operator 0 MAX_POOL_2D: a 3x0 filter; filter sizes must be at least 1"],
+                 id="window-filter"),
     # _data_movement_reason
     pytest.param("pack", [_quantization(1, scale=[0.05])],
                  ["operator 0 PACK: inputs and outputs quantized differently"],
@@ -349,6 +357,12 @@ ORDER = [
     pytest.param("max_pool_same", [_option(0, 0, "b", 2)], PER_TENSOR,
                  ["operator 0 MAX_POOL_2D: activations must be quantized per tensor"],
                  id="window-padding"),
+    pytest.param("max_pool_same", [_option(0, 1, "i", 0)], PER_TENSOR,
+                 ["operator 0 MAX_POOL_2D: activations must be quantized per tensor"],
+                 id="window-stride"),
+    pytest.param("max_pool_same", [_option(0, 3, "i", 0)], PER_TENSOR,
+                 ["operator 0 MAX_POOL_2D: activations must be quantized per tensor"],
+                 id="window-filter"),
     pytest.param("depthwise_multiplier", [_option(0, 3, "i", 1)], PER_TENSOR,
                  ["operator 0 DEPTHWISE_CONV_2D: activations must be quantized per tensor"],
                  id="depth-multiplier"),
@@ -393,6 +407,59 @@ def test_detection_options_left_out_take_tflite_micros_defaults():
     node = next(n for n in tflite.to_onnx(data, "detection").graph.node if n.domain == "tigris")
     attributes = {a.name: helper.get_attribute_value(a) for a in node.attribute}
     assert (attributes["detections_per_class"], attributes["use_regular_nms"]) == (100, 0)
+
+
+def _left_out(*slots):
+    """Operator 0's options without the fields at `slots`."""
+    def edit(graph, model):
+        for slot in slots:
+            graph.operators[0].options.fields[slot] = ("i", None)
+    return edit
+
+
+# Builtin options a file leaves out read as the schema's defaults, which are 0
+# for beta, strides and pool filters, as TFLite Micro reads them.
+LEFT_OUT = [
+    pytest.param("float_softmax", (0,), "SOFTMAX: beta other than 1", id="softmax-beta"),
+    pytest.param("float_conv_bias", (1, 2), "CONV_2D: a 0x0 stride; strides must be at least 1",
+                 id="conv-stride"),
+    pytest.param("float_depthwise_bias", (2,),
+                 "DEPTHWISE_CONV_2D: a 0x1 stride; strides must be at least 1", id="depthwise-stride"),
+    pytest.param("float_transpose_conv", (1,),
+                 "TRANSPOSE_CONV: a 2x0 stride; strides must be at least 1", id="transpose-conv-stride"),
+    pytest.param("float_max_pool_same", (1, 2), "MAX_POOL_2D: a 0x0 stride; strides must be at least 1",
+                 id="pool-stride"),
+    pytest.param("float_max_pool_same", (3, 4),
+                 "MAX_POOL_2D: a 0x0 filter; filter sizes must be at least 1", id="pool-filter"),
+]
+
+
+@pytest.mark.parametrize(("name", "slots", "reason"), LEFT_OUT)
+def test_an_option_left_out_takes_the_schema_default(name, slots, reason):
+    data = _edited(name, _left_out(*slots))
+    assert not set(slots) & set(tw.read(data).subgraphs[0].operators[0].options.source.present())
+    assert tflite.unsupported(data) == [f"operator 0 {reason}"]
+
+
+@pytest.mark.parametrize(("name", "reason"), [
+    pytest.param("float_conv_bias", "CONV_2D: a 1x0 stride", id="conv"),
+    pytest.param("float_depthwise_bias", "DEPTHWISE_CONV_2D: a 1x0 stride", id="depthwise"),
+    pytest.param("float_transpose_conv", "TRANSPOSE_CONV: a 2x0 stride", id="transpose-conv"),
+    pytest.param("float_max_pool_same", "MAX_POOL_2D: a 2x0 stride", id="max-pool"),
+    pytest.param("float_avg_pool_same", "AVERAGE_POOL_2D: a 1x0 stride", id="average-pool"),
+    pytest.param("float_l2_pool", "L2_POOL_2D: a 1x0 stride", id="l2-pool"),
+])
+def test_a_zero_stride_is_refused_by_every_entry_point(name, reason, tmp_path):
+    data = _edited(name, _option(0, 1, "i", 0))
+    reason = f"operator 0 {reason}; strides must be at least 1"
+    assert tflite.unsupported(data) == [reason]
+    with pytest.raises(ValueError, match=re.escape(reason)):
+        tflite.to_onnx(data, "model")
+    model = tmp_path / "model.tflite"
+    model.write_bytes(data)
+    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(tmp_path / "model.tgrs")])
+    assert result.exit_code != 0 and isinstance(result.exception, SystemExit), result.output
+    assert reason in result.output
 
 
 def _with_external_buffer(model: tw.Model, index: int, overstated: int = 0) -> bytes:

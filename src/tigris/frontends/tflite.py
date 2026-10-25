@@ -734,7 +734,7 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
         if not axes or (op.kind != "MEAN" and axes != list(range(axes[0], axes[-1] + 1))):
             return "axes that are not adjacent"
-    if op.kind == "SOFTMAX" and op.option(0, "f", 1.0) != 1.0:
+    if op.kind == "SOFTMAX" and op.option(0, "f") != 1.0:
         return "beta other than 1"
     if op.kind == "FULLY_CONNECTED" and op.option(1, "b") != 0:
         return "shuffled weights format"
@@ -960,9 +960,14 @@ def _window_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> st
     if op.kind in _WEIGHTED:
         kernel = ins[1].shape[1:3]
     else:
-        kernel = [op.option(4, "i", 1), op.option(3, "i", 1)]
-    stride_w, stride_h, dilation_w, dilation_h = (1 if slot is None else op.option(slot, "i", 1)
-                                                  for slot in _WINDOWED[op.kind])
+        kernel = [op.option(4, "i"), op.option(3, "i")]
+    slot_w, slot_h, *dilations = _WINDOWED[op.kind]
+    stride_w, stride_h = op.option(slot_w, "i"), op.option(slot_h, "i")
+    dilation_w, dilation_h = (1 if slot is None else op.option(slot, "i", 1) for slot in dilations)
+    if min(stride_h, stride_w) < 1:
+        return f"a {stride_h}x{stride_w} stride; strides must be at least 1"
+    if min(kernel) < 1:
+        return f"a {kernel[0]}x{kernel[1]} filter; filter sizes must be at least 1"
     # A transposed convolution's input is what a convolution of its output gives.
     source, target = (outs[0], ins[2]) if op.kind == "TRANSPOSE_CONV" else (ins[0], outs[0])
     given = []
@@ -1276,8 +1281,8 @@ class _Converter:
             y = self._fully_connected(op, tag)
         elif kind in ("MAX_POOL_2D", "AVERAGE_POOL_2D"):
             source = self.tensors[ins[0]]
-            kh, kw = op.option(4, "i", 1), op.option(3, "i", 1)
-            sh, sw = op.option(2, "i", 1), op.option(1, "i", 1)
+            kh, kw = op.option(4, "i"), op.option(3, "i")
+            sh, sw = op.option(2, "i"), op.option(1, "i")
             top, bottom = same_padding(source.shape[1], out.shape[1], kh, sh)
             left, right = same_padding(source.shape[2], out.shape[2], kw, sw)
             attributes = {"count_include_pad": 0} if kind == "AVERAGE_POOL_2D" else {}
@@ -1338,8 +1343,8 @@ class _Converter:
             y = self._l2_normalization(op, tag)
         elif kind == "L2_POOL_2D":
             source = self.tensors[ins[0]]
-            kh, kw = op.option(4, "i", 1), op.option(3, "i", 1)
-            sh, sw = op.option(2, "i", 1), op.option(1, "i", 1)
+            kh, kw = op.option(4, "i"), op.option(3, "i")
+            sh, sw = op.option(2, "i"), op.option(1, "i")
             top, bottom = same_padding(source.shape[1], out.shape[1], kh, sh)
             left, right = same_padding(source.shape[2], out.shape[2], kw, sw)
             x = self.value(ins[0])
@@ -1944,7 +1949,7 @@ class _Converter:
         out = self.tensors[op.outputs[0]]
         weights = np.transpose(weights_tensor.array(), (3, 0, 1, 2) if depthwise else (0, 3, 1, 2))
         kh, kw = weights.shape[2], weights.shape[3]
-        sw, sh = op.option(1, "i", 1), op.option(2, "i", 1)
+        sw, sh = op.option(1, "i"), op.option(2, "i")
         dw, dh = (op.option(5, "i", 1), op.option(6, "i", 1)) if depthwise else (
             op.option(4, "i", 1), op.option(5, "i", 1))
         top, bottom = same_padding(source.shape[1], out.shape[1], (kh - 1) * dh + 1, sh)
@@ -1963,7 +1968,7 @@ class _Converter:
         out = self.tensors[op.outputs[0]]
         weights = np.transpose(weights_tensor.array(), (3, 0, 1, 2))
         kh, kw = weights.shape[2], weights.shape[3]
-        sw, sh = op.option(1, "i", 1), op.option(2, "i", 1)
+        sw, sh = op.option(1, "i"), op.option(2, "i")
         top, bottom = same_padding(out.shape[1], source.shape[1], kh, sh)
         left, right = same_padding(out.shape[2], source.shape[2], kw, sw)
         w = self.weights(weights_tensor, weights, 1)
