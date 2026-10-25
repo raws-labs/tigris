@@ -1,11 +1,14 @@
 """Tests for the weights pipeline: extraction, binary round-trip, op references."""
 
 
+import math
+
 import numpy as np
+import pytest
 
 from tigris.emitters.binary.defs import NO_WEIGHT, OP_TYPE_MAP
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.emitters.binary.writer import _permute_fc_weight_for_nhwc, emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
 
@@ -133,6 +136,17 @@ def test_gemm_after_spatial_reshape_preserves_onnx_element_order():
     # Runtime order is NHWC: each position alternates its two channels.
     nhwc_to_nchw = [0, 4, 1, 5, 2, 6, 3, 7]
     np.testing.assert_array_equal(actual, weights[:, nhwc_to_nchw])
+
+
+@pytest.mark.parametrize("shape", [(1, 3, 4, 5), (1, 7, 1, 3), (1, 2, 9), (1, 5, 1), (2, 4, 3)])
+def test_fc_weight_on_the_channels_last_flatten_gives_the_model_result(shape):
+    columns = math.prod(shape[1:])
+    weights = np.random.default_rng(0).integers(-50, 50, (3, columns))
+    permuted = _permute_fc_weight_for_nhwc(weights, shape)
+    # One input per column: the model flattens it channel-major, the runtime channels-last.
+    inputs = np.eye(columns, dtype=np.int64).reshape(columns, *shape[1:])
+    channels_last = np.moveaxis(inputs, 1, -1).reshape(columns, columns)
+    np.testing.assert_array_equal(channels_last @ permuted.T, inputs.reshape(columns, columns) @ weights.T)
 
 
 # Op-to-weight references

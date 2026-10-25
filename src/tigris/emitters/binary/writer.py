@@ -428,41 +428,63 @@ def _permute_fc_weight_for_nhwc(
 
     W shape: [OC, IC] where IC = product(spatial_dims).
     """
-    if W.ndim != 2:
+    if W.ndim != 2 or len(pre_flatten_shape) not in (3, 4):
         return W
+    channels, *spatial = pre_flatten_shape[1:]
+    columns = channels * math.prod(spatial)
+    if W.shape[1] != columns:
+        return W
+    # Column j of the result is the NCHW column of the j-th NHWC flat element.
+    perm = np.arange(columns).reshape(channels, *spatial).transpose(*range(1, len(spatial) + 1), 0).ravel()
+    return W[:, perm]
 
-    shape = pre_flatten_shape
-    if len(shape) == 4:
-        N, C, H, Wd = shape
-        IC = C * H * Wd
-        if W.shape[1] != IC:
-            return W
-        # Build permutation: for each NHWC flat position, which NCHW column to read.
-        # NHWC flat index: h*W*C + w*C + c -> needs NCHW column: c*H*W + h*W + w
-        perm = np.zeros(IC, dtype=np.intp)
-        for c in range(C):
-            for h in range(H):
-                for w in range(Wd):
-                    nchw_idx = c * H * Wd + h * Wd + w
-                    nhwc_idx = h * Wd * C + w * C + c
-                    perm[nhwc_idx] = nchw_idx
-        return W[:, perm]
-    elif len(shape) == 3:
-        N, C, L = shape
-        IC = C * L
-        if W.shape[1] != IC:
-            return W
-        # For each NLC flat position, which NCL column to read.
-        # NLC flat index: l*C + c -> needs NCL column: c*L + l
-        perm = np.zeros(IC, dtype=np.intp)
-        for c in range(C):
-            for li in range(L):
-                ncl_idx = c * L + li
-                nlc_idx = li * C + c
-                perm[nlc_idx] = ncl_idx
-        return W[:, perm]
 
-    return W
+def _serialized_weights(
+    ag: AnalyzedGraph,
+    strings: _StringTable,
+) -> tuple[dict[str, int], list[tuple[bytes, int]]]:
+    """Each weight's stored bytes and name offset, in ``ag.weight_data`` order.
+
+    Returns (name->weight index map, [(raw bytes, name string offset)]).
+    """
+    weight_op_map = _build_weight_op_map(ag)
+    fc_layout_shapes = _build_fc_layout_permutations(ag)
+    binary_layouts = _binary_constant_layouts(ag)
+
+    weight_idx: dict[str, int] = {}
+    weights: list[tuple[bytes, int]] = []
+    for idx, (name, arr) in enumerate(ag.weight_data.items()):
+        weight_idx[name] = idx
+        if name in binary_layouts:
+            arr = _stored_like(arr, binary_layouts[name])
+        else:
+            arr = _transpose_weight_nhwc(arr, weight_op_map.get(name))
+        # Preserve ONNX flatten/reshape order across the internal layout change.
+        if name in fc_layout_shapes:
+            arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
+        # Preserve the integer dtypes of quantized weights
+        if arr.dtype in (np.int8, np.int16, np.int32, np.bool_):
+            raw = arr.tobytes()
+        else:
+            raw = arr.astype(np.float32).tobytes()
+        weights.append((raw, strings.add(name)))
+    return weight_idx, weights
+
+
+def _aligned_blob(raws) -> tuple[bytes, list[int]]:
+    """Concatenate weights so each starts WEIGHT_ALIGN-aligned; return the blob and offsets.
+
+    Combined with a WEIGHT_ALIGN-aligned base (the plan section, or the fast
+    arena a block decompresses into) every weight/bias pointer is aligned for
+    the opt kernels.
+    """
+    blob = bytearray()
+    offsets: list[int] = []
+    for raw in raws:
+        blob.extend(b"\x00" * ((-len(blob)) % WEIGHT_ALIGN))
+        offsets.append(len(blob))
+        blob.extend(raw)
+    return bytes(blob), offsets
 
 
 def _build_weights(
@@ -477,43 +499,13 @@ def _build_weights(
     if not ag.weight_data:
         return b"", {}
 
-    weight_op_map = _build_weight_op_map(ag)
-    fc_layout_shapes = _build_fc_layout_permutations(ag)
-    binary_layouts = _binary_constant_layouts(ag)
-
-    weight_idx: dict[str, int] = {}
-    entries_buf = bytearray()
-    blob_buf = bytearray()
-
-    for idx, (name, arr) in enumerate(ag.weight_data.items()):
-        weight_idx[name] = idx
-        op_type = weight_op_map.get(name)
-        if name in binary_layouts:
-            arr = _stored_like(arr, binary_layouts[name])
-        else:
-            arr = _transpose_weight_nhwc(arr, op_type)
-        # Preserve ONNX flatten/reshape order across the internal layout change.
-        if name in fc_layout_shapes:
-            arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
-        # Preserve the integer dtypes of quantized weights
-        if arr.dtype in (np.int8, np.int16, np.int32, np.bool_):
-            raw = arr.tobytes()
-        else:
-            raw = arr.astype(np.float32).tobytes()
-        name_off = strings.add(name)
-        # Pad so this weight starts WEIGHT_ALIGN-aligned within the blob.
-        # Combined with a WEIGHT_ALIGN-aligned blob base (emit assembler aligns
-        # the section) every weight/bias pointer is aligned for the opt kernels.
-        blob_buf.extend(b"\x00" * ((-len(blob_buf)) % WEIGHT_ALIGN))
-        blob_offset = len(blob_buf)
-        entries_buf.extend(WEIGHT_ENTRY_STRUCT.pack(
-            name_off,
-            blob_offset,
-            len(raw),
-        ))
-        blob_buf.extend(raw)
-
-    return bytes(entries_buf) + bytes(blob_buf), weight_idx
+    weight_idx, weights = _serialized_weights(ag, strings)
+    blob, offsets = _aligned_blob(raw for raw, _ in weights)
+    entries = b"".join(
+        WEIGHT_ENTRY_STRUCT.pack(name_off, offset, len(raw))
+        for (raw, name_off), offset in zip(weights, offsets)
+    )
+    return entries + blob, weight_idx
 
 
 def _group_weights_by_stage(
@@ -550,6 +542,26 @@ def _group_weights_by_stage(
     return sorted(stage_groups.items())
 
 
+def _stage_blocks(
+    ag: AnalyzedGraph,
+    weight_idx: dict[str, int],
+    weights: list[tuple[bytes, int]],
+) -> list[tuple[int, list[int], list[int], bytes]]:
+    """The uncompressed weight block of each stage that reads weights.
+
+    Returns [(stage_idx, sorted weight indices, offsets in the block, block bytes)].
+    """
+    if any(op.op_type == "While" and any(name in ag.weight_data for name in op.inputs)
+           for op in ag.ops):
+        # A control-flow stage reads its constants as stored.
+        raise ValueError("a loop starting from a constant does not compress")
+    blocks = []
+    for stage_idx, members in _group_weights_by_stage(ag, weight_idx):
+        data, offsets = _aligned_blob(weights[widx][0] for widx in members)
+        blocks.append((stage_idx, members, offsets, data))
+    return blocks
+
+
 def _build_weights_compressed(
     ag: AnalyzedGraph,
     strings: _StringTable,
@@ -565,105 +577,45 @@ def _build_weights_compressed(
 
     if not ag.weight_data:
         return b"", b"", {}
-    if any(op.op_type == "While" and any(name in ag.weight_data for name in op.inputs)
-           for op in ag.ops):
-        # A control-flow stage reads its constants as stored.
-        raise ValueError("a loop starting from a constant does not compress")
 
-    weight_op_map = _build_weight_op_map(ag)
-    fc_layout_shapes = _build_fc_layout_permutations(ag)
-    binary_layouts = _binary_constant_layouts(ag)
-
-    # First pass: prepare all weights (same transform as _build_weights)
-    weight_idx: dict[str, int] = {}
-    weight_names = list(ag.weight_data.keys())
-    prepared: list[tuple[bytes, int]]  = []  # (raw_bytes, name_str_off)
-
-    for idx, name in enumerate(weight_names):
-        arr = ag.weight_data[name]
-        weight_idx[name] = idx
-        op_type = weight_op_map.get(name)
-        if name in binary_layouts:
-            arr = _stored_like(arr, binary_layouts[name])
-        else:
-            arr = _transpose_weight_nhwc(arr, op_type)
-        if name in fc_layout_shapes:
-            arr = _permute_fc_weight_for_nhwc(arr, fc_layout_shapes[name])
-        if arr.dtype in (np.int8, np.int16, np.int32, np.bool_):
-            raw = arr.tobytes()
-        else:
-            raw = arr.astype(np.float32).tobytes()
-        name_off = strings.add(name)
-        prepared.append((raw, name_off))
-
-    # Group weights by stage
-    groups = _group_weights_by_stage(ag, weight_idx)
-
-    # Build per-stage blocks and entries with block-relative offsets
-    entries_buf = bytearray(len(prepared) * WEIGHT_ENTRY_SIZE)
-    blocks: list[tuple[int, int, int, int, int, bytes]] = []  # stage_idx, first_widx, num_w, uncomp_sz, comp_sz, comp_data
-    blob_parts: list[bytes] = []
+    weight_idx, weights = _serialized_weights(ag, strings)
+    blocks = _stage_blocks(ag, weight_idx, weights)
     compress_type = COMPRESS_LZ4 if compress == "lz4" else COMPRESS_NONE
 
-    for stage_idx, widx_list in groups:
-        # Build contiguous raw block for this stage's weights
-        block_buf = bytearray()
-        first_widx = widx_list[0]
-        for widx in widx_list:
-            raw, name_off = prepared[widx]
-            # Pad to WEIGHT_ALIGN so each weight is aligned after decompression
-            # into the (WEIGHT_ALIGN-aligned) fast arena - same requirement as
-            # the uncompressed path.
-            block_buf.extend(b"\x00" * ((-len(block_buf)) % WEIGHT_ALIGN))
-            # Write entry with block-relative offset
+    # Section layout: header num_blocks(u16) + compression_type(u16),
+    # tigris_weight_block_t[num_blocks], then the block blobs.
+    entries_buf = bytearray(len(weights) * WEIGHT_ENTRY_SIZE)
+    block_entries = bytearray()
+    blob_parts: list[bytes] = []
+    blob_offset = 0
+    assigned: set[int] = set()
+    for stage_idx, members, offsets, data in blocks:
+        for widx, offset in zip(members, offsets):
+            raw, name_off = weights[widx]
             WEIGHT_ENTRY_STRUCT.pack_into(
-                entries_buf, widx * WEIGHT_ENTRY_SIZE,
-                name_off, len(block_buf), len(raw),
-            )
-            block_buf.extend(raw)
-
-        uncompressed_size = len(block_buf)
+                entries_buf, widx * WEIGHT_ENTRY_SIZE, name_off, offset, len(raw))
         if compress_type == COMPRESS_LZ4:
-            compressed = lz4.block.compress(
-                bytes(block_buf), store_size=False)
+            compressed = lz4.block.compress(data, store_size=False)
         else:
-            compressed = bytes(block_buf)
-        compressed_size = len(compressed)
-
-        blocks.append((stage_idx, first_widx, len(widx_list),
-                       uncompressed_size, compressed_size, compressed))
+            compressed = data
+        block_entries.extend(WEIGHT_BLOCK_STRUCT.pack(
+            stage_idx, members[0], len(members), 0,  # pad
+            blob_offset, len(compressed), len(data),
+        ))
+        blob_offset += len(compressed)
         blob_parts.append(compressed)
+        assigned.update(members)
 
     # Handle weights not assigned to any stage (shouldn't happen but be safe)
-    assigned = set()
-    for _, widx_list in groups:
-        assigned.update(widx_list)
-    for widx in range(len(prepared)):
+    for widx, (raw, name_off) in enumerate(weights):
         if widx not in assigned:
-            raw, name_off = prepared[widx]
             WEIGHT_ENTRY_STRUCT.pack_into(
-                entries_buf, widx * WEIGHT_ENTRY_SIZE,
-                name_off, 0, len(raw),
-            )
+                entries_buf, widx * WEIGHT_ENTRY_SIZE, name_off, 0, len(raw))
 
-    # Build SEC_WEIGHT_BLOCKS section:
-    # header: num_blocks(u16) + compression_type(u16)
-    # block entries: tigris_weight_block_t[num_blocks]
-    # blob data
-    num_blocks = len(blocks)
-    sec_header = WEIGHT_BLOCK_SECTION_HEADER_STRUCT.pack(num_blocks, compress_type)
-    block_entries = bytearray()
-    current_blob_off = 0
-    for stage_idx, first_widx, num_w, uncomp_sz, comp_sz, comp_data in blocks:
-        block_entries.extend(WEIGHT_BLOCK_STRUCT.pack(
-            stage_idx, first_widx, num_w, 0,  # pad
-            current_blob_off, comp_sz, uncomp_sz,
-        ))
-        current_blob_off += comp_sz
-
-    blob_data = b"".join(blob_parts)
-    weight_blocks_section = sec_header + bytes(block_entries) + blob_data
-
+    weight_blocks_section = (
+        WEIGHT_BLOCK_SECTION_HEADER_STRUCT.pack(len(blocks), compress_type)
+        + bytes(block_entries) + b"".join(blob_parts)
+    )
     return bytes(entries_buf), weight_blocks_section, weight_idx
 
 
@@ -679,22 +631,12 @@ def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
     if not ag.weight_data:
         return 0
 
-    # ``none`` retains the exact block layout without doing needless LZ4 work.
-    _, section, _ = _build_weights_compressed(ag, _StringTable(), "none")
-    if len(section) < 4:
-        return 0
-    num_blocks, _ = WEIGHT_BLOCK_SECTION_HEADER_STRUCT.unpack_from(section, 0)
-    block_size = WEIGHT_BLOCK_STRUCT.size
-    block_bytes: dict[int, int] = {}
-    for i in range(num_blocks):
-        off = 4 + i * block_size
-        stage_idx, _, _, _, _, _, uncompressed = WEIGHT_BLOCK_STRUCT.unpack_from(
-            section, off
-        )
-        aligned = (uncompressed + ag.tensor_alignment - 1) & ~(
-            ag.tensor_alignment - 1
-        )
-        block_bytes[stage_idx] = aligned
+    weight_idx, weights = _serialized_weights(ag, _StringTable())
+    align = ag.tensor_alignment
+    block_bytes = {
+        stage_idx: (len(data) + align - 1) & ~(align - 1)
+        for stage_idx, _, _, data in _stage_blocks(ag, weight_idx, weights)
+    }
 
     reserve = max(block_bytes.values(), default=0)
     for stage in ag.stages:
