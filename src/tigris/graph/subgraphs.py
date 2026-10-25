@@ -83,3 +83,41 @@ def control_flow_cuts(ag: AnalyzedGraph) -> frozenset[int]:
             cuts.update((index, index + 1))
     return frozenset(cuts)
 
+
+def input_dependent_loop(ag: AnalyzedGraph) -> bool:
+    """True when a While in the graph or a subgraph below it may run a number
+    of iterations that depends on the values of the model inputs, state
+    included: its condition reads a loop variable that starts from an input
+    or that its body updates from one."""
+    return _input_dependence(ag, [True] * len(ag.model_inputs))[1]
+
+
+def _input_dependence(graph: AnalyzedGraph, dependent: list[bool]) -> tuple[list[bool], bool]:
+    """Which outputs of the graph depend on its inputs flagged in `dependent`,
+    and whether a While in it runs a number of iterations that does."""
+    reached = {name for name, flag in zip(graph.model_inputs, dependent) if flag}
+    loops = False
+    for op in graph.ops:
+        flags = [name in reached for name in op.inputs]
+        if op.op_type == "While":
+            body = graph.subgraphs[op.attrs["body_branch"]]
+            # A loop variable depends on the inputs once any iteration's body
+            # writes it from one that does.
+            while True:
+                updated, inner = _input_dependence(body, flags)
+                merged = [a or b for a, b in zip(flags, updated)]
+                if merged == flags:
+                    break
+                flags = merged
+            verdict, in_condition = _input_dependence(graph.subgraphs[op.attrs["cond_branch"]], flags)
+            loops = loops or inner or in_condition or any(verdict)
+            outputs = flags
+        elif op.op_type == "If":
+            results = [_input_dependence(graph.subgraphs[op.attrs[key]], flags[1:])
+                       for key in CONTROL_FLOW["If"]]
+            loops = loops or any(inner for _, inner in results)
+            outputs = [flags[0] or any(given[i] for given, _ in results) for i in range(len(op.outputs))]
+        else:
+            outputs = [any(flags)] * len(op.outputs)
+        reached.update(name for name, flag in zip(op.outputs, outputs) if flag)
+    return [name in reached for name in graph.model_outputs], loops
