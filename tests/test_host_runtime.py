@@ -441,6 +441,17 @@ def test_analyze_reports_measured_slow_traffic(conv_relu_chain_path):
     assert report["slow"]["traffic"]["written"] > 0 and report["slow"]["traffic"]["read"] > 0
 
 
+def test_analyze_traces_and_measures_a_plan_whose_slow_pool_fits(conv_relu_chain_path):
+    model = str(conv_relu_chain_path)
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "16K", "-m", "64K", "--trace"])
+    assert result.exit_code == 0, result.output
+    assert "their bytes equal the runtime's own counters" in result.output
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "16K", "-m", "64K"])
+    assert result.exit_code == 0, result.output
+    row = next(line for line in result.output.splitlines() if "slow traffic" in line)
+    assert "per inference:" in row
+
+
 def test_analyze_measures_a_loop_with_a_fixed_iteration_count():
     model = str(Path(__file__).parent / "fixtures" / "tflite" / "ops" / "float_while_counter.tflite")
     result = CliRunner().invoke(cli, ["analyze", model, "-m", "64K"])
