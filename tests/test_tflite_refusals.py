@@ -250,6 +250,14 @@ REASONS = [
     pytest.param("strided_slice", [_data(1, [-1, 1, 1, 1], np.int32), _option(0, 4, "i", 1)],
                  ["operator 0 STRIDED_SLICE: a dropped axis with a negative stride"],
                  id="strided-shrink-negative"),
+    pytest.param("strided_slice_shrink",
+                 [_data(3, [0, 6, 0, 0], np.int32), _data(2, [0, 7, 0, 0], np.int32)],
+                 ["operator 0 STRIDED_SLICE: a dropped axis at an index outside the axis"],
+                 id="strided-shrink-past-end"),
+    pytest.param("strided_slice_shrink",
+                 [_data(3, [0, -7, 0, 0], np.int32), _data(2, [0, -6, 0, 0], np.int32)],
+                 ["operator 0 STRIDED_SLICE: a dropped axis at an index outside the axis"],
+                 id="strided-shrink-before-start"),
     pytest.param("reverse_spatial", [_data(1, [1, 3], np.int32)],
                  ["operator 0 REVERSE_V2: axes that are not adjacent"], id="reverse-axes"),
     pytest.param("space_to_batch", [_tensor(0, shape=[1, 4, 12])],
@@ -330,6 +338,10 @@ ORDER = [
                  PER_TENSOR,
                  ["operator 0 STRIDED_SLICE: activations must be quantized per tensor"],
                  id="strided-shrink-negative"),
+    pytest.param("strided_slice_shrink",
+                 [_data(3, [0, 6, 0, 0], np.int32), _data(2, [0, 7, 0, 0], np.int32)], PER_TENSOR,
+                 ["operator 0 STRIDED_SLICE: activations must be quantized per tensor"],
+                 id="strided-shrink-outside"),
     pytest.param("reverse_spatial", [_data(1, [1, 3], np.int32)], PER_TENSOR,
                  ["operator 0 REVERSE_V2: activations must be quantized per tensor"],
                  id="reverse-axes"),
@@ -602,3 +614,43 @@ def test_a_dropped_axis_of_a_slice_with_steps(begin, tmp_path, require_host_libr
     x = np.random.default_rng(1).standard_normal((1, 6, 6, 4)).astype(np.float32)
     [y] = _run(data, {"x": x}, tmp_path)
     np.testing.assert_array_equal(y, x[:, ::2, begin, :])
+
+
+@pytest.mark.parametrize("begin", [2, 6])
+@pytest.mark.parametrize("stride", [1, 2], ids=["stride-1", "any-stride"])
+def test_a_dropped_axis_under_its_begin_mask_bit_takes_index_zero(begin, stride, tmp_path,
+                                                                  require_host_library):
+    """float_strided_slice_shrink with every begin_mask bit set: TFLite Micro takes
+    row 0 of the dropped axis whatever `begin` says, with or without a stride
+    other than 1 on another axis."""
+    data = _edited("float_strided_slice_shrink", _data(1, [0, begin, 0, 0], np.int32),
+                   _data(3, [1, 1, stride, 1], np.int32), _option(0, 0, "i", 15),
+                   _tensor(4, shape=[1, 6 // stride, 4]))
+    assert tflite.unsupported(data) == []
+    x = np.random.default_rng(2).standard_normal((1, 6, 6, 4)).astype(np.float32)
+    [y] = _run(data, {"x": x}, tmp_path)
+    np.testing.assert_array_equal(y, x[:, 0, ::stride, :])
+
+
+def test_a_folded_dropped_axis_under_its_begin_mask_bit_takes_index_zero(tmp_path,
+                                                                         require_host_library):
+    """float_mul with its second operand a constant STRIDED_SLICE that drops
+    axis 1 at begin 2 with every begin_mask bit set."""
+    values = (np.arange(300, dtype=np.float32) / 7 - 20).reshape(1, 3, 5, 5, 4)
+
+    def through(graph, model):
+        y = graph.inputs[1]
+        inputs = [_constant(graph, model, values, _FLOAT32),
+                  *(_constant(graph, model, np.asarray(v, np.int32), _INT32)
+                    for v in ([0, 2, 0, 0, 0], [1, 3, 5, 5, 4], [1, 1, 1, 1, 1]))]
+        options = tw.Options(32, None, {0: ("i", 31), 1: ("i", 31), 4: ("i", 2)})
+        graph.operators.insert(0, tw.Operator(_code(model, "STRIDED_SLICE"), inputs, [y], options))
+        graph.inputs = graph.inputs[:1]
+    data = _edited("float_mul", through)
+    _, graphs = tflite._read(data)
+    _, tensors, _, _, operators = graphs[0]
+    assert [op.kind for op in operators] == ["MUL"]
+    np.testing.assert_array_equal(tensors[operators[0].inputs[1]].array(), values[:, 0])
+    x = np.random.default_rng(0).standard_normal((1, 5, 5, 4)).astype(np.float32)
+    [y] = _run(data, {"x": x}, tmp_path)
+    np.testing.assert_array_equal(y, x * values[:, 0])
