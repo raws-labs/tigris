@@ -34,6 +34,7 @@ Passes applied in sequence (matches ``normalize()`` call order):
 """
 
 import math
+from collections import Counter
 from dataclasses import replace
 
 import numpy as np
@@ -234,11 +235,7 @@ def _quantize_uniform_constants(ag: AnalyzedGraph) -> AnalyzedGraph:
             if encoded is not None:
                 op.inputs = [encoded if n == name else n for n in op.inputs]
                 continue
-            encoded = f"{name}_int8"
-            suffix = 0
-            while encoded in ag.tensors or encoded in ag.weight_data:
-                suffix += 1
-                encoded = f"{name}_int8_{suffix}"
+            encoded = _fresh_name(ag, f"{name}_int8")
             encoded_constants[name] = encoded
             op.inputs = [encoded if n == name else n for n in op.inputs]
             name, info = encoded, replace(info, name=encoded)
@@ -284,10 +281,11 @@ def _lower_legacy_softmax(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
         outer = int(np.prod(info.shape[:axis], dtype=np.int64))
         inner = int(np.prod(info.shape[axis:], dtype=np.int64))
-        flat_in, flat_out = f"{op.name}_rows_in", f"{op.name}_rows_out"
+        flat_in = _fresh_name(ag, f"{op.name}_rows_in")
         ag.tensors[flat_in] = TensorInfo(
             name=flat_in, shape=(outer, inner), dtype=info.dtype,
             quant=info.quant, layout=Layout.LINEAR)
+        flat_out = _fresh_name(ag, f"{op.name}_rows_out")
         ag.tensors[flat_out] = TensorInfo(
             name=flat_out, shape=(outer, inner), dtype=out_info.dtype,
             quant=out_info.quant, layout=Layout.LINEAR)
@@ -411,7 +409,7 @@ def _lift_pad_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
         if value == 0.0:
             continue
         output = ag.tensors.get(op.outputs[0])
-        name = f"{op.name}_fill"
+        name = _fresh_name(ag, f"{op.name}_fill")
         if output is not None and output.quant is not None:
             scale = float(output.quant.scale[0])
             zero_point = int(output.quant.zero_point[0])
@@ -742,7 +740,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
                 target = converted.get(key)
                 if target is None:
                     counter += 1
-                    target = f"{name}_to_{enforced.value}_{counter}"
+                    target = _fresh_name(ag, f"{name}_to_{enforced.value}_{counter}")
                     ag.tensors[target] = TensorInfo(
                         name=target,
                         shape=info.shape,
@@ -806,7 +804,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
         if info.layout is Layout.SPATIAL or len(info.shape) < 3:
             continue
         counter += 1
-        produced = f"{name}_linear_{counter}"
+        produced = _fresh_name(ag, f"{name}_linear_{counter}")
         ag.tensors[produced] = TensorInfo(
             name=produced, shape=info.shape, dtype=info.dtype,
             quant=info.quant, layout=info.layout)
@@ -981,7 +979,7 @@ def _fold_split_onto(
     for position, part in enumerate(parts):
         block = widths[position] * stride
         tag = f"{product.name}_part{position}"
-        weight_name = f"{product.inputs[1]}_part{position}"
+        weight_name = _fresh_name(ag, f"{product.inputs[1]}_part{position}")
         ag.weight_data[weight_name] = np.ascontiguousarray(
             weight[:, offset:offset + block])
         ag.tensors[weight_name] = TensorInfo(
@@ -989,7 +987,7 @@ def _fold_split_onto(
             dtype=ag.tensors[product.inputs[1]].dtype, is_constant=True)
         inputs = [product.inputs[0], weight_name]
         if bias is not None:
-            bias_name = f"{product.inputs[2]}_part{position}"
+            bias_name = _fresh_name(ag, f"{product.inputs[2]}_part{position}")
             ag.weight_data[bias_name] = np.ascontiguousarray(
                 bias[offset:offset + block])
             ag.tensors[bias_name] = TensorInfo(
@@ -997,7 +995,7 @@ def _fold_split_onto(
                 dtype=ag.tensors[product.inputs[2]].dtype, is_constant=True)
             inputs.append(bias_name)
 
-        carried = f"{tag}_product" if chain else split.outputs[position]
+        carried = _fresh_name(ag, f"{tag}_product") if chain else split.outputs[position]
         if chain:
             ag.tensors[carried] = TensorInfo(
                 name=carried,
@@ -1013,8 +1011,7 @@ def _fold_split_onto(
         for depth, index in enumerate(reversed(chain)):
             step = ag.ops[index]
             last = depth == len(chain) - 1
-            output = split.outputs[position] if last else (
-                f"{tag}_step{depth}")
+            output = split.outputs[position] if last else _fresh_name(ag, f"{tag}_step{depth}")
             if not last:
                 shape = _part_shape(ag, step.outputs[0], widths[position],
                                     len(parts))
@@ -1113,11 +1110,11 @@ def _lower_linear_matmul(ag: AnalyzedGraph) -> AnalyzedGraph:
         columns = int(weight.shape[1])
 
         counter += 1
-        flat_in = f"{op.inputs[0]}_rows_{counter}"
-        flat_out = f"{op.outputs[0]}_rows_{counter}"
+        flat_in = _fresh_name(ag, f"{op.inputs[0]}_rows_{counter}")
         ag.tensors[flat_in] = TensorInfo(
             name=flat_in, shape=(rows, reduction), dtype=data_info.dtype,
             quant=data_info.quant, layout=Layout.LINEAR)
+        flat_out = _fresh_name(ag, f"{op.outputs[0]}_rows_{counter}")
         ag.tensors[flat_out] = TensorInfo(
             name=flat_out, shape=(rows, columns), dtype=out_info.dtype,
             quant=out_info.quant, layout=Layout.LINEAR)
@@ -1473,17 +1470,14 @@ def _transpose_quantized_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
     int8 weight like any other.
     """
     producer = {out: op for op in ag.ops for out in op.outputs}
-    readers: dict[str, int] = {}
-    for op in ag.ops:
-        for name in op.inputs:
-            readers[name] = readers.get(name, 0) + 1
+    reads = _read_counts(ag)
     removed: set[int] = set()
     for index, op in enumerate(ag.ops):
         if op.op_type != "Transpose" or len(op.inputs) != 1:
             continue
         dql = producer.get(op.inputs[0])
-        if (dql is None or dql.op_type != "DequantizeLinear" or readers.get(op.inputs[0], 0) != 1
-                or dql.inputs[0] not in ag.weight_data or readers.get(dql.inputs[0], 0) != 1
+        if (dql is None or dql.op_type != "DequantizeLinear" or reads[op.inputs[0]] != 1
+                or dql.inputs[0] not in ag.weight_data or reads[dql.inputs[0]] != 1
                 or any(n and n not in ag.weight_data for n in dql.inputs[1:])):
             continue
         data = ag.weight_data[dql.inputs[0]]
@@ -1552,7 +1546,7 @@ def _quantize_float_biases(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
         target = bias_name
         if consumers.get(bias_name, 0) > 1:
-            target = f"{bias_name}__int32_{op.name or len(ag.weight_data)}"
+            target = _fresh_name(ag, f"{bias_name}__int32_{op.name or len(ag.weight_data)}")
             op.inputs[2] = target
         ag.weight_data[target] = quantized.astype(np.int32).reshape(bias.shape)
         ag.tensors[target] = TensorInfo(
@@ -1617,8 +1611,9 @@ def _quantize_inputs_first(ag: AnalyzedGraph) -> AnalyzedGraph:
         for tensor in held[:-1]:
             first = consumers[tensor][0]
             shape = ag.tensors[tensor].shape
-            q, dq = f"{tensor}_input_q", f"{tensor}_input_dq"
+            q = _fresh_name(ag, f"{tensor}_input_q")
             ag.tensors[q] = TensorInfo(name=q, shape=shape, dtype=dtype)
+            dq = _fresh_name(ag, f"{tensor}_input_dq")
             ag.tensors[dq] = TensorInfo(name=dq, shape=shape, dtype=1)
             inserted.setdefault(id(first), []).extend([
                 OpNode(name=q, op_type="QuantizeLinear", inputs=[tensor, *params],
@@ -2060,7 +2055,7 @@ def _order_broadcast_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _fold_bn_into_quantized_conv(ag: AnalyzedGraph, conv_op: OpNode, gamma, beta,
-                                 mean, var, eps: float) -> bool:
+                                 mean, var, eps: float, reads: Counter) -> bool:
     """Fold y = a * x + c, the BN after a quantized Conv, into the Conv.
 
     The Conv output is s_in * s_w[k] * (acc + bias[k]) per output channel k, so
@@ -2111,15 +2106,17 @@ def _fold_bn_into_quantized_conv(ag: AnalyzedGraph, conv_op: OpNode, gamma, beta
     if np.any(np.abs(new_bias) > np.iinfo(np.int32).max):
         return False
 
+    w_name = _own_constant(ag, conv_op, 1, reads)
     ag.weight_data[w_name] = folded
-    w_info.quant = QuantParam(scale=new_scale.astype(np.float32),
-                              zero_point=np.zeros(channels, dtype=np.int8), axis=0)
+    ag.tensors[w_name].quant = QuantParam(scale=new_scale.astype(np.float32),
+                                          zero_point=np.zeros(channels, dtype=np.int8), axis=0)
     bias_quant = QuantParam(scale=accumulator_scale.astype(np.float32),
                             zero_point=np.zeros(channels, dtype=np.int32), axis=0)
     if has_bias:
-        b_name = conv_op.inputs[2]
+        b_name = _own_constant(ag, conv_op, 2, reads)
     else:
-        b_name = w_name + "_bn_bias"
+        b_name = _fresh_name(ag, w_name + "_bn_bias")
+        reads[b_name] += 1
         conv_op.inputs = list(conv_op.inputs[:2]) + [b_name] + list(conv_op.inputs[3:])
     ag.weight_data[b_name] = new_bias.astype(np.int32)
     b_info = ag.tensors.get(b_name)
@@ -2187,7 +2184,9 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
         for inp in op.inputs:
             input_to_consumers.setdefault(inp, []).append(i)
 
+    reads = _read_counts(ag)
     removed: set[int] = set()
+    folded_parameters: list[str] = []
 
     for i, op in enumerate(ag.ops):
         if op.op_type != "BatchNormalization":
@@ -2235,12 +2234,15 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
         conv_w_name = conv_op.inputs[1]
         W = ag.weight_data[conv_w_name]
 
+        # The BN goes with the fold, so its reads no longer count.
+        reads.subtract(op.inputs)
         # Quantized weights: fold the BN into the per-channel weight scale and
         # the int32 bias. A BN the fold cannot express stays in the graph, and
         # validation rejects it as unsupported.
         if W.dtype in (np.int8, np.int32):
             if not _fold_bn_into_quantized_conv(
-                    ag, conv_op, gamma, beta, mean, var, eps):
+                    ag, conv_op, gamma, beta, mean, var, eps, reads):
+                reads.update(op.inputs)
                 continue
             # Rewire: conv's output becomes the BN's output
             bn_output = op.outputs[0]
@@ -2250,13 +2252,7 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
             if bn_input in ag.tensors and not ag.tensors[bn_input].is_constant:
                 del ag.tensors[bn_input]
 
-            # Clean up BN weight tensors
-            for wname in [gamma_name, beta_name, mean_name, var_name]:
-                if wname in ag.weight_data:
-                    del ag.weight_data[wname]
-                if wname in ag.tensors:
-                    del ag.tensors[wname]
-
+            folded_parameters += [gamma_name, beta_name, mean_name, var_name]
             removed.add(i)
             continue
 
@@ -2281,15 +2277,19 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
         B_new = (B - mean) * inv_std * gamma + beta
 
         # Update weight_data
+        conv_w_name = _own_constant(ag, conv_op, 1, reads)
         ag.weight_data[conv_w_name] = W_new.astype(np.float32)
 
         if has_bias:
+            conv_b_name = _own_constant(ag, conv_op, 2, reads)
             ag.weight_data[conv_b_name] = B_new.astype(np.float32)
         else:
             # Create a new bias tensor
             bias_name = conv_w_name.replace("weight", "bias")
             if bias_name == conv_w_name:
                 bias_name = conv_w_name + "_bias"
+            bias_name = _fresh_name(ag, bias_name)
+            reads[bias_name] += 1
             ag.weight_data[bias_name] = B_new.astype(np.float32)
             ag.tensors[bias_name] = TensorInfo(
                 name=bias_name,
@@ -2309,13 +2309,7 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
         if bn_input in ag.tensors and not ag.tensors[bn_input].is_constant:
             del ag.tensors[bn_input]
 
-        # Clean up BN weight tensors from weight_data (no longer needed)
-        for wname in [gamma_name, beta_name, mean_name, var_name]:
-            if wname in ag.weight_data:
-                del ag.weight_data[wname]
-            if wname in ag.tensors:
-                del ag.tensors[wname]
-
+        folded_parameters += [gamma_name, beta_name, mean_name, var_name]
         removed.add(i)
 
     if removed:
@@ -2323,6 +2317,7 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
         # Re-assign step indices
         for step, op in enumerate(ag.ops):
             op.step = step
+        _forget_unread(ag, folded_parameters)
 
     return ag
 
@@ -2362,6 +2357,7 @@ def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
     transposes an activation, which no constant can absorb; validation refuses
     it.
     """
+    reads = _read_counts(ag)
     for op in ag.ops:
         if op.op_type != "Gemm" or len(op.inputs) < 2:
             continue
@@ -2370,8 +2366,8 @@ def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
         if alpha != 1.0:
             weight = ag.weight_data.get(op.inputs[1])
             if weight is not None and weight.dtype == np.float32:
-                ag.weight_data[op.inputs[1]] = np.ascontiguousarray(
-                    weight * np.float32(alpha))
+                scaled = _own_constant(ag, op, 1, reads)
+                ag.weight_data[scaled] = np.ascontiguousarray(weight * np.float32(alpha))
                 op.attrs["alpha"] = 1.0
 
         beta = float(op.attrs.get("beta", 1.0))
@@ -2382,8 +2378,8 @@ def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
             else:
                 bias = ag.weight_data.get(op.inputs[2])
                 if bias is not None and bias.dtype == np.float32:
-                    ag.weight_data[op.inputs[2]] = np.ascontiguousarray(
-                        bias * np.float32(beta))
+                    scaled = _own_constant(ag, op, 2, reads)
+                    ag.weight_data[scaled] = np.ascontiguousarray(bias * np.float32(beta))
                     op.attrs["beta"] = 1.0
     return ag
 
@@ -2565,6 +2561,42 @@ def _fresh_name(ag: AnalyzedGraph, base: str) -> str:
     return name
 
 
+def _read_counts(ag: AnalyzedGraph) -> Counter:
+    """How often each name is read: once per operand position and once per model output."""
+    counts = Counter(name for op in ag.ops for name in op.inputs)
+    counts.update(ag.model_outputs)
+    return counts
+
+
+def _own_constant(ag: AnalyzedGraph, op: OpNode, position: int, reads: Counter) -> str:
+    """The constant ``op`` reads at ``position``, under a name nothing else reads.
+
+    A fold rewrites the constant it returns. One that ``reads`` counts more than
+    once is copied under a fresh name and ``op`` reads the copy, so every other
+    reader keeps the original. ``reads`` is kept current.
+    """
+    name = op.inputs[position]
+    if reads[name] <= 1:
+        return name
+    copy = _fresh_name(ag, name)
+    ag.weight_data[copy] = ag.weight_data[name].copy()
+    if name in ag.tensors:
+        ag.tensors[copy] = replace(ag.tensors[name], name=copy)
+    op.inputs[position] = copy
+    reads[name] -= 1
+    reads[copy] += 1
+    return copy
+
+
+def _forget_unread(ag: AnalyzedGraph, names) -> None:
+    """Drop each constant in ``names`` that no operator reads and the model does not return."""
+    reads = _read_counts(ag)
+    for name in names:
+        if name in ag.weight_data and not reads[name]:
+            del ag.weight_data[name]
+            ag.tensors.pop(name, None)
+
+
 def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Rewrite a constant divisor as a multiplication by its reciprocal.
 
@@ -2603,11 +2635,7 @@ def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
             reciprocal = (1.0 / constant.astype(np.float64)).astype(np.float32)
             if not np.all(np.isfinite(reciprocal)):
                 continue
-            name = f"{divisor}_reciprocal"
-            suffix = 0
-            while name in ag.tensors or name in ag.weight_data:
-                suffix += 1
-                name = f"{divisor}_reciprocal_{suffix}"
+            name = _fresh_name(ag, f"{divisor}_reciprocal")
             ag.weight_data[name] = np.ascontiguousarray(reciprocal)
             ag.tensors[name] = replace(ag.tensors[divisor], name=name)
             reciprocals[divisor] = name
@@ -2915,7 +2943,7 @@ def _decompose_silu(ag: AnalyzedGraph) -> AnalyzedGraph:
         y_name = op.outputs[0]
 
         # Create intermediate tensor for sigmoid output
-        sig_name = f"{x_name}_sigmoid"
+        sig_name = _fresh_name(ag, f"{x_name}_sigmoid")
         x_info = ag.tensors.get(x_name)
         if x_info:
             ag.tensors[sig_name] = TensorInfo(
@@ -3062,11 +3090,14 @@ def _split_grouped_convs(ag: AnalyzedGraph) -> AnalyzedGraph:
     """
     rewritten: list[OpNode] = []
     for op in ag.ops:
+        if op.op_type != "Conv" or len(op.inputs) < 2 or not op.outputs:
+            rewritten.append(op)
+            continue
         group = int(op.attrs.get("group", 1))
-        weight = ag.weight_data.get(op.inputs[1]) if op.op_type == "Conv" and len(op.inputs) > 1 else None
+        weight = ag.weight_data.get(op.inputs[1])
         source = ag.tensors.get(op.inputs[0])
-        result = ag.tensors.get(op.outputs[0]) if op.outputs else None
-        if (op.op_type != "Conv" or group <= 1 or weight is None or source is None or result is None
+        result = ag.tensors.get(op.outputs[0])
+        if (group <= 1 or weight is None or source is None or result is None
                 or len(source.shape) < 3 or source.shape[1] % group or weight.shape[0] % group):
             rewritten.append(op)
             continue
@@ -3558,7 +3589,7 @@ def _adopt_detection(ag: AnalyzedGraph) -> AnalyzedGraph:
         a.update(max_detections=detections, detections_per_class=per_class, num_classes=classes,
                  use_regular_nms=regular, scales=[float(v) for v in a["scales"]])
         size = detection_scratch_bytes(count, detections, detections + (per_class if regular else 0))
-        scratch = f"{op.outputs[0]}_scratch"
+        scratch = _fresh_name(ag, f"{op.outputs[0]}_scratch")
         ag.tensors[scratch] = TensorInfo(name=scratch, shape=(-(-size // 4),), dtype=1)
         op.outputs.append(scratch)
     return ag
@@ -3724,6 +3755,7 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
     reductions = {"ReduceMean": "GlobalAveragePool", "ReduceMax": "GlobalMaxPool"}
 
     ops: list[OpNode] = []
+    dropped_axes: list[str] = []
     for op in ag.ops:
         ops.append(op)
         if op.op_type not in reductions:
@@ -3776,14 +3808,11 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         # Remove axes input and clean up axes tensor
         if len(op.inputs) >= 2:
-            axes_name = op.inputs[1]
+            dropped_axes.append(op.inputs[1])
             op.inputs = [op.inputs[0]]
-            if axes_name in ag.weight_data:
-                del ag.weight_data[axes_name]
-            if axes_name in ag.tensors:
-                del ag.tensors[axes_name]
 
     ag.ops = ops
+    _forget_unread(ag, dropped_axes)
     return ag
 
 
