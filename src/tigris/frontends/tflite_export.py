@@ -520,12 +520,9 @@ def _prune(model: tw.Model) -> tw.Model:
 
 def _tensors(model: tw.Model, referenced: bool = False) -> list:
     """Each tensor as tflm_arena takes it: (storage type, shape, placed). With
-    `referenced`, a tensor nothing references is not placed."""
+    `referenced`, a tensor _prune drops is not placed."""
     sg = model.subgraphs[0]
-    used = None
-    if referenced:
-        used = {i for op in sg.operators for i in (*op.inputs, *op.outputs)}
-        used |= set(sg.inputs) | set(sg.outputs)
+    used = set(_kept(model)) if referenced else None
     return [(_TENSOR_TYPES[t.type] if 0 <= t.type < len(_TENSOR_TYPES) else None, t.shape or [],
              not (_is_constant(model, t) or t.is_variable) and (used is None or i in used))
             for i, t in enumerate(sg.tensors)]
