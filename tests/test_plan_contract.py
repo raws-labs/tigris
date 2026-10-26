@@ -13,9 +13,9 @@ import pytest
 
 from tigris import SCHEMA_VERSION
 from tigris.cli import _run_pipeline
-from tigris.fixtures import build_linear_3op, build_conv_relu_chain, build_ds_cnn
 from tigris.emitters.binary.defs import HEADER_SIZE, MAGIC, OP_SIZE
 from tigris.emitters.binary.writer import emit_binary_bytes
+from scripts.contract_cases.fixtures import build_linear_3op, build_conv_relu_chain, build_ds_cnn
 
 
 # Helpers

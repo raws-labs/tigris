@@ -12,7 +12,7 @@ from tigris.analysis.partition_spatial import (
     _stage_tile_axis,
 )
 from tigris.analysis.validation import validate_memory_plan
-from tigris.fixtures import build_tcn
+from scripts.contract_cases.fixtures import build_tcn
 
 from conftest import full_pipeline
 
@@ -389,7 +389,8 @@ _BAND_KINDS = ["ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",
 ])
 def test_independent_operator_band_fits_256_bytes(tmp_path, kind, quantized):
     import onnx
-    from scripts.crossrepo_contract import _arg_case, _movement_case, _reduce_all_case, _reduction_case
+    from scripts.contract_cases.movement import _movement_case
+    from scripts.contract_cases.reduction import _arg_case, _reduce_all_case, _reduction_case
     from tigris.cli import _run_pipeline
 
     if kind in {"ArgMax", "ArgMin"}:

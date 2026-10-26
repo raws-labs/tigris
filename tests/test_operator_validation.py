@@ -1404,7 +1404,7 @@ def test_float32_results_stand_apart_from_int8_data():
 
 @pytest.mark.parametrize("kind", ["StridedSlice", "MirrorPad", "ReverseV2"])
 def test_movement_refuses_runtime_bounds(tmp_path, kind):
-    from scripts.crossrepo_contract import _movement_case
+    from scripts.contract_cases.movement import _movement_case
     case = _movement_case(kind, False)
     model = case.compile_model
     index_name = {"StridedSlice": "starts", "MirrorPad": "pads", "ReverseV2": "axes",
@@ -1427,7 +1427,7 @@ def test_movement_refuses_runtime_bounds(tmp_path, kind):
     ("ReverseV2", {"axes": []}, "nonempty"),
 ])
 def test_movement_refuses_invalid_constants(tmp_path, kind, changes, message):
-    from scripts.crossrepo_contract import _movement_case
+    from scripts.contract_cases.movement import _movement_case
     case = _movement_case(kind, False)
     for name, value in changes.items():
         initializer = next(item for item in case.compile_model.graph.initializer if item.name == name)
@@ -1534,7 +1534,7 @@ def test_sum_rejects_output_multiplier_outside_reference_domain():
 @pytest.mark.parametrize("kind", ["Gather", "GatherND", "EmbeddingLookup", "DynamicUpdateSlice"])
 @pytest.mark.parametrize("dtype", [6, 7])
 def test_runtime_index_inputs_narrow_and_keep_their_slot(tmp_path, kind, dtype):
-    from scripts.crossrepo_contract import _runtime_index_case
+    from scripts.contract_cases.movement import _runtime_index_case
     from tigris.emitters.binary.reader import read_binary_plan
     from tigris.emitters.binary.writer import emit_binary_bytes
 

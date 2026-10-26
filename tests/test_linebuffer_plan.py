@@ -9,7 +9,7 @@ from tigris.cli import _run_pipeline
 from tigris.emitters.binary.defs import STAGE_FLAG_LINE_BUFFERED
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.fixtures import build_ds_cnn
+from scripts.contract_cases.fixtures import build_ds_cnn
 
 
 def _chain_heads(ag):

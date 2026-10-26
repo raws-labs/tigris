@@ -917,7 +917,8 @@ def test_an_operator_writing_no_runtime_tensor_is_named(tmp_path):
 @pytest.mark.parametrize("state", [False, True])
 def test_tile_wire_layout(tmp_path, state):
     import onnx
-    from scripts.crossrepo_contract import _state_tile_case, _tiled_global_reduction_case
+    from scripts.contract_cases.common import _state_tile_case
+    from scripts.contract_cases.reduction import _tiled_global_reduction_case
     from tigris.cli import _run_pipeline
 
     case = _tiled_global_reduction_case()
@@ -955,7 +956,8 @@ def test_tile_wire_layout(tmp_path, state):
 
 def test_compact_preserved_axis_transpose(tmp_path):
     import onnx
-    from scripts.crossrepo_contract import _state_tile_case, _fixed_axis_transpose_case
+    from scripts.contract_cases.common import _state_tile_case
+    from scripts.contract_cases.movement import _fixed_axis_transpose_case
     from tigris.cli import _run_pipeline
     from tigris.runtime import Session
 
@@ -982,7 +984,7 @@ def test_compact_preserved_axis_transpose(tmp_path):
 @pytest.mark.parametrize("field_offset", [16, 20])
 def test_loader_refuses_incomplete_group_geometry(tmp_path, field_offset):
     import onnx
-    from scripts.crossrepo_contract import _grouped_global_reduction_case
+    from scripts.contract_cases.reduction import _grouped_global_reduction_case
     from tigris.cli import _run_pipeline
     from tigris.runtime import Session, RuntimeError as HostError
 
