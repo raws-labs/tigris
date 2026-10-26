@@ -227,18 +227,11 @@ def test_analyze_prints_the_trace(conv_relu_chain_path):
                                     "--trace"]).exit_code != 0
 
 
-@pytest.mark.parametrize(("command", "replacement"), [
-    (["plan", "-o"], "inspect PLAN --json"), (["simulate"], "--trace"),
-])
-def test_plan_and_simulate_are_deprecated_aliases(conv_relu_chain_path, tmp_path, command,
-                                                  replacement):
-    args = [command[0], str(conv_relu_chain_path), "-m", "64K"]
-    if command[0] == "plan":
-        args += ["-o", str(tmp_path / "plan.yaml")]
-    result = CliRunner().invoke(cli, args)
-    assert result.exit_code == 0, result.output
-    assert "deprecated" in result.stderr and replacement in result.stderr
-    assert "removed in the next release" in result.stderr.lower()
+@pytest.mark.parametrize("command", ["plan", "simulate"])
+def test_plan_and_simulate_are_removed(conv_relu_chain_path, command):
+    result = CliRunner().invoke(cli, [command, str(conv_relu_chain_path), "-m", "64K"])
+    assert result.exit_code == 2
+    assert f"No such command '{command}'" in result.output
 
 
 def test_run_pipeline_records_slow_tier(conv_relu_chain_path):
