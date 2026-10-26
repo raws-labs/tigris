@@ -6,6 +6,7 @@ by name, so a model is never compiled with a reinterpreted operator.
 """
 
 import json
+from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
@@ -116,7 +117,13 @@ class _Operator:
         self.index = index
 
     def option(self, slot: int, fmt: str, default=0):
-        return self.options.scalar(slot, fmt, default) if self.options else default
+        """Field `slot` of the options table: a scalar of struct format `fmt`,
+        a string for "s", a byte vector for "[B"; `default` without a table."""
+        if not self.options:
+            return default
+        if fmt == "s":
+            return self.options.string(slot)
+        return self.options.bytes(slot) if fmt == "[B" else self.options.scalar(slot, fmt, default)
 
 
 def _check_indices(owner: str, item: str, indices, count: int, lowest: int = 0) -> None:
@@ -157,9 +164,7 @@ def _read(data: bytes):
             # -1 is an operand left out.
             _check_indices(owner, "tensor", op.inputs, len(tensors), -1)
             _check_indices(owner, "tensor", op.outputs, len(tensors))
-            slots = {"IF": (0, 1), "WHILE": (0, 1), "CALL_ONCE": (0,)}.get(op.kind, ())
-            _check_indices(owner, "subgraph", [op.option(slot, "i") for slot in slots],
-                           len(graphs))
+            _check_indices(owner, "subgraph", _subgraphs(op), len(graphs))
             reason = _missing_operand(op)
             if reason:
                 raise ValueError(f"{owner}: {reason}")
@@ -172,8 +177,7 @@ def _read(data: bytes):
         for op in operators:
             if op.kind != "IF":
                 continue
-            for slot in (0, 1):
-                position = op.option(slot, "i")
+            for position in _subgraphs(op):
                 if not 0 < position < len(graphs):
                     continue
                 _, branch_tensors, branch_inputs, _, _ = graphs[position]
@@ -214,7 +218,7 @@ def _constant_result(op: "_Operator", tensors) -> "np.ndarray | None":
         return _constant_move(op, ins)
     if (op.kind in _CONSTANT_MATH and all(t.type in ("INT32", "INT64") and not len(t.scale)
                                           for t in (*ins, out))
-            and not op.option(_FUSED_SLOT.get(op.kind, 0), "b")):
+            and not _option(op, "fused_activation_function")):
         a, b = (t.array().astype(np.int64) for t in ins)
         value = _CONSTANT_MATH[op.kind](a, b)
         info = np.iinfo(_NUMPY[out.type])
@@ -249,7 +253,7 @@ class _StridedSliceOptions(NamedTuple):
 
     @classmethod
     def of(cls, op: "_Operator") -> "_StridedSliceOptions":
-        return cls(*(op.option(slot, "i") for slot in range(5)), op.option(5, "?", False))
+        return cls(*(_option(op, field) for field in cls._fields))
 
 
 def _strided_slice_axes(options: _StridedSliceOptions, shape, begins, ends, strides):
@@ -286,13 +290,13 @@ def _constant_move(op: "_Operator", ins) -> "np.ndarray | None":
     if op.kind in ("RESHAPE", "SQUEEZE", "EXPAND_DIMS"):
         return x  # _fold_constants gives it the output's static shape
     if op.kind == "PACK":
-        if op.option(0, "i") != len(ins):
+        if _option(op, "values_count") != len(ins):
             return None  # kept, so that the operator check refuses the count
-        return np.stack([t.array() for t in ins], axis=op.option(1, "i"))
+        return np.stack([t.array() for t in ins], axis=_option(op, "axis"))
     if op.kind == "CONCATENATION":
-        if op.option(1, "b") or not _same_quantization(ins):
+        if _option(op, "fused_activation_function") or not _same_quantization(ins):
             return None
-        return np.concatenate([t.array() for t in ins], axis=op.option(0, "i"))
+        return np.concatenate([t.array() for t in ins], axis=_option(op, "axis"))
     if op.kind == "SLICE":
         begin = [int(v) for v in ins[1].array().reshape(-1)]
         size = [int(v) for v in ins[2].array().reshape(-1)]
@@ -453,8 +457,8 @@ def _branch_subgraphs(graphs) -> dict[int, str]:
         for op in graphs[pending.pop()][4]:
             if op.kind not in ("IF", "WHILE"):
                 continue
-            found = ({op.option(0, "i"): "branch", op.option(1, "i"): "branch"} if op.kind == "IF"
-                     else {op.option(0, "i"): "condition", op.option(1, "i"): "body"})
+            found = dict(zip(_subgraphs(op), ("branch", "branch") if op.kind == "IF"
+                             else ("condition", "body")))
             for position, role in found.items():
                 if 0 < position < len(graphs) and position not in roles:
                     roles[position] = role
@@ -525,12 +529,21 @@ def _var_name(op: "_Operator") -> str:
     """The variable a VAR_HANDLE names: its container and shared name."""
     if op.options is None:
         return ""
-    return f"{op.options.string(0)}/{op.options.string(1)}"
+    return f"{_option(op, 'container')}/{_option(op, 'shared_name')}"
+
+
+def _subgraphs(op: "_Operator") -> list[int]:
+    """The subgraph indices an IF, WHILE or CALL_ONCE names, in field order;
+    none for other kinds."""
+    if op.kind not in ("IF", "WHILE", "CALL_ONCE"):
+        return []
+    return [_option(op, field) for field in _KINDS[op.kind].options]
 
 
 def _initializer_subgraphs(graphs) -> set[int]:
     """Subgraphs the main graph runs once through CALL_ONCE."""
-    return {op.option(0, "i") for op in graphs[0][4] if op.kind == "CALL_ONCE"} if graphs else set()
+    return ({position for op in graphs[0][4] if op.kind == "CALL_ONCE" for position in _subgraphs(op)}
+            if graphs else set())
 
 
 def _variable_initials(graphs, positions):
@@ -558,22 +571,14 @@ def _activation(code: int) -> str:
     return _ACTIVATIONS.get(code, f"activation {code}")
 
 
-# Slot of the fused activation in each operator's options table.
-_FUSED_SLOT = {"ADD": 0, "SUB": 0, "MUL": 0, "DIV": 0, "FULLY_CONNECTED": 0, "CONCATENATION": 1,
-               "CONV_2D": 3, "TRANSPOSE_CONV": 3, "DEPTHWISE_CONV_2D": 4,
-               "AVERAGE_POOL_2D": 5, "MAX_POOL_2D": 5, "L2_POOL_2D": 5}
 _UNARY = {"LOGISTIC": "Sigmoid", "TANH": "Tanh", "HARD_SWISH": "HardSwish", "RELU": "Relu",
           "ELU": "Elu"}
-_SHAPE_ONLY = ("RESHAPE", "SQUEEZE", "EXPAND_DIMS")
 # Elementwise math: the ONNX operator, or a composition the compiler folds back.
 _ELEMENTWISE_UNARY = {"ABS": "Abs", "NEG": "Neg", "EXP": "Exp", "LOG": "Log", "SQRT": "Sqrt",
                       "FLOOR": "Floor", "CEIL": "Ceil", "ROUND": "Round", "SIN": "Sin",
                       "COS": "Cos"}
 _ELEMENTWISE_BINARY = ("DIV", "MAXIMUM", "MINIMUM", "SQUARED_DIFFERENCE", "FLOOR_DIV",
                        "FLOOR_MOD")
-_ELEMENTWISE = (*_ELEMENTWISE_UNARY, *_ELEMENTWISE_BINARY, "RSQRT", "SQUARE")
-# The ones TFLite Micro also runs in int8; the others are float only there.
-_INT8_ELEMENTWISE = ("ABS", "RSQRT", "SQUARED_DIFFERENCE", "MAXIMUM", "MINIMUM", "DIV")
 # Data movement built from Split, Concat, Reshape and Transpose.
 _DATA_MOVEMENT = ("SLICE", "STRIDED_SLICE", "GATHER", "PACK", "UNPACK", "SPACE_TO_DEPTH",
                   "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND", "BROADCAST_TO",
@@ -602,14 +607,6 @@ _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "Red
 # The SSD box decoding and non-max suppression TFLite Micro registers as a
 # custom operator.
 _DETECTION = "CUSTOM:TFLite_Detection_PostProcess"
-_SUPPORTED = frozenset((
-    *_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS, *_INDEX,
-    *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N", "IF", "WHILE", "RELU6", "SOFTMAX",
-    "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION", "CUMSUM", "MEAN", "GELU",
-    "TRANSPOSE", "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
-    "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE", _DETECTION))
-# FullyConnectedOptions.quant_spec: a non-empty one names a quantization contract a runtime must refuse unless it knows it.
-_FC_QUANT_SPEC = 5
 # Operators whose options set their output shapes from the input shapes.
 _OPTION_SHAPED = ("PACK", "UNPACK", "CONCATENATION", "GATHER", "BATCH_MATMUL", "STRIDED_SLICE")
 # Positions of the data, weights and bias operands of the weighted operators.
@@ -696,188 +693,257 @@ def _axes(values, rank: int) -> list:
     return sorted({a % rank for a in values})
 
 
+def _option(op: _Operator, name: str):
+    """Option `name` of the operator, by the slot, format and absent value
+    its kind's entry in _KINDS gives."""
+    slot, fmt, default = _KINDS[op.kind].options[name]
+    return op.option(slot, fmt, default)
+
+
 def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
-    if op.kind not in _SUPPORTED:
+    """Why `op` does not convert, or "" when it does: the first failing check
+    of the constant operands, the kind's early checks, the dtypes and
+    quantization of the data operands and outputs, the fused activation and
+    the kind's late checks, in this order."""
+    entry = _KINDS.get(op.kind)
+    if entry is None:
         return "not supported"
     ins = [tensors[i] if i >= 0 else None for i in op.inputs]
     outs = [tensors[i] for i in op.outputs]
-    if op.kind == _DETECTION:
-        return _detection_reason(op, ins, outs)
-    if op.kind == "FULLY_CONNECTED" and op.options is not None and op.options.bytes(_FC_QUANT_SPEC):
-        return "a non-standard quantization contract in quant_spec"
-    if op.kind in ("PACK", "UNPACK"):
-        stated, operands = op.option(0, "i"), len(ins) if op.kind == "PACK" else len(outs)
-        if stated != operands:
-            field, side = ("values_count", "input") if op.kind == "PACK" else ("num", "output")
-            return f"{field} {stated} for {operands} {side}{'s' if operands != 1 else ''}"
-    if op.kind in _VARIABLES:
-        values = [t for t in [*ins, *outs] if t is not None and t.type != "RESOURCE"]
-        if any(t.type != "FLOAT32" for t in values):
-            # The converter keeps variables in float even in int8 models.
-            return "variables other than float32"
-        return ""
     for position in _CONSTANT_OPERANDS.get(op.kind, ()):
         if position < len(ins) and ins[position] is not None and not _is_constant(ins[position]):
             if position != _INDEX_SLOTS.get(op.kind):
                 return f"input {position} must be a constant"
             if ins[position].type != "INT32":
                 return f"{ins[position].type} run-time indices; the runtime takes int32"
-    if op.kind == "IF":
-        if ins[0].type != "BOOL" or int(np.prod(ins[0].shape)) != 1:
-            return "a condition other than one bool"
-        if any(t.type not in ("FLOAT32", "INT32")
-               for t in [*(t for t in ins[1:] if not _is_constant(t)), *outs]):
-            return "operands other than float32 or int32"
-        return ""
-    if op.kind == "WHILE":
-        if any(t.type not in ("FLOAT32", "INT32") for t in [*ins, *outs]):
-            return "loop variables other than float32 or int32"
-        return ""
-    if op.kind in _CONSTANT_MOVES and all(t is not None and _is_constant(t) for t in ins):
-        # The fold kept it: its operands or options are the cause, not its dtype.
-        reason = ((op.kind in _DATA_MOVEMENT and _data_movement_reason(op, ins, outs))
-                  or (op.kind in _OPTION_SHAPED and _option_shape_reason(op, ins, outs)))
-        if reason:
-            return reason
-    if any(t is not None and t.type == "INT32" for t in [*ins, *outs]):
-        reason = _int32_reason(op, ins, outs)
+    for check in entry.early:
+        reason = check(op, ins, outs)
         if reason is not None:
             return reason
-    if op.kind == "SVDF":
-        return _svdf_reason(op, ins, outs)
-    if op.kind == "UNIDIRECTIONAL_SEQUENCE_LSTM":
-        return _lstm_reason(op, ins, outs)
-    data = [t for i, t in enumerate(ins) if t is not None and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
-    if op.kind in _WEIGHTED:
-        source, position, bias_position = _WEIGHTED[op.kind]
-        weights = ins[position]
-        bias = ins[bias_position] if bias_position < len(ins) else None
-        data = [ins[source]]
-        if data[0].type == "FLOAT32":
-            if weights.type != "FLOAT32" or not _is_constant(weights):
-                reason = "weights of a float32 operator must be constant float32"
-                if weights.type == "INT8" and _is_constant(weights):
-                    # Dynamic-range quantization: int8 weights, float activations.
-                    reason += ("; convert to full int8 or to float32 without dynamic-range "
-                               "quantization")
-                return reason
-            if bias is not None and bias.type != "FLOAT32":
-                return "bias of a float32 operator must be float32"
-        else:
-            # TFLite's int8 convolutions ignore the filter zero point, which the
-            # converter's own QUANTIZE of a weight can leave nonzero.
-            symmetric = op.kind in ("CONV_2D", "DEPTHWISE_CONV_2D") or not np.any(weights.zero_point != 0)
-            if weights.type != "INT8" or not symmetric or not _is_constant(weights):
-                return "weights must be constant symmetric int8"
-            if bias is not None and bias.type != "INT32":
-                return "bias must be int32"
-    if op.kind in _BOOL_SLOTS:
-        positions, bool_output = _BOOL_SLOTS[op.kind]
-        if any((t.type == "BOOL") != (i in positions) for i, t in enumerate(ins) if t is not None):
-            return "operands of the wrong dtype"
-        if (outs[0].type == "BOOL") != bool_output:
-            return "an output of the wrong dtype"
-        if op.kind == "CAST" and outs[0].type == "INT8" and (
-                outs[0].scale.size != 1 or outs[0].scale[0] != 1 or outs[0].zero_point[0] != 0):
-            # TFLite copies the raw 0 or 1 into the int8 output.
-            return "int8 output encoding other than scale 1 and zero point 0"
-        data = [t for i, t in enumerate(ins) if t is not None and i not in positions
-                and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
-        if bool_output:
-            outs = []
-    if op.kind in _INDEX:
-        if outs[0].type != "INT32":
-            return f"{outs[0].type} indices; TFLite Micro writes int32"
-        outs = []
-    if op.kind == "QUANTIZE":
-        # uint8 only enters and leaves an int8 model, as the converter writes
-        # its boundaries for inference_input_type and inference_output_type uint8.
-        if (data[0].type, outs[0].type) not in (("FLOAT32", "INT8"), ("INT8", "INT8"),
-                                                ("UINT8", "INT8"), ("INT8", "UINT8")):
-            return "only float or int8 to int8 converts"
-    elif op.kind == "DEQUANTIZE":
-        if data[0].type != "INT8" or outs[0].type != "FLOAT32":
-            return "only int8 to float converts"
-    elif all(t.type == "FLOAT32" for t in [*data, *outs]):
-        pass
-    elif any(t.type != "INT8" for t in [*data, *outs]):
-        return "activations must be all int8 or all float32"
-    elif (op.kind in _ELEMENTWISE and op.kind not in _INT8_ELEMENTWISE) or op.kind == "L2_POOL_2D":
-        return "TFLite Micro runs it in float32 only"
-    if any(len(t.scale) != 1 for t in [*data, *outs] if t.type in ("INT8", "UINT8")):
+    data, checked = _checked_operands(op, ins, outs)
+    reason = entry.dtypes(data, checked)
+    if reason:
+        return reason
+    if any(len(t.scale) != 1 for t in [*data, *checked] if t.type in ("INT8", "UINT8")):
         return "activations must be quantized per tensor"
-    if op.kind in _FUSED_SLOT:
-        fused = _activation(op.option(_FUSED_SLOT[op.kind], "b"))
+    if entry.fused:
+        fused = _activation(_option(op, "fused_activation_function"))
         if fused not in ("none", "relu", "relu6"):
             return f"fused {fused}"
-    if op.kind in _ELEMENTWISE_BINARY and all(_is_constant(t) for t in ins):
-        return "only constant operands"
-    if op.kind == "CONCATENATION" and outs[0].type == "INT8":
-        if any(t.scale[0] != outs[0].scale[0] or t.zero_point[0] != outs[0].zero_point[0] for t in data):
-            return "inputs quantized differently from the output"
-    if op.kind in _DATA_MOVEMENT:
-        reason = _data_movement_reason(op, ins, outs)
+    for check in entry.late:
+        reason = check(op, ins, outs)
         if reason:
             return reason
-    if op.kind == "L2_NORMALIZATION" and op.option(0, "b") != 0:
-        return f"fused {_activation(op.option(0, 'b'))}"
-    if op.kind in _REDUCTIONS or op.kind == "MEAN":
-        axes = _axes(ins[1].array().reshape(-1).tolist(), len(ins[0].shape))
-        if not axes or (op.kind != "MEAN" and axes != list(range(axes[0], axes[-1] + 1))):
-            return "axes that are not adjacent"
-    if op.kind == "SOFTMAX" and op.option(0, "f") != 1.0:
-        return "beta other than 1"
-    if op.kind == "FULLY_CONNECTED" and op.option(1, "b") != 0:
-        return "shuffled weights format"
-    if op.kind in WINDOWED:
-        reason = _window_reason(op, ins, outs)
-        if reason:
-            return reason
-    if op.kind == "BATCH_MATMUL" and len(ins[0].shape) != len(ins[1].shape):
-        return "operands of different rank"
-    if op.kind in _OPTION_SHAPED:
-        reason = _option_shape_reason(op, ins, outs)
-        if reason:
-            return reason
-    if op.kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
-        align, half_pixel = _resize_flags(op)
-        if align and half_pixel:
-            return "align_corners and half_pixel_centers together"
     return ""
 
 
-def _resize_flags(op: _Operator) -> tuple:
-    """align_corners and half_pixel_centers of a RESIZE_BILINEAR or a
-    RESIZE_NEAREST_NEIGHBOR."""
-    first = 2 if op.kind == "RESIZE_BILINEAR" else 0
-    return op.option(first, "?", False), op.option(first + 1, "?", False)
+def _checked_operands(op: _Operator, ins: list, outs: list[_Tensor]) -> tuple[list, list]:
+    """The data operands and outputs the dtype and quantization checks read:
+    no constant operand, weights, bias, bool operand or output, or index output."""
+    if op.kind in _WEIGHTED:
+        return [ins[_WEIGHTED[op.kind][0]]], outs
+    positions, bool_output = _BOOL_SLOTS.get(op.kind, ((), False))
+    data = [t for i, t in enumerate(ins) if t is not None and i not in positions
+            and i not in _CONSTANT_OPERANDS.get(op.kind, ())]
+    return data, [] if bool_output or op.kind in _INDEX else outs
+
+
+def _float_or_int8(data: list, outs: list) -> str:
+    tensors = [*data, *outs]
+    if all(t.type == "FLOAT32" for t in tensors) or all(t.type == "INT8" for t in tensors):
+        return ""
+    return "activations must be all int8 or all float32"
+
+
+def _float_only(data: list, outs: list) -> str:
+    if all(t.type == "FLOAT32" for t in [*data, *outs]):
+        return ""
+    return _float_or_int8(data, outs) or "TFLite Micro runs it in float32 only"
+
+
+def _quantize_dtypes(data: list, outs: list) -> str:
+    # uint8 only enters and leaves an int8 model, as the converter writes
+    # its boundaries for inference_input_type and inference_output_type uint8.
+    if (data[0].type, outs[0].type) not in (("FLOAT32", "INT8"), ("INT8", "INT8"),
+                                            ("UINT8", "INT8"), ("INT8", "UINT8")):
+        return "only float or int8 to int8 converts"
+    return ""
+
+
+def _dequantize_dtypes(data: list, outs: list) -> str:
+    if data[0].type != "INT8" or outs[0].type != "FLOAT32":
+        return "only int8 to float converts"
+    return ""
+
+
+def _quant_spec_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    """A non-empty quant_spec names a quantization contract a runtime must
+    refuse unless it knows it."""
+    return "a non-standard quantization contract in quant_spec" if _option(op, "quant_spec") else None
+
+
+def _count_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    field, side = ("values_count", "input") if op.kind == "PACK" else ("num", "output")
+    stated, operands = _option(op, field), len(ins) if op.kind == "PACK" else len(outs)
+    if stated != operands:
+        return f"{field} {stated} for {operands} {side}{'s' if operands != 1 else ''}"
+    return None
+
+
+def _variables_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    values = [t for t in [*ins, *outs] if t is not None and t.type != "RESOURCE"]
+    if any(t.type != "FLOAT32" for t in values):
+        # The converter keeps variables in float even in int8 models.
+        return "variables other than float32"
+    return ""
+
+
+def _if_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    if ins[0].type != "BOOL" or int(np.prod(ins[0].shape)) != 1:
+        return "a condition other than one bool"
+    if any(t.type not in ("FLOAT32", "INT32")
+           for t in [*(t for t in ins[1:] if not _is_constant(t)), *outs]):
+        return "operands other than float32 or int32"
+    return ""
+
+
+def _while_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    if any(t.type not in ("FLOAT32", "INT32") for t in [*ins, *outs]):
+        return "loop variables other than float32 or int32"
+    return ""
+
+
+def _kept_constant_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    """For an operator on constants only, which the fold kept: its operands
+    or options are the cause, not its dtype."""
+    if not all(t is not None and _is_constant(t) for t in ins):
+        return None
+    return ((op.kind in _DATA_MOVEMENT and _data_movement_reason(op, ins, outs))
+            or (op.kind in _OPTION_SHAPED and _option_shape_reason(op, ins, outs)) or None)
+
+
+def _has_int32(ins: list, outs: list[_Tensor]) -> bool:
+    return any(t is not None and t.type == "INT32" for t in [*ins, *outs])
+
+
+def _int32_arithmetic(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    if not _has_int32(ins, outs):
+        return None
+    if any(t.type != "INT32" for t in [*ins, *outs]):
+        return "int32 mixed with other operands"
+    if _activation(_option(op, "fused_activation_function")) != "none":
+        return "a fused activation on int32"
+    if all(_is_constant(t) for t in ins):
+        return "only constant operands"
+    return ""
+
+
+def _int32_comparison(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    if not _has_int32(ins, outs):
+        return None
+    return "int32 compared with another dtype" if any(t.type != "INT32" for t in ins) else ""
+
+
+def _int32_movement(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    return "" if ins[0].type == outs[0].type == "INT32" else None
+
+
+def _int32_cast(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    if not _has_int32(ins, outs):
+        return None
+    return "" if outs[0].type in {"FLOAT32", "INT32"} else "int32 cast to other than float32"
+
+
+def _weights_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    source, position, bias_position = _WEIGHTED[op.kind]
+    weights = ins[position]
+    bias = ins[bias_position] if bias_position < len(ins) else None
+    if ins[source].type == "FLOAT32":
+        if weights.type != "FLOAT32" or not _is_constant(weights):
+            reason = "weights of a float32 operator must be constant float32"
+            if weights.type == "INT8" and _is_constant(weights):
+                # Dynamic-range quantization: int8 weights, float activations.
+                reason += ("; convert to full int8 or to float32 without dynamic-range "
+                           "quantization")
+            return reason
+        if bias is not None and bias.type != "FLOAT32":
+            return "bias of a float32 operator must be float32"
+        return None
+    # TFLite's int8 convolutions ignore the filter zero point, which the
+    # converter's own QUANTIZE of a weight can leave nonzero.
+    symmetric = op.kind in ("CONV_2D", "DEPTHWISE_CONV_2D") or not np.any(weights.zero_point != 0)
+    if weights.type != "INT8" or not symmetric or not _is_constant(weights):
+        return "weights must be constant symmetric int8"
+    if bias is not None and bias.type != "INT32":
+        return "bias must be int32"
+    return None
+
+
+def _bool_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    positions, bool_output = _BOOL_SLOTS[op.kind]
+    if any((t.type == "BOOL") != (i in positions) for i, t in enumerate(ins) if t is not None):
+        return "operands of the wrong dtype"
+    if (outs[0].type == "BOOL") != bool_output:
+        return "an output of the wrong dtype"
+    return None
+
+
+def _cast_encoding_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    if outs[0].type == "INT8" and (
+            outs[0].scale.size != 1 or outs[0].scale[0] != 1 or outs[0].zero_point[0] != 0):
+        # TFLite copies the raw 0 or 1 into the int8 output.
+        return "int8 output encoding other than scale 1 and zero point 0"
+    return None
+
+
+def _index_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
+    return f"{outs[0].type} indices; TFLite Micro writes int32" if outs[0].type != "INT32" else None
+
+
+def _constant_only_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    return "only constant operands" if all(_is_constant(t) for t in ins) else ""
+
+
+def _concat_quantization_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    if outs[0].type == "INT8" and any(t.scale[0] != outs[0].scale[0]
+                                      or t.zero_point[0] != outs[0].zero_point[0] for t in ins):
+        return "inputs quantized differently from the output"
+    return ""
+
+
+def _l2_fused_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    fused = _option(op, "fused_activation_function")
+    return f"fused {_activation(fused)}" if fused != 0 else ""
+
+
+def _reduction_axes_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    axes = _axes(ins[1].array().reshape(-1).tolist(), len(ins[0].shape))
+    if not axes or (op.kind != "MEAN" and axes != list(range(axes[0], axes[-1] + 1))):
+        return "axes that are not adjacent"
+    return ""
+
+
+def _beta_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    return "beta other than 1" if _option(op, "beta") != 1.0 else ""
+
+
+def _weights_format_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    return "shuffled weights format" if _option(op, "weights_format") != 0 else ""
+
+
+def _rank_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    return "operands of different rank" if len(ins[0].shape) != len(ins[1].shape) else ""
+
+
+def _resize_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
+    if _option(op, "align_corners") and _option(op, "half_pixel_centers"):
+        return "align_corners and half_pixel_centers together"
+    return ""
 
 
 def _integer_use(op: _Operator) -> bool:
     """Operators that take an int32 model input as a value."""
     return op.kind in ("ADD", "SUB", "MUL", "CAST", "RESHAPE", "TRANSPOSE", "IF", "WHILE", *_COMPARISONS)
-
-
-def _int32_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> "str | None":
-    """Why an int32 computation does not convert, "" when it does, None when
-    the operator takes int32 only as indices or axes."""
-    if op.kind in ("ADD", "SUB", "MUL"):
-        if any(t.type != "INT32" for t in [*ins, *outs]):
-            return "int32 mixed with other operands"
-        if _activation(op.option(_FUSED_SLOT[op.kind], "b")) != "none":
-            return "a fused activation on int32"
-        if all(_is_constant(t) for t in ins):
-            return "only constant operands"
-        return ""
-    if op.kind in _COMPARISONS:
-        if any(t.type != "INT32" for t in ins):
-            return "int32 compared with another dtype"
-        return ""
-    if op.kind in {"RESHAPE", "TRANSPOSE"} and ins[0].type == outs[0].type == "INT32":
-        return ""
-    if op.kind == "CAST":
-        return "" if outs[0].type in {"FLOAT32", "INT32"} else "int32 cast to other than float32"
-    return None
 
 
 def _same_quantization(tensors) -> bool:
@@ -903,10 +969,10 @@ def _gather_run(op: _Operator, ins: list[_Tensor]):
     """(axis, first, count, scalar) when a GATHER takes a contiguous run of one
     axis, or None."""
     indices = [int(v) for v in ins[1].array().reshape(-1)]
-    axis = op.option(0, "i") % len(ins[0].shape)
+    axis = _option(op, "axis") % len(ins[0].shape)
     extent = ins[0].shape[axis]
     indices = [i + extent if i < 0 else i for i in indices]
-    if (op.option(1, "i") or not indices or any(not 0 <= i < extent for i in indices)
+    if (_option(op, "batch_dims") or not indices or any(not 0 <= i < extent for i in indices)
             or indices != list(range(indices[0], indices[0] + len(indices)))):
         return None
     return axis, indices[0], len(indices), len(ins[1].shape) == 0
@@ -920,7 +986,7 @@ def _svdf_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
         return "no bias, which TFLite Micro requires"
     if len(x.shape) != 2:
         return "input of rank other than 2"
-    rank, filters = op.option(0, "i"), feature.shape[0] if feature.shape else 0
+    rank, filters = _option(op, "rank"), feature.shape[0] if feature.shape else 0
     if rank <= 0 or filters % rank:
         return f"rank {rank} for {filters} filters"
     reason = _shape_reason(f"rank {rank}", y.shape, [x.shape[0], filters // rank])
@@ -929,7 +995,7 @@ def _svdf_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
     if x.type == "FLOAT32":
         if any(t.type != "FLOAT32" for t in (feature, time, bias, state, y)):
             return "float32 input with operands of another dtype"
-        fused = _activation(op.option(1, "b"))
+        fused = _activation(_option(op, "fused_activation_function"))
         if fused not in ("none", "relu", "relu6"):
             return f"fused {fused}"
         return ""
@@ -958,12 +1024,13 @@ def _lstm_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
         return "input of rank other than 3"
     if any(len(ins[i].shape) == 1 for i in range(5, 9)):
         return "diagonal recurrent weights, which TFLite Micro does not run"
-    if _activation(op.option(0, "b")) != "tanh":
-        return f"cell activation {_activation(op.option(0, 'b'))}"
+    activation = _activation(_option(op, "fused_activation_function"))
+    if activation != "tanh":
+        return f"cell activation {activation}"
     if any(not _is_constant(ins[i]) for i in _LSTM_CONSTANTS):
         return "weights and biases must be constant"
     # time_major picks the batch axis of the input, which the states are sized by.
-    time_major = op.option(3, "?", False)
+    time_major = _option(op, "time_major")
     given = [ins[0].shape[1 if time_major else 0], ins[18].shape[-1] if ins[18].shape else 0]
     for role, state in (("hidden state", ins[18]), ("cell state", ins[19])):
         reason = _shape_reason(f"time_major {str(time_major).lower()}", state.shape, given, role)
@@ -1053,7 +1120,7 @@ def _window_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> st
     maps depthwise channels by depth_multiplier, but runs over the output the
     file states; the conversion pads by the stated shapes, so both must agree."""
     if op.kind == "DEPTHWISE_CONV_2D":
-        multiplier, channels, produced = op.option(3, "i"), ins[0].shape[3], outs[0].shape[3]
+        multiplier, channels, produced = _option(op, "depth_multiplier"), ins[0].shape[3], outs[0].shape[3]
         if multiplier * channels != produced:
             return f"depth_multiplier {multiplier} for {channels} input and {produced} output channels"
     win = window(op.kind, op.option, ins[1].shape if op.kind in _WEIGHTED else None)
@@ -1111,7 +1178,7 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
 def _block_reason(op: _Operator, source: _Tensor, target: _Tensor) -> str:
     """TFLite Micro shapes the output by block_size; the conversion reshapes to
     the output the file states, so both must agree."""
-    block, (n, h, w, c) = op.option(0, "i"), source.shape
+    block, (n, h, w, c) = _option(op, "block_size"), source.shape
     if op.kind == "SPACE_TO_DEPTH":
         valid = block > 0 and h % block == 0 and w % block == 0
         given = [n, h // block, w // block, c * block * block] if valid else []
@@ -1149,7 +1216,7 @@ def _option_shape_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
         given = [[len(range(start, stop, step)) for start, stop, step, dropped in axes if not dropped]]
         setting = "the slice"
     elif op.kind in ("PACK", "UNPACK", "CONCATENATION"):
-        axis = op.option(0 if op.kind == "CONCATENATION" else 1, "i")
+        axis = _option(op, "axis")
         setting, rank = f"axis {axis}", len(first) + (op.kind == "PACK")
         a = axis + rank if axis < 0 else axis
         if op.kind == "UNPACK":
@@ -1167,7 +1234,7 @@ def _option_shape_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
                 return f"{setting} for inputs {inputs}"
             given = [first[:a] + [sum(s[a] for s in shapes)] + first[a + 1:]]
     elif op.kind == "GATHER":
-        axis, batch = op.option(0, "i"), op.option(1, "i")
+        axis, batch = _option(op, "axis"), _option(op, "batch_dims")
         setting, data, indices = f"axis {axis}, batch_dims {batch}", shapes[0], shapes[1]
         a = axis + len(data) if axis < 0 else axis
         b = batch + len(indices) if batch < 0 else batch
@@ -1175,7 +1242,7 @@ def _option_shape_reason(op: _Operator, ins: list, outs: list[_Tensor]) -> str:
             return f"{setting} for inputs {inputs}"
         given = [data[:a] + indices[b:] + data[a + 1:]]
     else:
-        adj_x, adj_y = op.option(0, "?", False), op.option(1, "?", False)
+        adj_x, adj_y = _option(op, "adj_x"), _option(op, "adj_y")
         setting = f"adj_x {str(adj_x).lower()}, adj_y {str(adj_y).lower()}"
         rank = max(len(s) for s in shapes[:2])
         lhs, rhs = ([1] * (rank - len(s)) + s for s in shapes[:2])
@@ -1388,322 +1455,310 @@ class _Converter:
         return y
 
     def convert(self, op: _Operator) -> None:
+        """Adds `op` by its kind's converter; a result it returns is finished
+        as the output, after the fused activation."""
+        entry = _KINDS[op.kind]
+        tag = self.tensors[op.outputs[0]].name + "_float" if op.outputs else ""
+        y = entry.convert(self, op, tag)
+        if y is not None:
+            fused = _activation(_option(op, "fused_activation_function")) if entry.fused else "none"
+            self.finish(self.b.fused_activation(y, fused, tag), op.outputs[0])
+
+    def _variable(self, op: _Operator, tag: str) -> None:
+        """A read sees the variable's latest value: the state input, or what
+        this invocation assigned before it."""
         ins, outs = op.inputs, op.outputs
-        if op.kind in _VARIABLES:
-            # A read sees the variable's latest value: the state input, or what
-            # this invocation assigned before it.
-            if op.kind == "VAR_HANDLE":
-                self.handles[outs[0]] = _var_name(op)
-            elif op.kind == "READ_VARIABLE":
-                self.values[outs[0]] = self.variables[self.handles[ins[0]]]["current"]
-            elif op.kind == "ASSIGN_VARIABLE":
-                self.variables[self.handles[ins[0]]]["current"] = self.value(ins[1])
-            return
-        out = self.tensors[outs[0]]
-        tag = out.name + "_float"
-        kind = op.kind
-        fused = _activation(op.option(_FUSED_SLOT[kind], "b")) if kind in _FUSED_SLOT else "none"
-        b = self.b
-        if kind in _INDEX:
-            # The index in TFLite's axis order, cast to the int32 TFLite writes.
-            rank = len(self.tensors[ins[0]].shape)
-            x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
-            y = b.node(_INDEX[kind], [x], tag, axis=self.ints(ins[1])[0] % rank, keepdims=0,
-                       select_last_index=0)
-            self.values[outs[0]] = b.node("Cast", [y], out.name, to=TensorProto.INT32)
-            return
-        if kind in ("IF", "WHILE"):
-            self._control_flow(op, tag)
-            return
-        if kind in ("QUANTIZE", "DEQUANTIZE") and (
-                (ins[0] if kind == "QUANTIZE" else outs[0]) in self.float_boundary
+        if op.kind == "VAR_HANDLE":
+            self.handles[outs[0]] = _var_name(op)
+        elif op.kind == "READ_VARIABLE":
+            self.values[outs[0]] = self.variables[self.handles[ins[0]]]["current"]
+        elif op.kind == "ASSIGN_VARIABLE":
+            self.variables[self.handles[ins[0]]]["current"] = self.value(ins[1])
+
+    def _index(self, op: _Operator, tag: str) -> None:
+        """The index in TFLite's axis order, cast to the int32 TFLite writes."""
+        ins, b = op.inputs, self.b
+        rank = len(self.tensors[ins[0]].shape)
+        x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
+        y = b.node(_INDEX[op.kind], [x], tag, axis=self.ints(ins[1])[0] % rank, keepdims=0,
+                   select_last_index=0)
+        self.values[op.outputs[0]] = b.node("Cast", [y], self.tensors[op.outputs[0]].name,
+                                            to=TensorProto.INT32)
+
+    def _quantization(self, op: _Operator, tag: str) -> str | None:
+        ins, outs, kind = op.inputs, op.outputs, op.kind
+        if ((ins[0] if kind == "QUANTIZE" else outs[0]) in self.float_boundary
                 and self.tensors[ins[0] if kind == "DEQUANTIZE" else outs[0]].type == "INT8"):
-            y = self.custom("Quantize" if kind == "QUANTIZE" else "Dequantize", [self.value(ins[0])],
-                            tag, _onnx_shape(out.shape))
-            self.finish(y, outs[0])
-            return
+            return self.custom("Quantize" if kind == "QUANTIZE" else "Dequantize",
+                               [self.value(ins[0])], tag, _onnx_shape(self.tensors[outs[0]].shape))
         if kind == "DEQUANTIZE" and outs[0] in self.detection_operands:
             # The detection operator reads the int8 tensor through its quantization.
             self.values[outs[0]] = self.value(ins[0])
-            return
-        if kind == _DETECTION:
-            self._detection(op, tag)
-            return
-        if kind == "SVDF":
-            self.finish(self._svdf(op, tag), outs[0])
-            return
-        if kind == "UNIDIRECTIONAL_SEQUENCE_LSTM":
-            self.finish(self._lstm(op, tag), outs[0])
-            return
-        if kind in ("CONV_2D", "DEPTHWISE_CONV_2D"):
-            y = self._conv(op, tag)
-        elif kind == "TRANSPOSE_CONV":
-            y = self._transpose_conv(op, tag)
-        elif kind == "FULLY_CONNECTED":
-            y = self._fully_connected(op, tag)
-        elif kind in ("MAX_POOL_2D", "AVERAGE_POOL_2D"):
-            attributes = {"count_include_pad": 0} if kind == "AVERAGE_POOL_2D" else {}
-            y = b.node("MaxPool" if kind == "MAX_POOL_2D" else "AveragePool", [self.value(ins[0])],
-                       tag, **self._pool_window(op), **attributes)
-        elif kind in ("ADD", "SUB", "MUL"):
-            y = b.node({"ADD": "Add", "SUB": "Sub", "MUL": "Mul"}[kind], self.operands(op), tag)
-        elif kind == "CONCATENATION":
-            y = self._concat([(self.value(i), list(self.tensors[i].shape), i) for i in ins],
-                             op.option(0, "i") % len(out.shape), outs[0], tag)
-        elif kind in _ELEMENTWISE_UNARY:
-            y = b.node(_ELEMENTWISE_UNARY[kind], [self.value(ins[0])], tag)
-        elif kind == "RSQRT":
-            y = b.node("Reciprocal", [b.node("Sqrt", [self.value(ins[0])], tag + "_sqrt")], tag)
-        elif kind == "SQUARE":
-            x = self.value(ins[0])
-            y = b.node("Mul", [x, x], tag)
-        elif kind in ("DIV", "MAXIMUM", "MINIMUM"):
-            y = b.node({"DIV": "Div", "MAXIMUM": "Max", "MINIMUM": "Min"}[kind],
-                       self.operands(op), tag)
-        elif kind == "SQUARED_DIFFERENCE":
-            difference = b.node("Sub", self.operands(op), tag + "_difference")
-            y = b.node("Mul", [difference, difference], tag)
-        elif kind == "FLOOR_DIV":
-            y = b.node("Floor", [b.node("Div", self.operands(op), tag + "_quotient")], tag)
-        elif kind == "FLOOR_MOD":
-            y = self._floor_mod(*self.operands(op), tag)
-        elif kind == "GELU":
-            y = self.custom("Gelu", [self.value(ins[0])], tag, _onnx_shape(out.shape),
-                       approximate="tanh" if op.option(0, "?", False) else "none")
-        elif kind in _UNARY:
-            y = b.node(_UNARY[kind], [self.value(ins[0])], tag)
-        elif kind in _COMPARISONS:
-            y = b.node(_COMPARISONS[kind], self.operands(op), tag + "_equal" if kind == "NOT_EQUAL" else tag)
-            if kind == "NOT_EQUAL":
-                y = b.node("Not", [y], tag)
-        elif kind in _LOGICAL:
-            y = b.node(_LOGICAL[kind], self.operands(op), tag)
-        elif kind == "SELECT_V2":
-            y = b.node("Where", self.operands(op), tag)
-        elif kind == "CAST":
-            # A bool cast to int8 is the float 0.0 or 1.0 quantized into the output.
-            y = (b.node("Identity", [self.value(ins[0])], tag) if out.type == "INT32" else
-                 b.node("Cast", [self.value(ins[0])], tag, to=TensorProto.FLOAT))
-        elif kind == "ADD_N":
-            y = b.node("Sum", [self.value(i) for i in ins], tag)
-        elif kind == "RELU6":
-            y = b.fused_activation(self.value(ins[0]), "relu6", tag)
-        elif kind in ("SOFTMAX", "LOG_SOFTMAX"):
-            y = b.node("Softmax" if kind == "SOFTMAX" else "LogSoftmax", [self.value(ins[0])], tag,
-                       axis=_onnx_axis(-1, len(out.shape)))
-        elif kind == "LEAKY_RELU":
-            y = b.node("LeakyRelu", [self.value(ins[0])], tag, alpha=op.option(0, "f", 0.0))
-        elif kind == "PRELU":
-            y = b.node("PRelu", self.operands(op), tag)
-        elif kind == "L2_NORMALIZATION":
-            y = self._l2_normalization(op, tag)
-        elif kind == "L2_POOL_2D":
-            x = self.value(ins[0])
-            pooled = b.node("AveragePool", [b.node("Mul", [x, x], tag + "_square")], tag + "_mean",
-                            count_include_pad=0, **self._pool_window(op))
-            y = b.node("Sqrt", [pooled], tag)
-        elif kind in _REDUCTIONS or kind == "CUMSUM":
-            y = self._reduction(op, tag)
-        elif kind == "MEAN" and not _spatial_mean(op, self.tensors):
-            y = self._reduction(op, tag)
-        elif kind == "MEAN":
-            source = self.tensors[ins[0]]
-            rank = len(source.shape)
-            axes = sorted(_onnx_axis(a, rank) for a in self.ints(ins[1]))
-            y = b.node("ReduceMean", [self.value(ins[0])], tag, axes=axes, keepdims=1)
-            if len(out.shape) != rank:
-                reduced = _axes(self.ints(ins[1]), rank)
-                kept = [1 if i in reduced else d for i, d in enumerate(source.shape)]
-                y = self.reshape(self.held(y, outs[0], tag + "_kept"), kept, out.shape,
-                                 tag + "_squeezed", outs[0])
-        elif kind in _SHAPE_ONLY:
-            y = self.reshape(self.value(ins[0]), self.tensors[ins[0]].shape, out.shape, tag, outs[0])
-        elif kind == "TRANSPOSE":
-            rank = len(out.shape)
-            perm = [p % rank for p in self.ints(ins[1])]
-            first, last = _to_first(rank), _to_last(rank)
-            perm = [last[perm[first[i]]] for i in range(rank)]
-            y = b.node("Transpose", [self.value(ins[0])], tag, perm=perm)
-        elif kind in ("SPLIT", "SPLIT_V"):
-            source_index, axis_index = (ins[1], ins[0]) if kind == "SPLIT" else (ins[0], ins[2])
-            rank = len(self.tensors[source_index].shape)
-            axis = self.ints(axis_index)[0] % rank
-            sizes = b.constant(np.asarray([self.tensors[i].shape[axis] for i in outs], np.int64),
-                               out.name + "_sizes")
-            names = [self.tensors[i].name + "_float" for i in outs]
-            parts = b.multi_node("Split", [self.value(source_index), sizes], names,
-                                 axis=_onnx_axis(axis, rank))
-            for index, part in zip(outs, parts):
-                self.finish(part, index)
-            return
-        elif kind in ("PAD", "PADV2"):
-            pads = self._pads_constant(op, tag)
-            source = self.tensors[ins[0]]
-            if kind != "PADV2" or len(ins) < 3 or ins[2] < 0:
-                fill = 0.0
-            elif source.type == "FLOAT32":
-                fill = float(self.tensors[ins[2]].array().reshape(-1)[0])
-            else:
-                fill = float((int(self.ints(ins[2])[0]) - source.zero_point[0]) * source.scale[0])
-            y = b.node("Pad", [self.value(ins[0]), pads, b.constant(np.float32(fill), tag + "_fill")],
-                       tag, mode="constant")
-        elif kind == "GATHER" and (not _is_constant(self.tensors[ins[1]])
-                                   or _gather_run(op, [self.tensors[i] for i in ins]) is None):
-            y = self._gather("Gather", ins[0], ins[1], op.option(0, "i"), op, tag)
-        elif kind == "EMBEDDING_LOOKUP":
-            y = self._gather("Gather", ins[1], ins[0], 0, op, tag)
-        elif kind == "GATHER_ND":
-            y = self._gather("GatherND", ins[0], ins[1], None, op, tag)
-        elif (kind == "STRIDED_SLICE"
-              and _strided_slice_bounds(op, [self.tensors[i] for i in ins]) is None):
-            y = self._strided_slice(op, tag)
-        elif kind == "MIRROR_PAD":
-            pads = self._pads_constant(op, tag)
-            if op.option(0, "b") == 0:
-                y = b.node("Pad", [self.value(ins[0]), pads], tag, mode="reflect")
-            else:
-                y = self.custom("MirrorPad", [self.value(ins[0]), pads], tag,
-                                _onnx_shape(out.shape), mode="symmetric")
-        elif kind == "REVERSE_V2":
-            rank = len(out.shape)
-            x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
-            axes = b.constant(np.asarray(self.ints(ins[1]), np.int64), tag + "_axes")
-            y = self.tflite_order_out(self.custom("ReverseV2", [x, axes], tag + "_reversed",
-                                                  out.shape), outs[0], tag)
-        elif kind == "DYNAMIC_UPDATE_SLICE" and not _is_constant(self.tensors[ins[2]]):
+            return None
+        return self.value(ins[0])
+
+    def _pool(self, op: _Operator, tag: str) -> str:
+        attributes = {"count_include_pad": 0} if op.kind == "AVERAGE_POOL_2D" else {}
+        return self.b.node("MaxPool" if op.kind == "MAX_POOL_2D" else "AveragePool",
+                           [self.value(op.inputs[0])], tag, **self._pool_window(op), **attributes)
+
+    def _l2_pool(self, op: _Operator, tag: str) -> str:
+        b = self.b
+        x = self.value(op.inputs[0])
+        pooled = b.node("AveragePool", [b.node("Mul", [x, x], tag + "_square")], tag + "_mean",
+                        count_include_pad=0, **self._pool_window(op))
+        return b.node("Sqrt", [pooled], tag)
+
+    def _concatenation(self, op: _Operator, tag: str) -> str:
+        out = self.tensors[op.outputs[0]]
+        return self._concat([(self.value(i), list(self.tensors[i].shape), i) for i in op.inputs],
+                            _option(op, "axis") % len(out.shape), op.outputs[0], tag)
+
+    def _comparison(self, op: _Operator, tag: str) -> str:
+        y = self.b.node(_COMPARISONS[op.kind], self.operands(op),
+                        tag + "_equal" if op.kind == "NOT_EQUAL" else tag)
+        return self.b.node("Not", [y], tag) if op.kind == "NOT_EQUAL" else y
+
+    def _cast(self, op: _Operator, tag: str) -> str:
+        # A bool cast to int8 is the float 0.0 or 1.0 quantized into the output.
+        x = self.value(op.inputs[0])
+        if self.tensors[op.outputs[0]].type == "INT32":
+            return self.b.node("Identity", [x], tag)
+        return self.b.node("Cast", [x], tag, to=TensorProto.FLOAT)
+
+    def _softmax(self, op: _Operator, tag: str) -> str:
+        return self.b.node("Softmax" if op.kind == "SOFTMAX" else "LogSoftmax",
+                           [self.value(op.inputs[0])], tag,
+                           axis=_onnx_axis(-1, len(self.tensors[op.outputs[0]].shape)))
+
+    def _mean(self, op: _Operator, tag: str) -> str:
+        if not _spatial_mean(op, self.tensors):
+            return self._reduction(op, tag)
+        ins, out = op.inputs, self.tensors[op.outputs[0]]
+        source = self.tensors[ins[0]]
+        rank = len(source.shape)
+        axes = sorted(_onnx_axis(a, rank) for a in self.ints(ins[1]))
+        y = self.b.node("ReduceMean", [self.value(ins[0])], tag, axes=axes, keepdims=1)
+        if len(out.shape) != rank:
+            reduced = _axes(self.ints(ins[1]), rank)
+            kept = [1 if i in reduced else d for i, d in enumerate(source.shape)]
+            y = self.reshape(self.held(y, op.outputs[0], tag + "_kept"), kept, out.shape,
+                             tag + "_squeezed", op.outputs[0])
+        return y
+
+    def _shape_only(self, op: _Operator, tag: str) -> str:
+        return self.reshape(self.value(op.inputs[0]), self.tensors[op.inputs[0]].shape,
+                            self.tensors[op.outputs[0]].shape, tag, op.outputs[0])
+
+    def _transpose(self, op: _Operator, tag: str) -> str:
+        rank = len(self.tensors[op.outputs[0]].shape)
+        perm = [p % rank for p in self.ints(op.inputs[1])]
+        first, last = _to_first(rank), _to_last(rank)
+        perm = [last[perm[first[i]]] for i in range(rank)]
+        return self.b.node("Transpose", [self.value(op.inputs[0])], tag, perm=perm)
+
+    def _split(self, op: _Operator, tag: str) -> None:
+        ins, outs = op.inputs, op.outputs
+        source_index, axis_index = (ins[1], ins[0]) if op.kind == "SPLIT" else (ins[0], ins[2])
+        rank = len(self.tensors[source_index].shape)
+        axis = self.ints(axis_index)[0] % rank
+        sizes = self.b.constant(np.asarray([self.tensors[i].shape[axis] for i in outs], np.int64),
+                                self.tensors[outs[0]].name + "_sizes")
+        names = [self.tensors[i].name + "_float" for i in outs]
+        parts = self.b.multi_node("Split", [self.value(source_index), sizes], names,
+                                  axis=_onnx_axis(axis, rank))
+        for index, part in zip(outs, parts):
+            self.finish(part, index)
+
+    def _pad(self, op: _Operator, tag: str) -> str:
+        ins = op.inputs
+        pads = self._pads_constant(op, tag)
+        source = self.tensors[ins[0]]
+        if op.kind != "PADV2" or len(ins) < 3 or ins[2] < 0:
+            fill = 0.0
+        elif source.type == "FLOAT32":
+            fill = float(self.tensors[ins[2]].array().reshape(-1)[0])
+        else:
+            fill = float((int(self.ints(ins[2])[0]) - source.zero_point[0]) * source.scale[0])
+        return self.b.node("Pad", [self.value(ins[0]), pads,
+                                   self.b.constant(np.float32(fill), tag + "_fill")],
+                           tag, mode="constant")
+
+    def _mirror_pad(self, op: _Operator, tag: str) -> str:
+        pads = self._pads_constant(op, tag)
+        if _option(op, "mode") == 0:
+            return self.b.node("Pad", [self.value(op.inputs[0]), pads], tag, mode="reflect")
+        return self.custom("MirrorPad", [self.value(op.inputs[0]), pads], tag,
+                           _onnx_shape(self.tensors[op.outputs[0]].shape), mode="symmetric")
+
+    def _gather(self, op: _Operator, tag: str) -> str:
+        """A GATHER of a contiguous run of constant indices slices the axis."""
+        ins = op.inputs
+        run = (_is_constant(self.tensors[ins[1]])
+               and _gather_run(op, [self.tensors[i] for i in ins]))
+        if not run:
+            return self._gather_node("Gather", ins[0], ins[1], _option(op, "axis"), op, tag)
+        axis, first, count, scalar = run
+        bounds = [(0, extent, False) for extent in self.tensors[ins[0]].shape]
+        bounds[axis] = (first, count, scalar)
+        return self._cut(op, bounds, tag)
+
+    def _strided_slice(self, op: _Operator, tag: str) -> str:
+        bounds = _strided_slice_bounds(op, [self.tensors[i] for i in op.inputs])
+        return self._slice_steps(op, tag) if bounds is None else self._cut(op, bounds, tag)
+
+    def _slice(self, op: _Operator, tag: str) -> str:
+        source = self.tensors[op.inputs[0]]
+        bounds = [(begin, (extent - begin) if size == -1 else size, False)
+                  for begin, size, extent in zip(self.ints(op.inputs[1]), self.ints(op.inputs[2]),
+                                                 source.shape)]
+        return self._cut(op, bounds, tag)
+
+    def _cut(self, op: _Operator, bounds, tag: str) -> str:
+        """Per axis (begin, size, dropped) of the first input, each cut axis a
+        Split part, reshaped to the output's shape."""
+        ins, b = op.inputs, self.b
+        source, out = self.tensors[ins[0]], self.tensors[op.outputs[0]]
+        cut = [axis for axis, (begin, size, _) in enumerate(bounds)
+               if not (begin == 0 and size == source.shape[axis])]
+        y, shape = self.value(ins[0]), list(source.shape)
+        for step, axis in enumerate(cut):
+            begin, size, _ = bounds[axis]
+            y = self.slice_axis(y, shape, axis, begin, size, f"{tag}_slice{step}", ins[0],
+                                hold=step < len(cut) - 1)
+            shape[axis] = size
+        if list(shape) != list(out.shape):
+            if cut:
+                y = self.held(y, ins[0], tag + "_sliced")
+            y = self.reshape(y, shape, out.shape, tag, op.outputs[0])
+        elif not cut:
+            y = b.node("Identity", [y], tag)
+        return y
+
+    def _reverse(self, op: _Operator, tag: str) -> str:
+        ins = op.inputs
+        rank = len(self.tensors[op.outputs[0]].shape)
+        x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
+        axes = self.b.constant(np.asarray(self.ints(ins[1]), np.int64), tag + "_axes")
+        return self.tflite_order_out(self.custom("ReverseV2", [x, axes], tag + "_reversed",
+                                                 self.tensors[op.outputs[0]].shape),
+                                     op.outputs[0], tag)
+
+    def _dynamic_update_slice(self, op: _Operator, tag: str) -> str:
+        ins, out = op.inputs, self.tensors[op.outputs[0]]
+        rank = len(out.shape)
+        if not _is_constant(self.tensors[ins[2]]):
             # Run-time starts are in TFLite's axis order, so the update runs there.
-            rank = len(out.shape)
             x = self.last_to_last(self.value(ins[0]), rank, tag + "_last", ins[0], True)
             u = self.last_to_last(self.value(ins[1]), rank, tag + "_update", ins[1], True)
-            y = self.tflite_order_out(self.custom("DynamicUpdateSlice", [x, u, self.value(ins[2])],
-                                                  tag + "_updated", out.shape), outs[0], tag)
-        elif kind == "DYNAMIC_UPDATE_SLICE":
-            rank = len(out.shape)
-            starts = [self.ints(ins[2])[a] for a in _to_first(rank)]
-            y = self.custom("DynamicUpdateSlice",
-                            [self.value(ins[0]), self.value(ins[1]),
-                             b.constant(np.asarray(starts, np.int64), tag + "_starts")],
-                            tag, _onnx_shape(out.shape))
-        elif kind in ("SLICE", "STRIDED_SLICE", "GATHER"):
-            source = self.tensors[ins[0]]
-            if kind == "SLICE":
-                sizes = self.ints(ins[2])
-                bounds = [(begin, (extent - begin) if size == -1 else size, False)
-                          for begin, size, extent in zip(self.ints(ins[1]), sizes, source.shape)]
-            elif kind == "STRIDED_SLICE":
-                bounds = _strided_slice_bounds(op, [self.tensors[i] for i in ins])
-            else:
-                axis, first, count, scalar = _gather_run(op, [self.tensors[i] for i in ins])
-                bounds = [(0, extent, False) for extent in source.shape]
-                bounds[axis] = (first, count, scalar)
-            cut = [axis for axis, (begin, size, _) in enumerate(bounds)
-                   if not (begin == 0 and size == source.shape[axis])]
-            y, shape = self.value(ins[0]), list(source.shape)
-            for step, axis in enumerate(cut):
-                begin, size, _ = bounds[axis]
-                y = self.slice_axis(y, shape, axis, begin, size, f"{tag}_slice{step}", ins[0],
-                                    hold=step < len(cut) - 1)
-                shape[axis] = size
-            if list(shape) != list(out.shape):
-                if cut:
-                    y = self.held(y, ins[0], tag + "_sliced")
-                y = self.reshape(y, shape, out.shape, tag, outs[0])
-            elif not cut:
-                y = b.node("Identity", [y], tag)
-        elif kind == "PACK":
-            axis = op.option(1, "i") % len(out.shape)
-            parts = []
-            for step, i in enumerate(ins):
-                shape = list(self.tensors[i].shape)
-                expanded = shape[:axis] + [1] + shape[axis:]
-                parts.append((self.held(self.reshape(self.value(i), shape, expanded,
-                                                     f"{tag}_part{step}", i), i,
-                                        f"{tag}_part{step}_q"), expanded, i))
-            y = self._concat(parts, axis, outs[0], tag)
-        elif kind == "UNPACK" and len(outs) == 1:
+            return self.tflite_order_out(self.custom("DynamicUpdateSlice", [x, u, self.value(ins[2])],
+                                                     tag + "_updated", out.shape), op.outputs[0], tag)
+        starts = [self.ints(ins[2])[a] for a in _to_first(rank)]
+        return self.custom("DynamicUpdateSlice",
+                           [self.value(ins[0]), self.value(ins[1]),
+                            self.b.constant(np.asarray(starts, np.int64), tag + "_starts")],
+                           tag, _onnx_shape(out.shape))
+
+    def _pack(self, op: _Operator, tag: str) -> str:
+        axis = _option(op, "axis") % len(self.tensors[op.outputs[0]].shape)
+        parts = []
+        for step, i in enumerate(op.inputs):
+            shape = list(self.tensors[i].shape)
+            expanded = shape[:axis] + [1] + shape[axis:]
+            parts.append((self.held(self.reshape(self.value(i), shape, expanded,
+                                                 f"{tag}_part{step}", i), i,
+                                    f"{tag}_part{step}_q"), expanded, i))
+        return self._concat(parts, axis, op.outputs[0], tag)
+
+    def _unpack(self, op: _Operator, tag: str) -> str | None:
+        ins, outs = op.inputs, op.outputs
+        source = self.tensors[ins[0]]
+        if len(outs) == 1:
             # The one part is the input without its axis.
-            source = self.tensors[ins[0]]
-            y = self.reshape(self.value(ins[0]), list(source.shape), out.shape, tag, outs[0])
-        elif kind == "UNPACK":
-            source = self.tensors[ins[0]]
-            axis = op.option(1, "i") % len(source.shape)
-            names = [f"{self.tensors[i].name}_float_part" for i in outs]
-            sizes = b.constant(np.ones(len(outs), np.int64), tag + "_sizes")
-            parts = b.multi_node("Split", [self.value(ins[0]), sizes], names,
-                                 axis=_onnx_axis(axis, len(source.shape)))
-            shape = list(source.shape)
-            shape[axis] = 1
-            for part, index in zip(parts, outs):
-                name = self.tensors[index].name + "_float"
-                held = self.held(part, index, name + "_part_q")
-                self.finish(self.reshape(held, shape, self.tensors[index].shape, name, index),
-                            index)
-            return
-        elif kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE"):
-            # Reshape to six axes, swap the two in the middle, reshape back,
-            # all in TFLite's own axis order.
-            block = op.option(0, "i")
-            n, h, w, c = self.tensors[ins[0]].shape
-            if kind == "SPACE_TO_DEPTH":
-                split = [n, h // block, block, w // block, block, c]
-            else:
-                split = [n, h, w, block, block, c // (block * block)]
-            y = self.last_to_last(self.value(ins[0]), 4, tag + "_nhwc", ins[0], True)
-            y = self._six(y, split, [0, 1, 3, 2, 4, 5], out.shape, tag, ins[0], "_swap")
-            y = b.node("Transpose", [y], tag, perm=_to_first(4))
-        elif kind in ("SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND"):
-            y = self._batch_space(op, tag)
-        elif kind == "BROADCAST_TO":
-            # Leading axes by reshape, then each broadcast axis as copies.
-            source = list(self.tensors[ins[0]].shape)
-            shape = [1] * (len(out.shape) - len(source)) + source
-            y = self.value(ins[0])
-            if shape != source:
-                y = self.held(self.reshape(y, source, shape, tag + "_rank", ins[0]), ins[0],
-                              tag + "_rank_q")
-            axes = [a for a, (d, t) in enumerate(zip(shape, out.shape)) if d != t]
-            for step, axis in enumerate(axes):
-                y = b.node("Concat", [y] * out.shape[axis], f"{tag}_axis{axis}",
-                           axis=_onnx_axis(axis, len(shape)))
-                if step < len(axes) - 1:
-                    y = self.held(y, ins[0], f"{tag}_axis{axis}_q")
-            if not axes:
-                y = b.node("Identity", [y], tag)
-        elif kind == "BATCH_MATMUL":
-            # The matrices are the last two TFLite axes, so the product runs
-            # in TFLite's own axis order.
-            rank = len(out.shape)
-            operands = []
-            for i, adjoint in zip(ins, (op.option(0, "?", False), op.option(1, "?", False))):
-                perm = list(range(rank))
-                if adjoint:
-                    perm[-2:] = perm[-1], perm[-2]
-                perm = [_to_last(rank)[p] for p in perm]
-                x = self.value(i)
-                if perm != list(range(rank)):
-                    x = self.held(b.node("Transpose", [x], tag + "_operand", perm=perm), i,
-                                  tag + "_operand_q")
-                operands.append(x)
-            y = b.node("MatMul", operands, tag)
-            if rank in (3, 4):
-                y = b.node("Transpose", [self.held(y, outs[0], tag + "_q")], tag + "_first",
-                           perm=_to_first(rank))
-        elif kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
-            sizes = b.constant(np.asarray(_onnx_shape(out.shape), np.int64), tag + "_sizes")
-            align, half_pixel = _resize_flags(op)
-            if kind == "RESIZE_BILINEAR":
-                coordinate = "align_corners" if align else "half_pixel" if half_pixel else "asymmetric"
-                attributes = {"mode": "linear", "coordinate_transformation_mode": coordinate}
-            else:
-                coordinate = "align_corners" if align else "tf_half_pixel_for_nn" if half_pixel else "asymmetric"
-                attributes = {"mode": "nearest", "coordinate_transformation_mode": coordinate,
-                              "nearest_mode": "round_prefer_ceil" if align else "floor"}
-            y = b.node("Resize", [self.value(ins[0]), "", "", sizes], tag, **attributes)
-        elif kind in ("QUANTIZE", "DEQUANTIZE"):
-            y = self.value(ins[0])
+            return self.reshape(self.value(ins[0]), list(source.shape), self.tensors[outs[0]].shape,
+                                tag, outs[0])
+        axis = _option(op, "axis") % len(source.shape)
+        names = [f"{self.tensors[i].name}_float_part" for i in outs]
+        sizes = self.b.constant(np.ones(len(outs), np.int64), tag + "_sizes")
+        parts = self.b.multi_node("Split", [self.value(ins[0]), sizes], names,
+                                  axis=_onnx_axis(axis, len(source.shape)))
+        shape = list(source.shape)
+        shape[axis] = 1
+        for part, index in zip(parts, outs):
+            name = self.tensors[index].name + "_float"
+            held = self.held(part, index, name + "_part_q")
+            self.finish(self.reshape(held, shape, self.tensors[index].shape, name, index), index)
+        return None
+
+    def _depth_space(self, op: _Operator, tag: str) -> str:
+        """Reshape to six axes, swap the two in the middle, reshape back, all
+        in TFLite's own axis order."""
+        ins = op.inputs
+        block = _option(op, "block_size")
+        n, h, w, c = self.tensors[ins[0]].shape
+        if op.kind == "SPACE_TO_DEPTH":
+            split = [n, h // block, block, w // block, block, c]
         else:
-            raise ValueError(f"no conversion for {kind}")
-        self.finish(b.fused_activation(y, fused, tag), outs[0])
+            split = [n, h, w, block, block, c // (block * block)]
+        y = self.last_to_last(self.value(ins[0]), 4, tag + "_nhwc", ins[0], True)
+        y = self._six(y, split, [0, 1, 3, 2, 4, 5], self.tensors[op.outputs[0]].shape, tag, ins[0],
+                      "_swap")
+        return self.b.node("Transpose", [y], tag, perm=_to_first(4))
+
+    def _broadcast_to(self, op: _Operator, tag: str) -> str:
+        """Leading axes by reshape, then each broadcast axis as copies."""
+        ins, b, out = op.inputs, self.b, self.tensors[op.outputs[0]]
+        source = list(self.tensors[ins[0]].shape)
+        shape = [1] * (len(out.shape) - len(source)) + source
+        y = self.value(ins[0])
+        if shape != source:
+            y = self.held(self.reshape(y, source, shape, tag + "_rank", ins[0]), ins[0],
+                          tag + "_rank_q")
+        axes = [a for a, (d, t) in enumerate(zip(shape, out.shape)) if d != t]
+        for step, axis in enumerate(axes):
+            y = b.node("Concat", [y] * out.shape[axis], f"{tag}_axis{axis}",
+                       axis=_onnx_axis(axis, len(shape)))
+            if step < len(axes) - 1:
+                y = self.held(y, ins[0], f"{tag}_axis{axis}_q")
+        if not axes:
+            y = b.node("Identity", [y], tag)
+        return y
+
+    def _batch_matmul(self, op: _Operator, tag: str) -> str:
+        """The matrices are the last two TFLite axes, so the product runs in
+        TFLite's own axis order."""
+        b = self.b
+        rank = len(self.tensors[op.outputs[0]].shape)
+        operands = []
+        for i, adjoint in zip(op.inputs, (_option(op, "adj_x"), _option(op, "adj_y"))):
+            perm = list(range(rank))
+            if adjoint:
+                perm[-2:] = perm[-1], perm[-2]
+            perm = [_to_last(rank)[p] for p in perm]
+            x = self.value(i)
+            if perm != list(range(rank)):
+                x = self.held(b.node("Transpose", [x], tag + "_operand", perm=perm), i,
+                              tag + "_operand_q")
+            operands.append(x)
+        y = b.node("MatMul", operands, tag)
+        if rank in (3, 4):
+            y = b.node("Transpose", [self.held(y, op.outputs[0], tag + "_q")], tag + "_first",
+                       perm=_to_first(rank))
+        return y
+
+    def _resize(self, op: _Operator, tag: str) -> str:
+        b = self.b
+        sizes = b.constant(np.asarray(_onnx_shape(self.tensors[op.outputs[0]].shape), np.int64),
+                           tag + "_sizes")
+        align, half_pixel = _option(op, "align_corners"), _option(op, "half_pixel_centers")
+        if op.kind == "RESIZE_BILINEAR":
+            coordinate = "align_corners" if align else "half_pixel" if half_pixel else "asymmetric"
+            attributes = {"mode": "linear", "coordinate_transformation_mode": coordinate}
+        else:
+            coordinate = "align_corners" if align else "tf_half_pixel_for_nn" if half_pixel else "asymmetric"
+            attributes = {"mode": "nearest", "coordinate_transformation_mode": coordinate,
+                          "nearest_mode": "round_prefer_ceil" if align else "floor"}
+        return b.node("Resize", [self.value(op.inputs[0]), "", "", sizes], tag, **attributes)
 
     def _concat(self, parts, axis: int, index: int, tag: str) -> str:
         """Concatenation along TFLite axis `axis` of (value, TFLite shape,
@@ -1804,8 +1859,8 @@ class _Converter:
         axis = _onnx_axis(1, 3)
         if op.kind == "CUMSUM":
             operands = [x, b.constant(np.asarray(axis, np.int64), tag + "_axis")]
-            options = {"exclusive": int(op.option(0, "?", False)),
-                       "reverse": int(op.option(1, "?", False))}
+            options = {"exclusive": int(_option(op, "exclusive")),
+                       "reverse": int(_option(op, "reverse"))}
             if source.type == "INT8":
                 # TFLite seeds the int8 sum with the input zero point, which
                 # ONNX's CumSum over dequantized values does not; the
@@ -1849,7 +1904,7 @@ class _Converter:
         return self.b.node("Transpose", [self.held(y, index, tag + "_q")], tag,
                            perm=_to_first(rank))
 
-    def _gather(self, kind: str, data: int, ids: int, axis, op: _Operator, tag: str) -> str:
+    def _gather_node(self, kind: str, data: int, ids: int, axis, op: _Operator, tag: str) -> str:
         """GATHER, GATHER_ND or EMBEDDING_LOOKUP with constant indices, run in
         TFLite's axis order, where its axis and index tuples are stated."""
         rank = len(self.tensors[data].shape)
@@ -1864,7 +1919,7 @@ class _Converter:
                    if _is_constant(self.tensors[ids]) else self.last_to_last(
                        self.value(ids), len(self.tensors[ids].shape), tag + "_index_order", ids, True))
         attributes = {} if axis is None else {"axis": axis % rank}
-        batch = op.option(1, "i") if op.kind == "GATHER" else 0
+        batch = _option(op, "batch_dims") if op.kind == "GATHER" else 0
         if batch or (kind == "GatherND" and not _is_constant(self.tensors[ids])):
             # ONNX GatherND takes int64 indices; this form keeps runtime int32.
             y = self.custom(kind, [x, indices], tag + "_gathered",
@@ -1880,8 +1935,8 @@ class _Converter:
         b = self.b
         x, feature, time, bias, state = op.inputs
         quantized = self.tensors[x].type == "INT8"
-        attributes = {"rank": op.option(0, "i"),
-                      "activation": "none" if quantized else _activation(op.option(1, "b"))}
+        activation = "none" if quantized else _activation(_option(op, "fused_activation_function"))
+        attributes = {"rank": _option(op, "rank"), "activation": activation}
         if quantized:
             attributes.update(feature_scale=float(self.tensors[feature].scale[0]),
                               time_scale=float(self.tensors[time].scale[0]),
@@ -1930,8 +1985,8 @@ class _Converter:
         b = self.b
         kind, roles = (("If", ("then_branch", "else_branch")) if op.kind == "IF"
                        else ("While", ("cond_branch", "body_branch")))
-        graphs = {role: _branch_graph(self.graphs, op.option(slot, "i"), f"{tag}_{role}")
-                  for slot, role in enumerate(roles)}
+        graphs = {role: _branch_graph(self.graphs, position, f"{tag}_{role}")
+                  for position, role in zip(_subgraphs(op), roles)}
         results = [b.unique(f"{tag}_{n}") for n in range(len(op.outputs))]
         # A constant operand is read inside the branch itself.
         operands = [i for n, i in enumerate(op.inputs)
@@ -1950,8 +2005,8 @@ class _Converter:
         ins = op.inputs
         x = self.last_to_last(self.value(ins[0]), 3, tag + "_last", ins[0], True)
         constants = [b.constant(self.tensors[ins[i]].array(), f"{tag}_w{i}") for i in _LSTM_CONSTANTS]
-        attributes = {"time_major": int(op.option(3, "?", False)),
-                      "cell_clip": float(op.option(1, "f", 0.0))}
+        attributes = {"time_major": int(_option(op, "time_major")),
+                      "cell_clip": float(_option(op, "cell_clip"))}
         if self.tensors[ins[0]].type == "INT8":
             # Integer weights pass as stored, their scales stated; the int16
             # cell state stays raw.
@@ -1977,7 +2032,7 @@ class _Converter:
             self.held_state[index]["output"] = name
         return self.tflite_order_out(self.held(y, op.outputs[0], tag + "_q"), op.outputs[0], tag)
 
-    def _strided_slice(self, op: _Operator, tag: str) -> str:
+    def _slice_steps(self, op: _Operator, tag: str) -> str:
         """A STRIDED_SLICE with any strides, as an ONNX Slice in TFLite's axis
         order; a dropped axis is a slice of one, reshaped away."""
         b = self.b
@@ -2139,6 +2194,170 @@ class _Converter:
                                        tag + "_shape", op.outputs[0]),
                           op.outputs[0], tag + "_shape_q")
         return y
+
+
+class _Kind(NamedTuple):
+    """How the importer checks and converts one operator kind.
+
+    convert(converter, op, tag): the ONNX value of the output, or None when it
+    stored its results itself. options: the fields read from the options
+    table, by name, as (slot, format, value when absent). early: checks after
+    the constant operands; the first to return a string gives the result, ""
+    accepting the operator. dtypes: the dtype check of the data operands and
+    outputs. fused: fused_activation_function is checked, then applied after
+    the operator. late: checks after it; the first non-empty reason refuses
+    the operator."""
+    convert: Callable
+    options: dict = {}
+    early: tuple = ()
+    late: tuple = ()
+    dtypes: Callable = _float_or_int8
+    fused: bool = False
+
+
+def _unary(onnx_type: str) -> Callable:
+    return lambda c, op, tag: c.b.node(onnx_type, [c.value(op.inputs[0])], tag)
+
+
+def _broadcast(onnx_type: str) -> Callable:
+    return lambda c, op, tag: c.b.node(onnx_type, c.operands(op), tag)
+
+
+def _fused(slot: int) -> dict:
+    return {"fused_activation_function": (slot, "b", 0)}
+
+
+_MOVEMENT = (_data_movement_reason,)
+_SHAPED_MOVEMENT = (_data_movement_reason, _option_shape_reason)
+_KINDS: dict[str, _Kind] = {
+    **{kind: _Kind(_unary(name)) for kind, name in _UNARY.items()},
+    # dtypes=_float_only: elementwise math TFLite Micro runs in float32 only.
+    **{kind: _Kind(_unary(name), dtypes=_float_or_int8 if kind == "ABS" else _float_only)
+       for kind, name in _ELEMENTWISE_UNARY.items()},
+    "RSQRT": _Kind(lambda c, op, tag: c.b.node(
+        "Reciprocal", [c.b.node("Sqrt", [c.value(op.inputs[0])], tag + "_sqrt")], tag)),
+    "SQUARE": _Kind(lambda c, op, tag: c.b.node("Mul", [c.value(op.inputs[0])] * 2, tag),
+                    dtypes=_float_only),
+    "RELU6": _Kind(lambda c, op, tag: c.b.fused_activation(c.value(op.inputs[0]), "relu6", tag)),
+    "LEAKY_RELU": _Kind(lambda c, op, tag: c.b.node("LeakyRelu", [c.value(op.inputs[0])], tag,
+                                                    alpha=_option(op, "alpha")),
+                        {"alpha": (0, "f", 0.0)}),
+    "PRELU": _Kind(_broadcast("PRelu")),
+    "GELU": _Kind(lambda c, op, tag: c.custom(
+        "Gelu", [c.value(op.inputs[0])], tag, _onnx_shape(c.tensors[op.outputs[0]].shape),
+        approximate="tanh" if _option(op, "approximate") else "none"),
+        {"approximate": (0, "?", False)}),
+    "SOFTMAX": _Kind(_Converter._softmax, {"beta": (0, "f", 0)}, late=(_beta_reason,)),
+    "LOG_SOFTMAX": _Kind(_Converter._softmax),
+    "L2_NORMALIZATION": _Kind(_Converter._l2_normalization, _fused(0), late=(_l2_fused_reason,)),
+    **{kind: _Kind(_broadcast(name), _fused(0), early=(_int32_arithmetic,), fused=True)
+       for kind, name in (("ADD", "Add"), ("SUB", "Sub"), ("MUL", "Mul"))},
+    "DIV": _Kind(_broadcast("Div"), _fused(0), late=(_constant_only_reason,), fused=True),
+    **{kind: _Kind(_broadcast(name), late=(_constant_only_reason,))
+       for kind, name in (("MAXIMUM", "Max"), ("MINIMUM", "Min"))},
+    "SQUARED_DIFFERENCE": _Kind(lambda c, op, tag: c.b.node(
+        "Mul", [c.b.node("Sub", c.operands(op), tag + "_difference")] * 2, tag),
+        late=(_constant_only_reason,)),
+    "FLOOR_DIV": _Kind(lambda c, op, tag: c.b.node(
+        "Floor", [c.b.node("Div", c.operands(op), tag + "_quotient")], tag),
+        late=(_constant_only_reason,), dtypes=_float_only),
+    "FLOOR_MOD": _Kind(lambda c, op, tag: c._floor_mod(*c.operands(op), tag),
+                       late=(_constant_only_reason,), dtypes=_float_only),
+    "ADD_N": _Kind(lambda c, op, tag: c.b.node("Sum", [c.value(i) for i in op.inputs], tag)),
+    **{kind: _Kind(_Converter._comparison, early=(_int32_comparison, _bool_reason))
+       for kind in _COMPARISONS},
+    **{kind: _Kind(_broadcast(name), early=(_bool_reason,)) for kind, name in _LOGICAL.items()},
+    "SELECT_V2": _Kind(_broadcast("Where"), early=(_bool_reason,)),
+    "CAST": _Kind(_Converter._cast, early=(_int32_cast, _bool_reason, _cast_encoding_reason)),
+    **{kind: _Kind(_Converter._index, early=(_index_reason,)) for kind in _INDEX},
+    **{kind: _Kind(_Converter._reduction, late=(_reduction_axes_reason,))
+       for kind in ("REDUCE_MAX", "REDUCE_MIN", "SUM")},
+    "REDUCE_ALL": _Kind(_Converter._reduction, early=(_bool_reason,),
+                        late=(_reduction_axes_reason,)),
+    "MEAN": _Kind(_Converter._mean, late=(_reduction_axes_reason,)),
+    "CUMSUM": _Kind(_Converter._reduction,
+                    {"exclusive": (0, "?", False), "reverse": (1, "?", False)}),
+    # Weighted and windowed operators.
+    "CONV_2D": _Kind(_Converter._conv, _fused(3), early=(_weights_reason,),
+                     late=(_window_reason,), fused=True),
+    "DEPTHWISE_CONV_2D": _Kind(_Converter._conv, {"depth_multiplier": (3, "i", 0), **_fused(4)},
+                               early=(_weights_reason,), late=(_window_reason,), fused=True),
+    "TRANSPOSE_CONV": _Kind(_Converter._transpose_conv, _fused(3), early=(_weights_reason,),
+                            late=(_window_reason,), fused=True),
+    "FULLY_CONNECTED": _Kind(_Converter._fully_connected,
+                             {**_fused(0), "weights_format": (1, "b", 0), "quant_spec": (5, "[B", b"")},
+                             early=(_quant_spec_reason, _weights_reason),
+                             late=(_weights_format_reason,), fused=True),
+    **{kind: _Kind(_Converter._pool, _fused(5), late=(_window_reason,), fused=True)
+       for kind in ("MAX_POOL_2D", "AVERAGE_POOL_2D")},
+    "L2_POOL_2D": _Kind(_Converter._l2_pool, _fused(5), late=(_window_reason,), dtypes=_float_only,
+                        fused=True),
+    "BATCH_MATMUL": _Kind(_Converter._batch_matmul,
+                          {"adj_x": (0, "?", False), "adj_y": (1, "?", False)},
+                          late=(_rank_reason, _option_shape_reason)),
+    # Shapes and data movement.
+    **{kind: _Kind(_Converter._shape_only, early=(_kept_constant_reason,))
+       for kind in ("SQUEEZE", "EXPAND_DIMS")},
+    "RESHAPE": _Kind(_Converter._shape_only, early=(_kept_constant_reason, _int32_movement)),
+    "TRANSPOSE": _Kind(_Converter._transpose, early=(_int32_movement,)),
+    "CONCATENATION": _Kind(_Converter._concatenation, {"axis": (0, "i", 0), **_fused(1)},
+                           early=(_kept_constant_reason,),
+                           late=(_concat_quantization_reason, _option_shape_reason), fused=True),
+    "PACK": _Kind(_Converter._pack, {"values_count": (0, "i", 0), "axis": (1, "i", 0)},
+                  early=(_count_reason, _kept_constant_reason), late=_SHAPED_MOVEMENT),
+    "UNPACK": _Kind(_Converter._unpack, {"num": (0, "i", 0), "axis": (1, "i", 0)},
+                    early=(_count_reason,), late=_SHAPED_MOVEMENT),
+    "SPLIT": _Kind(_Converter._split),
+    "SPLIT_V": _Kind(_Converter._split),
+    "SLICE": _Kind(_Converter._slice, early=(_kept_constant_reason,), late=_MOVEMENT),
+    "STRIDED_SLICE": _Kind(_Converter._strided_slice,
+                           {"begin_mask": (0, "i", 0), "end_mask": (1, "i", 0),
+                            "ellipsis_mask": (2, "i", 0), "new_axis_mask": (3, "i", 0),
+                            "shrink_axis_mask": (4, "i", 0), "offset": (5, "?", False)},
+                           early=(_kept_constant_reason,), late=_SHAPED_MOVEMENT),
+    "GATHER": _Kind(_Converter._gather, {"axis": (0, "i", 0), "batch_dims": (1, "i", 0)},
+                    late=_SHAPED_MOVEMENT),
+    "GATHER_ND": _Kind(lambda c, op, tag: c._gather_node("GatherND", op.inputs[0], op.inputs[1],
+                                                         None, op, tag), late=_MOVEMENT),
+    "EMBEDDING_LOOKUP": _Kind(lambda c, op, tag: c._gather_node("Gather", op.inputs[1],
+                                                                op.inputs[0], 0, op, tag),
+                              late=_MOVEMENT),
+    "DYNAMIC_UPDATE_SLICE": _Kind(_Converter._dynamic_update_slice, late=_MOVEMENT),
+    **{kind: _Kind(_Converter._depth_space, {"block_size": (0, "i", 0)}, late=_MOVEMENT)
+       for kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE")},
+    **{kind: _Kind(_Converter._batch_space, late=_MOVEMENT)
+       for kind in ("SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND")},
+    "BROADCAST_TO": _Kind(_Converter._broadcast_to, late=_MOVEMENT),
+    "REVERSE_V2": _Kind(_Converter._reverse, late=_MOVEMENT),
+    "PAD": _Kind(_Converter._pad),
+    "PADV2": _Kind(_Converter._pad),
+    "MIRROR_PAD": _Kind(_Converter._mirror_pad, {"mode": (0, "b", 0)}, late=_MOVEMENT),
+    "RESIZE_BILINEAR": _Kind(_Converter._resize, {"align_corners": (2, "?", False),
+                                                  "half_pixel_centers": (3, "?", False)},
+                             late=(_resize_reason,)),
+    "RESIZE_NEAREST_NEIGHBOR": _Kind(_Converter._resize, {"align_corners": (0, "?", False),
+                                                          "half_pixel_centers": (1, "?", False)},
+                                     late=(_resize_reason,)),
+    "QUANTIZE": _Kind(_Converter._quantization, dtypes=_quantize_dtypes),
+    "DEQUANTIZE": _Kind(_Converter._quantization, dtypes=_dequantize_dtypes),
+    # State, control flow and detection.
+    "SVDF": _Kind(_Converter._svdf, {"rank": (0, "i", 0), **_fused(1)}, early=(_svdf_reason,)),
+    "UNIDIRECTIONAL_SEQUENCE_LSTM": _Kind(
+        _Converter._lstm, {**_fused(0), "cell_clip": (1, "f", 0.0), "time_major": (3, "?", False)},
+        early=(_lstm_reason,)),
+    "CALL_ONCE": _Kind(_Converter._variable, {"init_subgraph_index": (0, "i", 0)},
+                       early=(_variables_reason,)),
+    "VAR_HANDLE": _Kind(_Converter._variable, {"container": (0, "s", ""), "shared_name": (1, "s", "")},
+                        early=(_variables_reason,)),
+    **{kind: _Kind(_Converter._variable, early=(_variables_reason,))
+       for kind in ("READ_VARIABLE", "ASSIGN_VARIABLE")},
+    "IF": _Kind(_Converter._control_flow, {"then_subgraph_index": (0, "i", 0),
+                                           "else_subgraph_index": (1, "i", 0)}, early=(_if_reason,)),
+    "WHILE": _Kind(_Converter._control_flow, {"cond_subgraph_index": (0, "i", 0),
+                                              "body_subgraph_index": (1, "i", 0)},
+                   early=(_while_reason,)),
+    _DETECTION: _Kind(_Converter._detection, early=(_detection_reason,)),
+}
 
 
 def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
