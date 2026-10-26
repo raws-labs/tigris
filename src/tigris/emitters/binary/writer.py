@@ -1622,7 +1622,7 @@ def _build_quant_params(
         # multiplier and shift arrays must fit together in that page.
         if num_channels > page_size // 2:
             raise ValueError(
-                f"quantization channels for {name!r} exceed the v3 per-param "
+                f"quantization channels for {name!r} exceed the per-param "
                 f"limit ({num_channels} > {page_size // 2})")
 
         # v3 retains the compact 16-byte entry and uses its former padding as
@@ -1665,7 +1665,7 @@ def _build_quant_params(
         raise ValueError("quantization parameter count exceeds uint16 plan limit")
     pages = (data_offset + page_size - 1) // page_size
     if pages > 0xFFFF:
-        raise ValueError("quantization data exceeds v3 page-count limit")
+        raise ValueError("quantization data exceeds the plan page-count limit")
     # v3 section header: num_quant_params(u16) + quant_data_pages(u16).
     header = QUANT_SECTION_HEADER_STRUCT.pack(len(quant_idx_map), pages)
     return header + bytes(entries_buf) + bytes(data_buf), quant_idx_map
