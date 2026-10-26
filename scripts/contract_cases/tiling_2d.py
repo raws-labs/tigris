@@ -8,68 +8,24 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from .common import Array, ContractCase, _model, _qdq, _scalars
+from .common import (
+    Array, ContractCase, _model, _qdq, _qdq_named, _qdq_operator_model, _qparams, _scalars, _vi,
+)
 
 
-def build_conv(
-    *,
-    n: int,
-    c_in: int,
-    c_out: int,
-    h: int,
-    w: int,
-    kernel: int,
-    stride: int,
-    pad: int,
-    seed: int = 0,
-) -> tuple[onnx.ModelProto, onnx.ModelProto, dict[str, Array]]:
-    """A single float32 Conv on an NCHW activation.
+# The Conv of the 66x66 cases, float and int8.
+_CONV0 = dict(name="conv0", kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
 
-    The compile model and the ORT reference model are identical (as in
-    _tiled_pool_case and _dilated_conv_case); only random weights and a
-    uniform input distinguish instances at different resolutions.
-    """
-    out_h = (h + 2 * pad - kernel) // stride + 1
-    out_w = (w + 2 * pad - kernel) // stride + 1
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [n, c_in, h, w]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [n, c_out, out_h, out_w]
-    )
-    rng = np.random.default_rng(seed)
-    weights = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c_out, c_in, kernel, kernel)).astype(
-            np.float32
-        ),
-        "weights",
-    )
-    bias = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c_out,)).astype(np.float32), "bias"
-    )
-    model = _model(
-        "conv2d",
-        [
-            helper.make_node(
-                "Conv",
-                ["input", "weights", "bias"],
-                ["output"],
-                name="conv0",
-                kernel_shape=[kernel, kernel],
-                strides=[stride, stride],
-                pads=[pad, pad, pad, pad],
-            )
-        ],
-        [model_input],
-        [model_output],
-        [weights, bias],
-    )
-    inputs = {
-        "input": rng.uniform(-1.0, 1.0, size=(n, c_in, h, w)).astype(
-            np.float32
-        )
-    }
-    return model, model, inputs
+
+def _conv0(rng: np.random.Generator, source: str, out: str, c_in: int,
+           c_out: int) -> tuple[onnx.NodeProto, list[onnx.TensorProto]]:
+    """A float 3x3 stride-1 pad-1 Conv named conv0, with weights and bias drawn from `rng`."""
+    initializers = [
+        numpy_helper.from_array(
+            rng.normal(0.0, 0.05, size=(c_out, c_in, 3, 3)).astype(np.float32), "weights"),
+        numpy_helper.from_array(rng.normal(0.0, 0.05, size=(c_out,)).astype(np.float32), "bias"),
+    ]
+    return helper.make_node("Conv", [source, "weights", "bias"], [out], **_CONV0), initializers
 
 
 def _2d_tiled_conv_case() -> ContractCase:
@@ -87,18 +43,14 @@ def _2d_tiled_conv_case() -> ContractCase:
     an emitted axis == TILE_AXIS_HW plan is itself proof the 1D path failed
     closed at this budget.
     """
-    compile_model, reference_model, inputs = build_conv(
-        n=1, c_in=64, c_out=64, h=66, w=66, kernel=3, stride=1, pad=1
-    )
+    rng = np.random.default_rng(0)
+    conv, initializers = _conv0(rng, "input", "output", 64, 64)
+    model = _model("conv2d", [conv], [_vi("input", [1, 64, 66, 66])],
+                   [_vi("output", [1, 64, 66, 66])], initializers)
     return ContractCase(
-        "float_2d_tiled_conv",
-        compile_model,
-        reference_model,
-        inputs,
-        expected_operators=("Conv",),
-        mem_budget="24K",
-        expect_tiled=True,
-        expect_2d=True,
+        "float_2d_tiled_conv", model, model,
+        {"input": rng.uniform(-1.0, 1.0, size=(1, 64, 66, 66)).astype(np.float32)},
+        expected_operators=("Conv",), mem_budget="24K", expect_tiled=True, expect_2d=True,
     )
 
 
@@ -139,115 +91,21 @@ def _strided_depthwise_2d_case(*, quantized: bool) -> ContractCase:
 
 
 def _qdq_2d_tiled_conv_case() -> ContractCase:
-    """The int8 sibling of _2d_tiled_conv_case, built via the _qdq_case QDQ
-    pattern: input NCHW [1, 256, 66, 66], a 3x3 stride-1 pad-1 Conv, 24K
-    budget. 256 int8 channels give the same per-pixel byte footprint as the
-    float case's 64 float32 channels, so the compiler solves the same 4x8
-    2D output tile with the same partial last row, column, and corner.
+    """The int8 sibling of _2d_tiled_conv_case: input NCHW [1, 256, 66, 66], a
+    3x3 stride-1 pad-1 Conv, 24K budget. 256 int8 channels give the same
+    per-pixel byte footprint as the float case's 64 float32 channels, so the
+    compiler solves the same 4x8 2D output tile with the same partial last row,
+    column, and corner.
     """
-    h = w = 66
-    c = 256
-    kernel, stride, pad = 3, 1, 1
-    out_h = (h + 2 * pad - kernel) // stride + 1
-    out_w = (w + 2 * pad - kernel) // stride + 1
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, c, h, w]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, c, out_h, out_w]
-    )
-
+    shape = [1, 256, 66, 66]
     rng = np.random.default_rng(3)
-    input_scale = numpy_helper.from_array(
-        np.array([0.02], dtype=np.float32), "input_scale"
-    )
-    input_zero_point = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "input_zero_point"
-    )
-    output_scale = numpy_helper.from_array(
-        np.array([0.05], dtype=np.float32), "output_scale"
-    )
-    output_zero_point = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "output_zero_point"
-    )
-    weight = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c, c, kernel, kernel)).astype(
-            np.float32
-        ),
-        "weight",
-    )
-    weight_scale = numpy_helper.from_array(
-        np.array([0.01], dtype=np.float32), "weight_scale"
-    )
-    weight_zero_point = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "weight_zero_point"
-    )
-    initializers = [
-        input_scale,
-        input_zero_point,
-        output_scale,
-        output_zero_point,
-        weight,
-        weight_scale,
-        weight_zero_point,
-    ]
-    nodes = [
-        helper.make_node(
-            "QuantizeLinear",
-            ["input", "input_scale", "input_zero_point"],
-            ["input_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["input_q", "input_scale", "input_zero_point"],
-            ["input_dq"],
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["weight", "weight_scale", "weight_zero_point"],
-            ["weight_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["weight_q", "weight_scale", "weight_zero_point"],
-            ["weight_dq"],
-        ),
-        helper.make_node(
-            "Conv",
-            ["input_dq", "weight_dq"],
-            ["raw"],
-            name="conv0",
-            kernel_shape=[kernel, kernel],
-            strides=[stride, stride],
-            pads=[pad, pad, pad, pad],
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["raw", "output_scale", "output_zero_point"],
-            ["output_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["output_q", "output_scale", "output_zero_point"],
-            ["output"],
-        ),
-    ]
-    compile_model = _model(
-        "qdq_2d_tiled_conv", nodes, [model_input], [model_output], initializers
-    )
-    reference_model = copy.deepcopy(compile_model)
-    onnx.checker.check_model(reference_model)
-
-    input_data = rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32)
+    weight = rng.normal(0.0, 0.05, size=(256, 256, 3, 3)).astype(np.float32)
+    model = _qdq_operator_model("qdq_2d_tiled_conv", "Conv", shape, shape, ([0.02], [0]),
+                                ([0.05], [0]), weight, ([0.01], [0]), **_CONV0)
     return ContractCase(
-        "int8_2d_tiled_conv",
-        compile_model,
-        reference_model,
-        {"input": input_data},
-        ("Conv",),
-        mem_budget="24K",
-        expect_tiled=True,
-        expect_2d=True,
+        "int8_2d_tiled_conv", model, model,
+        {"input": rng.uniform(-1.0, 1.0, size=shape).astype(np.float32)},
+        ("Conv",), mem_budget="24K", expect_tiled=True, expect_2d=True,
     )
 
 
@@ -262,52 +120,15 @@ def _2d_tiled_conv_sigmoid_case() -> ContractCase:
     Sigmoid stage exercises the 2D executor running a pointwise op on a
     packed (non-full-width) tile, which no other contract case covers.
     """
-    h = w = 66
-    c = 64
-    kernel, stride, pad = 3, 1, 1
+    shape = [1, 64, 66, 66]
     rng = np.random.default_rng(5)
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, c, h, w]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, c, h, w]
-    )
-    weights = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c, c, kernel, kernel)).astype(
-            np.float32
-        ),
-        "weights",
-    )
-    bias = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c,)).astype(np.float32), "bias"
-    )
-    nodes = [
-        helper.make_node(
-            "Conv",
-            ["input", "weights", "bias"],
-            ["conv_out"],
-            name="conv0",
-            kernel_shape=[kernel, kernel],
-            strides=[stride, stride],
-            pads=[pad, pad, pad, pad],
-        ),
-        helper.make_node("Sigmoid", ["conv_out"], ["output"]),
-    ]
-    model = _model(
-        "conv_sigmoid_2d", nodes, [model_input], [model_output], [weights, bias]
-    )
-    inputs = {
-        "input": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32)
-    }
+    conv, initializers = _conv0(rng, "input", "conv_out", 64, 64)
+    model = _model("conv_sigmoid_2d", [conv, helper.make_node("Sigmoid", ["conv_out"], ["output"])],
+                   [_vi("input", shape)], [_vi("output", shape)], initializers)
     return ContractCase(
-        "float_2d_tiled_conv_sigmoid",
-        model,
-        model,
-        inputs,
-        expected_operators=("Conv", "Sigmoid"),
-        mem_budget="24K",
-        expect_tiled=True,
-        expect_2d=True,
+        "float_2d_tiled_conv_sigmoid", model, model,
+        {"input": rng.uniform(-1.0, 1.0, size=shape).astype(np.float32)},
+        expected_operators=("Conv", "Sigmoid"), mem_budget="24K", expect_tiled=True, expect_2d=True,
     )
 
 
@@ -325,63 +146,22 @@ def _cotiled_concat_2d_case() -> ContractCase:
     loads up and skip at the same tile rectangle and must reproduce the
     whole-op result bit-exact.
     """
-    h = w = 66
-    c = 32
-    kernel, stride, pad = 3, 1, 1
+    shape = [1, 32, 66, 66]
     rng = np.random.default_rng(17)
-    up = helper.make_tensor_value_info("up", TensorProto.FLOAT, [1, c, h, w])
-    skip = helper.make_tensor_value_info(
-        "skip", TensorProto.FLOAT, [1, c, h, w]
-    )
-    output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, c, h, w]
-    )
-    weights = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c, 2 * c, kernel, kernel)).astype(
-            np.float32
-        ),
-        "weights",
-    )
-    bias = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c,)).astype(np.float32), "bias"
-    )
+    conv, initializers = _conv0(rng, "cat", "output", 64, 32)
     model = _model(
-        "cotiled_concat_2d",
-        [
-            helper.make_node("Concat", ["up", "skip"], ["cat"], axis=1),
-            helper.make_node(
-                "Conv",
-                ["cat", "weights", "bias"],
-                ["output"],
-                name="conv0",
-                kernel_shape=[kernel, kernel],
-                strides=[stride, stride],
-                pads=[pad, pad, pad, pad],
-            ),
-        ],
-        [up, skip],
-        [output],
-        [weights, bias],
+        "cotiled_concat_2d", [helper.make_node("Concat", ["up", "skip"], ["cat"], axis=1), conv],
+        [_vi("up", shape), _vi("skip", shape)], [_vi("output", shape)], initializers,
     )
-    inputs = {
-        "up": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
-        "skip": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
-    }
+    inputs = {name: rng.uniform(-1.0, 1.0, size=shape).astype(np.float32) for name in ("up", "skip")}
     return ContractCase(
-        "float_cotiled_concat_2d",
-        model,
-        model,
-        inputs,
-        expected_operators=("Concat", "Conv"),
-        mem_budget="24K",
-        expect_tiled=True,
-        expect_2d=True,
+        "float_cotiled_concat_2d", model, model, inputs,
+        expected_operators=("Concat", "Conv"), mem_budget="24K", expect_tiled=True, expect_2d=True,
     )
 
 
 def _qdq_cotiled_concat_2d_case() -> ContractCase:
-    """The int8 sibling of _cotiled_concat_2d_case, built via the _qdq
-    QDQ pattern.
+    """The int8 sibling of _cotiled_concat_2d_case.
 
     up and skip are NCHW [1, 128, 66, 66]; a channel-axis Concat builds
     cat [1, 256, 66, 66] which a 3x3 stride-1 pad-1 Conv maps to int8 output
@@ -392,132 +172,32 @@ def _qdq_cotiled_concat_2d_case() -> ContractCase:
     Both the Concat and the Conv stage tile on TILE_AXIS_HW with tiles_h > 1
     and tiles_w > 1.
     """
-    h = w = 66
     c = 128
-    kernel, stride, pad = 3, 1, 1
+    shape = [1, c, 66, 66]
     rng = np.random.default_rng(23)
-    up = helper.make_tensor_value_info("up", TensorProto.FLOAT, [1, c, h, w])
-    skip = helper.make_tensor_value_info(
-        "skip", TensorProto.FLOAT, [1, c, h, w]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, c, h, w]
-    )
-
-    def _scalar(value: float, name: str, dtype=np.float32) -> onnx.TensorProto:
-        return numpy_helper.from_array(np.array([value], dtype=dtype), name)
-
-    # up, skip, and cat share one scale so the Concat rescales nothing.
-    skip_scale = _scalar(0.02, "skip_scale")
-    skip_zero_point = _scalar(0, "skip_zero_point", np.int8)
-    up_scale = _scalar(0.02, "up_scale")
-    up_zero_point = _scalar(0, "up_zero_point", np.int8)
-    cat_scale = _scalar(0.02, "cat_scale")
-    cat_zero_point = _scalar(0, "cat_zero_point", np.int8)
-    output_scale = _scalar(0.05, "output_scale")
-    output_zero_point = _scalar(0, "output_zero_point", np.int8)
-    weight = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c, 2 * c, kernel, kernel)).astype(
-            np.float32
-        ),
-        "weight",
-    )
-    weight_scale = _scalar(0.01, "weight_scale")
-    weight_zero_point = _scalar(0, "weight_zero_point", np.int8)
     initializers = [
-        up_scale,
-        up_zero_point,
-        skip_scale,
-        skip_zero_point,
-        cat_scale,
-        cat_zero_point,
-        output_scale,
-        output_zero_point,
-        weight,
-        weight_scale,
-        weight_zero_point,
+        tensor for prefix, scale in (("up", 0.02), ("skip", 0.02), ("cat", 0.02), ("output", 0.05))
+        for tensor in _qparams(f"{prefix}_scale", f"{prefix}_zero_point", [scale], [0])
+    ] + [
+        numpy_helper.from_array(
+            rng.normal(0.0, 0.05, size=(c, 2 * c, 3, 3)).astype(np.float32), "weight"),
+        *_qparams("weight_scale", "weight_zero_point", [0.01], [0]),
     ]
     nodes = [
-        helper.make_node(
-            "QuantizeLinear", ["up", "up_scale", "up_zero_point"], ["up_q"]
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["up_q", "up_scale", "up_zero_point"],
-            ["up_dq"],
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["skip", "skip_scale", "skip_zero_point"],
-            ["skip_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["skip_q", "skip_scale", "skip_zero_point"],
-            ["skip_dq"],
-        ),
+        *_qdq_named("up"),
+        *_qdq_named("skip"),
         helper.make_node("Concat", ["up_dq", "skip_dq"], ["cat"], axis=1),
-        helper.make_node(
-            "QuantizeLinear", ["cat", "cat_scale", "cat_zero_point"], ["cat_q"]
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["cat_q", "cat_scale", "cat_zero_point"],
-            ["cat_dq"],
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["weight", "weight_scale", "weight_zero_point"],
-            ["weight_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["weight_q", "weight_scale", "weight_zero_point"],
-            ["weight_dq"],
-        ),
-        helper.make_node(
-            "Conv",
-            ["cat_dq", "weight_dq"],
-            ["raw"],
-            name="conv0",
-            kernel_shape=[kernel, kernel],
-            strides=[stride, stride],
-            pads=[pad, pad, pad, pad],
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["raw", "output_scale", "output_zero_point"],
-            ["output_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["output_q", "output_scale", "output_zero_point"],
-            ["output"],
-        ),
+        *_qdq_named("cat"),
+        *_qdq_named("weight"),
+        helper.make_node("Conv", ["cat_dq", "weight_dq"], ["raw"], **_CONV0),
+        *_qdq_named("output", "raw", "output"),
     ]
-    compile_model = _model(
-        "qdq_cotiled_concat_2d",
-        nodes,
-        [up, skip],
-        [model_output],
-        initializers,
-    )
-    reference_model = copy.deepcopy(compile_model)
-    onnx.checker.check_model(reference_model)
-
-    inputs = {
-        "up": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
-        "skip": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
-    }
+    model = _model("qdq_cotiled_concat_2d", nodes, [_vi("up", shape), _vi("skip", shape)],
+                   [_vi("output", shape)], initializers)
+    inputs = {name: rng.uniform(-1.0, 1.0, size=shape).astype(np.float32) for name in ("up", "skip")}
     return ContractCase(
-        "int8_cotiled_concat_2d",
-        compile_model,
-        reference_model,
-        inputs,
-        ("Concat", "Conv"),
-        mem_budget="24K",
-        expect_tiled=True,
-        expect_2d=True,
+        "int8_cotiled_concat_2d", model, model, inputs,
+        ("Concat", "Conv"), mem_budget="24K", expect_tiled=True, expect_2d=True,
     )
 
 
@@ -533,55 +213,17 @@ def _cotiled_add_2d_case() -> ContractCase:
     stages solve a TILE_AXIS_HW tile with tiles_h > 1 and tiles_w > 1, and
     the runtime loads x and skip at the same tile rectangle.
     """
-    h = w = 66
-    c = 64
-    kernel, stride, pad = 3, 1, 1
+    shape = [1, 64, 66, 66]
     rng = np.random.default_rng(19)
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, c, h, w])
-    skip = helper.make_tensor_value_info(
-        "skip", TensorProto.FLOAT, [1, c, h, w]
-    )
-    output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, c, h, w]
-    )
-    weights = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c, c, kernel, kernel)).astype(np.float32),
-        "weights",
-    )
-    bias = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c,)).astype(np.float32), "bias"
-    )
+    conv, initializers = _conv0(rng, "added", "output", 64, 64)
     model = _model(
-        "cotiled_add_2d",
-        [
-            helper.make_node("Add", ["x", "skip"], ["added"]),
-            helper.make_node(
-                "Conv",
-                ["added", "weights", "bias"],
-                ["output"],
-                name="conv0",
-                kernel_shape=[kernel, kernel],
-                strides=[stride, stride],
-                pads=[pad, pad, pad, pad],
-            ),
-        ],
-        [x, skip],
-        [output],
-        [weights, bias],
+        "cotiled_add_2d", [helper.make_node("Add", ["x", "skip"], ["added"]), conv],
+        [_vi("x", shape), _vi("skip", shape)], [_vi("output", shape)], initializers,
     )
-    inputs = {
-        "x": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
-        "skip": rng.uniform(-1.0, 1.0, size=(1, c, h, w)).astype(np.float32),
-    }
+    inputs = {name: rng.uniform(-1.0, 1.0, size=shape).astype(np.float32) for name in ("x", "skip")}
     return ContractCase(
-        "float_cotiled_add_2d",
-        model,
-        model,
-        inputs,
-        expected_operators=("Add", "Conv"),
-        mem_budget="24K",
-        expect_tiled=True,
-        expect_2d=True,
+        "float_cotiled_add_2d", model, model, inputs,
+        expected_operators=("Add", "Conv"), mem_budget="24K", expect_tiled=True, expect_2d=True,
     )
 
 
@@ -590,51 +232,26 @@ def _build_convtranspose_2d(
 ) -> tuple[onnx.ModelProto, dict[str, Array]]:
     """Build a stride-2 kernel-2 pad-0 float ConvTranspose upsampler.
 
-    Mirrors _convtranspose_case's node and weight construction (ONNX weight
-    layout [C_in, C_out, kH, kW], transposed to OHWI by the compiler) but
-    parameterizes the geometry so a caller can drive the stage over a tight
-    budget. Output height and width follow stride * (in - 1) + kernel = 2 * in,
-    so the tensor doubles on each spatial axis; the compiler grids the 2D tile
-    over that expanded OUTPUT extent, not the pre-upsample input.
+    The node and weight layout of _convtranspose_case (ONNX weight [C_in, C_out, kH, kW],
+    transposed to OHWI by the compiler) with the geometry as parameters, so a caller can
+    drive the stage over a tight budget. Height and width double: stride * (in - 1) +
+    kernel = 2 * in, and the compiler grids the 2D tile over that expanded OUTPUT
+    extent, not the pre-upsample input.
     """
-    out_h, out_w = 2 * h_in, 2 * w_in
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, c_in, h_in, w_in]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, c_out, out_h, out_w]
-    )
     rng = np.random.default_rng(seed)
-    weights = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c_in, c_out, 2, 2)).astype(np.float32),
-        "weights",
-    )
-    bias = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c_out,)).astype(np.float32), "bias"
-    )
+    initializers = [
+        numpy_helper.from_array(
+            rng.normal(0.0, 0.05, size=(c_in, c_out, 2, 2)).astype(np.float32), "weights"),
+        numpy_helper.from_array(rng.normal(0.0, 0.05, size=(c_out,)).astype(np.float32), "bias"),
+    ]
     model = _model(
         "convtranspose2d",
-        [
-            helper.make_node(
-                "ConvTranspose",
-                ["input", "weights", "bias"],
-                ["output"],
-                kernel_shape=[2, 2],
-                strides=[2, 2],
-                pads=[0, 0, 0, 0],
-                group=1,
-            )
-        ],
-        [model_input],
-        [model_output],
-        [weights, bias],
+        [helper.make_node("ConvTranspose", ["input", "weights", "bias"], ["output"],
+                          kernel_shape=[2, 2], strides=[2, 2], pads=[0, 0, 0, 0], group=1)],
+        [_vi("input", [1, c_in, h_in, w_in])], [_vi("output", [1, c_out, 2 * h_in, 2 * w_in])],
+        initializers,
     )
-    inputs = {
-        "input": rng.uniform(-1.0, 1.0, size=(1, c_in, h_in, w_in)).astype(
-            np.float32
-        )
-    }
-    return model, inputs
+    return model, {"input": rng.uniform(-1.0, 1.0, size=(1, c_in, h_in, w_in)).astype(np.float32)}
 
 
 def _convtranspose_2d_tiled_case() -> ContractCase:
@@ -679,109 +296,18 @@ def _qdq_convtranspose_2d_tiled_case() -> ContractCase:
     ConvTranspose kernel under the 2D tile context and must match ORT's int8 QDQ
     reference to one LSB.
     """
-    c_in = c_out = 48
-    h_in = w_in = 16
-    out_h, out_w = 2 * h_in, 2 * w_in
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, c_in, h_in, w_in]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, c_out, out_h, out_w]
-    )
+    c, side = 48, 16
     rng = np.random.default_rng(7)
-    input_scale = numpy_helper.from_array(
-        np.array([0.02], dtype=np.float32), "input_scale"
-    )
-    input_zero_point = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "input_zero_point"
-    )
-    output_scale = numpy_helper.from_array(
-        np.array([0.05], dtype=np.float32), "output_scale"
-    )
-    output_zero_point = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "output_zero_point"
-    )
-    weight = numpy_helper.from_array(
-        rng.normal(0.0, 0.05, size=(c_in, c_out, 2, 2)).astype(np.float32),
-        "weight",
-    )
-    weight_scale = numpy_helper.from_array(
-        np.array([0.01], dtype=np.float32), "weight_scale"
-    )
-    weight_zero_point = numpy_helper.from_array(
-        np.array([0], dtype=np.int8), "weight_zero_point"
-    )
-    initializers = [
-        input_scale,
-        input_zero_point,
-        output_scale,
-        output_zero_point,
-        weight,
-        weight_scale,
-        weight_zero_point,
-    ]
-    nodes = [
-        helper.make_node(
-            "QuantizeLinear",
-            ["input", "input_scale", "input_zero_point"],
-            ["input_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["input_q", "input_scale", "input_zero_point"],
-            ["input_dq"],
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["weight", "weight_scale", "weight_zero_point"],
-            ["weight_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["weight_q", "weight_scale", "weight_zero_point"],
-            ["weight_dq"],
-        ),
-        helper.make_node(
-            "ConvTranspose",
-            ["input_dq", "weight_dq"],
-            ["raw"],
-            kernel_shape=[2, 2],
-            strides=[2, 2],
-            pads=[0, 0, 0, 0],
-            group=1,
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["raw", "output_scale", "output_zero_point"],
-            ["output_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["output_q", "output_scale", "output_zero_point"],
-            ["output"],
-        ),
-    ]
-    compile_model = _model(
-        "qdq_convtranspose_2d",
-        nodes,
-        [model_input],
-        [model_output],
-        initializers,
-    )
-    reference_model = copy.deepcopy(compile_model)
-    onnx.checker.check_model(reference_model)
-    input_data = rng.uniform(-1.0, 1.0, size=(1, c_in, h_in, w_in)).astype(
-        np.float32
+    weight = rng.normal(0.0, 0.05, size=(c, c, 2, 2)).astype(np.float32)
+    model = _qdq_operator_model(
+        "qdq_convtranspose_2d", "ConvTranspose", [1, c, side, side], [1, c, 2 * side, 2 * side],
+        ([0.02], [0]), ([0.05], [0]), weight, ([0.01], [0]),
+        kernel_shape=[2, 2], strides=[2, 2], pads=[0, 0, 0, 0], group=1,
     )
     return ContractCase(
-        "int8_convtranspose_2d",
-        compile_model,
-        reference_model,
-        {"input": input_data},
-        ("ConvTranspose",),
-        mem_budget="4K",
-        expect_tiled=True,
-        expect_2d=True,
+        "int8_convtranspose_2d", model, model,
+        {"input": rng.uniform(-1.0, 1.0, size=(1, c, side, side)).astype(np.float32)},
+        ("ConvTranspose",), mem_budget="4K", expect_tiled=True, expect_2d=True,
     )
 
 

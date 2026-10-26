@@ -6,10 +6,9 @@ import copy
 from pathlib import Path
 
 import numpy as np
-import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from .common import ContractCase, _model, _qdq, _scalars
+from .common import ContractCase, _model, _qdq, _qdq_operator_model, _scalars
 
 
 def _linear_spatial_max_case(*, quantized: bool) -> ContractCase:
@@ -219,12 +218,10 @@ def _reduce_mean_case(*, quantized: bool, keepdims: bool) -> ContractCase:
             "output", TensorProto.FLOAT, out_shape)],
         initializers,
     )
-    reference_model = copy.deepcopy(model)
-    onnx.checker.check_model(reference_model)
     return ContractCase(
         label,
         model,
-        reference_model,
+        model,
         {"input": data},
         ("ReduceMean",),
     )
@@ -401,61 +398,12 @@ def _tiled_global_reduction_case() -> ContractCase:
 
 def _qdq_tiled_global_reduction_case() -> ContractCase:
     """The int8 sibling: the banded sum must requantize exactly once."""
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 8, 64, 64]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 8, 1, 1]
-    )
-    initializers = [
-        numpy_helper.from_array(np.array(0.25, dtype=np.float32), "input_scale"),
-        numpy_helper.from_array(np.array(-3, dtype=np.int8), "input_zero_point"),
-        numpy_helper.from_array(np.array(0.125, dtype=np.float32), "output_scale"),
-        numpy_helper.from_array(np.array(7, dtype=np.int8), "output_zero_point"),
-    ]
-    nodes = [
-        helper.make_node(
-            "QuantizeLinear",
-            ["input", "input_scale", "input_zero_point"],
-            ["input_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["input_q", "input_scale", "input_zero_point"],
-            ["input_dq"],
-        ),
-        helper.make_node(
-            "GlobalAveragePool", ["input_dq"], ["raw"], name="gap"
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["raw", "output_scale", "output_zero_point"],
-            ["output_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["output_q", "output_scale", "output_zero_point"],
-            ["output"],
-        ),
-    ]
-    compile_model = _model(
-        "qdq_tiled_global_reduction",
-        nodes,
-        [model_input],
-        [model_output],
-        initializers,
-    )
-    reference_model = copy.deepcopy(compile_model)
-    onnx.checker.check_model(reference_model)
+    model = _qdq_operator_model("qdq_tiled_global_reduction", "GlobalAveragePool",
+                                [1, 8, 64, 64], [1, 8, 1, 1], (0.25, -3), (0.125, 7), name="gap")
     values = np.arange(1 * 8 * 64 * 64, dtype=np.float32).reshape(1, 8, 64, 64)
     return ContractCase(
-        "int8_tiled_global_reduction",
-        compile_model,
-        reference_model,
-        {"input": (values % 61) * 0.25 - 7.5},
-        ("GlobalAveragePool",),
-        mem_budget="8K",
-        expect_tiled=True,
+        "int8_tiled_global_reduction", model, model, {"input": (values % 61) * 0.25 - 7.5},
+        ("GlobalAveragePool",), mem_budget="8K", expect_tiled=True,
     )
 
 

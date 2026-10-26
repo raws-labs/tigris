@@ -10,7 +10,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from .common import ContractCase, _model, _qdq, _scalars
+from .common import ContractCase, _model, _qdq, _scalars, _vi
 
 
 def _fixed_axis_transpose_case() -> ContractCase:
@@ -917,64 +917,24 @@ def _inference_identity_case() -> ContractCase:
 
 def _resize_concat_case() -> ContractCase:
     """Resize scale extraction and NCHW-to-NHWC Concat-axis mapping."""
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 1, 2, 2]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 2, 4, 4]
-    )
     initializers = [
-        numpy_helper.from_array(
-            np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32),
-            "left_scales",
-        ),
-        numpy_helper.from_array(
-            np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32),
-            "right_scales",
-        ),
-        numpy_helper.from_array(
-            np.array(1.5, dtype=np.float32), "multiplier"
-        ),
+        numpy_helper.from_array(np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), "left_scales"),
+        numpy_helper.from_array(np.array([1.0, 1.0, 2.0, 2.0], dtype=np.float32), "right_scales"),
+        numpy_helper.from_array(np.array(1.5, dtype=np.float32), "multiplier"),
     ]
-    resize_attrs = {
-        "coordinate_transformation_mode": "asymmetric",
-        "mode": "nearest",
-        "nearest_mode": "floor",
-    }
+    nearest = dict(coordinate_transformation_mode="asymmetric", mode="nearest", nearest_mode="floor")
     model = _model(
         "resize_concat",
         [
-            helper.make_node(
-                "Resize",
-                ["input", "", "left_scales"],
-                ["left"],
-                **resize_attrs,
-            ),
-            helper.make_node(
-                "Mul", ["input", "multiplier"], ["scaled"]
-            ),
-            helper.make_node(
-                "Resize",
-                ["scaled", "", "right_scales"],
-                ["right"],
-                **resize_attrs,
-            ),
-            helper.make_node(
-                "Concat", ["left", "right"], ["output"], axis=1
-            ),
+            helper.make_node("Resize", ["input", "", "left_scales"], ["left"], **nearest),
+            helper.make_node("Mul", ["input", "multiplier"], ["scaled"]),
+            helper.make_node("Resize", ["scaled", "", "right_scales"], ["right"], **nearest),
+            helper.make_node("Concat", ["left", "right"], ["output"], axis=1),
         ],
-        [model_input],
-        [model_output],
-        initializers,
+        [_vi("input", [1, 1, 2, 2])], [_vi("output", [1, 2, 4, 4])], initializers,
     )
     return ContractCase(
-        "float_resize_concat",
-        model,
-        model,
-        {
-            "input": np.array(
-                [[[[1.0, -2.0], [3.0, 0.5]]]], dtype=np.float32
-            )
-        },
+        "float_resize_concat", model, model,
+        {"input": np.array([[[[1.0, -2.0], [3.0, 0.5]]]], dtype=np.float32)},
         ("Resize", "Mul", "Resize", "Concat"),
     )

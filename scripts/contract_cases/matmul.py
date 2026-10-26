@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from onnx import TensorProto, helper, numpy_helper
 
-from .common import ContractCase, _model
+from .common import ContractCase, _model, _vi
 
 
 def _float_gemm_bias_add_case() -> ContractCase:
@@ -203,36 +203,18 @@ def _gemm_no_transpose_case() -> ContractCase:
     The weight is then [K, N] like MatMul's, so it needs the same transpose
     before it means what the kernels compute.
     """
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 4]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 3]
-    )
     initializers = [
-        numpy_helper.from_array(
-            np.array(
-                [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0],
-                 [10.0, 11.0, 12.0]],
-                dtype=np.float32,
-            ),
-            "weight",
-        ),
-        numpy_helper.from_array(
-            np.array([0.5, -1.5, 2.0], dtype=np.float32), "bias"
-        ),
+        numpy_helper.from_array(np.array(
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+            dtype=np.float32), "weight"),
+        numpy_helper.from_array(np.array([0.5, -1.5, 2.0], dtype=np.float32), "bias"),
     ]
     model = _model(
-        "gemm_no_transpose",
-        [helper.make_node("Gemm", ["input", "weight", "bias"], ["output"])],
-        [model_input],
-        [model_output],
-        initializers,
+        "gemm_no_transpose", [helper.make_node("Gemm", ["input", "weight", "bias"], ["output"])],
+        [_vi("input", [1, 4])], [_vi("output", [1, 3])], initializers,
     )
     return ContractCase(
-        "float_gemm_no_transpose",
-        model,
-        model,
+        "float_gemm_no_transpose", model, model,
         {"input": np.array([[0.5, -1.0, 2.0, -0.25]], dtype=np.float32)},
         ("Gemm",),
     )
