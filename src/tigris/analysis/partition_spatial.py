@@ -2175,6 +2175,46 @@ def _external_outputs_keep_their_rows(
     return True
 
 
+def _maps_rows_one_to_one(op: OpNode, weight_shapes) -> bool:
+    """A convolution or pool whose output row r reads input row r only."""
+    pads = op.attrs.get("pads") or []
+    return (_get_kernel_h(op, weight_shapes) == 1 and _get_stride_h(op) == 1
+            and (int(pads[0]) if len(pads) >= 1 else 0) == 0
+            and (int(pads[2]) if len(pads) >= 3 else 0) == 0)
+
+
+def _ops_read_the_running_band(ag: AnalyzedGraph, stage: Stage) -> bool:
+    """Whether every op of a chained stage reads the band the chain executor holds.
+
+    The chain executor runs a stage as one height band. The band starts at the
+    stage input rows, and each convolution or pool that does not map rows one
+    to one moves it to that op's output rows. Every op reads the current band.
+    An op that reads a tensor from an earlier point of the band, such as a
+    branch off the input of a strided convolution, would be handed rows of the
+    wrong height and position. A two-operand binary op is the exception: the
+    executor offsets a carried operand to the band's rows.
+    """
+    weight_shapes = _ag_weight_shapes(ag)
+    level = dict.fromkeys(stage.input_tensors, 0)
+    current = 0
+    for op_i in stage.op_indices:
+        op = ag.ops[op_i]
+        dynamic = [name for name in op.inputs
+                   if name in ag.tensors and not ag.tensors[name].is_constant]
+        on_band = [name for name in dynamic if level.get(name) == current]
+        if op.op_type in _BINARY_OPS and len(dynamic) == 2:
+            if not on_band:
+                return False
+        elif len(on_band) != len(dynamic):
+            return False
+        if (op_category(op) in (TileCategory.CONV, TileCategory.POOL)
+                and not _maps_rows_one_to_one(op, weight_shapes)):
+            current += 1
+        for name in op.outputs:
+            level[name] = current
+    return True
+
+
 def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
     """Check if a stage may be part of a streamable CHAIN (used only by
     detect_chains): all ops implement the schema-v4 height-stripe contract and
@@ -2203,6 +2243,8 @@ def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
             return False
         if info.layout is not Layout.SPATIAL:
             return False
+    if not _ops_read_the_running_band(ag, stage):
+        return False
     return _external_outputs_keep_their_rows(
         stage, [ag.ops[i] for i in stage.op_indices]
     )
