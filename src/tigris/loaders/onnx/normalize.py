@@ -1,37 +1,4 @@
-"""ONNX-specific normalizations for deployment.
-
-Passes applied in sequence (matches ``normalize()`` call order):
-
- 1. **QDQ fold**: For quantized (QDQ) models, fold QuantizeLinear /
-    DequantizeLinear ops -- extract scale/zero-point, store as
-    ``QuantParam`` on tensors, keep int8 weight data, remove Q/DQ ops.
- 2. **BN fold**: For each Conv->BatchNormalization pattern, fold the BN
-    parameters (gamma, beta, mean, var, epsilon) into the convolution
-    weights and bias, then remove the BN op and rewire outputs.
- 3. **SiLU decomposition**: Replace ``Silu`` ops with ``Sigmoid`` + ``Mul``
-    sequence for runtime execution.
- 4. **DepthwiseConv relabeling**: Convolutions where ``group == C_in``
-    (i.e., depthwise) are relabeled from ``Conv`` to ``DepthwiseConv``
-    so the runtime can dispatch a specialised kernel.
- 5. **Conv1D relabeling**: Conv ops with ``len(kernel_shape) == 1`` are
-    relabeled from ``Conv`` to ``Conv1D`` for dedicated 1D kernel dispatch.
- 6. **Clip(0, 6) -> Relu6**: Replace ``Clip`` ops whose min/max are 0/6
-    with the simpler ``Relu6`` op type.
- 7. **ReduceMean -> GlobalAveragePool**: Replace ``ReduceMean(axes=[2,3])``
-    with ``GlobalAveragePool`` (PyTorch >= 2.x uses ReduceMean for GAP).
- 8. **Shape op folding**: Remove chains of shape-computation ops
-    (Constant, Shape, Gather, Unsqueeze, Concat) that feed Reshape's
-    shape input. All shapes are static at compile time.
- 9. **Resize scale extraction**: Extract integer scale factors from
-    ``Resize`` ops' constant inputs and store in ``strides`` attr.
-10. **Concat axis normalization**: Translate Concat axis from NCHW to NHWC
-    and store in ``kernel_shape`` attr for spatial packing.
-11. **Transpose validation**: Validate explicit/default permutations before
-    emission; the binary plan records them as per-operator attributes.
-12. **Activation absorption**: Fuse Relu/Relu6 into preceding
-    Conv/DepthwiseConv/Gemm/Conv1D ops as ``fused_activation`` attr.
-    Runs last so all relabeling and rewiring is already done.
-"""
+"""ONNX-specific normalizations; the pass order is the body of ``normalize()``."""
 
 import math
 from collections import Counter
@@ -69,6 +36,7 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _adopt_detection(ag)
     ag = _adopt_quantize(ag)
     ag = _normalize_arg_outputs(ag)
+    # Names tigris::Gather and tigris::GatherND: _normalize_movement strips the prefix.
     ag = _narrow_index_casts(ag)
     ag = _drop_inference_identities(ag)
     ag = _lower_legacy_softmax(ag)
@@ -108,6 +76,7 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _validate_transposes(ag)
     ag = _order_broadcast_operands(ag)
     ag = _absorb_activations(ag)
+    # Reaches MatMul and the transB=0 Gemms that _relabel_matmul_to_gemm skipped.
     ag = _fold_split_into_its_weight(ag)
     ag = _assign_tensor_layouts(ag)
     ag = _align_state_layouts(ag)
@@ -118,6 +87,8 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _lower_linear_matmul(ag, transposed)
     ag = _drop_unreferenced_weights(ag)
     ag = _restore_output_names(ag, declared_outputs)
+    for step, op in enumerate(ag.ops):
+        op.step = step
     return ag
 
 
@@ -301,8 +272,6 @@ def _lower_legacy_softmax(ag: AnalyzedGraph) -> AnalyzedGraph:
             name=f"{op.name}_shape", op_type="Reshape",
             inputs=[flat_out], outputs=[op.outputs[0]]))
     ag.ops = rewritten
-    for step, op in enumerate(ag.ops):
-        op.step = step
     return ag
 
 
@@ -383,7 +352,6 @@ _METADATA_INPUTS: dict[str, int] = {
     "CumSum": 1,
     "ReduceAll": 1,
     "Reshape": 1,
-    "Resize": 1,
     "Squeeze": 1,
     "Unsqueeze": 1,
 }
@@ -447,7 +415,6 @@ def _strip_metadata_inputs(ag: AnalyzedGraph) -> AnalyzedGraph:
         else:
             del op.inputs[first:]
     return ag
-
 
 
 # Operators whose activation operands are spatial pictures: the runtime holds
@@ -828,14 +795,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
         if info is not None:
             info.layout = Layout.LINEAR
 
-    for step, op in enumerate(ag.ops):
-        op.step = step
     return ag
-
-
-
-# Shape-only operators a split can be pushed back through.
-_SPLIT_TRANSPARENT = frozenset({"Reshape", "Transpose"})
 
 
 def _split_axis_before_reshape(
@@ -935,8 +895,6 @@ def _fold_one_split(ag: AnalyzedGraph) -> bool:
                     return True
                 break
             else:
-                break
-            if op.op_type not in _SPLIT_TRANSPARENT:
                 break
             chain.append((index, stacked, int(current.shape[stacked])))
             name = op.inputs[0]
@@ -1067,8 +1025,6 @@ def _fold_split_onto(
         else:
             ops.append(op)
     ag.ops = ops
-    for step, op in enumerate(ag.ops):
-        op.step = step
     return True
 
 
@@ -1167,8 +1123,6 @@ def _lower_linear_matmul(ag: AnalyzedGraph, transposed: dict[str, str]) -> Analy
             inputs=[flat_out], outputs=[op.outputs[0]]))
 
     ag.ops = rewritten
-    for step, op in enumerate(ag.ops):
-        op.step = step
     return ag
 
 
@@ -1353,8 +1307,6 @@ def _fold_static_subgraphs(ag: AnalyzedGraph) -> AnalyzedGraph:
             info.is_constant = True
 
     ag.ops = [op for index, op in enumerate(ag.ops) if index not in removed]
-    for step, op in enumerate(ag.ops):
-        op.step = step
     return ag
 
 
@@ -1478,6 +1430,9 @@ def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
     for name in removed:
         ag.tensors.pop(name, None)
     return ag
+
+
+# Quantization
 
 
 def _transpose_quantized_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -1648,8 +1603,6 @@ def _quantize_inputs_first(ag: AnalyzedGraph) -> AnalyzedGraph:
     for op in ag.ops:
         ops.extend(inserted.get(id(op), []))
         ops.append(op)
-    for step, op in enumerate(ops):
-        op.step = step
     ag.ops = ops
     return ag
 
@@ -1710,14 +1663,16 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
                 float_required.add(parent)
                 pending.append(parent)
 
+    def from_activation_dequantize(op):
+        return any(n in output_to_op and
+                   ag.ops[output_to_op[n]].op_type == "DequantizeLinear"
+                   and ag.ops[output_to_op[n]].inputs[0] not in ag.weight_data
+                   for n in op.inputs)
+
     def float_constant_boundary(op):
         constants = [n for n in op.inputs if n in ag.weight_data
                      and ag.weight_data[n].dtype == np.float32]
-        if (op.op_type not in binary or not constants
-                or not any(n in output_to_op and
-                           ag.ops[output_to_op[n]].op_type == "DequantizeLinear"
-                           and ag.ops[output_to_op[n]].inputs[0] not in ag.weight_data
-                           for n in op.inputs)):
+        if op.op_type not in binary or not constants or not from_activation_dequantize(op):
             return False
         if any(output_to_op.get(n) in float_required for n in op.outputs):
             return True
@@ -1751,10 +1706,7 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
         if op.op_type in qdq_types:
             continue
         unencoded_constant = float_constant_boundary(op)
-        from_dequantize = any(n in output_to_op and
-                             ag.ops[output_to_op[n]].op_type == "DequantizeLinear" and
-                             ag.ops[output_to_op[n]].inputs[0] not in ag.weight_data
-                             for n in op.inputs)
+        from_dequantize = from_activation_dequantize(op)
         from_section = any(output_to_op.get(n) in float_ops and n in ag.tensors
                            and ag.tensors[n].dtype == 1 for n in op.inputs)
         float_output = any(n in ag.tensors and ag.tensors[n].dtype == 1 for n in op.outputs)
@@ -1802,7 +1754,6 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
                 ag.model_outputs = [source if n == target else n for n in ag.model_outputs]
             if target != source:
                 ag.tensors.pop(target, None)
-        deferred_cleanup.update(n for n in dql.inputs[1:] if n)
 
     # A scale or zero point may be shared by a weight pair and an activation
     # pair. Deleting it as soon as the weight pair is folded leaves the
@@ -1928,7 +1879,6 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
         # its place and becomes the int8 tensor the kernels read; the dtype
         # the model declares stays recorded, so the plan converts at the
         # boundary instead of carrying a float copy of the input.
-        is_boundary_dql = False
         if (
             not is_weight_dql
             and dql_input in ag.model_inputs
@@ -1942,16 +1892,10 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
         ):
             qp, _ = _get_quant_param(op)
             if qp is not None:
-                is_boundary_dql = True
                 ag.is_quantized = True
                 ag.tensors[dql_input].quant = qp
                 ag.tensors[dql_input].dtype = 3  # INT8
                 bypass_dql(i, dql_input)
-
-        if is_weight_dql or is_boundary_dql:
-            for inp_name in op.inputs[1:]:
-                if inp_name:
-                    deferred_cleanup.add(inp_name)
 
     # Pass 2: Process activation Q/DQ pairs.
     # Pattern: activation -> QuantizeLinear -> int8 -> DequantizeLinear -> consumer
@@ -2036,8 +1980,6 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
         replacements = dict(requantized)
         ag.ops = [replacements.get(idx, op) for idx, op in enumerate(ag.ops)
                   if idx not in removed or idx in replacements]
-        for step, op in enumerate(ag.ops):
-            op.step = step
         ag.is_quantized = True
 
     return ag
@@ -2048,7 +1990,7 @@ def _same_quant(a: QuantParam, b: QuantParam) -> bool:
             and np.array_equal(np.asarray(a.zero_point), np.asarray(b.zero_point)))
 
 
-# Batch normalization
+# Broadcast operand order
 
 
 def _order_broadcast_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -2071,6 +2013,9 @@ def _order_broadcast_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
         if tuple(first.shape) != result and tuple(second.shape) == result:
             op.inputs = [op.inputs[1], op.inputs[0]]
     return ag
+
+
+# Batch normalization
 
 
 def _fold_bn_into_quantized_conv(ag: AnalyzedGraph, conv_op: OpNode, gamma, beta,
@@ -2184,8 +2129,6 @@ def _standalone_bn_as_affine(ag: AnalyzedGraph) -> AnalyzedGraph:
         rewritten.append(OpNode(name=op.name, op_type="Add", inputs=[scaled, names[1]],
                                 outputs=list(op.outputs[:1])))
     ag.ops = rewritten
-    for step, op in enumerate(ag.ops):
-        op.step = step
     return ag
 
 
@@ -2333,9 +2276,6 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     if removed:
         ag.ops = [op for i, op in enumerate(ag.ops) if i not in removed]
-        # Re-assign step indices
-        for step, op in enumerate(ag.ops):
-            op.step = step
         _forget_unread(ag, folded_parameters)
 
     return ag
@@ -2363,7 +2303,6 @@ def _takes_a_bias(ag: AnalyzedGraph, producer: OpNode) -> bool:
         return False
     weight = ag.weight_data.get(producer.inputs[1])
     return weight is not None and weight.ndim == 2
-
 
 
 def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -2734,13 +2673,6 @@ def _axis_broadcast_size(
     return extent_on_axis
 
 
-def _channel_broadcast_size(
-    constant_shape: tuple[int, ...], reference_shape: tuple[int, ...]
-) -> int | None:
-    """The channel count a constant addresses on an NCHW or NCL activation."""
-    return _axis_broadcast_size(constant_shape, reference_shape, 1)
-
-
 def _bias_broadcast_size(
     producer_type: str,
     constant_shape: tuple[int, ...],
@@ -2843,8 +2775,6 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     if removed:
         ag.ops = [op for idx, op in enumerate(ag.ops) if idx not in removed]
-        for step, op in enumerate(ag.ops):
-            op.step = step
 
     return ag
 
@@ -2990,14 +2920,12 @@ def _decompose_silu(ag: AnalyzedGraph) -> AnalyzedGraph:
     ``Silu`` op is present.
     """
     new_ops: list[OpNode] = []
-    changed = False
 
     for op in ag.ops:
         if op.op_type != "Silu":
             new_ops.append(op)
             continue
 
-        changed = True
         x_name = op.inputs[0]
         y_name = op.outputs[0]
 
@@ -3032,11 +2960,7 @@ def _decompose_silu(ag: AnalyzedGraph) -> AnalyzedGraph:
         new_ops.append(sig_op)
         new_ops.append(mul_op)
 
-    if changed:
-        ag.ops = new_ops
-        for step, op in enumerate(ag.ops):
-            op.step = step
-
+    ag.ops = new_ops
     return ag
 
 
@@ -3124,8 +3048,8 @@ def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
             # Depthwise: IC/G == 1 and OC a multiple of group
             if W.ndim >= 2 and W.shape[1] == 1 and W.shape[0] % group == 0:
                 op.op_type = "DepthwiseConv"
-        elif group > 1:
-            # No weight data but group > 1 - check tensor info
+        else:
+            # No weight data: check tensor info
             if w_name and w_name in ag.tensors:
                 w_info = ag.tensors[w_name]
                 if (
@@ -3199,8 +3123,6 @@ def _split_grouped_convs(ag: AnalyzedGraph) -> AnalyzedGraph:
         rewritten.append(OpNode(name=op.name, op_type="Concat", inputs=parts_out,
                                 outputs=[op.outputs[0]], attrs={"axis": 1}))
     ag.ops = rewritten
-    for step, op in enumerate(ag.ops):
-        op.step = step
     return ag
 
 
@@ -3251,8 +3173,6 @@ def _relabel_conv1d(ag: AnalyzedGraph) -> AnalyzedGraph:
         op.inputs = [wide_in, flat, *op.inputs[2:]]
         op.outputs = [wide_out]
     ag.ops = rewritten
-    for step, op in enumerate(ag.ops):
-        op.step = step
     return ag
 
 
@@ -3701,13 +3621,11 @@ def _adopt_if(ag: AnalyzedGraph) -> AnalyzedGraph:
         condition = ag.tensors[op.inputs[0]]
         if condition.dtype != 9 or int(np.prod(condition.shape)) != 1:
             raise ValueError("If requires a one-element bool condition")
-        operands = [ag.tensors[name] for name in op.inputs[1:]]
-        results = [ag.tensors[name] for name in op.outputs]
+        operands = _forms(ag, op.inputs[1:])
+        results = _forms(ag, op.outputs)
         for branch in branches:
-            entering = [branch.tensors[name] for name in branch.model_inputs]
-            leaving = [branch.tensors[name] for name in branch.model_outputs]
-            if ([(t.shape, t.dtype) for t in entering] != [(t.shape, t.dtype) for t in operands]
-                    or [(t.shape, t.dtype) for t in leaving] != [(t.shape, t.dtype) for t in results]):
+            if (_forms(branch, branch.model_inputs) != operands
+                    or _forms(branch, branch.model_outputs) != results):
                 raise ValueError("If branches must take its operands and give its results")
     return ag
 
@@ -3725,10 +3643,10 @@ def _adopt_while(ag: AnalyzedGraph) -> AnalyzedGraph:
         op.op_type = "While"
         condition = ag.subgraphs[op.attrs["cond_branch"]]
         body = ag.subgraphs[op.attrs["body_branch"]]
-        variables = [(ag.tensors[n].shape, ag.tensors[n].dtype) for n in op.inputs]
+        variables = _forms(ag, op.inputs)
         verdict = [condition.tensors[n] for n in condition.model_outputs]
         if (len(op.outputs) != len(op.inputs)
-                or [(ag.tensors[n].shape, ag.tensors[n].dtype) for n in op.outputs] != variables
+                or _forms(ag, op.outputs) != variables
                 or _forms(condition, condition.model_inputs) != variables
                 or _forms(body, body.model_inputs) != variables
                 or _forms(body, body.model_outputs) != variables):
@@ -3778,15 +3696,25 @@ def _normalize_arg_outputs(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
+def _reduction_axes(ag: AnalyzedGraph, op: OpNode, prefer: str) -> list | None:
+    """The axes an operator reduces: its attribute (opset < 18) and its constant
+    second operand (opset >= 18). ``prefer`` is the one that wins when both are
+    present, ``"attribute"`` or ``"operand"``."""
+    attribute = op.attrs.get("axes")
+    operand = None
+    if len(op.inputs) >= 2 and op.inputs[1] in ag.weight_data:
+        operand = ag.weight_data[op.inputs[1]].reshape(-1).tolist()
+    first, second = (attribute, operand) if prefer == "attribute" else (operand, attribute)
+    return second if first is None else first
+
+
 def _normalize_reduction_axes(ag: AnalyzedGraph) -> AnalyzedGraph:
     for op in ag.ops:
         if op.op_type not in {"ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ReduceAll"}:
             continue
         source = ag.tensors.get(op.inputs[0]) if op.inputs else None
         rank = len(source.shape) if source is not None else 0
-        axes = op.attrs.get("axes")
-        if len(op.inputs) >= 2 and op.inputs[1] in ag.weight_data:
-            axes = ag.weight_data[op.inputs[1]].reshape(-1).tolist()
+        axes = _reduction_axes(ag, op, prefer="operand")
         if axes is None or not axes or rank == 0 or any(int(a) < -rank or int(a) >= rank for a in axes):
             raise ValueError(f"{op.op_type} requires explicit constant axes within the input rank")
         op.attrs["axes"] = sorted({int(a) % rank for a in axes})
@@ -3820,15 +3748,7 @@ def _reduce_mean_to_gap(ag: AnalyzedGraph) -> AnalyzedGraph:
         if op.op_type not in reductions:
             continue
 
-        # Try axes from attribute first (opset < 18)
-        axes = op.attrs.get("axes")
-
-        # Try axes from second input (opset >= 18)
-        if axes is None and len(op.inputs) >= 2:
-            axes_name = op.inputs[1]
-            if axes_name in ag.weight_data:
-                axes = ag.weight_data[axes_name].flatten().tolist()
-
+        axes = _reduction_axes(ag, op, prefer="attribute")
         if axes is None:
             continue
 
@@ -3983,8 +3903,6 @@ def _fold_shape_ops(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     if removed:
         ag.ops = [op for i, op in enumerate(ag.ops) if i not in removed]
-        for step, op in enumerate(ag.ops):
-            op.step = step
 
     # Fix Reshape output shapes that ONNX shape inference couldn't resolve
     _fix_reshape_shapes(ag)
@@ -3992,7 +3910,7 @@ def _fold_shape_ops(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-# NOTE: Mutates ag in place (unlike other passes which return ag).
+# Edits ag in place and returns None; the passes return ag.
 def _fix_reshape_shapes(ag: AnalyzedGraph) -> None:
     """Compute correct output shapes for Reshape ops with unknown outputs.
 
@@ -4298,7 +4216,5 @@ def _absorb_activations(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     if removed:
         ag.ops = [op for idx, op in enumerate(ag.ops) if idx not in removed]
-        for step, op in enumerate(ag.ops):
-            op.step = step
 
     return ag

@@ -9,7 +9,7 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
-from tigris.loaders.onnx.normalize import _decompose_silu
+from tigris.loaders.onnx.normalize import _decompose_silu, normalize
 
 from conftest import save_onnx
 
@@ -51,7 +51,8 @@ def test_silu_decomposes_to_supported_sigmoid_mul():
     assert normalized.ops[1].inputs == ["input", "input_sigmoid"]
     assert normalized.ops[1].outputs == ["output"]
     assert normalized.tensors["input_sigmoid"].shape == (1, 4)
-    assert [op.step for op in normalized.ops] == [0, 1]
+
+    assert [op.step for op in normalize(graph).ops] == [0, 1]
 
 
 # Conv -> Relu fusion

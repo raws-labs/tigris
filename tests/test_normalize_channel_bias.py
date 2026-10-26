@@ -5,8 +5,8 @@ from onnx import helper, numpy_helper
 
 from tigris.loaders.onnx.loader import load_model
 from tigris.loaders.onnx.normalize import (
+    _axis_broadcast_size,
     _bias_broadcast_size,
-    _channel_broadcast_size,
     normalize,
 )
 
@@ -93,15 +93,15 @@ def test_add_feeding_a_second_consumer_is_left_alone(tmp_path):
     assert "Add" in [op.op_type for op in ag.ops]
 
 
-def test_channel_broadcast_size_reads_the_aligned_axis():
+def test_axis_broadcast_size_reads_the_aligned_axis():
     ref = (1, 8, 4, 8)
     # Right-aligned forms that address the channel axis.
-    assert _channel_broadcast_size((1, 8, 1, 1), ref) == 8
-    assert _channel_broadcast_size((8, 1, 1), ref) == 8
+    assert _axis_broadcast_size((1, 8, 1, 1), ref, 1) == 8
+    assert _axis_broadcast_size((8, 1, 1), ref, 1) == 8
     # Width has the same extent as C here: size alone would confuse the two.
-    assert _channel_broadcast_size((1, 1, 1, 8), ref) is None
-    assert _channel_broadcast_size((8,), ref) is None
-    assert _channel_broadcast_size((4, 1), ref) is None
+    assert _axis_broadcast_size((1, 1, 1, 8), ref, 1) is None
+    assert _axis_broadcast_size((8,), ref, 1) is None
+    assert _axis_broadcast_size((4, 1), ref, 1) is None
 
 
 def test_which_axis_a_bias_addresses_follows_its_producer():
