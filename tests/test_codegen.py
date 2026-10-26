@@ -1,6 +1,7 @@
 """Tests for C harness generation and XIP plan metadata."""
 
 import struct
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -21,12 +22,15 @@ from tigris.emitters.binary.defs import (
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.emitters.codegen import (
+    _build_limits_needed,
     _executor_workspace_limits,
     generate_c,
     generate_core_header,
 )
 
 from conftest import full_pipeline
+
+TFLITE_OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
 
 
 @pytest.fixture
@@ -328,7 +332,23 @@ def test_codegen_workspace_limits_include_only_executable_chain_capacity():
         ],
     }
 
-    assert _executor_workspace_limits(plan) == (9, 2, 3, 2, 2)
+    assert _executor_workspace_limits(plan) == (9, 2, 3, 2, 2, 0)
+
+    # The chain's spatial operators are summed over its stages, while the
+    # build limit stays the most in one stage.
+    plan["ops"][2]["op_type"] = 1
+    assert _executor_workspace_limits(plan) == (9, 2, 3, 2, 3, 0)
+    assert _build_limits_needed(plan) == (9, 2, 3, 2, 2)
+
+
+@pytest.mark.parametrize("name,depth", [("float_if", 1), ("float_if_if", 2),
+                                        ("float_while_if_through", 2), ("conv_bias", 0)])
+def test_codegen_workspace_states_the_nesting_depth(name, depth, tmp_path):
+    plan_path = tmp_path / "model.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(TFLITE_OPS / f"{name}.tflite"),
+                                      "-m", "256K", "-o", str(plan_path)])
+    assert result.exit_code == 0, result.output
+    assert _executor_workspace_limits(read_binary_plan(plan_path.read_bytes()))[5] == depth
 
 
 def test_compressed_core_header_uses_plan_alignment_for_arena_requirement(

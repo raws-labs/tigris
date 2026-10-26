@@ -237,7 +237,7 @@ def _plan_requirements(plan: dict) -> dict:
         RUNTIME_MAX_CHAIN_STAGES, RUNTIME_MAX_STAGE_INPUTS, RUNTIME_MAX_STAGE_OUTPUTS,
         RUNTIME_MAX_TENSORS)
     from tigris.analysis.plan_graph import fast_activation_bytes
-    from tigris.emitters.codegen import _executor_workspace_limits
+    from tigris.emitters.codegen import _build_limits_needed
 
     def aligned(size):
         return -(-size // _MAX_TENSOR_ALIGN) * _MAX_TENSOR_ALIGN
@@ -253,7 +253,7 @@ def _plan_requirements(plan: dict) -> dict:
             if index <= block["stage_idx"] < index + stage["chain_len"]:
                 firsts.setdefault(block["stage_idx"], block)
         decompression = max(decompression, sum(aligned(b["uncompressed_size"]) for b in firsts.values()))
-    tensors, inputs, outputs, chain, spatial = _executor_workspace_limits(
+    tensors, inputs, outputs, chain, spatial = _build_limits_needed(
         {**plan, "num_tensors": len(plan["tensors"])})
     defaults = {"TIGRIS_MAX_TENSORS": RUNTIME_MAX_TENSORS,
                 "TIGRIS_MAX_STAGE_INPUTS": RUNTIME_MAX_STAGE_INPUTS,

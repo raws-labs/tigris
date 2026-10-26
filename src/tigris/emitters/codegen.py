@@ -8,6 +8,7 @@ Backend selection implies the target platform:
 
 from __future__ import annotations
 
+import functools
 import re
 
 from tigris.capabilities import (
@@ -20,7 +21,8 @@ from tigris.capabilities import (
 )
 from tigris.dtypes import check_dtype_signatures
 from tigris.emitters.binary.defs import (
-    FLAG_XIP, OP_C_NAMES, OP_TYPE_MAP, TENSOR_FLAG_CONSTANT, TENSOR_FLAG_STATE,
+    FLAG_XIP, OP_ATTR_SUBGRAPHS, OP_C_NAMES, OP_TYPE_MAP, TENSOR_FLAG_CONSTANT,
+    TENSOR_FLAG_STATE,
 )
 from tigris.analysis.plan_graph import fast_activation_bytes, slow_arena_required
 from tigris.emitters.binary.reader import read_binary_plan
@@ -91,46 +93,75 @@ def _cmsis_weight_decompression_overhead(plan: dict) -> int:
 _HEIGHT_SPATIAL_OPS = frozenset({"Conv", "DepthwiseConv", "MaxPool", "AveragePool", "L2Pool"})
 
 
-def _executor_workspace_limits(plan: dict) -> tuple[int, int, int, int, int]:
-    """Return runtime workspace dimensions derived from the serialized plan."""
+def _chains(plan: dict) -> list[list[dict]]:
+    """The stages of each chain, from its head."""
     stages = plan.get("stages", [])
-    ops = plan.get("ops", [])
-    max_inputs = max((len(stage["inputs"]) for stage in stages), default=0)
-    max_outputs = max((len(stage["outputs"]) for stage in stages), default=0)
-    max_chain = 0
-    max_spatial = 0
-
+    chains = []
     for stage_idx, stage in enumerate(stages):
         chain_len = stage["chain_len"]
         if chain_len < 2 or stage["chain_id"] != stage_idx:
             continue
         if stage_idx + chain_len > len(stages):
             raise ValueError("Plan contains a chain beyond the stage table")
-        max_chain = max(max_chain, chain_len)
-        for member in stages[stage_idx : stage_idx + chain_len]:
-            spatial = sum(
-                OP_TYPE_BY_CODE.get(ops[op_idx]["op_type"]) in _HEIGHT_SPATIAL_OPS
-                for op_idx in member["ops"]
-            )
-            max_spatial = max(max_spatial, spatial)
+        chains.append(stages[stage_idx : stage_idx + chain_len])
+    return chains
 
+
+def _spatial_ops(plan: dict, stage: dict) -> int:
+    ops = plan.get("ops", [])
+    return sum(OP_TYPE_BY_CODE.get(ops[op_idx]["op_type"]) in _HEIGHT_SPATIAL_OPS
+               for op_idx in stage["ops"])
+
+
+def _subgraph_depth(plan: dict) -> int:
+    """How many control-flow operators run one inside another at most."""
+    graphs = plan.get("subgraphs", [])
+    if not graphs:
+        return 0
+    runs = {attr["op_index"]: attr["data"] for attr in plan.get("op_attributes", [])
+            if attr["type"] == OP_ATTR_SUBGRAPHS}
+    stages = plan["stages"]
+
+    @functools.cache
+    def height(graph: int) -> int:
+        first, count = graphs[graph]["first_stage"], graphs[graph]["num_stages"]
+        children = [int.from_bytes(runs[op][slot:slot + 2], "little")
+                    for stage in stages[first:first + count] for op in stage["ops"]
+                    if op in runs for slot in (0, 2)]
+        return max((height(child) + 1 for child in children), default=0)
+
+    return height(0)
+
+
+def _build_limits_needed(plan: dict) -> tuple[int, int, int, int, int]:
+    """The build limits the plan asks for, in tigris_config.h's order."""
+    stages = plan.get("stages", [])
+    chains = _chains(plan)
     return (
         plan["num_tensors"],
-        max_inputs,
-        max_outputs,
-        max_chain,
-        max_spatial,
+        max((len(stage["inputs"]) for stage in stages), default=0),
+        max((len(stage["outputs"]) for stage in stages), default=0),
+        max((len(chain) for chain in chains), default=0),
+        max((_spatial_ops(plan, stage) for chain in chains for stage in chain), default=0),
     )
+
+
+def _executor_workspace_limits(plan: dict) -> tuple[int, int, int, int, int, int]:
+    """The arguments of TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS for the
+    plan: its tensors, the most inputs and outputs of a stage, the longest
+    chain, the most spatial operators in one chain and the nesting depth."""
+    tensors, inputs, outputs, chain, _ = _build_limits_needed(plan)
+    chain_spatial = max((sum(_spatial_ops(plan, stage) for stage in chain)
+                         for chain in _chains(plan)), default=0)
+    return tensors, inputs, outputs, chain, chain_spatial, _subgraph_depth(plan)
 
 
 def _executor_workspace_declaration(plan: dict) -> str:
-    tensors, inputs, outputs, chain_stages, spatial_ops = (
-        _executor_workspace_limits(plan)
-    )
+    args = ", ".join(f"{value}u" for value in _executor_workspace_limits(plan))
     return f"""\
 #define TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES \\
     TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS( \\
-        {tensors}u, {inputs}u, {outputs}u, {chain_stages}u, {spatial_ops}u)
+        {args})
 static uint8_t executor_workspace[TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES];
 """
 
@@ -140,14 +171,12 @@ def _build_limit_assertions(plan: dict) -> str:
 
     The workspace above is sized from the plan, but the loader refuses a plan
     that asks more than the build it runs in was compiled to carry, and those
-    limits size fixed storage inside the runtime rather than in this file.
+    limits are compiled into the runtime rather than this file.
     Defining them here would change only this translation unit and leave the
     loader refusing at run time, so this says what the build must set and
     fails while there is still a compiler to say it to.
     """
-    tensors, inputs, outputs, chain_stages, spatial_ops = (
-        _executor_workspace_limits(plan)
-    )
+    tensors, inputs, outputs, chain_stages, spatial_ops = _build_limits_needed(plan)
     needed = (
         ("TIGRIS_MAX_TENSORS", tensors),
         ("TIGRIS_MAX_STAGE_INPUTS", inputs),

@@ -130,9 +130,9 @@ WEIGHT_ALIGN = PLAN_SECTION_ALIGNMENT
 # These are execution limits of the current runtime, rather than wire-format
 # limits. Keep them explicit here so the compiler fails before producing a plan
 # the loader will inevitably reject.
-# What the runtime carries by default. It states these at compile time because
-# they size fixed storage, so a plan that needs more is not wrong, it needs a
-# target built for it. Nothing here refuses such a plan: the target does.
+# What the runtime carries by default. It states these at compile time, so a
+# plan that needs more is not wrong, it needs a target built for it. Nothing
+# here refuses such a plan: the target does.
 RUNTIME_MAX_TENSORS = 512
 RUNTIME_MAX_STAGE_INPUTS = 16
 RUNTIME_MAX_STAGE_OUTPUTS = 16
