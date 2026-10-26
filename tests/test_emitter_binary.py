@@ -834,7 +834,7 @@ def test_attribute_payloads_start_four_byte_aligned(tmp_path):
     onnx.save(model, path)
     graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
     tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
-    section = _build_op_attributes(_op_attribute_records(graph, tensor_idx))
+    section = _build_op_attributes(_op_attribute_records(graph, tensor_idx, {}, {}))
     count, _ = OP_ATTRIBUTE_SECTION_HEADER_STRUCT.unpack_from(section)
     entries = [OP_ATTRIBUTE_STRUCT.unpack_from(section, OP_ATTRIBUTE_SECTION_HEADER_STRUCT.size
                                                + k * OP_ATTRIBUTE_STRUCT.size) for k in range(count)]
@@ -897,7 +897,7 @@ def test_a_tensor_outside_its_operator_dtype_slots_is_named(tmp_path):
     graph.tensors["h"].dtype = 6
     tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
 
-    assert _contract_violations(graph, tensor_idx, {}, _op_attribute_records(graph, tensor_idx)) == [
+    assert _contract_violations(graph, tensor_idx, {}, _op_attribute_records(graph, tensor_idx, {}, {})) == [
         "product (Gemm: output 0 has ONNX dtype 6, which its slot does not take)",
         "scores (Softmax: input 0 has ONNX dtype 6, which its slot does not take)"]
 
@@ -910,7 +910,7 @@ def test_an_operator_writing_no_runtime_tensor_is_named(tmp_path):
     next(op for op in graph.ops if op.op_type == "Softmax").outputs = ["w"]
     tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
 
-    assert _contract_violations(graph, tensor_idx, {}, _op_attribute_records(graph, tensor_idx)) == [
+    assert _contract_violations(graph, tensor_idx, {}, _op_attribute_records(graph, tensor_idx, {}, {})) == [
         "scores (Softmax: writes no runtime tensor)"]
 
 

@@ -20,8 +20,8 @@ from tigris.capabilities import (
 )
 from tigris.dtypes import check_dtype_signatures
 from tigris.emitters.binary.defs import (
-    FLAG_XIP, OP_ATTR_SUBGRAPHS, OP_C_NAMES, OP_TYPE_MAP, TENSOR_FLAG_CONSTANT,
-    TENSOR_FLAG_STATE,
+    FLAG_XIP, NO_QUANT_PARAM, NO_WEIGHT, OP_ATTR_CONSTANT_OPERAND, OP_ATTR_SUBGRAPHS, OP_C_NAMES,
+    OP_TYPE_MAP, TENSOR_FLAG_CONSTANT, TENSOR_FLAG_STATE,
 )
 from tigris.analysis.memory import TENSOR_ALIGN, align_up
 from tigris.analysis.plan_graph import fast_activation_bytes, slow_arena_required
@@ -193,18 +193,18 @@ def _build_limit_assertions(plan: dict) -> str:
 def _plan_dtype(plan: dict) -> DTypeMode:
     """Resolve the graph-wide runtime dtype from serialized tensors."""
     constants = {a["op_index"]: a["data"][0] for a in plan.get("op_attributes", [])
-                 if a["type"] == 9 and a["data"]}
+                 if a["type"] == OP_ATTR_CONSTANT_OPERAND and a["data"]}
     operators = []
     for index, op in enumerate(plan.get("ops", [])):
         inputs = list(op["inputs"])
         if index in constants:
             inputs.insert(constants[index], None)
-        elif OP_TYPE_BY_CODE.get(op["op_type"]) == "DynamicUpdateSlice" and op["weight_idx"] != 65535:
+        elif OP_TYPE_BY_CODE.get(op["op_type"]) == "DynamicUpdateSlice" and op["weight_idx"] != NO_WEIGHT:
             inputs.insert(1, None)
         operators.append((OP_TYPE_BY_CODE.get(op["op_type"], ""), inputs, op["outputs"]))
     by_dtype, issues = check_dtype_signatures(
-        [(index, tensor["dtype"], bool(tensor.get("flags", 0) & 1),
-          tensor.get("quant_param_idx", 65535) != 65535)
+        [(index, tensor["dtype"], bool(tensor.get("flags", 0) & TENSOR_FLAG_CONSTANT),
+          tensor.get("quant_param_idx", NO_QUANT_PARAM) != NO_QUANT_PARAM)
          for index, tensor in enumerate(plan.get("tensors", []))],
         operators,
         plan.get("model_inputs", []), plan.get("model_outputs", []),

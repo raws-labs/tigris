@@ -46,10 +46,11 @@ from .defs import (
     FLAG_XIP,
     HEADER_SIZE,
     HEADER_STRUCT,
-    INDEX_STRUCT,
     MEMORY_STRUCT,
     MAGIC,
     NO_QUANT_PARAM,
+    NO_STATE_OUTPUT,
+    NO_TILE_PLAN,
     NO_WEIGHT,
     OP_ATTR_AXES,
     OP_ATTR_GELU_APPROXIMATE,
@@ -87,7 +88,11 @@ from .defs import (
     SEC_STATE,
     SEC_SUBGRAPHS,
     STATE_ENTRY_SIZE,
+    STATE_ENTRY_STRUCT,
     STATE_HEADER_SIZE,
+    STATE_HEADER_STRUCT,
+    SUBGRAPH_ENTRY_STRUCT,
+    SUBGRAPH_HEADER_STRUCT,
     SEC_OPS,
     SEC_QUANT_PARAMS,
     SEC_SHAPE_POOL,
@@ -101,10 +106,7 @@ from .defs import (
     SECTION_ENTRY_STRUCT,
     SPATIAL_ATTRS_STRUCT,
     STAGE_FLAG_LINE_BUFFERED,
-    STAGE_SIZE,
     STAGE_STRUCT,
-    STAGE_TILE_PLAN_INDEX_OFFSET,
-    TENSOR_FLAG_CONSTANT,
     TENSOR_FLAG_LINEAR,
     TENSOR_FLAG_STATE,
     TENSOR_FLAG_MODEL_INPUT,
@@ -171,8 +173,6 @@ class _StringTable:
         return offset
 
     def data(self) -> bytes:
-        if not self._buf:
-            self._buf.append(0)  # at least one null byte
         return bytes(self._buf)
 
 
@@ -596,9 +596,6 @@ def _build_weights_compressed(
     """
     import lz4.block
 
-    if not ag.weight_data:
-        return b"", b"", {}
-
     weight_idx, weights = _serialized_weights(ag, strings)
     blocks = _stage_blocks(ag, weight_idx, weights)
     compress_type = COMPRESS_LZ4 if compress == "lz4" else COMPRESS_NONE
@@ -665,10 +662,6 @@ def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
 # Section builders
 
 
-def _state_names(ag: AnalyzedGraph) -> set[str]:
-    return state_tensor_names(ag)
-
-
 _STATE_DTYPES = {1: np.float32, 3: np.int8, 5: np.int16}
 
 
@@ -679,8 +672,8 @@ def _build_subgraphs(ranges, tensor_idx: dict[str, int], index_pool: "_IndexPool
     for graph in ranges:
         inputs = index_pool.add([tensor_idx[name] for name in graph.inputs])
         outputs = index_pool.add([tensor_idx[name] for name in graph.outputs])
-        entries.append(struct.pack("<6H", graph.first_stage, graph.num_stages, *inputs, *outputs))
-    return struct.pack("<HH", len(entries), 0) + b"".join(entries)
+        entries.append(SUBGRAPH_ENTRY_STRUCT.pack(graph.first_stage, graph.num_stages, *inputs, *outputs))
+    return SUBGRAPH_HEADER_STRUCT.pack(len(entries), 0) + b"".join(entries)
 
 
 def _build_state(ag: AnalyzedGraph, tensor_idx: dict[str, int]) -> bytes:
@@ -706,26 +699,25 @@ def _build_state(ag: AnalyzedGraph, tensor_idx: dict[str, int]) -> bytes:
         value = np.ascontiguousarray(
             np.asarray(port.initial, _STATE_DTYPES[info.dtype]).reshape(info.shape).transpose(perm))
         data = value.tobytes()
-        entries.append(struct.pack("<HHIII", tensor_idx[name],
-                                   tensor_idx[out] if out is not None else 0xFFFF,
-                                   offset, len(data), head + len(initials)))
+        entries.append(STATE_ENTRY_STRUCT.pack(tensor_idx[name],
+                                               tensor_idx[out] if out is not None else NO_STATE_OUTPUT,
+                                               offset, len(data), head + len(initials)))
         initials.extend(data)
         offset += (len(data) + 3) & ~3
-    return struct.pack("<HHI", len(entries), 0, offset) + b"".join(entries) + bytes(initials)
+    return STATE_HEADER_STRUCT.pack(len(entries), 0, offset) + b"".join(entries) + bytes(initials)
 
 
 def _build_tensors(
     ag: AnalyzedGraph,
     strings: _StringTable,
     shapes: _ShapePool,
-    quant_idx_map: dict[str, int] | None = None,
+    quant_idx_map: dict[str, int],
 ) -> tuple[bytes, dict[str, int]]:
     """Build tensor table. Returns (bytes, name->index map)."""
     buf = bytearray()
     tensor_idx: dict[str, int] = {}
     idx = 0
-    no_qp = NO_QUANT_PARAM
-    state_names = _state_names(ag)
+    state_names = state_tensor_names(ag)
 
     for name, info in ag.tensors.items():
         if info.is_constant:
@@ -748,8 +740,6 @@ def _build_tensors(
         shape_off, ndim = shapes.add(shape)
 
         flags = 0
-        if info.is_constant:
-            flags |= TENSOR_FLAG_CONSTANT
         if name in state_names:
             flags |= TENSOR_FLAG_STATE
         else:
@@ -760,7 +750,7 @@ def _build_tensors(
         if info.layout is Layout.LINEAR:
             flags |= TENSOR_FLAG_LINEAR
 
-        qp_idx = quant_idx_map.get(name, no_qp) if quant_idx_map else no_qp
+        qp_idx = quant_idx_map.get(name, NO_QUANT_PARAM)
 
         # The dtype the model file declares for this boundary, where folding the
         # quantization into the tensor changed it. 0 says the tensor's own dtype
@@ -935,16 +925,15 @@ def _lstm_payload(ag: AnalyzedGraph, op: OpNode) -> bytes:
 
 def _op_attribute_records(
     ag: AnalyzedGraph, tensor_idx: dict[str, int],
-    quant_idx_map: dict[str, int] | None = None,
-    weight_idx: dict[str, int] | None = None,
+    quant_idx_map: dict[str, int], weight_idx: dict[str, int],
 ) -> list[tuple[int, int, bytes]]:
     """The optional, typed per-operator attributes as (operator, kind, payload)."""
     records: list[tuple[int, int, bytes]] = []
     for op_index, op in enumerate(ag.ops):
-        constant = _constant_operand_payload(ag, op, quant_idx_map or {})
+        constant = _constant_operand_payload(ag, op, quant_idx_map)
         if constant is not None:
             records.append((op_index, OP_ATTR_CONSTANT_OPERAND, constant))
-        _, _, indices = _operator_weights(op, weight_idx or {}, tensor_idx)
+        _, _, indices = _operator_weights(op, weight_idx, tensor_idx)
         if indices is not None:
             records.append((op_index, OP_ATTR_CONSTANTS, struct.pack(f"<{len(indices)}H", *indices)))
         if op.op_type == "Svdf":
@@ -1172,16 +1161,11 @@ def _compute_act_bounds(
     output_zp = int(qp.zero_point[0])
     output_scale = float(qp.scale[0])
 
+    act_min = max(output_zp, -128)
     if fused_act == ACT_RELU:
-        act_min = max(output_zp, -128)
-        act_max = 127
-    elif fused_act == ACT_RELU6:
-        act_min = max(output_zp, -128)
-        act_max = min(_round_half_away(6.0 / output_scale) + output_zp, 127)
-    else:
-        act_min, act_max = -128, 127
-
-    return act_min, act_max
+        return act_min, 127
+    # ACT_RELU6
+    return act_min, min(_round_half_away(6.0 / output_scale) + output_zp, 127)
 
 
 def _fused_activation(op: OpNode) -> int:
@@ -1331,6 +1315,7 @@ def _build_stages(
     ag: AnalyzedGraph,
     tensor_idx: dict[str, int],
     index_pool: _IndexPool,
+    stage_to_tile: dict[int, int],
 ) -> bytes:
     """Build stage table. Returns bytes."""
     buf = bytearray()
@@ -1355,12 +1340,6 @@ def _build_stages(
         inp_off, inp_count = index_pool.add(inp_indices)
         out_off, out_count = index_pool.add(out_indices)
 
-        # tile_plan_idx: index into tile_plan table, or 0xFFFF if none
-        tile_idx = 0xFFFF
-        # We'll set this after building tile plans; for now track stage_id -> tile_plan_idx
-        # Actually, we build tile plans in order of stages that have them
-        # Let the caller patch this
-
         # tigris_stage_t: 28 bytes
         # peak_bytes(u32)
         # ops_offset(u16) ops_count(u16)
@@ -1375,7 +1354,7 @@ def _build_stages(
             ops_off, ops_count,
             inp_off, inp_count,
             out_off, out_count,
-            tile_idx, 0,
+            stage_to_tile.get(stage.stage_id, NO_TILE_PLAN), 0,
             stage.chain_id,
             stage.chain_len,
             stage.chain_tile_h,
@@ -1489,9 +1468,7 @@ def _compute_effective_scales(ag: AnalyzedGraph) -> dict[str, np.ndarray]:
     # Every operator whose kernel requantizes an int32 accumulator belongs
     # here. Conv1D is a distinct op type from Conv after the normalizer
     # relabels it, and its kernel requantizes the same way.
-    weight_ops = {"Conv", "Conv1D", "ConvTranspose", "ConvInteger",
-                  "DepthwiseConv", "MatMul", "Gemm", "QLinearConv",
-                  "QLinearMatMul"}
+    weight_ops = {"Conv", "Conv1D", "ConvTranspose", "DepthwiseConv", "MatMul", "Gemm"}
 
     for op in ag.ops:
         if op.op_type not in weight_ops:
@@ -1637,14 +1614,12 @@ def _build_quant_params(
         # Store multiplier/shift for both per-tensor (1) and per-channel (>1)
         multiplier_off = data_offset
         shift_off = data_offset + num_channels
-        for c in range(num_channels):
-            scale = float(eff[c]) if eff is not None else float(qp.scale[c])
-            m, s = _compute_multiplier_shift(scale)
-            data_buf.extend(QUANT_DATA_STRUCT.pack(m))
-        for c in range(num_channels):
-            scale = float(eff[c]) if eff is not None else float(qp.scale[c])
-            _, s = _compute_multiplier_shift(scale)
-            data_buf.extend(QUANT_DATA_STRUCT.pack(s))
+        pairs = [_compute_multiplier_shift(float(eff[c]) if eff is not None else float(qp.scale[c]))
+                 for c in range(num_channels)]
+        for multiplier, _ in pairs:
+            data_buf.extend(QUANT_DATA_STRUCT.pack(multiplier))
+        for _, shift in pairs:
+            data_buf.extend(QUANT_DATA_STRUCT.pack(shift))
         data_offset += 2 * num_channels
 
         # tigris_quant_param_t: 16 bytes
@@ -1669,15 +1644,6 @@ def _build_quant_params(
     # v3 section header: num_quant_params(u16) + quant_data_pages(u16).
     header = QUANT_SECTION_HEADER_STRUCT.pack(len(quant_idx_map), pages)
     return header + bytes(entries_buf) + bytes(data_buf), quant_idx_map
-
-
-def _patch_stage_tile_indices(stage_data: bytearray, ag: AnalyzedGraph, stage_to_tile: dict[int, int]) -> bytes:
-    """Patch tile_plan_idx in stage entries."""
-    for i, stage in enumerate(ag.stages):
-        tile_idx = stage_to_tile.get(stage.stage_id, 0xFFFF)
-        offset = i * STAGE_SIZE + STAGE_TILE_PLAN_INDEX_OFFSET
-        INDEX_STRUCT.pack_into(stage_data, offset, tile_idx)
-    return bytes(stage_data)
 
 
 # Plan assembly
@@ -1837,18 +1803,16 @@ def _emit(
     quant_data, quant_idx_map = _build_quant_params(ag)
 
     # Add model I/O to index pool
-    tensor_data, tensor_idx = _build_tensors(
-        ag, strings, shapes, quant_idx_map or None
-    )
+    tensor_data, tensor_idx = _build_tensors(ag, strings, shapes, quant_idx_map)
 
-    state_names = _state_names(ag)
+    state_names = state_tensor_names(ag)
     model_inp_indices = [tensor_idx[n] for n in ag.model_inputs
                          if n in tensor_idx and n not in state_names]
     model_out_indices = [tensor_idx[n] for n in ag.model_outputs
                          if n in tensor_idx and n not in state_names]
     state_data = _build_state(ag, tensor_idx)
     subgraph_data = _build_subgraphs(ranges, tensor_idx, index_pool) if ranges else b""
-    model_io_off, model_io_count = index_pool.add(model_inp_indices + model_out_indices)
+    model_io_off, _ = index_pool.add(model_inp_indices + model_out_indices)
 
     op_data = _build_ops(ag, tensor_idx, weight_idx, strings, index_pool)
     attribute_records = _op_attribute_records(ag, tensor_idx, quant_idx_map, weight_idx)
@@ -1859,14 +1823,12 @@ def _emit(
             + ", ".join(violations)
         )
     op_attributes_data = _build_op_attributes(attribute_records)
-    stage_data = bytearray(_build_stages(ag, tensor_idx, index_pool))
-    version = SCHEMA_VERSION
     tile_data, stage_to_tile = _build_tile_plans(ag)
+    stage_data = _build_stages(ag, tensor_idx, index_pool, stage_to_tile)
     if scheduled_peak is None:
         scheduled_peak = scheduled_fast_peak(ag)
     _require_uint(scheduled_peak, 32, "scheduled fast peak")
     memory_data = MEMORY_STRUCT.pack(scheduled_peak)
-    stage_data_final = _patch_stage_tile_indices(stage_data, ag, stage_to_tile)
 
     index_data = index_pool.data()
     shape_data = shapes.data()
@@ -1879,15 +1841,7 @@ def _emit(
     num_tile_plans = len(stage_to_tile)
     num_weights = len(weight_idx)
 
-    for value, field in (
-        (num_tensors, "tensor count"),
-        (num_ops, "operator count"),
-        (num_stages, "stage count"),
-        (num_tile_plans, "tile-plan count"),
-        (num_weights, "weight count"),
-    ):
-        _require_uint(value, 16, field)
-    _require_uint(model_io_off, 16, "model I/O index-pool offset")
+    _require_uint(num_ops, 16, "operator count")
     _require_uint(len(model_inp_indices), 8, "model input count")
     _require_uint(len(model_out_indices), 8, "model output count")
 
@@ -1895,7 +1849,7 @@ def _emit(
     section_parts = [
         (SEC_TENSORS, tensor_data),
         (SEC_OPS, op_data),
-        (SEC_STAGES, stage_data_final),
+        (SEC_STAGES, stage_data),
         (SEC_TILE_PLANS, tile_data),
         (SEC_INDEX_POOL, index_data),
         (SEC_SHAPE_POOL, shape_data),
@@ -1962,7 +1916,7 @@ def _emit(
         header_flags |= FLAG_XIP
     header = HEADER_STRUCT.pack(
         MAGIC,
-        version,
+        SCHEMA_VERSION,
         file_size,
         HEADER_SIZE,  # section_dir starts right after header
         num_tensors,
@@ -1979,8 +1933,6 @@ def _emit(
         num_qp,
         header_flags,
     )
-    if len(header) != HEADER_SIZE:
-        raise ValueError(f"Header is {len(header)} bytes, expected {HEADER_SIZE}")
 
     # Assemble
     out = bytearray()
@@ -1988,7 +1940,4 @@ def _emit(
     out.extend(sec_dir)
     for data in placed_parts:
         out.extend(data)
-
-    if len(out) != file_size:
-        raise ValueError(f"Output is {len(out)} bytes, expected {file_size}")
     return bytes(out)
