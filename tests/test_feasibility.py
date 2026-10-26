@@ -8,10 +8,13 @@ import pytest
 from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
 
+from tigris import SCHEMA_VERSION
 from tigris.analysis.findings import compute_findings
 from tigris.analysis.validation import validate_memory_plan
 from tigris.cli import _run_pipeline, cli
 from tigris.emitters.binary.writer import emit_binary_bytes
+
+from conftest import save_onnx
 
 
 def _write_oversized_height_op_model(tmp_path, op_type):
@@ -39,21 +42,10 @@ def _write_oversized_height_op_model(tmp_path, op_type):
         )
         initializers = [scales]
 
-    graph = helper.make_graph(
-        [node],
-        f"oversized_{op_type}",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, input_shape)],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)],
-        initializer=initializers,
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)]
-    )
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"{op_type}.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(tmp_path, f"oversized_{op_type}", [node],
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, input_shape)],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)],
+                     initializers, ir_version=8, check=True, filename=f'{op_type}.onnx')
 
 
 def test_a_global_reduction_tiles_along_its_input(tmp_path):
@@ -219,6 +211,7 @@ def test_analyze_displays_failing_verdict(conv_relu_chain_path):
     assert "none at this budget" in result.output
 
 
+@pytest.mark.usefixtures("require_host_library")
 def test_analyze_prints_the_trace(conv_relu_chain_path):
     trace = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "64K", "--trace"])
     assert trace.exit_code == 0, trace.output
@@ -275,14 +268,11 @@ def test_a_plan_beyond_the_default_build_is_written_and_names_the_build(tmp_path
     import json
 
     outputs = [f"part{k}" for k in range(19)]
-    model = helper.make_model(helper.make_graph(
-        [helper.make_node("Split", ["input"], outputs, axis=1, num_outputs=19)], "parts",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 19])],
-        [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 1]) for name in outputs]),
-        opset_imports=[helper.make_opsetid("", 18)])
-    model.ir_version = 8
-    source = tmp_path / "parts.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "parts",
+                       [helper.make_node("Split", ["input"], outputs, axis=1, num_outputs=19)],
+                       [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 19])],
+                       [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 1]) for name in outputs],
+                       opset=18, ir_version=8)
     plan = tmp_path / "parts.tgrs"
     expected = "runtime build   -DTIGRIS_MAX_STAGE_OUTPUTS=19"
     for args in (["compile", str(source), "-m", "16K", "-o", str(plan)],
@@ -313,6 +303,7 @@ def test_a_control_flow_plan_names_the_tensor_count_of_the_whole_plan(tmp_path, 
 
 
 @pytest.mark.parametrize("budget", ["128", "32M"])
+@pytest.mark.usefixtures("require_host_library")
 def test_int8_global_pool_refuses_an_overflowing_sum(tmp_path, budget):
     from tigris.analysis.validation import validate_operator_support
     from tigris.emitters.binary.reader import read_binary_plan
@@ -335,6 +326,6 @@ def test_int8_global_pool_refuses_an_overflowing_sum(tmp_path, budget):
         emit_binary_bytes(graph)
     from tigris.emitters.binary.writer import _emit
     path.write_bytes(_emit(graph, compress=None, validate=False))
-    assert read_binary_plan(path.read_bytes())["version"] == 11
+    assert read_binary_plan(path.read_bytes())["version"] == SCHEMA_VERSION
     with pytest.raises(HostError):
         Session(path)

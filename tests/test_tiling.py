@@ -14,7 +14,7 @@ from tigris.analysis.partition_spatial import (
 from tigris.analysis.validation import validate_memory_plan
 from scripts.contract_cases.fixtures import build_tcn
 
-from conftest import full_pipeline
+from conftest import full_pipeline, save_onnx
 
 
 def _write_conv1d(path, length=32):
@@ -31,27 +31,10 @@ def _write_conv1d(path, length=32):
     bias = numpy_helper.from_array(
         np.array([0.1, -0.2, 0.3], dtype=np.float32), "bias"
     )
-    graph = helper.make_graph(
-        [
-            helper.make_node(
-                "Conv",
-                ["input", "weights", "bias"],
-                ["output"],
-                name="conv1d",
-                kernel_shape=[3],
-                pads=[1, 1],
-            )
-        ],
-        "conv1d_tiling",
-        [model_input],
-        [model_output],
-        [weights, bias],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 17)]
-    )
-    path.write_bytes(model.SerializeToString())
-    return path
+    return save_onnx(path.parent, "conv1d_tiling",
+                     [helper.make_node("Conv", ["input", "weights", "bias"], ["output"],
+                                       name="conv1d", kernel_shape=[3], pads=[1, 1])],
+                     [model_input], [model_output], [weights, bias], opset=17, filename=path.name)
 
 
 def _write_rank3_pointwise(path, op_type, length=64):
@@ -71,17 +54,9 @@ def _write_rank3_pointwise(path, op_type, length=64):
     output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 4, length]
     )
-    model = helper.make_model(
-        helper.make_graph(
-            [helper.make_node(op_type, node_inputs, ["output"], name="pointwise")],
-            f"rank3_{op_type.lower()}",
-            inputs,
-            [output],
-        ),
-        opset_imports=[helper.make_opsetid("", 17)],
-    )
-    path.write_bytes(model.SerializeToString())
-    return path
+    return save_onnx(path.parent, f"rank3_{op_type.lower()}",
+                     [helper.make_node(op_type, node_inputs, ["output"], name="pointwise")], inputs,
+                     [output], opset=17, filename=path.name)
 
 
 # Op classification
@@ -333,21 +308,14 @@ class TestOversizedStagesCarryTilePlan:
 def _gated_map_path(tmp_path, channels=16, side=12):
     """GlobalAveragePool -> 1x1 Conv -> Sigmoid gates the map it came from."""
     weight = np.full((channels, channels, 1, 1), 0.1, dtype=np.float32)
-    model = helper.make_model(
-        helper.make_graph(
-            [helper.make_node("GlobalAveragePool", ["input"], ["pooled"]),
-             helper.make_node("Conv", ["pooled", "w"], ["fc"], kernel_shape=[1, 1]),
-             helper.make_node("Sigmoid", ["fc"], ["gate"]),
-             helper.make_node("Mul", ["gate", "input"], ["output"])],
-            "gated_map",
-            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
-            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, side, side])],
-            [numpy_helper.from_array(weight, "w")]),
-        opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    path = tmp_path / "gated_map.onnx"
-    path.write_bytes(model.SerializeToString())
-    return path
+    return save_onnx(tmp_path, "gated_map",
+                     [helper.make_node("GlobalAveragePool", ["input"], ["pooled"]),
+                      helper.make_node("Conv", ["pooled", "w"], ["fc"], kernel_shape=[1, 1]),
+                      helper.make_node("Sigmoid", ["fc"], ["gate"]),
+                      helper.make_node("Mul", ["gate", "input"], ["output"])],
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, side, side])],
+                     [numpy_helper.from_array(weight, "w")], ir_version=8)
 
 
 def test_per_channel_operand_stage_is_banded_over_the_full_operand(tmp_path):

@@ -17,6 +17,8 @@ from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris import SCHEMA_VERSION, runtime
 from tigris.runtime import Session, runtime_info, runtime_version
 
+from conftest import save_onnx
+
 
 pytestmark = pytest.mark.usefixtures("require_host_library")
 
@@ -460,17 +462,14 @@ def test_cli_execution(linear_plan, tmp_path, suffix):
 
 
 def test_multiple_inputs_and_named_outputs(tmp_path):
-    import onnx
     from onnx import TensorProto, helper
 
     inputs = [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 4]) for name in ("a", "b")]
     outputs = [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 4]) for name in ("file", "allow_pickle")]
     nodes = [helper.make_node("Add", ["a", "b"], ["file"]),
              helper.make_node("Sub", ["a", "b"], ["allow_pickle"])]
-    model = helper.make_model(helper.make_graph(nodes, "two_inputs", inputs, outputs),
-                              opset_imports=[helper.make_opsetid("", 17)], ir_version=8)
-    source = tmp_path / "model.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "two_inputs", nodes, inputs, outputs, opset=17, ir_version=8,
+                       filename="model.onnx")
     graph, _ = _run_pipeline(str(source), ("4K",))
     path = tmp_path / "model.tgrs"
     path.write_bytes(emit_binary_bytes(graph))
@@ -488,19 +487,14 @@ def test_multiple_inputs_and_named_outputs(tmp_path):
 
 
 def test_bool_passthrough_boundary_selects_data_dispatcher(tmp_path):
-    import onnx
     from onnx import TensorProto, helper
     from tigris.emitters.codegen import generate_c
 
     flag = helper.make_tensor_value_info("flag", TensorProto.BOOL, [4])
     data = helper.make_tensor_value_info("data", TensorProto.FLOAT, [4])
     output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [4])
-    model = helper.make_model(helper.make_graph([helper.make_node("Relu", ["data"], ["output"])],
-                                                "boundary", [flag, data], [flag, output]),
-                              opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    model_path = tmp_path / "boundary.onnx"
-    onnx.save(model, model_path)
+    model_path = save_onnx(tmp_path, "boundary", [helper.make_node("Relu", ["data"], ["output"])],
+                           [flag, data], [flag, output], ir_version=8)
     graph, _ = _run_pipeline(str(model_path), ("4K",))
     plan = emit_binary_bytes(graph)
     assert "t->dtype == 9u" in generate_c(plan, "reference")
@@ -652,7 +646,6 @@ def test_a_trace_that_outgrows_its_buffer_reruns_from_the_session_state(tmp_path
 @pytest.mark.parametrize("axes_input", [False, True])
 def test_spatial_mean_without_kept_axes_runs_as_a_global_pool(tmp_path, axes_input):
     """ReduceMean over H and W with keepdims=0, as ShuffleNet and MNASNet end."""
-    import onnx
     import onnxruntime as ort
     from onnx import TensorProto, helper, numpy_helper
 
@@ -664,13 +657,10 @@ def test_spatial_mean_without_kept_axes_runs_as_a_global_pool(tmp_path, axes_inp
         mean_inputs, opset, attrs = ["conv", "axes"], 18, {}
     nodes = [helper.make_node("Conv", ["input", "w"], ["conv"], pads=[1, 1, 1, 1]),
              helper.make_node("ReduceMean", mean_inputs, ["output"], keepdims=0, **attrs)]
-    model = helper.make_model(helper.make_graph(
-        nodes, "mean", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 6])], initializers),
-        opset_imports=[helper.make_opsetid("", opset)])
-    model.ir_version = 8
-    source = tmp_path / "mean.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "mean", nodes,
+                       [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])],
+                       [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 6])],
+                       initializers, opset=opset, ir_version=8)
     plan = tmp_path / "mean.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(source), "-m", "4K", "-o", str(plan)])
     assert result.exit_code == 0, result.output
@@ -729,7 +719,6 @@ def test_one_dimensional_convolutions_match_onnx_runtime(tmp_path, form):
 def test_a_flatten_into_a_product_keeps_the_model_order(tmp_path, also_output):
     """The flatten a Gemm reads may stay in stored order, its weights permuted,
     but not when the model also returns it."""
-    import onnx
     import onnxruntime as ort
     from onnx import TensorProto, helper, numpy_helper
 
@@ -740,14 +729,12 @@ def test_a_flatten_into_a_product_keeps_the_model_order(tmp_path, also_output):
     outputs = [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3])]
     if also_output:
         outputs.insert(0, helper.make_tensor_value_info("flat", TensorProto.FLOAT, [1, 120]))
-    model = helper.make_model(helper.make_graph(
-        nodes, "flatten", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2, 6, 4])], outputs,
-        [numpy_helper.from_array(rng.normal(size=(5, 2, 3, 3)).astype(np.float32), "w"),
-         numpy_helper.from_array(rng.normal(size=(3, 120)).astype(np.float32), "fw")]),
-        opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    source = tmp_path / "flatten.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "flatten", nodes,
+                       [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 2, 6, 4])],
+                       outputs,
+                       [numpy_helper.from_array(rng.normal(size=(5, 2, 3, 3)).astype(np.float32), "w"),
+                        numpy_helper.from_array(rng.normal(size=(3, 120)).astype(np.float32), "fw")],
+                       opset=17, ir_version=8)
     plan = tmp_path / "flatten.tgrs"
     assert CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)]).exit_code == 0
     x = rng.uniform(-1, 1, (1, 2, 6, 4)).astype(np.float32)
@@ -859,7 +846,6 @@ def test_ceil_mode_pools_match_onnx_runtime(tmp_path, op_type, size, kernel, str
 def test_a_requantization_tiles_and_matches_its_untiled_plan(tmp_path):
     """An activation in two encodings: the int8 Quantize between them tiles as a
     pointwise operator, and the tiled plan's outputs equal the untiled plan's."""
-    import onnx
     from onnx import TensorProto, helper, numpy_helper
 
     from tigris.inspection import inspect_file
@@ -878,14 +864,11 @@ def test_a_requantization_tiles_and_matches_its_untiled_plan(tmp_path):
         helper.make_node("DequantizeLinear", ["second_q", "bs", "bz"], ["second"]),
     ]
     shape = [1, 8, 32, 32]
-    model = helper.make_model(helper.make_graph(
-        nodes, "two_encodings", [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
-        [helper.make_tensor_value_info(n, TensorProto.FLOAT, shape) for n in ("first", "second")],
-        [s("xs", 0.05), z("xz"), s("as", 0.02), z("az"), s("bs", 0.07), z("bz")]),
-        opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    source = tmp_path / "two.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "two_encodings", nodes,
+                       [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                       [helper.make_tensor_value_info(n, TensorProto.FLOAT, shape) for n in ("first", "second")],
+                       [s("xs", 0.05), z("xz"), s("as", 0.02), z("az"), s("bs", 0.07), z("bz")],
+                       ir_version=8, filename="two.onnx")
     outputs = {}
     for budget in ("4K", "1M"):
         plan = tmp_path / f"two_{budget}.tgrs"
@@ -907,7 +890,6 @@ def test_a_requantization_tiles_and_matches_its_untiled_plan(tmp_path):
                                               ("Mul", [[[[2.0]], [[2.0]], [[2.0]]]])])
 def test_a_uniform_float_constant_of_an_int8_operator_matches_onnx_runtime(tmp_path, op_type, constant):
     """A QDQ export can leave a scalar operand in float, as in x * relu6(x + 3) / 6."""
-    import onnx
     import onnxruntime as ort
     from onnx import TensorProto, helper, numpy_helper
 
@@ -920,14 +902,11 @@ def test_a_uniform_float_constant_of_an_int8_operator_matches_onnx_runtime(tmp_p
         helper.make_node("QuantizeLinear", ["y", "ys", "yz"], ["yq"]),
         helper.make_node("DequantizeLinear", ["yq", "ys", "yz"], ["output"]),
     ]
-    model = helper.make_model(helper.make_graph(
-        nodes, "constant", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 4, 4])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 4, 4])],
-        [s("xs", 0.04), z("xz"), s("ys", 0.05), z("yz"), s("c", constant)]),
-        opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    source = tmp_path / "constant.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "constant", nodes,
+                       [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 4, 4])],
+                       [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 4, 4])],
+                       [s("xs", 0.04), z("xz"), s("ys", 0.05), z("yz"), s("c", constant)],
+                       ir_version=8)
     plan = tmp_path / "constant.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
     assert result.exit_code == 0, result.output
@@ -941,7 +920,6 @@ def test_a_uniform_float_constant_of_an_int8_operator_matches_onnx_runtime(tmp_p
 
 def test_a_batch_normalization_no_convolution_absorbs_matches_onnx_runtime(tmp_path):
     """Pre-activation networks normalize the sum of a residual Add."""
-    import onnx
     import onnxruntime as ort
     from onnx import TensorProto, helper, numpy_helper
 
@@ -950,16 +928,13 @@ def test_a_batch_normalization_no_convolution_absorbs_matches_onnx_runtime(tmp_p
     params = [numpy_helper.from_array(v.astype(np.float32), n) for n, v in (
         ("gamma", rng.uniform(0.5, 2, channels)), ("beta", rng.normal(size=channels)),
         ("mean", rng.normal(size=channels)), ("var", rng.uniform(0.2, 3, channels)))]
-    model = helper.make_model(helper.make_graph(
-        [helper.make_node("Add", ["a", "b"], ["sum"]),
-         helper.make_node("BatchNormalization", ["sum", "gamma", "beta", "mean", "var"], ["bn"], epsilon=1e-5),
-         helper.make_node("Relu", ["bn"], ["output"])], "preact",
-        [helper.make_tensor_value_info(n, TensorProto.FLOAT, [1, channels, 5, 7]) for n in ("a", "b")],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 5, 7])], params),
-        opset_imports=[helper.make_opsetid("", 15)])
-    model.ir_version = 8
-    source = tmp_path / "preact.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "preact",
+                       [helper.make_node("Add", ["a", "b"], ["sum"]),
+                        helper.make_node("BatchNormalization", ["sum", "gamma", "beta", "mean", "var"], ["bn"], epsilon=1e-5),
+                        helper.make_node("Relu", ["bn"], ["output"])],
+                       [helper.make_tensor_value_info(n, TensorProto.FLOAT, [1, channels, 5, 7]) for n in ("a", "b")],
+                       [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 5, 7])],
+                       params, opset=15, ir_version=8)
     plan = tmp_path / "preact.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
     assert result.exit_code == 0, result.output
@@ -973,7 +948,6 @@ def test_a_batch_normalization_no_convolution_absorbs_matches_onnx_runtime(tmp_p
 @pytest.mark.parametrize("steps", [["Reshape"], ["Transpose"], ["Reshape", "Transpose"]])
 def test_a_layout_step_before_the_first_quantize_matches_onnx_runtime(tmp_path, steps):
     """Exporters move a float input into NCHW and quantize the result."""
-    import onnx
     import onnxruntime as ort
     from onnx import TensorProto, helper, numpy_helper
 
@@ -1003,13 +977,10 @@ def test_a_layout_step_before_the_first_quantize_matches_onnx_runtime(tmp_path, 
               # int16 pair sums of full-range weights, so the reference would depend on the CPU.
               numpy_helper.from_array(rng.integers(-63, 64, (4, 3, 3, 3)).astype(np.int8), "w"),
               numpy_helper.from_array(np.array(target, np.int64), "target")]
-    model = helper.make_model(helper.make_graph(
-        nodes, "layout", [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 4, 5])], params),
-        opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    source = tmp_path / "layout.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "layout", nodes,
+                       [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                       [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 4, 5])],
+                       params, ir_version=8)
     plan = tmp_path / "layout.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
     assert result.exit_code == 0, result.output
@@ -1105,7 +1076,6 @@ def _fold_case(kind, rng):
 
 
 def _check_fold_case(tmp_path, kind, without_copy=False):
-    import onnx
     import onnxruntime as ort
     from onnx import TensorProto, helper
 
@@ -1114,14 +1084,10 @@ def _check_fold_case(tmp_path, kind, without_copy=False):
     if without_copy:
         # The same model without its last node, the Identity that writes y.
         nodes, outputs, kind = nodes[:-1], {n: s for n, s in outputs.items() if n != "y"}, f"{kind}_without_copy"
-    model = helper.make_model(helper.make_graph(
-        nodes, kind, [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in inputs.items()],
-        [helper.make_tensor_value_info(n, *(s if isinstance(s, tuple) else (TensorProto.FLOAT, s)))
-         for n, s in outputs.items()], params),
-        opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    source = tmp_path / f"{kind}.onnx"
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, kind, nodes,
+                       [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in inputs.items()],
+                       [helper.make_tensor_value_info(n, *(s if isinstance(s, tuple) else (TensorProto.FLOAT, s)))
+                        for n, s in outputs.items()], params, opset=17, ir_version=8)
     plan = tmp_path / f"{kind}.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
     assert result.exit_code == 0, result.output

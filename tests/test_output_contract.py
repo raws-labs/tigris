@@ -1,7 +1,6 @@
 """Observable model-output contract validation."""
 
 import numpy as np
-import onnx
 import onnxruntime as ort
 import pytest
 from onnx import TensorProto, helper
@@ -14,6 +13,8 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.loaders import load_model
 from tigris.loaders.onnx.loader import load_model as load_raw_model
+
+from conftest import save_onnx
 
 
 @pytest.fixture
@@ -35,18 +36,8 @@ def trailing_transpose_path(tmp_path):
             perm=[2, 0, 1],
         ),
     ]
-    graph = helper.make_graph(
-        nodes, "trailing_transpose", [model_input], [model_output]
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)]
-    )
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-
-    path = tmp_path / "trailing_transpose.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(tmp_path, "trailing_transpose", nodes, [model_input], [model_output],
+                     ir_version=8, check=True)
 
 
 def test_trailing_transpose_is_observable_and_preserved(trailing_transpose_path):
@@ -89,20 +80,11 @@ def test_terminal_rank4_transpose_remaps_internal_layout(tmp_path):
     model_output = helper.make_tensor_value_info(
         "output", TensorProto.FLOAT, [1, 4, 2, 3]
     )
-    graph = helper.make_graph(
-        [
-            helper.make_node("Relu", ["input"], ["pretranspose"], name="relu"),
-            helper.make_node(
-                "Transpose", ["pretranspose"], ["output"],
-                name="output_transpose", perm=[0, 3, 1, 2],
-            ),
-        ],
-        "rank4_trailing_transpose", [model_input], [model_output],
-    )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    path = tmp_path / "rank4_trailing_transpose.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "rank4_trailing_transpose",
+                     [helper.make_node("Relu", ["input"], ["pretranspose"], name="relu"),
+                      helper.make_node("Transpose", ["pretranspose"], ["output"],
+                                       name="output_transpose", perm=[0, 3, 1, 2])], [model_input],
+                     [model_output], ir_version=8)
 
     compiled = load_model(path)
     compiled = compute_lifetimes(compiled)

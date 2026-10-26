@@ -15,6 +15,8 @@ from tigris.emitters.binary import defs
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.inspection import inspect_file
 
+from conftest import save_onnx, section_entries
+
 
 FIXTURES = Path(__file__).parent / "schema_compat"
 
@@ -88,13 +90,10 @@ def test_tile_records_list_the_fields_their_schema_states(tmp_path):
     # The same plan at schema 10: its one record's first 32 bytes are the schema 10 record.
     older = bytearray(data)
     struct.pack_into("<I", older, 4, 10)
-    entry = defs.HEADER_SIZE
-    while struct.unpack_from("<I", older, entry)[0] != defs.SEC_MEMORY:
-        if struct.unpack_from("<I", older, entry)[0] == defs.SEC_TILE_PLANS:
-            # Below schema 11 a height stripe states its band in input rows.
-            struct.pack_into("<II", older, struct.unpack_from("<I", older, entry + 4)[0] + 4, 1, 0)
-        entry += defs.SECTION_ENTRY_SIZE
-    struct.pack_into("<II", older, entry, 0, 0)
+    entries = section_entries(older)
+    # Below schema 11 a height stripe states its band in input rows.
+    struct.pack_into("<II", older, entries[defs.SEC_TILE_PLANS][1] + 4, 1, 0)
+    struct.pack_into("<II", older, entries[defs.SEC_MEMORY][0], 0, 0)
     path = tmp_path / "schema-10.tgrs"
     path.write_bytes(bytes(older))
     (tile,) = inspect_file(path)["plan"]["tile_plans"]
@@ -116,11 +115,9 @@ def test_a_layout_conversion_counts_the_compilers_band(tmp_path):
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     shape = [1, 4096, 8]
-    graph = helper.make_graph([helper.make_node("Softmax", ["x"], ["y"], axis=-1)], "softmax",
-                              [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
-                              [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
-    source = tmp_path / "softmax.onnx"
-    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), source)
+    source = save_onnx(tmp_path, "softmax", [helper.make_node("Softmax", ["x"], ["y"], axis=-1)],
+                       [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+                       [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
     compiled, _ = _run_pipeline(str(source), ("32000",))
     path = tmp_path / "softmax.tgrs"
     path.write_bytes(emit_binary_bytes(compiled))
@@ -218,15 +215,8 @@ def test_unsupported_schema(tmp_path):
 
 def test_bad_tensor_reference(tmp_path):
     data = bytearray((FIXTURES / "schema-v4-transpose.tgrs").read_bytes())
-    header = defs.HEADER_STRUCT.unpack_from(data)
-    offset = header[3]
-    while True:
-        kind, start = defs.SECTION_ENTRY_STRUCT.unpack_from(data, offset)
-        if kind == defs.SEC_INDEX_POOL:
-            break
-        assert kind
-        offset += defs.SECTION_ENTRY_SIZE
-    struct.pack_into("<H", data, start + header[11] * 2, 65534)
+    start = section_entries(data)[defs.SEC_INDEX_POOL][1]
+    struct.pack_into("<H", data, start + defs.HEADER_STRUCT.unpack_from(data)[11] * 2, 65534)
     path = tmp_path / "bad.tgrs"
     path.write_bytes(data)
     with pytest.raises(ValueError, match="Invalid tensors reference"):
@@ -287,13 +277,7 @@ def test_nonfinite_attributes_produce_standard_json(tmp_path):
 ])
 def test_pool_and_weight_bounds(tmp_path, kind, field, value):
     data = bytearray((FIXTURES / "schema-v6-interface-dtype.tgrs").read_bytes())
-    offset = defs.HEADER_STRUCT.unpack_from(data)[3]
-    while True:
-        section, start = defs.SECTION_ENTRY_STRUCT.unpack_from(data, offset)
-        if section == kind:
-            break
-        assert section
-        offset += defs.SECTION_ENTRY_SIZE
+    start = section_entries(data)[kind][1]
     record = defs.TENSOR_STRUCT if kind == defs.SEC_TENSORS else defs.WEIGHT_ENTRY_STRUCT
     values = list(record.unpack_from(data, start))
     values[field] = value

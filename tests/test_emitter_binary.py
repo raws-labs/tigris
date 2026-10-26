@@ -49,7 +49,7 @@ from tigris.graph.ir import (
     TilePlan,
 )
 
-from conftest import full_pipeline
+from conftest import full_pipeline, save_onnx, section_entries
 
 
 # Quant param pages
@@ -506,20 +506,9 @@ def test_plan_states_its_scheduled_fast_peak(conv_relu_chain_path, compress):
     assert bool(plan["weight_blocks"]) == bool(compress)
 
 
-def _memory_section_entry(data: bytes) -> int:
-    """Byte offset of the memory section's directory entry."""
-    off = HEADER_SIZE
-    while True:
-        kind, _ = struct.unpack_from("<II", data, off)
-        if kind == defs.SEC_MEMORY:
-            return off
-        assert kind, "plan has no memory section"
-        off += 8
-
-
 def test_memory_section_belongs_to_schema_11(linear_3op_path):
     data = emit_binary_bytes(full_pipeline(linear_3op_path, budget=4096))
-    entry = _memory_section_entry(data)
+    entry = section_entries(data)[defs.SEC_MEMORY][0]
     older = bytearray(data)
     struct.pack_into("<I", older, 4, 10)
     with pytest.raises(ValueError, match="Schema 10 plan has a memory section"):
@@ -546,13 +535,7 @@ def test_missing_required_section_is_rejected_cleanly(linear_3op_path):
 def reader_plan():
     data = bytearray((Path(__file__).parent / "schema_compat" / "schema-v6-interface-dtype.tgrs").read_bytes())
     header = list(defs.HEADER_STRUCT.unpack_from(data))
-    sections = {}
-    for offset in range(header[3], len(data), defs.SECTION_ENTRY_SIZE):
-        kind, start = defs.SECTION_ENTRY_STRUCT.unpack_from(data, offset)
-        if not kind:
-            break
-        sections[kind] = start
-    return data, header, sections
+    return data, header, {kind: start for kind, (_, start) in section_entries(data).items()}
 
 
 def test_reader_rejects_directory_overlapping_header(reader_plan):
@@ -667,18 +650,10 @@ def _reduce_mean_model(path, shape, axes, keepdims, projected=False):
             extent for axis, extent in enumerate(shape)
             if axis not in collapsed
         ]
-    graph = helper.make_graph(
-        nodes,
-        "reduce_mean",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shape)],
-        initializers,
-    )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path.write_bytes(model.SerializeToString())
-    return path
+    return save_onnx(path.parent, "reduce_mean", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shape)],
+                     initializers, opset=17, ir_version=8, check=True, filename=path.name)
 
 
 def test_a_spatial_mean_over_both_image_axes_becomes_a_global_pool(tmp_path):
@@ -743,15 +718,10 @@ def _pool_model(path, pool, quantized):
                   helper.make_node("DequantizeLinear", ["fq", "s", "z"], ["output"])]
     else:
         nodes.append(helper.make_node("Flatten", [result], ["output"], axis=1))
-    model = helper.make_model(
-        helper.make_graph(
-            nodes, "pool",
-            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 5, 3])],
-            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])], inits),
-        opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.save(model, path)
-    return path
+    return save_onnx(path.parent, "pool", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 5, 3])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])], inits,
+                     ir_version=8, filename=path.name)
 
 
 def _pool_rounding_records(tmp_path, pool, quantized):
@@ -822,16 +792,13 @@ def test_attribute_payloads_start_four_byte_aligned(tmp_path):
                                              OP_ATTRIBUTE_STRUCT)
     from tigris.emitters.binary.writer import _build_op_attributes, _op_attribute_records
 
-    model = helper.make_model(helper.make_graph(
-        [helper.make_node("Transpose", ["input"], ["moved"], perm=[0, 2, 1]),
-         helper.make_node("Pad", ["moved", "pads"], ["output"])],
-        "aligned", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 5])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 7, 3])],
-        [numpy_helper.from_array(np.array([0, 1, 0, 0, 1, 0], dtype=np.int64), "pads")]),
-        opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "aligned.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "aligned",
+                     [helper.make_node("Transpose", ["input"], ["moved"], perm=[0, 2, 1]),
+                      helper.make_node("Pad", ["moved", "pads"], ["output"])],
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 5])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 7, 3])],
+                     [numpy_helper.from_array(np.array([0, 1, 0, 0, 1, 0], dtype=np.int64), "pads")],
+                     opset=17, ir_version=8)
     graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
     tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
     section = _build_op_attributes(_op_attribute_records(graph, tensor_idx, {}, {}))
@@ -862,16 +829,13 @@ def _softmax_over_a_constant(graph):
 def _contract_graph(tmp_path):
     from tigris.cli import _run_pipeline
 
-    model = helper.make_model(helper.make_graph(
-        [helper.make_node("MatMul", ["input", "w"], ["h"], name="product"),
-         helper.make_node("Softmax", ["h"], ["output"], axis=-1, name="scores")],
-        "contract", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 8])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 8])],
-        [numpy_helper.from_array(np.eye(8, dtype=np.float32), "w")]),
-        opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "contract.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "contract",
+                     [helper.make_node("MatMul", ["input", "w"], ["h"], name="product"),
+                      helper.make_node("Softmax", ["h"], ["output"], axis=-1, name="scores")],
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 8])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 8])],
+                     [numpy_helper.from_array(np.eye(8, dtype=np.float32), "w")], opset=17,
+                     ir_version=8)
     graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
     return graph
 
@@ -916,7 +880,6 @@ def test_an_operator_writing_no_runtime_tensor_is_named(tmp_path):
 
 @pytest.mark.parametrize("state", [False, True])
 def test_tile_wire_layout(tmp_path, state):
-    import onnx
     from scripts.contract_cases.common import _state_tile_case
     from scripts.contract_cases.reduction import _tiled_global_reduction_case
     from tigris.cli import _run_pipeline
@@ -934,15 +897,7 @@ def test_tile_wire_layout(tmp_path, state):
     assert plan["version"] == SCHEMA_VERSION
     assert plan["tile_plans"] and plan["tile_plans"][0]["num_tiles"] > 1
     # Read the record at its directory offset, independent of the reader.
-    directory = struct.unpack_from("<I", data, 12)[0]
-    offsets = {}
-    while True:
-        kind, offset = struct.unpack_from("<II", data, directory)
-        directory += 8
-        if not kind:
-            break
-        offsets[kind] = offset
-    start = offsets[defs.SEC_TILE_PLANS]
+    start = section_entries(data)[defs.SEC_TILE_PLANS][1]
     fields = struct.unpack_from("<BBH7I3IHBB", data, start)
     assert fields[:3] == (1, 1, 0)
     assert fields[3] == tile.tile_height
@@ -954,8 +909,8 @@ def test_tile_wire_layout(tmp_path, state):
     assert defs.TILE_PLAN_V11_SIZE == 48
 
 
+@pytest.mark.usefixtures("require_host_library")
 def test_compact_preserved_axis_transpose(tmp_path):
-    import onnx
     from scripts.contract_cases.common import _state_tile_case
     from scripts.contract_cases.movement import _fixed_axis_transpose_case
     from tigris.cli import _run_pipeline
@@ -982,8 +937,8 @@ def test_compact_preserved_axis_transpose(tmp_path):
 
 
 @pytest.mark.parametrize("field_offset", [16, 20])
+@pytest.mark.usefixtures("require_host_library")
 def test_loader_refuses_incomplete_group_geometry(tmp_path, field_offset):
-    import onnx
     from scripts.contract_cases.reduction import _grouped_global_reduction_case
     from tigris.cli import _run_pipeline
     from tigris.runtime import Session, RuntimeError as HostError
@@ -993,12 +948,7 @@ def test_loader_refuses_incomplete_group_geometry(tmp_path, field_offset):
     onnx.save(case.compile_model, source)
     graph, _ = _run_pipeline(str(source), (case.mem_budget, "16K"))
     data = bytearray(emit_binary_bytes(graph))
-    header = defs.HEADER_STRUCT.unpack_from(data)
-    for offset in range(header[3], len(data), defs.SECTION_ENTRY_SIZE):
-        kind, start = defs.SECTION_ENTRY_STRUCT.unpack_from(data, offset)
-        if kind == defs.SEC_TILE_PLANS:
-            struct.pack_into("<I", data, start + field_offset, 0)
-            break
+    struct.pack_into("<I", data, section_entries(data)[defs.SEC_TILE_PLANS][1] + field_offset, 0)
     plan = read_binary_plan(data)
     field = "input_channel_group" if field_offset == 16 else "input_spatial_interval"
     assert plan["tile_plans"][0][field] == 0

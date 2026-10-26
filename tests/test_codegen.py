@@ -1,11 +1,9 @@
 """Tests for C harness generation and XIP plan metadata."""
 
-import struct
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-import onnx
 import pytest
 from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
@@ -15,8 +13,6 @@ from tigris.analysis.validation import OperatorSupportValidation
 from tigris.cli import cli
 from tigris.emitters.binary.defs import (
     FLAG_XIP,
-    HEADER_SIZE,
-    SECTION_ENTRY_SIZE,
     SEC_TENSORS,
 )
 from tigris.emitters.binary.reader import read_binary_plan
@@ -28,7 +24,7 @@ from tigris.emitters.codegen import (
     generate_core_header,
 )
 
-from conftest import full_pipeline
+from conftest import full_pipeline, save_onnx, section_entries
 
 TFLITE_OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
 
@@ -97,28 +93,10 @@ def unsupported_operator_plan(tmp_path):
             ["output"],
         ),
     ]
-    graph = helper.make_graph(
-        nodes,
-        "quantized_unsupported",
-        [model_input],
-        [model_output],
-        initializer=[
-            input_scale,
-            input_zp,
-            norm_scale,
-            norm_bias,
-            output_scale,
-            output_zp,
-        ],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)]
-    )
-    model.ir_version = 8
-    onnx.checker.check_model(model)
+    model_path = save_onnx(tmp_path, "quantized_unsupported", nodes, [model_input], [model_output],
+                           [input_scale, input_zp, norm_scale, norm_bias, output_scale, output_zp],
+                           ir_version=8, check=True)
 
-    model_path = tmp_path / "quantized_unsupported.onnx"
-    onnx.save(model, model_path)
     analyzed = full_pipeline(model_path, budget=4096)
     assert analyzed.is_quantized
     assert [op.op_type for op in analyzed.ops] == ["InstanceNormalization"]
@@ -434,18 +412,7 @@ def test_codegen_rejects_plan_with_mixed_serialized_dtypes(qdq_conv_path):
     ag = full_pipeline(qdq_conv_path, budget=4096)
     data = bytearray(emit_binary_bytes(ag))
 
-    section_off = HEADER_SIZE
-    tensor_section = None
-    while section_off + SECTION_ENTRY_SIZE <= len(data):
-        section_type, payload_off = struct.unpack_from("<II", data, section_off)
-        if section_type == SEC_TENSORS:
-            tensor_section = payload_off
-            break
-        if section_type == 0:
-            break
-        section_off += SECTION_ENTRY_SIZE
-    assert tensor_section is not None
-    data[tensor_section + 11] = TensorProto.FLOAT
+    data[section_entries(data)[SEC_TENSORS][1] + 11] = TensorProto.FLOAT
 
     with pytest.raises(
         ValueError, match="cannot select one graph-wide runtime dispatcher"

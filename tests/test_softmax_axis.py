@@ -1,27 +1,20 @@
 """Which Softmax axis is reducible is a property of the tensor's layout."""
 
-import onnx
 import pytest
 from onnx import TensorProto, helper
 
 from tigris.analysis.validation import validate_operator_support
 from tigris.graph.ir import Layout
-from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize
+
+from conftest import normalized
 
 
 def _normalized(tmp_path, shape, axis):
     node = helper.make_node("Softmax", ["x"], ["y"], axis=axis, name="sm1")
-    graph = helper.make_graph(
-        [node], "softmax_axis",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "softmax.onnx"
-    onnx.save(model, str(path))
-    return normalize(load_model(str(path)))
+    return normalized(tmp_path, "softmax_axis", [node],
+                      [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+                      [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)],
+                      filename="softmax.onnx")
 
 
 @pytest.mark.parametrize("shape", [[1, 8, 16], [1, 4, 3, 5]])

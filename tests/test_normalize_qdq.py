@@ -19,12 +19,6 @@ from tigris.emitters.binary.defs import NO_QUANT_PARAM
 from conftest import full_pipeline, save_onnx
 
 
-def _load_and_fold(path):
-    """Load raw ONNX (no normalize) then apply full normalize."""
-    ag = load_raw(path)
-    return normalize(ag)
-
-
 def test_qdq_fold_removes_ql_dql_ops(qdq_conv_path):
     """All QuantizeLinear and DequantizeLinear ops should be removed."""
     ag = load_raw(qdq_conv_path)
@@ -38,7 +32,7 @@ def test_qdq_fold_removes_ql_dql_ops(qdq_conv_path):
 
 def test_qdq_fold_quantizes_the_conv(qdq_conv_path):
     """Folding leaves one int8 Conv+Relu with weight, input and output quant params."""
-    ag = _load_and_fold(qdq_conv_path)
+    ag = load_model(qdq_conv_path)
 
     # Relu is absorbed as fused activation
     op_types = [op.op_type for op in ag.ops]
@@ -525,14 +519,10 @@ def _int_weight_conv(path, weight_type):
         helper.make_node("QuantizeLinear", ["conv", "y_scale", "y_zp"], ["y_q"]),
         helper.make_node("DequantizeLinear", ["y_q", "y_scale", "y_zp"], ["output"]),
     ]
-    graph = helper.make_graph(
-        nodes, "int_weight_conv",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 4, 4])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2, 2, 2])], initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
-    model.ir_version = 10
-    onnx.save(model, path)
-    return path
+    return save_onnx(path.parent, "int_weight_conv", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 4, 4])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2, 2, 2])],
+                     initializers, opset=21, ir_version=10, filename=path.name)
 
 
 def test_int4_weights_compile_as_the_same_int8_values(tmp_path):
@@ -566,14 +556,11 @@ def test_a_second_encoding_of_an_activation_is_a_requantization(tmp_path):
         helper.make_node("QuantizeLinear", ["rd", "bs", "bz"], ["second_q"]),
         helper.make_node("DequantizeLinear", ["second_q", "bs", "bz"], ["second"]),
     ]
-    graph = helper.make_graph(
-        nodes, "two_encodings", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 8])],
-        [helper.make_tensor_value_info(n, TensorProto.FLOAT, [1, 8]) for n in ("first", "second")],
-        [s("xs", 0.05), z("xz"), s("as", 0.02), z("az"), s("bs", 0.07), z("bz")])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    path = tmp_path / "two.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "two_encodings", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 8])],
+                     [helper.make_tensor_value_info(n, TensorProto.FLOAT, [1, 8]) for n in ("first", "second")],
+                     [s("xs", 0.05), z("xz"), s("as", 0.02), z("az"), s("bs", 0.07), z("bz")],
+                     ir_version=8, filename="two.onnx")
     ag = _fold_qdq(load_raw(path))
     relu = next(op for op in ag.ops if op.op_type == "Relu")
     assert float(ag.tensors[relu.outputs[0]].quant.scale[0]) == np.float32(0.02)

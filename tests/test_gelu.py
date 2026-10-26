@@ -15,6 +15,8 @@ from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import Layout
 from tigris.runtime import Session
 
+pytestmark = pytest.mark.usefixtures("require_host_library")
+
 FIXTURES = Path(__file__).parent / "fixtures/tflite/ops"
 
 

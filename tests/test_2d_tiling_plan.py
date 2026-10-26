@@ -14,13 +14,8 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris import TILE_AXIS_HW
 from tigris.analysis.validation import validate_memory_plan
 from tigris.cli import _run_pipeline
-from tigris.emitters.binary.defs import (
-    HEADER_STRUCT,
-    SEC_TILE_PLANS,
-    SECTION_ENTRY_STRUCT,
-    TILE_BAND_KIND_HW,
-    TILE_PLAN_V11_STRUCT,
-)
+from tigris.emitters.binary.defs import TILE_BAND_KIND_HW
+from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 
 
@@ -61,50 +56,13 @@ def compile_high_res_conv_to_bytes(h: int, w: int, c: int, budget: str, tmp_path
     return emit_binary_bytes(ag)
 
 
-def decode_first_tile_plan(plan_bytes: bytes):
-    """Locate the tile-plan section and unpack the first record."""
-    header = HEADER_STRUCT.unpack_from(plan_bytes, 0)
-    section_dir_off = header[3]
-
-    sections: dict[int, int] = {}
-    off = section_dir_off
-    while off + SECTION_ENTRY_STRUCT.size <= len(plan_bytes):
-        sec_type, sec_off = SECTION_ENTRY_STRUCT.unpack_from(plan_bytes, off)
-        off += SECTION_ENTRY_STRUCT.size
-        if sec_type == 0:
-            break
-        sections[sec_type] = sec_off
-
-    tp_base = sections[SEC_TILE_PLANS]
-    # The schema 11 record layout, which every current plan uses.
-    (
-        tileable, axis, _flags, _input_band, _output_band, output_width,
-        _channel_group, _spatial_interval, _linear_segment, tiled_peak_bytes,
-        tile_extent, num_tiles, original_extent, _halo, _band_axis, band,
-    ) = TILE_PLAN_V11_STRUCT.unpack_from(plan_bytes, tp_base)
-
-    class _TilePlan:
-        pass
-
-    tp = _TilePlan()
-    tp.tileable = tileable
-    tp.axis = axis
-    tp.tile_height = tile_extent
-    tp.tile_width = output_width
-    tp.num_tiles = num_tiles
-    tp.original_height = original_extent
-    tp.tiled_peak_bytes = tiled_peak_bytes
-    tp.band = band
-    return tp
-
-
 def test_2d_plan_encodes_hw_axis_and_tile_width(tmp_path):
     plan_bytes = compile_high_res_conv_to_bytes(h=256, w=256, c=256, budget="24K", tmp_path=tmp_path)
-    tp = decode_first_tile_plan(plan_bytes)
-    assert tp.tileable == 1
-    assert tp.axis == TILE_AXIS_HW
-    assert tp.tile_height >= 1 and tp.tile_width >= 1
-    assert tp.band == TILE_BAND_KIND_HW
+    tp = read_binary_plan(plan_bytes)["tile_plans"][0]
+    assert tp["tileable"]
+    assert tp["axis"] == TILE_AXIS_HW
+    assert tp["tile_extent"] >= 1 and tp["output_width_extent"] >= 1
+    assert (tp["band_kind"], tp["band_mode"]) == (TILE_BAND_KIND_HW, 0)
 
 
 def test_even_2d_min_tile_infeasible_fails_closed(tmp_path):

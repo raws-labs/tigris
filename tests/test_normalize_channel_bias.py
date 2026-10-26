@@ -3,16 +3,9 @@
 import numpy as np
 from onnx import helper, numpy_helper
 
-from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize
 from tigris.loaders.onnx.normalize.fusion import _axis_broadcast_size, _bias_broadcast_size
 
-from conftest import save_onnx, vi
-
-
-def _normalized(tmp_path, name, nodes, inputs, outputs, init=()):
-    path = save_onnx(tmp_path, name, nodes, inputs, outputs, init)
-    return normalize(load_model(str(path)))
+from conftest import normalized, vi
 
 
 def _weight(name="weight"):
@@ -26,15 +19,12 @@ def _channel(values, shape, name="channel"):
 
 
 def test_channel_add_becomes_the_producers_bias(tmp_path):
-    ag = _normalized(
-        tmp_path, "as_bias",
-        [
-            helper.make_node("Conv", ["x", "weight"], ["p"],
-                             kernel_shape=[3, 3], pads=[1, 1, 1, 1], name="conv1"),
-            helper.make_node("Add", ["p", "channel"], ["y"], name="add1"),
-        ],
-        [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
-        [_weight(), _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
+    ag = normalized(tmp_path, "as_bias",
+                    [helper.make_node("Conv", ["x", "weight"], ["p"], kernel_shape=[3, 3],
+                                      pads=[1, 1, 1, 1], name="conv1"),
+                     helper.make_node("Add", ["p", "channel"], ["y"], name="add1")],
+                    [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
+                    [_weight(), _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
 
     assert [op.op_type for op in ag.ops] == ["Conv"]
     conv = ag.ops[0]
@@ -45,17 +35,14 @@ def test_channel_add_becomes_the_producers_bias(tmp_path):
 
 
 def test_channel_add_sums_into_an_existing_bias(tmp_path):
-    ag = _normalized(
-        tmp_path, "onto_bias",
-        [
-            helper.make_node("Conv", ["x", "weight", "bias"], ["p"],
-                             kernel_shape=[3, 3], pads=[1, 1, 1, 1], name="conv1"),
-            helper.make_node("Add", ["p", "channel"], ["y"], name="add1"),
-        ],
-        [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
-        [_weight(),
-         numpy_helper.from_array(np.array([1.0, 2.0, 3.0], np.float32), "bias"),
-         _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
+    ag = normalized(tmp_path, "onto_bias",
+                    [helper.make_node("Conv", ["x", "weight", "bias"], ["p"], kernel_shape=[3, 3],
+                                      pads=[1, 1, 1, 1], name="conv1"),
+                     helper.make_node("Add", ["p", "channel"], ["y"], name="add1")],
+                    [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
+                    [_weight(),
+                     numpy_helper.from_array(np.array([1.0, 2.0, 3.0], np.float32), "bias"),
+                     _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
 
     assert [op.op_type for op in ag.ops] == ["Conv"]
     assert np.allclose(
@@ -64,28 +51,24 @@ def test_channel_add_sums_into_an_existing_bias(tmp_path):
 
 def test_add_without_a_bias_producer_is_left_alone(tmp_path):
     """Nothing to fold into: the Add must survive and be reported unsupported."""
-    ag = _normalized(
-        tmp_path, "no_producer",
-        [helper.make_node("Add", ["x", "channel"], ["y"], name="add1")],
-        [vi("x", [1, 3, 4, 4])], [vi("y", [1, 3, 4, 4])],
-        [_channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
+    ag = normalized(tmp_path, "no_producer",
+                    [helper.make_node("Add", ["x", "channel"], ["y"], name="add1")],
+                    [vi("x", [1, 3, 4, 4])], [vi("y", [1, 3, 4, 4])],
+                    [_channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
 
     assert [op.op_type for op in ag.ops] == ["Add"]
 
 
 def test_add_feeding_a_second_consumer_is_left_alone(tmp_path):
     """Folding past another reader of the product would change what it sees."""
-    ag = _normalized(
-        tmp_path, "shared_product",
-        [
-            helper.make_node("Conv", ["x", "weight"], ["p"],
-                             kernel_shape=[3, 3], pads=[1, 1, 1, 1], name="conv1"),
-            helper.make_node("Add", ["p", "channel"], ["a"], name="add1"),
-            helper.make_node("Relu", ["p"], ["b"], name="relu1"),
-            helper.make_node("Add", ["a", "b"], ["y"], name="add2"),
-        ],
-        [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
-        [_weight(), _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
+    ag = normalized(tmp_path, "shared_product",
+                    [helper.make_node("Conv", ["x", "weight"], ["p"], kernel_shape=[3, 3],
+                                      pads=[1, 1, 1, 1], name="conv1"),
+                     helper.make_node("Add", ["p", "channel"], ["a"], name="add1"),
+                     helper.make_node("Relu", ["p"], ["b"], name="relu1"),
+                     helper.make_node("Add", ["a", "b"], ["y"], name="add2")],
+                    [vi("x", [1, 2, 3, 3])], [vi("y", [1, 3, 3, 3])],
+                    [_weight(), _channel([0.5, -1.25, 2.0], (1, 3, 1, 1))])
 
     assert "Add" in [op.op_type for op in ag.ops]
 

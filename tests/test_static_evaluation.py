@@ -11,6 +11,8 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.cli import cli
 from tigris.runtime import Session
 
+from conftest import save_onnx
+
 pytestmark = pytest.mark.usefixtures("require_host_library")
 
 
@@ -118,15 +120,12 @@ def test_branch_constants_become_constants_and_keep_the_operator_order(tmp_path)
             helper.make_node("Add", ["x", f"{name}_k"], [f"{name}_a"]),
             helper.make_node("Mul", [f"{name}_r", f"{name}_a"], [f"{name}_y"])], name, [], [out])
 
-    graph = helper.make_graph(
-        [helper.make_node("If", ["cond"], ["y"], then_branch=branch("then"), else_branch=branch("else"))],
-        "branch_constants",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4]),
-         helper.make_tensor_value_info("cond", TensorProto.BOOL, [1])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    onnx.save(model, tmp_path / "branch_constants.onnx")
+    save_onnx(tmp_path, "branch_constants",
+              [helper.make_node("If", ["cond"], ["y"], then_branch=branch("then"), else_branch=branch("else"))],
+              [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4]),
+               helper.make_tensor_value_info("cond", TensorProto.BOOL, [1])],
+              [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])], opset=17,
+              ir_version=8)
 
     ag = load_raw(tmp_path / "branch_constants.onnx")
 

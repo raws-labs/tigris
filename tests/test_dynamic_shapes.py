@@ -13,17 +13,14 @@ from tigris.loaders import load_model
 from tigris.loaders.onnx.loader import resolve_shapes
 from tigris.loaders.onnx.shapes import bind_free_dims
 
+from conftest import save_onnx
+
 
 def _save_relu_model(tmp_path, input_shape, output_shape):
     inp = helper.make_tensor_value_info("input", TensorProto.FLOAT, input_shape)
     out = helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)
     relu = helper.make_node("Relu", ["input"], ["output"], name="relu")
-    graph = helper.make_graph([relu], "dynamic_relu", [inp], [out])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "dynamic_relu.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(tmp_path, "dynamic_relu", [relu], [inp], [out], opset=17, ir_version=8)
 
 
 def _save_shape_subgraph_model(tmp_path):
@@ -50,55 +47,34 @@ def _save_shape_subgraph_model(tmp_path):
         helper.make_node("Concat", ["batch_1d", "rest"], ["target"], name="concat", axis=0),
         helper.make_node("Reshape", ["act", "target"], ["output"], name="reshape"),
     ]
-    graph = helper.make_graph(nodes, "shape_subgraph", [inp], [out], initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 12)])
-    model.ir_version = 7
-    path = tmp_path / "shape_subgraph.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(tmp_path, "shape_subgraph", nodes, [inp], [out], initializers, opset=12,
+                     ir_version=7)
 
 
-def test_free_batch_dimension_is_bound_to_one(tmp_path):
-    path = _save_relu_model(tmp_path, ["batch", 64], ["batch", 64])
+@pytest.mark.parametrize("declared, label", [(["batch", 64], "batch"), ([None, 64], "unknown")],
+                         ids=["batch", "unknown"])
+def test_an_unset_dimension_is_bound_to_one(tmp_path, declared, label):
+    path = _save_relu_model(tmp_path, declared, declared)
 
     graph = load_model(path)
 
     assert graph.tensors["input"].shape == (1, 64)
     assert graph.tensors["output"].shape == (1, 64)
     assert graph.shape_bindings == [
-        "input axis 0 (batch) is unset; using 1 (--input-shape overrides)"
+        f"input axis 0 ({label}) is unset; using 1 (--input-shape overrides)"
     ]
 
 
-def test_unknown_dimension_is_bound_to_one(tmp_path):
-    path = _save_relu_model(tmp_path, [None, 64], [None, 64])
-
-    graph = load_model(path)
-
-    assert graph.tensors["input"].shape == (1, 64)
-    assert graph.shape_bindings == [
-        "input axis 0 (unknown) is unset; using 1 (--input-shape overrides)"
-    ]
-
-
-def test_input_shape_is_not_reported_as_a_binding(tmp_path):
+@pytest.mark.parametrize("declared, shape", [(["batch", 64], (4, 64)), ([1, 64], (8, 64))],
+                         ids=["named_dimension", "concrete_dimension"])
+def test_input_shape_sets_the_dimension_and_is_not_reported_as_a_binding(tmp_path, declared, shape):
     """A shape the caller named is not a dimension the compiler guessed."""
-    path = _save_relu_model(tmp_path, ["batch", 64], ["batch", 64])
+    path = _save_relu_model(tmp_path, declared, declared)
 
-    graph = load_model(path, {"input": (4, 64)})
+    graph = load_model(path, {"input": shape})
 
-    assert graph.tensors["input"].shape == (4, 64)
-    assert graph.tensors["output"].shape == (4, 64)
-    assert graph.shape_bindings == []
-
-
-def test_input_shape_overrides_a_concrete_dimension(tmp_path):
-    path = _save_relu_model(tmp_path, [1, 64], [1, 64])
-
-    graph = load_model(path, {"input": (8, 64)})
-
-    assert graph.tensors["input"].shape == (8, 64)
-    assert graph.tensors["output"].shape == (8, 64)
+    assert graph.tensors["input"].shape == shape
+    assert graph.tensors["output"].shape == shape
     assert graph.shape_bindings == []
 
 
@@ -108,11 +84,7 @@ def test_binding_is_reported_for_an_input_no_override_names(tmp_path):
     other = helper.make_tensor_value_info("other", TensorProto.FLOAT, ["batch", 64])
     out = helper.make_tensor_value_info("output", TensorProto.FLOAT, None)
     nodes = [helper.make_node("Add", ["input", "other"], ["output"], name="add")]
-    graph = helper.make_graph(nodes, "two_inputs", [inp, other], [out])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "two_inputs.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "two_inputs", nodes, [inp, other], [out], opset=17, ir_version=8)
 
     ag = load_model(path, {"input": (4, 64)})
 

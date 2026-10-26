@@ -12,6 +12,7 @@ import onnx
 import pytest
 from click.testing import CliRunner
 
+from tigris import SCHEMA_VERSION
 from tigris.analysis.plan_graph import slow_arena_required
 from tigris.cli import cli
 from tigris.emitters.binary.reader import read_binary_plan
@@ -20,6 +21,7 @@ from tigris.frontends.flatbuffer import Table
 from tigris.frontends.tflite_export import tflm_tensor_arena
 from tigris.frontends.tflite_schema import BUILTIN_OPERATORS
 from tigris.inspection import inspect_file
+from tigris.runtime import Session
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tflite"
 KWS = FIXTURES / "kws_ref_model.tflite"
@@ -44,21 +46,10 @@ def test_conversion_keeps_the_interface_names():
     assert [o.name for o in model.graph.output] == ["Identity"]
 
 
-def _session():
-    import tigris
-    if not (Path(tigris.__file__).parent / "native" / "manifest.json").exists():
-        if os.environ.get("TIGRIS_REQUIRE_HOST"):
-            pytest.fail("Installed wheel has no host library")
-        pytest.skip("Host library has not been staged in this source checkout")
-    from tigris.runtime import Session
-    return Session
-
-
 def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path):
     """Runs the compiled plan on TFLite Micro's recorded inputs, in the
     model's own dtypes, and compares the outputs bit for bit. The slow arena
     is exactly what generated applications reserve for the plan."""
-    Session = _session()
     plan_path = tmp_path / "model.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", budget, "-o", str(plan_path)])
     assert result.exit_code == 0, result.output
@@ -88,6 +79,7 @@ def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_pat
                                                   err_msg=f"sample {sample}, output {position}")
 
 
+@pytest.mark.usefixtures("require_host_library")
 def test_plan_reproduces_tflite_micro_outputs(tmp_path):
     """Recorded TFLite Micro reference outputs, compared bit for bit."""
     recorded = np.load(FIXTURES / "kws_ref_model_tflm.npz")
@@ -100,6 +92,7 @@ def test_plan_reproduces_tflite_micro_outputs(tmp_path):
 
 @pytest.mark.parametrize("name", ["vww_96_int8", "pretrainedResnet_quant"])
 @pytest.mark.parametrize("budget,tiled", [("256K", False), ("16K", True)])
+@pytest.mark.usefixtures("require_host_library")
 def test_reference_model_matches_tflite_micro(name, budget, tiled, tmp_path):
     """Whole MLPerf Tiny models, in one stage and at a budget that tiles
     most of them."""
@@ -111,6 +104,7 @@ def test_reference_model_matches_tflite_micro(name, budget, tiled, tmp_path):
 
 
 @pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("*.tflite")), ids=lambda p: p.stem)
+@pytest.mark.usefixtures("require_host_library")
 def test_single_operator_matches_tflite_micro(model, tmp_path):
     assert tflite.unsupported(model.read_bytes()) == []
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256K", tmp_path)
@@ -217,7 +211,7 @@ def test_the_tight_budget_tables_name_fixtures():
 
 
 @pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("*.tflite")), ids=lambda p: p.stem)
-def test_single_operator_at_a_tight_budget(model, tmp_path):
+def test_single_operator_at_a_tight_budget(model, tmp_path, request):
     """The same comparison at 256 bytes, or at 1K for the fixtures in
     TILES_AT_1K, which forces tiling wherever the operator tiles. Whether
     each fixture tiles, fits untiled or is refused is recorded above, so a
@@ -234,6 +228,7 @@ def test_single_operator_at_a_tight_budget(model, tmp_path):
         if name not in TILES_AT_1K:
             return
         budget, limit = "1K", 1024
+    request.getfixturevalue("require_host_library")
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), budget, tmp_path)
     plan = read_binary_plan((tmp_path / "model.tgrs").read_bytes())
     for tile in plan["tile_plans"]:
@@ -256,6 +251,7 @@ def test_single_operator_at_a_tight_budget(model, tmp_path):
     ("float_cumsum_offset", "CumSum"), ("float_reduce_max_spatial", "ReduceMax"),
     ("float_reduce_min_rows", "ReduceMin"), ("float_sum_spatial", "ReduceSum"),
 ])
+@pytest.mark.usefixtures("require_host_library")
 def test_independent_axis_and_reshape_fit_tight_budget(name, kind, tmp_path):
     from tigris.cli import _run_pipeline
 
@@ -272,6 +268,7 @@ def test_independent_axis_and_reshape_fit_tight_budget(name, kind, tmp_path):
 
 
 @pytest.mark.parametrize("name", ["float_depth_to_space", "float_space_to_depth", "float_reshape"])
+@pytest.mark.usefixtures("require_host_library")
 def test_reshape_rank_boundary_fits_tight_budget(name, tmp_path):
     model = FIXTURES / "ops" / (name + ".tflite")
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
@@ -282,6 +279,7 @@ def test_reshape_rank_boundary_fits_tight_budget(name, tmp_path):
     ("float_sum_channels", "ReduceSum", 2),
     ("float_cumsum_exclusive_reverse", "CumSum", 2),
 ])
+@pytest.mark.usefixtures("require_host_library")
 def test_contiguous_reshape_and_leading_operator_fit_tight_budget(name, kind, count, tmp_path):
     from tigris.cli import _run_pipeline
     from tigris.analysis.validation import validate_memory_plan
@@ -298,8 +296,7 @@ def test_contiguous_reshape_and_leading_operator_fit_tight_budget(name, kind, co
     assert stage.tile_plan.original_height == 36 and stage.tile_plan.num_tiles > 1
     assert stage.tile_plan.tiled_peak_bytes <= 256
     _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256", tmp_path)
-    assert read_binary_plan((tmp_path / "model.tgrs").read_bytes())["version"] == 11
-
+    assert read_binary_plan((tmp_path / "model.tgrs").read_bytes())["version"] == SCHEMA_VERSION
 
 
 def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
@@ -825,16 +822,16 @@ def test_an_int8_cumsum_keeps_tflite_semantics_in_the_compilers_own_form():
     assert [node.domain for node in scans] == ["tigris"]
 
 
+@pytest.mark.usefixtures("require_host_library")
 def test_a_variable_is_kept_across_runs_and_reset(tmp_path):
     """The window variable carries from run to run, as TFLite Micro keeps it,
     and a reset starts it over."""
-    Session = _session()
     model = FIXTURES / "ops" / "float_variable_window.tflite"
     golden = np.load(model.with_suffix(".npz"))
     plan = tmp_path / "window.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(plan)])
     assert result.exit_code == 0, result.output
-    assert read_binary_plan(plan.read_bytes())["version"] == 11
+    assert read_binary_plan(plan.read_bytes())["version"] == SCHEMA_VERSION
     with Session(plan) as session:
         assert [i["name"] for i in session.inputs] == ["serving_default_x:0"]
         assert len(session.outputs) == 1
@@ -848,6 +845,7 @@ def test_a_variable_is_kept_across_runs_and_reset(tmp_path):
 
 
 @pytest.mark.parametrize("name", ["mean_spatial", "mean_spatial_flat", "float_mean_spatial", "float_mean_spatial_flat"])
+@pytest.mark.usefixtures("require_host_library")
 def test_grouped_pool_preserves_recorded_outputs(name, tmp_path):
     from dataclasses import replace
     from tigris.cli import _run_pipeline
@@ -865,8 +863,7 @@ def test_grouped_pool_preserves_recorded_outputs(name, tmp_path):
     path = tmp_path / "grouped.tgrs"
     path.write_bytes(emit_binary_bytes(graph))
     plan = read_binary_plan(path.read_bytes())
-    assert plan["version"] == 11
-    Session = _session()
+    assert plan["version"] == SCHEMA_VERSION
     golden = np.load(source.with_suffix(".npz"))
     with Session(path, slow_capacity=slow_arena_required(plan)) as session:
         for sample in range(len(golden["input_0"])):

@@ -1,28 +1,19 @@
 """A Clip that states an activation the runtime already has."""
 
 import numpy as np
-import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.validation import validate_operator_support
-from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize
+
+from conftest import normalized
 
 
 def _normalized(tmp_path, inputs, init):
     node = helper.make_node("Clip", inputs, ["y"], name="clip1")
-    graph = helper.make_graph(
-        [node], "clip",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])],
-        list(init),
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "clip.onnx"
-    onnx.save(model, str(path))
-    return normalize(load_model(str(path)))
+    return normalized(tmp_path, "clip", [node],
+                      [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
+                      [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])], list(init))
 
 
 def _scalar(value, name):
