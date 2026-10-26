@@ -155,15 +155,6 @@ class OpNode:
 
 
 @dataclass
-class MemorySnapshot:
-    """Memory state at a single execution step."""
-
-    step: int
-    live_bytes: int
-    live_tensors: list[str]
-
-
-@dataclass
 class TilePlan:
     """Tiling analysis result for a single stage."""
 
@@ -295,7 +286,6 @@ class AnalyzedGraph:
     lifetimes: dict[str, TensorLifetime] = field(default_factory=dict)
 
     # Populated by memory analysis
-    timeline: list[MemorySnapshot] = field(default_factory=list)
     peak_memory_bytes: int = 0
 
     # Populated by partitioner

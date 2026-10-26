@@ -15,8 +15,8 @@ _CAUSES_SHOWN = 5
 _BUDGETS_TRIED = 3
 
 
-def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, source: str,
-            tflm_arena: int | None, tried: list, traffic, tflm_export=None) -> dict:
+def _report(ag, findings, budget: int, source: str, tflm_arena: int | None, tried: list,
+            traffic, tflm_export=None) -> dict:
     """The analysis as versioned JSON; byte counts are integers."""
     from tigris.cli.export import export_report
     f = findings
@@ -62,7 +62,7 @@ def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, sour
             "infeasible": list(f.feasibility_errors),
         },
         "slow": {
-            "budget_bytes": slow_budget,
+            "budget_bytes": ag.budget.slow,
             "peak_bytes": f.slow_peak_bytes,
             "fits": f.slow_fits,
             "overflow_stages": list(f.slow_overflow_stages),
@@ -70,10 +70,10 @@ def _report(ag, findings, budget: int, slow_budget: int, flash_budget: int, sour
             "traffic": traffic if isinstance(traffic, dict) else None,
         },
         "flash": {
-            "budget_bytes": flash_budget,
+            "budget_bytes": ag.budget.flash,
             "weight_bytes": f.total_weight_bytes,
             "plan_bytes": f.plan_size_bytes or None,
-            "plan_fits": f.plan_fits_flash if flash_budget and f.plan_size_bytes else None,
+            "plan_fits": f.plan_fits_flash if ag.budget.flash and f.plan_size_bytes else None,
             "estimates": {"int8_plan_bytes": f.int8_plan_size_bytes or None,
                           "lz4_plan_bytes": f.lz4_plan_size_bytes or None},
         },
@@ -163,7 +163,7 @@ def _stage_count(n: int) -> str:
     return _count(n, "stage")
 
 
-def verdict_lines(findings, budget: int, slow_budget: int, stages=()) -> list[str]:
+def verdict_lines(findings, budget: int, ag) -> list[str]:
     """The verdict, then one line per cause, worst first."""
     f = findings
     if f.unsupported_operators:
@@ -175,7 +175,7 @@ def verdict_lines(findings, budget: int, slow_budget: int, stages=()) -> list[st
         return [text.bad("cannot compile") + f": {(f.output_errors + f.dtype_errors)[0]}"]
     if budget <= 0:
         return [text.dim("no budget given; memory figures only")]
-    tiled = sum(runs_tiled(s) for s in stages)
+    tiled = sum(runs_tiled(s) for s in ag.stages)
     if f.blocking_stages:
         count = len(f.blocking_stages)
         lines = [text.bad("does not fit") + f" {fmt_bytes(budget)} fast memory: "
@@ -192,13 +192,13 @@ def verdict_lines(findings, budget: int, slow_budget: int, stages=()) -> list[st
         fit += f", {tiled} tiled"
     if not f.slow_fits:
         return [text.warn(f"fits{fit}; slow memory {fmt_bytes(f.slow_peak_bytes)} needed, "
-                          f"{fmt_bytes(slow_budget)} given")]
+                          f"{fmt_bytes(ag.budget.slow)} given")]
     return [text.good("fits") + fit]
 
 
-def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budget: int,
-            tflm_arena: int | None, tried: list | None = None, traffic=None,
-            lz4_tried: bool = False, tflm_export=None) -> None:
+def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
+            tried: list | None = None, traffic=None, lz4_tried: bool = False,
+            tflm_export=None) -> None:
     """The header, verdict, memory and flash, shared by analyze and compile.
     `traffic` is what trace.traffic measured; None leaves the row out. The LZ4
     row needs `lz4_tried`: the estimate stands only where -c lz4 compiles.
@@ -212,7 +212,7 @@ def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budge
     text.echo(text.bold(Path(model).name) + "   " + title)
     for line in text.columns(interface_rows(ag)):
         text.echo(line)
-    for line in verdict_lines(f, budget, slow_budget, ag.stages):
+    for line in verdict_lines(f, budget, ag):
         text.echo(line)
 
     memory = []
@@ -233,7 +233,7 @@ def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budge
                        text.dim(f"{fmt_bytes(budget - f.scheduled_peak_bytes)} headroom")])
     if f.slow_peak_bytes > 0:
         memory.append(["slow memory", fmt_bytes(f.slow_peak_bytes),
-                       text.dim(f"budget {fmt_bytes(slow_budget)}") if slow_budget else ""])
+                       text.dim(f"budget {fmt_bytes(ag.budget.slow)}") if ag.budget.slow else ""])
     if isinstance(traffic, dict):
         memory.append(["slow traffic", fmt_bytes(traffic["written"] + traffic["read"]),
                        text.dim(f"per inference: {fmt_bytes(traffic['written'])} written, "
@@ -259,9 +259,9 @@ def summary(model: str, ag, findings, budget: int, slow_budget: int, flash_budge
                 flash.append(["with -c lz4", fmt_bytes(f.lz4_plan_size_bytes), text.dim("estimate")])
             if f.is_float32 and not f.is_quantized:
                 flash.append(["as int8", fmt_bytes(f.int8_plan_size_bytes), text.dim("estimate")])
-            if flash_budget > 0:
-                over = f.plan_size_bytes - flash_budget
-                flash.append(["flash budget", fmt_bytes(flash_budget),
+            if ag.budget.flash > 0:
+                over = f.plan_size_bytes - ag.budget.flash
+                flash.append(["flash budget", fmt_bytes(ag.budget.flash),
                               text.good("fits") if over <= 0 else
                               text.bad(f"exceeds it by {fmt_bytes(over)}")])
         text.section("flash", flash, "<>")
@@ -329,7 +329,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
 
     data = Path(model).read_bytes()
     tflm_arena = tflm_tensor_arena(data)
-    findings = compute_findings(ag, flash_budget=flash_budget)
+    findings = compute_findings(ag)
     supported = not (findings.unsupported_operators or findings.output_errors or findings.dtype_errors)
     tried = (_tried(model, budget, not findings.blocking_stages, input_shape)
              if budget > 0 and supported else [])
@@ -340,12 +340,11 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     traffic = measure_traffic(ag) if supported else None
     tflm_export = None if tflm_arena is None else export(data)
     if as_json:
-        click.echo(json.dumps(_report(ag, findings, budget, slow_budget, flash_budget,
-                                      "tflite" if is_tflite(data) else "onnx", tflm_arena,
-                                      tried, traffic, tflm_export),
+        click.echo(json.dumps(_report(ag, findings, budget, "tflite" if is_tflite(data) else "onnx",
+                                      tflm_arena, tried, traffic, tflm_export),
                               indent=2, ensure_ascii=True, allow_nan=False))
         return
-    summary(model, ag, findings, budget, slow_budget, flash_budget, tflm_arena, tried, traffic,
-            lz4_tried=True, tflm_export=tflm_export)
+    summary(model, ag, findings, budget, tflm_arena, tried, traffic, lz4_tried=True,
+            tflm_export=tflm_export)
     if verbose and ag.stages:
         _stages(ag)
