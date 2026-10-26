@@ -18,6 +18,20 @@ from tigris.analysis.lifetime import _same_stored_bytes
 from tigris.analysis.broadcast import is_constant, stored_operands
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.analysis.partition_temporal import partition_temporal
+from tigris.emitters.binary.defs import (
+    TILE_BAND_KIND_BY_INPUT,
+    TILE_BAND_KIND_HW,
+    TILE_BAND_KIND_LEADING,
+    TILE_BAND_KIND_RESHAPE,
+    TILE_BAND_KIND_ROWS,
+    TILE_BAND_KIND_STRIPE,
+    TILE_BAND_KIND_TRANSPOSE,
+    TILE_BAND_MODE_AXIS_BASE,
+    TILE_BAND_MODE_BATCH,
+    TILE_BAND_MODE_LEADING,
+    TILE_BAND_MODE_TIME_MAJOR_BATCH,
+    TILE_BAND_MODE_TRAILING,
+)
 from tigris.operator_contract import OPERATOR_CONTRACT
 from tigris.graph.ir import (
     AnalyzedGraph,
@@ -904,6 +918,24 @@ def _independent_mode(ag: AnalyzedGraph, op: OpNode) -> int:
     return next((mode for mode in (1, 2) if _independent_band(ag, op, leading=mode)), 0)
 
 
+def _band_mode(op: OpNode, mode: int) -> int:
+    """The tile record's band mode for an `_independent_mode` result."""
+    if op.op_type in {"Svdf", "Lstm"}:
+        return TILE_BAND_MODE_TIME_MAJOR_BATCH if op.attrs.get("time_major", False) else TILE_BAND_MODE_BATCH
+    if mode == 1:
+        return TILE_BAND_MODE_LEADING
+    if mode == 2:
+        return TILE_BAND_MODE_TRAILING
+    return TILE_BAND_MODE_AXIS_BASE + mode - 3
+
+
+def _banded(plan: TilePlan, kind: int, mode: int = 0) -> TilePlan:
+    """The plan, stating how the runtime bands the stage when it tiles."""
+    if plan.tileable:
+        plan.band_kind, plan.band_mode = kind, mode
+    return plan
+
+
 def _row_band_axis(ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]) -> int:
     """The matrix-row axis of the first stage input a row band cuts."""
     batch, rows, _ = _row_view(ag.tensors[stage_ops[0].outputs[0]])
@@ -1759,12 +1791,14 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         reshape = _reshape_band(ag, stage)
         if reshape is not None:
-            stage.tile_plan = _reshape_tile_for_bytes(
-                reshape, budget, ag.tensor_alignment, ag.tensors[stage.input_tensors[0]].elem_size)
+            stage.tile_plan = _banded(_reshape_tile_for_bytes(
+                reshape, budget, ag.tensor_alignment, ag.tensors[stage.input_tensors[0]].elem_size),
+                TILE_BAND_KIND_RESHAPE)
             continue
 
         if any(op_category(op) is TileCategory.UPSAMPLE for op in stage_ops):
-            stage.tile_plan = _solve_resize_height(ag, stage, stage_ops, budget)
+            stage.tile_plan = _banded(_solve_resize_height(ag, stage, stage_ops, budget),
+                                      TILE_BAND_KIND_STRIPE)
             continue
 
         # ConvTranspose stays UNTILEABLE in _OP_CATEGORY on purpose (so it is
@@ -1773,20 +1807,23 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         # branch that grids the expanded OUTPUT extent. Every other stage falls
         # through to the existing byte-identical path below.
         if _stage_is_convtranspose_2d(stage_ops):
-            stage.tile_plan = _solve_convtranspose_2d(ag, stage, stage_ops, budget)
+            stage.tile_plan = _banded(_solve_convtranspose_2d(ag, stage, stage_ops, budget),
+                                      TILE_BAND_KIND_HW)
             continue
 
         # Rank 2 has no axis the stripe contract names, but a matrix
         # pipeline's rows are independent, so it bands along them.
         if _stage_is_row_tiled(ag, stage, stage_ops):
-            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget,
-                                              band_axis=_row_band_axis(ag, stage, stage_ops))
+            stage.tile_plan = _banded(_solve_row_tile(
+                ag, stage, stage_ops, budget, band_axis=_row_band_axis(ag, stage, stage_ops)),
+                TILE_BAND_KIND_ROWS)
             continue
 
         # The runtime runs this band as a height stripe, so it counts the output's rows.
         if len(stage_ops) == 1 and _independent_band(ag, stage_ops[0], row_tiled=False):
-            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, _height_view,
-                                              band_axis=1, output_rows=True)
+            stage.tile_plan = _banded(_solve_row_tile(
+                ag, stage, stage_ops, budget, _height_view, band_axis=1, output_rows=True),
+                TILE_BAND_KIND_STRIPE)
             continue
 
         if (len(stage_ops) == 1 and not stage.chain_len and
@@ -1796,23 +1833,24 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             view = (lambda info: _batch_view(info, op.attrs.get("time_major", False))) \
                 if op.op_type in {"Svdf", "Lstm"} else \
                 (lambda info: _leading_view(info, mode == 2, mode - 3 if mode >= 3 else None))
-            stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, view, independent=True,
-                                              band_axis=_leading_band_axis(ag, op, mode))
+            stage.tile_plan = _banded(_solve_row_tile(
+                ag, stage, stage_ops, budget, view, independent=True,
+                band_axis=_leading_band_axis(ag, op, mode)), TILE_BAND_KIND_LEADING, _band_mode(op, mode))
             continue
 
         # A global reduction has no output axis to tile, so the runtime walks
         # its input instead. Like ConvTranspose it stays UNTILEABLE in
         # _OP_CATEGORY and reaches its execution path only through this branch.
         if _stage_is_global_reduction(ag, stage, stage_ops):
-            stage.tile_plan = _solve_global_reduction(
-                ag, stage, stage_ops, budget)
+            stage.tile_plan = _banded(_solve_global_reduction(ag, stage, stage_ops, budget),
+                                      TILE_BAND_KIND_BY_INPUT)
             continue
 
         # A conversion permutes the two axes the stripe contract propagates,
         # so it reaches its own execution path the same way.
         if _stage_is_tiled_transpose(ag, stage, stage_ops):
-            stage.tile_plan = _solve_layout_conversion(
-                ag, stage, stage_ops, budget)
+            stage.tile_plan = _banded(_solve_layout_conversion(ag, stage, stage_ops, budget),
+                                      TILE_BAND_KIND_TRANSPOSE)
             continue
 
         tile_axis = _stage_tile_axis(ag, stage, stage_ops)
@@ -1906,7 +1944,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             if _find_input_extent_width(ag, stage) > 0:
                 plan_2d = _solve_forward_2d(ag, stage, stage_ops, budget, rf_h)
                 if plan_2d.tileable:
-                    stage.tile_plan = plan_2d
+                    stage.tile_plan = _banded(plan_2d, TILE_BAND_KIND_HW)
                     continue
 
                 # Even a 1x1 output tile does not fit the budget. Mark this
@@ -1948,6 +1986,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             warnings=warnings,
             min_2d_tile_infeasible=min_2d_tile_infeasible,
             min_tile_bytes=min_2d_bytes,
+            band_kind=TILE_BAND_KIND_STRIPE,
         )
 
     return ag

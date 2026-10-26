@@ -88,6 +88,12 @@ def schema_package() -> dict[str, object]:
                 "as Resize and 2D records do; the runtime's loader derives them from the plan "
                 "and refuses a record that disagrees"
             ),
+            "tile_band_v11": (
+                "a tileable record states the band kind the runtime runs the stage by in the "
+                "low four bits of its band byte, and a leading band's mode in the high four; "
+                "the loader refuses a kind the stage does not meet, and an untileable record "
+                "states 0"
+            ),
             "state_v10": "state, subgraphs and grouped tiles need schema 10 or later",
             "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
             "subgraphs_v10": "control flow needs schema 10 or later; graph 0 is the main graph",
@@ -108,7 +114,15 @@ def schema_package() -> dict[str, object]:
                        "input_spatial_interval": [20, 4], "output_linear_segment": [24, 4],
                        "tiled_peak_bytes": [28, 4], "tile_extent": [32, 4],
                        "num_tiles": [36, 4], "original_extent": [40, 4], "halo": [44, 2],
-                       "band_axis": [46, 1], "reserved": [47, 1]},
+                       "band_axis": [46, 1], "band": [47, 1]},
+            "band_kinds": {"reshape": defs.TILE_BAND_KIND_RESHAPE, "leading": defs.TILE_BAND_KIND_LEADING,
+                           "rows": defs.TILE_BAND_KIND_ROWS, "transpose": defs.TILE_BAND_KIND_TRANSPOSE,
+                           "by_input": defs.TILE_BAND_KIND_BY_INPUT, "hw": defs.TILE_BAND_KIND_HW,
+                           "stripe": defs.TILE_BAND_KIND_STRIPE},
+            "band_modes": {"leading": defs.TILE_BAND_MODE_LEADING, "batch": defs.TILE_BAND_MODE_BATCH,
+                           "time_major_batch": defs.TILE_BAND_MODE_TIME_MAJOR_BATCH,
+                           "trailing": defs.TILE_BAND_MODE_TRAILING,
+                           "axis_base": defs.TILE_BAND_MODE_AXIS_BASE},
         },
         "tile_axes": {
             "height_or_length": TILE_AXIS_HEIGHT_OR_LENGTH,

@@ -478,7 +478,8 @@ _TILE_FACTS_DUMP = r"""
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Per plan its load result, then what the runtime derives for each tile record. */
+/* Per plan its load result, then what the runtime derives for each tile record,
+ * and the band kind and mode its own order finds when it reads the records as schema 10. */
 int main(int argc, char **argv)
 {
     for (int a = 1; a < argc; a++) {
@@ -493,14 +494,36 @@ int main(int argc, char **argv)
         tigris_plan_t plan;
         tigris_error_t err = tigris_plan_load(buf, (uint32_t)size, &plan);
         printf("plan %d %d\n", a - 1, (int)err);
+        tigris_tile_plan_v10_t *choices = NULL;
+        tigris_file_header_t header;
+        tigris_plan_t older;
+        if (err == TIGRIS_OK) {
+            choices = calloc(plan.header->num_tile_plans + 1u, sizeof(*choices));
+            if (!choices) return 4;
+            for (uint16_t t = 0; t < plan.header->num_tile_plans; t++)
+                choices[t] = plan.tile_plans_v11[t].choices;
+            header = *plan.header;
+            header.version = TIGRIS_SCHEMA_VERSION_V10;
+            older = plan;
+            older.header = &header;
+            older.tile_plans_v10 = choices;
+            older.tile_plans_v11 = NULL;
+        }
         for (uint16_t s = 0; err == TIGRIS_OK && s < plan.header->num_stages; s++) {
             if (plan.stages[s].tile_plan_idx == TIGRIS_NO_TILE_PLAN) continue;
             tigris_tile_facts_t d;
             int ok = tigris_stage_tile_facts(&plan, &plan.stages[s], &d);
-            printf("stage %u %d %u %u %u %u %u\n", (unsigned)s, ok, (unsigned)d.tile_extent,
+            tigris_stage_band_t band;
+            tigris_band_kind_t kind = tigris_stage_band_kind(&older, &plan.stages[s], &band);
+            if (!plan.tile_plans_v11[plan.stages[s].tile_plan_idx].choices.tileable)
+                kind = TIGRIS_BAND_KIND_NONE;
+            printf("stage %u %d %u %u %u %u %u %u %u %d %d\n", (unsigned)s, ok, (unsigned)d.tile_extent,
                    (unsigned)d.num_tiles, (unsigned)d.original_extent, (unsigned)d.halo,
-                   (unsigned)d.band_axis);
+                   (unsigned)d.band_axis, (unsigned)TIGRIS_TILE_BAND_KIND(d.band),
+                   (unsigned)TIGRIS_TILE_BAND_MODE(d.band), (int)kind,
+                   kind == TIGRIS_BAND_KIND_LEADING ? (int)band.mode : 0);
         }
+        free(choices);
         free(buf);
     }
     return 0;
@@ -508,36 +531,56 @@ int main(int argc, char **argv)
 """
 
 
+def _rank2_dense_constant_model(directory: Path, op_type: str) -> Path:
+    """y = op(x, k) with x [256, 64] and k a constant of the same shape."""
+    import numpy as np
+    from onnx import helper, numpy_helper
+    from conftest import save_onnx, vi
+
+    constant = np.linspace(1.0, 2.0, 256 * 64, dtype=np.float32).reshape(256, 64)
+    return save_onnx(directory, f"{op_type.lower()}_dense_constant",
+                     [helper.make_node(op_type, ["x", "k"], ["y"])], [vi("x", [256, 64])],
+                     [vi("y", [256, 64])], [numpy_helper.from_array(constant, "k")])
+
+
 def test_runtime_derives_every_stated_tile_fact(sanitized_runtime, tmp_path):
-    """Every tile record of the operator fixtures at 256 B, 1 KiB and 4 KiB
-    states what the runtime derives from the plan with the rules it bands the
-    stage by, and reads back as the compiler's tile plan: the band, the tile
-    count, the extent, the halo and the band axis, and the loader accepts the
-    plan."""
+    """Every tile record of the operator fixtures at 256 B, 1 KiB and 4 KiB, and
+    of a rank-2 Add and Max with a full-shape constant at 16 KiB, states what
+    the runtime derives from the plan with the rules it bands the stage by, and
+    reads back as the compiler's tile plan: the band, the tile count, the
+    extent, the halo, the band axis and the band kind and mode, and the loader
+    accepts the plan. The stated kind and mode are the ones the runtime's own
+    order finds for the stage when it reads the plan's records as schema 10."""
     from tigris.analysis.plan_graph import graph_from_plan
     from tigris.analysis.validation import validate_memory_plan
     from tigris.cli import _run_pipeline
     from tigris.emitters.binary.reader import read_binary_plan
 
-    facts = ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis")
+    facts = ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis", "band_kind", "band_mode")
     fields = ("tileable", "axis", "band_on_columns", "band_in_output_rows", "tile_height",
               "tile_width", "num_tiles", "original_height", "halo", "band_axis",
-              "input_channel_group", "input_spatial_interval", "tiled_peak_bytes")
+              "input_channel_group", "input_spatial_interval", "tiled_peak_bytes",
+              "band_kind", "band_mode")
     expected, paths = [], []
     fixtures = Path(__file__).parent / "fixtures" / "tflite" / "ops"
-    for model in sorted(fixtures.glob("*.tflite")):
-        for budget in ("256", "1K", "4K"):
-            graph, _ = _run_pipeline(str(model), (budget,), report_bindings=False)
+    budgets = {model: ("256", "1K", "4K") for model in sorted(fixtures.glob("*.tflite"))}
+    for op_type in ("Add", "Max"):
+        budgets[_rank2_dense_constant_model(tmp_path, op_type)] = (("16K", "4M"),)
+    for model, model_budgets in budgets.items():
+        for budget in model_budgets:
+            graph, _ = _run_pipeline(str(model), budget if isinstance(budget, tuple) else (budget,),
+                                     report_bindings=False)
             if not validate_memory_plan(graph).feasible or not any(
                     stage.tile_plan for stage in graph.stages):
                 continue
             data = emit_binary_bytes(graph)
             plan = read_binary_plan(data)
-            stated = {}
+            stated, kinds = {}, {}
             for index, stage in enumerate(plan["stages"]):
                 if stage["tile_plan_idx"] != 0xFFFF:
                     record = plan["tile_plans"][stage["tile_plan_idx"]]
                     stated[index] = tuple(record[field] for field in facts)
+                    kinds[index] = (record["band_kind"], record["band_mode"])
             stages = graph_from_plan(plan).stages
             assert len(stages) == len(graph.stages)
             for compiled, read in zip(graph.stages, stages):
@@ -545,9 +588,9 @@ def test_runtime_derives_every_stated_tile_fact(sanitized_runtime, tmp_path):
                     assert ([getattr(compiled.tile_plan, field) for field in fields] ==
                             [getattr(read.tile_plan, field) for field in fields]), (
                         model.stem, budget, compiled.stage_id)
-            paths.append(tmp_path / f"{model.stem}-{budget}.tgrs")
+            paths.append(tmp_path / f"{model.stem}-{budget[0] if isinstance(budget, tuple) else budget}.tgrs")
             paths[-1].write_bytes(data)
-            expected.append(stated)
+            expected.append((stated, kinds))
     assert len(paths) > 300
 
     source = tmp_path / "facts.c"
@@ -556,16 +599,28 @@ def test_runtime_derives_every_stated_tile_fact(sanitized_runtime, tmp_path):
     result = subprocess.run([str(binary), *map(str, paths)], text=True, capture_output=True,
                             check=False)
     assert result.returncode == 0, result.stdout + result.stderr
-    derived: list[dict] = []
+    derived: list[tuple[dict, dict]] = []
     for line in result.stdout.splitlines():
         kind, *values = line.split()
         if kind == "plan":
             assert values[1] == "0", (paths[int(values[0])].name, line)
-            derived.append({})
+            derived.append(({}, {}))
         else:
             assert values[1] == "1", (paths[len(derived) - 1].name, line)
-            derived[-1][int(values[0])] = tuple(int(value) for value in values[2:])
-    differences = [(path.name, index, record, got.get(index))
-                   for path, want, got in zip(paths, expected, derived)
-                   for index, record in want.items() if got.get(index) != record]
+            numbers = tuple(int(value) for value in values[2:])
+            derived[-1][0][int(values[0])] = numbers[:7]
+            derived[-1][1][int(values[0])] = numbers[7:]
+    differences = [(path.name, index, record, got[0].get(index))
+                   for path, (want, _), got in zip(paths, expected, derived)
+                   for index, record in want.items() if got[0].get(index) != record]
     assert len(derived) == len(paths) and not differences, differences[:10]
+    # The solver's kind is the runtime's own choice, so stating it changes no stage's run.
+    kinds = [(path.name, index, kind, got[1].get(index))
+             for path, (_, want), got in zip(paths, expected, derived)
+             for index, kind in want.items() if got[1].get(index) != kind]
+    assert not kinds, kinds[:10]
+    assert {kind for _, want in expected for kind, _ in want.values()} == set(range(1, 8))
+    # A dense constant keeps the rank-2 stage off the row band: it is a leading band on axis 0.
+    from tigris.emitters.binary.defs import TILE_BAND_KIND_LEADING, TILE_BAND_MODE_AXIS_BASE
+    dense = [set(want.values()) for path, (_, want) in zip(paths, expected) if "dense_constant" in path.name]
+    assert dense == [{(TILE_BAND_KIND_LEADING, TILE_BAND_MODE_AXIS_BASE)}] * 2

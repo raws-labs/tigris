@@ -149,7 +149,7 @@ def _tile_fields(entry: dict) -> dict:
     # A grouped reduction's tile_extent is its interval, which TilePlan keeps apart from tile_height.
     fields.update(tile_height=0 if grouped else entry["tile_extent"], num_tiles=entry["num_tiles"],
                   original_height=entry["original_extent"], halo=entry["halo"],
-                  band_axis=entry["band_axis"])
+                  band_axis=entry["band_axis"], band_kind=entry["band_kind"], band_mode=entry["band_mode"])
     return fields
 
 

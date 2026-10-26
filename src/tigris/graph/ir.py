@@ -184,6 +184,9 @@ class TilePlan:
     input_spatial_interval: int = 0
     # Serialized axis the bands run along: on the input they cut, or the first output for output rows.
     band_axis: int = 0
+    # How the runtime bands the stage (TILE_BAND_KIND_*), and a leading band's mode (TILE_BAND_MODE_*).
+    band_kind: int = 0
+    band_mode: int = 0
     # Set when a stage was eligible for 2D (HW) tiling and solve_2d_tile
     # attempted the search but even a 1x1 core tile did not fit the budget.
     # Distinguishes this case from the generic 1D minimum-tile shortfall so

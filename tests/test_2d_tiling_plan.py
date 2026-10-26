@@ -18,6 +18,7 @@ from tigris.emitters.binary.defs import (
     HEADER_STRUCT,
     SEC_TILE_PLANS,
     SECTION_ENTRY_STRUCT,
+    TILE_BAND_KIND_HW,
     TILE_PLAN_V11_STRUCT,
 )
 from tigris.emitters.binary.writer import emit_binary_bytes
@@ -79,7 +80,7 @@ def decode_first_tile_plan(plan_bytes: bytes):
     (
         tileable, axis, _flags, _input_band, _output_band, output_width,
         _channel_group, _spatial_interval, _linear_segment, tiled_peak_bytes,
-        tile_extent, num_tiles, original_extent, _halo, _band_axis, _reserved,
+        tile_extent, num_tiles, original_extent, _halo, _band_axis, band,
     ) = TILE_PLAN_V11_STRUCT.unpack_from(plan_bytes, tp_base)
 
     class _TilePlan:
@@ -93,6 +94,7 @@ def decode_first_tile_plan(plan_bytes: bytes):
     tp.num_tiles = num_tiles
     tp.original_height = original_extent
     tp.tiled_peak_bytes = tiled_peak_bytes
+    tp.band = band
     return tp
 
 
@@ -102,6 +104,7 @@ def test_2d_plan_encodes_hw_axis_and_tile_width(tmp_path):
     assert tp.tileable == 1
     assert tp.axis == TILE_AXIS_HW
     assert tp.tile_height >= 1 and tp.tile_width >= 1
+    assert tp.band == TILE_BAND_KIND_HW
 
 
 def test_even_2d_min_tile_infeasible_fails_closed(tmp_path):
