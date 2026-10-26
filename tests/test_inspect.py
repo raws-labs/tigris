@@ -79,8 +79,9 @@ def test_tile_records_list_the_fields_their_schema_states(tmp_path):
     report = inspect_file(FIXTURES / "schema-v11-scheduled-peak.tgrs")
     assert report["inspection_version"] == 2
     (tile,) = report["plan"]["tile_plans"]
-    assert (tile["input_band_extent"], tile["tile_extent"], tile["num_tiles"],
-            tile["original_extent"], tile["halo"], tile["band_axis"]) == (1, 1, 7, 7, 2, 1)
+    assert (tile["input_band_extent"], tile["output_band_extent"], tile["tile_extent"],
+            tile["num_tiles"], tile["original_extent"], tile["halo"],
+            tile["band_axis"]) == (0, 1, 1, 7, 7, 2, 1)
     assert not {"tile_height", "original_height", "receptive_field", "overhead_bytes"} & set(tile)
 
     # The same plan at schema 10: its one record's first 32 bytes are the schema 10 record.
@@ -88,6 +89,9 @@ def test_tile_records_list_the_fields_their_schema_states(tmp_path):
     struct.pack_into("<I", older, 4, 10)
     entry = defs.HEADER_SIZE
     while struct.unpack_from("<I", older, entry)[0] != defs.SEC_MEMORY:
+        if struct.unpack_from("<I", older, entry)[0] == defs.SEC_TILE_PLANS:
+            # Below schema 11 a height stripe states its band in input rows.
+            struct.pack_into("<II", older, struct.unpack_from("<I", older, entry + 4)[0] + 4, 1, 0)
         entry += defs.SECTION_ENTRY_SIZE
     struct.pack_into("<II", older, entry, 0, 0)
     path = tmp_path / "schema-10.tgrs"

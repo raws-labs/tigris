@@ -1409,8 +1409,7 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
                       "input_spatial_interval", "tiled_peak_bytes"):
             _require_uint(int(getattr(tp, field)), 32, f"stage {stage.stage_id} tile plan {field}")
         ops = [ag.ops[i] for i in stage.op_indices]
-        output_driven = tp.axis == TILE_AXIS_HW or any(
-            op.op_type in {"Resize", "ResizeLinear"} for op in ops)
+        output_driven = tp.axis == TILE_AXIS_HW or tp.band_in_output_rows
         transpose = _stage_is_tiled_transpose(ag, stage, ops)
         input_band = tp.tile_height if tp.tileable and not output_driven and not transpose else 0
         output_band = tp.tile_height if tp.tileable and output_driven else 0

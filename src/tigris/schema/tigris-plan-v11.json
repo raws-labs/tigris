@@ -253,6 +253,6 @@
     "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
     "state_v10": "state, subgraphs and grouped tiles need schema 10 or later",
     "subgraphs_v10": "control flow needs schema 10 or later; graph 0 is the main graph",
-    "tile_facts_v11": "a tile record states the band axis, the extent the bands divide, the band, the tile count and the halo; the runtime's loader derives them from the plan and refuses a record that disagrees"
+    "tile_facts_v11": "a tile record states the band axis, the extent the bands divide, the band, the tile count and the halo; a height stripe states its band in output rows, as Resize and 2D records do; the runtime's loader derives them from the plan and refuses a record that disagrees"
   }
 }

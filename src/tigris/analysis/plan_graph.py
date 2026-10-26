@@ -11,6 +11,7 @@ import struct
 
 import numpy as np
 
+from tigris import TILE_AXIS_HW
 from tigris.emitters.binary.defs import (
     OP_ATTR_SUBGRAPHS,
     OP_TYPE_MAP,
@@ -138,7 +139,8 @@ def _tile_fields(entry: dict) -> dict:
     grouped = entry["input_channel_group"] != 0
     fields = {"tile_width": entry["output_width_extent"],
               "input_channel_group": entry["input_channel_group"],
-              "input_spatial_interval": entry["input_spatial_interval"]}
+              "input_spatial_interval": entry["input_spatial_interval"],
+              "band_in_output_rows": entry["output_band_extent"] != 0 and entry["axis"] != TILE_AXIS_HW}
     if entry["tile_extent"] is None:
         # A schema 10 record states its scheduling choices only.
         fields["tile_height"] = 0 if grouped else (

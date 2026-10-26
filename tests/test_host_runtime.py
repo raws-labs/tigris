@@ -66,6 +66,29 @@ def test_a_slow_arena_that_cannot_hold_an_input_is_reported(path):
                 session.run(inputs)
 
 
+def test_a_strided_stripe_runs_the_bands_its_plan_states(strided_conv_path, tmp_path):
+    """The runtime runs the eight output bands the plan states, and they reproduce the
+    unbanded result exactly."""
+    from tigris.emitters.binary.reader import read_binary_plan
+
+    results = []
+    for budget in ("1280", "64K"):
+        graph, _ = _run_pipeline(str(strided_conv_path), (budget,), report_bindings=False)
+        path = tmp_path / f"strided-{budget}.tgrs"
+        path.write_bytes(emit_binary_bytes(graph))
+        with Session(path) as session:
+            (item,) = session.inputs
+            image = np.random.default_rng(0).standard_normal(item["shape"]).astype(np.float32)
+            outputs, _, counters = session.trace({item["name"]: image})
+        results.append((read_binary_plan(path.read_bytes())["tile_plans"], outputs, counters))
+    (banded, outputs, counters), (unbanded, reference, _) = results
+    assert [record["num_tiles"] for record in banded] == [8] and not unbanded
+    assert counters["tiles"] == 8
+    assert outputs.keys() == reference.keys()
+    for key in outputs:
+        np.testing.assert_array_equal(outputs[key], reference[key])
+
+
 @pytest.fixture
 def override_library(tmp_path):
     directory = Path(runtime.__file__).with_name("native")

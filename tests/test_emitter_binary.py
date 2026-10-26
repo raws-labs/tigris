@@ -367,7 +367,7 @@ def test_immutable_supported_schema_fixtures():
         (
             11,
             "schema-v11-scheduled-peak.tgrs",
-            "1af8980f086704e2db54db5d79b8cbb938624cc4f917692a861e8b7b53a2e78d",
+            "6f5bcdcf014a99e794f7a0aa02064b8b5f473e3d1f2b29bf6ac715c2b5dd65bb",
             2,
             0,
         ),

@@ -196,6 +196,17 @@ def conv_pool_chain_path(tmp_path):
 
 
 @pytest.fixture
+def strided_conv_path(tmp_path):
+    """Conv3x3 with row stride 2, pad 1, [1,4,32,8] -> [1,8,16,8]."""
+    weights = numpy_helper.from_array(
+        np.linspace(-1.0, 1.0, 8 * 4 * 9, dtype=np.float32).reshape(8, 4, 3, 3), "weights")
+    conv = helper.make_node("Conv", ["input", "weights"], ["output"], name="conv0",
+                            kernel_shape=[3, 3], strides=[2, 1], pads=[1, 1, 1, 1])
+    return save_onnx(tmp_path, "strided_conv", [conv], [vi("input", [1, 4, 32, 8])],
+                     [vi("output", [1, 8, 16, 8])], [weights], opset=17, ir_version=8)
+
+
+@pytest.fixture
 def qdq_conv_path(tmp_path):
     """Quantized Conv->Relu with QDQ operators (int8 weights + activation Q/DQ).
 
