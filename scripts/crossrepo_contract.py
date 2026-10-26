@@ -4457,6 +4457,41 @@ def _tiled_erf_case() -> ContractCase:
     )
 
 
+def _rank2_dense_constant_case(op_type: str) -> ContractCase:
+    """A rank-2 binary operator against a constant of its own full shape, banded.
+
+    A row band hands a constant to the kernel whole, so a constant that differs
+    from row to row takes the leading band, which offsets it to each band's
+    rows. Less writes bool from a float constant and Where reads a bool
+    condition, so the constant's element differs from the output's. The banded
+    plan has to equal the one-pass plan bit for bit.
+    """
+    rows, cols = 128, 16
+    rng = np.random.default_rng(11)
+    label = f"rank2_dense_constant_{op_type.lower()}"
+    if op_type == "Where":
+        constant = rng.random((rows, cols)) > 0.5
+        node = helper.make_node(op_type, ["constant", "input", "other"], ["output"])
+    else:
+        constant = rng.uniform(-2, 2, size=(rows, cols)).astype(np.float32)
+        node = helper.make_node(op_type, ["input", "constant"], ["output"])
+    inputs = [helper.make_tensor_value_info("input", TensorProto.FLOAT, [rows, cols])]
+    data = {"input": rng.uniform(-2, 2, size=(rows, cols)).astype(np.float32)}
+    if op_type == "Where":
+        inputs.append(helper.make_tensor_value_info("other", TensorProto.FLOAT, [rows, cols]))
+        data["other"] = rng.uniform(-2, 2, size=(rows, cols)).astype(np.float32)
+    output = TensorProto.BOOL if op_type == "Less" else TensorProto.FLOAT
+    model = _model(
+        label,
+        [node],
+        inputs,
+        [helper.make_tensor_value_info("output", output, [rows, cols])],
+        [numpy_helper.from_array(constant, "constant")],
+    )
+    return ContractCase(f"float_{label}", model, model, data, (op_type,),
+                        mem_budget="4K", slow_budget="64K", expect_tiled=True, exact_untiled=True)
+
+
 def _tiled_matrix_rows_case() -> ContractCase:
     """A projection pipeline the solver has to band along its rows.
 
@@ -8201,6 +8236,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_layer_norm_case(),
         _tiled_erf_case(),
         _tiled_matrix_rows_case(),
+        *[_rank2_dense_constant_case(op_type) for op_type in ("Add", "Max", "Less", "Where")],
         _tiled_attention_transpose_case(),
         _normalized_classifier_case(),
         _two_input_compressed_case(),
