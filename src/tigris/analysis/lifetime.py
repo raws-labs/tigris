@@ -5,7 +5,7 @@ import numpy as np
 from tigris.graph.ir import AnalyzedGraph, Layout, TensorLifetime, serialized_shape
 
 # Operators that give a tensor a new shape without moving a byte.
-_RESHAPE_OPS = frozenset({"Reshape", "Flatten"})
+RESHAPE_OPS = frozenset({"Reshape", "Flatten"})
 
 
 def _states_its_own_order(info) -> bool:
@@ -69,12 +69,12 @@ def pure_reinterpretations(ag: AnalyzedGraph) -> dict[str, str]:
     allocation. The chain is followed to its source, since a reshape pair
     around a lowered matrix product is two of these back to back.
 
-    Mirrors is_pure_reinterpretation in the executor, which derives the same
-    fact from the plan rather than being told it.
+    Mirrors tigris_pure_reinterpretation in the runtime, which derives the
+    same fact from the plan rather than being told it.
     """
     alias: dict[str, str] = {}
     for op in ag.ops:
-        if op.op_type not in _RESHAPE_OPS or len(op.outputs) != 1:
+        if op.op_type not in RESHAPE_OPS or len(op.outputs) != 1:
             continue
         sources = [
             name for name in op.inputs

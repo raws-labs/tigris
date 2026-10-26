@@ -26,6 +26,7 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.analysis.plan_graph import fast_activation_bytes, slow_arena_required
 from tigris.emitters.binary.reader import read_binary_plan
+from tigris.operator_contract import operators_with
 
 
 BACKENDS = CODEGEN_BACKENDS
@@ -90,7 +91,7 @@ def _cmsis_weight_decompression_overhead(plan: dict) -> int:
 
 # The operators the executor reserves per-op tiling state for in a chain
 # (tigris_height_spatial_op in the runtime).
-_HEIGHT_SPATIAL_OPS = frozenset({"Conv", "DepthwiseConv", "MaxPool", "AveragePool", "L2Pool"})
+_HEIGHT_SPATIAL_OPS = operators_with("spatial")
 
 
 def _chains(plan: dict) -> list[list[dict]]:

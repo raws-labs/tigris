@@ -77,6 +77,11 @@ OPERATOR_CONTRACT: dict[str, OperatorContract] = {
     'Add': OperatorContract(7, 'TIGRIS_OP_ADD', (1, 2), (1, 1), DTypeSignature((253, 253, 253), (253,)), 'optional', 'none', (7, 9), (), frozenset(('binary', 'row', 'axis_binary', 'height', 'fused')), frozenset(('reference', 's8_ref')), False, 'validate_contract_add'),
     'Mul': OperatorContract(8, 'TIGRIS_OP_MUL', (1, 2), (1, 1), DTypeSignature((253, 253, 253), (253,)), 'optional', 'none', (9,), (), frozenset(('binary', 'row', 'axis_binary', 'height')), frozenset(('reference', 's8_ref', 'esp-nn', 'cmsis-nn')), False, 'validate_contract_add'),
     'Gemm': OperatorContract(9, 'TIGRIS_OP_FULLY_CONN', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'required', 'optional', (), (), frozenset(('row', 'whole_operand', 'fused')), frozenset(('reference', 's8_ref', 'esp-nn', 'cmsis-nn')), False, 'validate_contract_fully_conn'),
+    # Softmax normalizes along the final stored dimension, the channel axis in
+    # both NHWC and NLC. Both tile axes are ahead of it, so a band holds whole
+    # normalization rows and needs nothing from its neighbors: shape-preserving
+    # and halo-free, which is what the height mode means, although the operator
+    # itself is a reduction.
     'Softmax': OperatorContract(10, 'TIGRIS_OP_SOFTMAX', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(('axis_unary', 'row', 'height')), frozenset(('reference', 's8_ref')), False, 'validate_contract_relu'),
     'Clip': OperatorContract(11, 'TIGRIS_OP_CLIP', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (4,), (), frozenset(()), frozenset(()), False, None),
     'Sigmoid': OperatorContract(12, 'TIGRIS_OP_SIGMOID', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(('axis_unary', 'row', 'height')), frozenset(('reference', 's8_ref')), False, 'validate_contract_relu'),
@@ -97,9 +102,14 @@ OPERATOR_CONTRACT: dict[str, OperatorContract] = {
     'Squeeze': OperatorContract(27, 'TIGRIS_OP_SQUEEZE', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(()), frozenset(()), False, None),
     'Unsqueeze': OperatorContract(28, 'TIGRIS_OP_UNSQUEEZE', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(()), frozenset(()), False, None),
     'Transpose': OperatorContract(29, 'TIGRIS_OP_TRANSPOSE', (1, 1), (1, 1), DTypeSignature((255, 255, 255), (255,)), 'none', 'none', (1,), (1,), frozenset(()), frozenset(('reference', 's8_ref')), False, 'validate_contract_transpose'),
+    # Resampling bands only along the height axis and only on its own stage,
+    # because the chain executor does not compose a fractional stride through
+    # the rest of a run, so it carries the resample mode and not the height mode.
     'Resize': OperatorContract(30, 'TIGRIS_OP_RESIZE', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (10,), (), frozenset(('resample',)), frozenset(('reference', 's8_ref')), False, 'validate_contract_resize_linear'),
     'GlobalMaxPool': OperatorContract(31, 'TIGRIS_OP_GLOBAL_MAX', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(()), frozenset(('reference', 's8_ref')), False, 'validate_contract_global_max'),
     'Conv1D': OperatorContract(32, 'TIGRIS_OP_CONV1D', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'required', 'optional', (), (), frozenset(('fused',)), frozenset(('reference', 's8_ref')), False, 'validate_contract_conv1d'),
+    # Reduces along the final stored dimension, as Softmax does, so it carries
+    # the height mode for the same reason.
     'LayerNormalization': OperatorContract(33, 'TIGRIS_OP_LAYER_NORM', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'required', 'optional', (2,), (2,), frozenset(('axis_unary', 'row', 'height')), frozenset(('reference', 's8_ref')), False, 'validate_contract_layer_norm'),
     'Erf': OperatorContract(34, 'TIGRIS_OP_ERF', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(('axis_unary', 'row', 'height')), frozenset(('reference', 's8_ref')), False, 'validate_contract_hardswish'),
     'Split': OperatorContract(35, 'TIGRIS_OP_SPLIT', (1, 1), (2, 255), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(()), frozenset(('reference', 's8_ref')), False, 'validate_contract_split'),
@@ -171,3 +181,8 @@ EXECUTOR_OPERATORS = frozenset(name for name, row in OPERATOR_CONTRACT.items() i
 
 def native_operators(backend: str) -> frozenset[str]:
     return frozenset(name for name, row in OPERATOR_CONTRACT.items() if backend in row.backends)
+
+
+def operators_with(mode: str) -> frozenset[str]:
+    """The operators whose record carries one execution mode."""
+    return frozenset(name for name, row in OPERATOR_CONTRACT.items() if mode in row.modes)
