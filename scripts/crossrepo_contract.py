@@ -32,7 +32,7 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris import SCHEMA_VERSION, TILE_AXIS_HW
 from tigris.analysis.plan_graph import graph_from_plan, slow_arena_required
 from tigris.analysis.validation import io_in_fast, slow_pool_usage, validate_memory_plan
-from tigris.capabilities import KERNEL_CAPABILITIES, OP_TYPE_BY_CODE
+from tigris.capabilities import KERNEL_CAPABILITIES
 from tigris.cli import _run_pipeline
 from tigris.emitters.codegen import _executor_workspace_limits
 from tigris.emitters.binary.defs import (
@@ -46,6 +46,7 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
 from tigris.fixtures import build_ds_cnn, build_fc_autoencoder, build_tcn
 from tigris.frontends.tflite import STATE_KEY
+from tigris.operator_contract import OP_TYPE_BY_CODE
 from tigris.runtime import Session
 from tigris.cli.trace import check as check_trace
 from tigris.cli.trace import units as trace_units

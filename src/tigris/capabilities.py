@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal
 
-from tigris.operator_contract import OP_TYPE_MAP, EXECUTOR_OPERATORS as EXECUTOR_OPERATORS, native_operators
+from tigris.operator_contract import OP_TYPE_MAP, native_operators
 
 
 DTypeMode = Literal["float32", "int8"]
@@ -257,8 +257,6 @@ _CODEGEN_KERNEL_SELECTION: dict[tuple[str, DTypeMode], str] = {
     ("cmsis-nn", "float32"): "reference",
     ("cmsis-nn", "int8"): "cmsis-nn",
 }
-
-OP_TYPE_BY_CODE = {opcode: name for name, opcode in OP_TYPE_MAP.items()}
 
 
 def resolve_kernel_backend(codegen_backend: str, dtype: DTypeMode) -> str:

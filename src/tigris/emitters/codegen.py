@@ -14,7 +14,6 @@ import re
 from tigris.capabilities import (
     CODEGEN_BACKENDS,
     DTypeMode,
-    OP_TYPE_BY_CODE,
     describe_codegen_route,
     effective_operators,
     resolve_kernel_backend,
@@ -27,7 +26,7 @@ from tigris.emitters.binary.defs import (
 from tigris.analysis.memory import TENSOR_ALIGN, align_up
 from tigris.analysis.plan_graph import fast_activation_bytes, slow_arena_required
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.operator_contract import operators_with
+from tigris.operator_contract import OP_TYPE_BY_CODE, operators_with
 
 
 BACKENDS = CODEGEN_BACKENDS

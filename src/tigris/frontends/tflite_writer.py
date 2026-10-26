@@ -14,24 +14,17 @@ import flatbuffers
 import numpy as np
 
 from tigris.frontends.flatbuffer import Table
-from tigris.frontends.tflite import (
-    _B_DATA, _B_OFFSET, _B_SIZE, _MODEL_BUFFERS, _MODEL_DESCRIPTION, _MODEL_OPCODES,
-    _MODEL_SUBGRAPHS, _MODEL_VERSION, _OC_CODE, _OC_CUSTOM, _OC_DEPRECATED_CODE, _OC_VERSION,
-    _OP_CUSTOM_OPTIONS, _OP_INPUTS, _OP_OPCODE, _OP_OPTIONS, _OP_OUTPUTS, _Q_DIMENSION, _Q_SCALE,
-    _Q_ZERO_POINT, _SG_INPUTS, _SG_NAME, _SG_OPERATORS, _SG_OUTPUTS, _SG_TENSORS, _T_BUFFER,
-    _T_NAME, _T_QUANT, _T_SHAPE, _T_TYPE, _T_VARIABLE, MAGIC, is_tflite,
+from tigris.frontends.tflite_schema import (
+    B_DATA, B_OFFSET, B_SIZE, MAGIC, MAP_NAME, MAP_TENSOR, META_BUFFER, META_NAME, MODEL_BUFFERS,
+    MODEL_DESCRIPTION, MODEL_METADATA, MODEL_METADATA_BUFFER, MODEL_OPCODES, MODEL_SIGNATURES,
+    MODEL_SUBGRAPHS, MODEL_VERSION, OC_CODE, OC_CUSTOM, OC_DEPRECATED_CODE, OC_VERSION,
+    OP_CUSTOM_FORMAT, OP_CUSTOM_OPTIONS, OP_DEBUG, OP_INPUTS, OP_INTERMEDIATES, OP_MUTATING,
+    OP_OPCODE, OP_OPTIONS, OP_OPTIONS2, OP_OPTIONS2_TYPE, OP_OPTIONS_TYPE, OP_OUTPUTS, Q_DETAILS,
+    Q_DETAILS_TYPE, Q_DIMENSION, Q_MAX, Q_MIN, Q_SCALE, Q_ZERO_POINT, SG_DEBUG, SG_INPUTS, SG_NAME,
+    SG_OPERATORS, SG_OUTPUTS, SG_TENSORS, SIG_INPUTS, SIG_KEY, SIG_OUTPUTS, SIG_SUBGRAPH, SIG_TAG,
+    T_BUFFER, T_HAS_RANK, T_NAME, T_QUANT, T_SHAPE, T_SHAPE_SIGNATURE, T_TYPE, T_VARIABLE,
+    is_tflite,
 )
-
-# Field slots in the TFLite schema beyond those the reader names.
-_MODEL_METADATA_BUFFER, _MODEL_METADATA, _MODEL_SIGNATURES = 5, 6, 7
-_SG_DEBUG = 5
-_T_SHAPE_SIGNATURE, _T_HAS_RANK = 7, 8
-_Q_MIN, _Q_MAX, _Q_DETAILS_TYPE, _Q_DETAILS = 0, 1, 4, 5
-_OP_OPTIONS_TYPE, _OP_CUSTOM_FORMAT, _OP_MUTATING, _OP_INTERMEDIATES = 3, 6, 7, 8
-_OP_OPTIONS2_TYPE, _OP_OPTIONS2, _OP_DEBUG = 11, 12, 13
-_META_NAME, _META_BUFFER = 0, 1
-_SIG_INPUTS, _SIG_OUTPUTS, _SIG_KEY, _SIG_TAG, _SIG_SUBGRAPH = 0, 1, 2, 3, 4
-_MAP_NAME, _MAP_TENSOR = 0, 1
 
 # The slots each table of the schema has that this module reads and writes.
 _KNOWN = {
@@ -201,55 +194,55 @@ def _quantization(table: Table | None) -> Quantization | None:
         return None
     present = _check_fields(table, "quantization")
     custom = None
-    details_type = table.scalar(_Q_DETAILS_TYPE, "B")
-    if details_type or _Q_DETAILS in present:
-        details = table.table(_Q_DETAILS)
+    details_type = table.scalar(Q_DETAILS_TYPE, "B")
+    if details_type or Q_DETAILS in present:
+        details = table.table(Q_DETAILS)
         if details_type != _CUSTOM_QUANTIZATION or details is None:
             raise ValueError(f"quantization details of type {details_type} are not supported")
         _check_fields(details, "custom quantization")
         custom = details.bytes(0)
     return Quantization(
-        scale=_vector(table, present, _Q_SCALE, "f"),
-        zero_point=_vector(table, present, _Q_ZERO_POINT, "q"),
-        quantized_dimension=table.scalar(_Q_DIMENSION, "i"),
-        min=_vector(table, present, _Q_MIN, "f"),
-        max=_vector(table, present, _Q_MAX, "f"),
+        scale=_vector(table, present, Q_SCALE, "f"),
+        zero_point=_vector(table, present, Q_ZERO_POINT, "q"),
+        quantized_dimension=table.scalar(Q_DIMENSION, "i"),
+        min=_vector(table, present, Q_MIN, "f"),
+        max=_vector(table, present, Q_MAX, "f"),
         custom=custom)
 
 
 def _tensor(table: Table) -> Tensor:
     present = _check_fields(table, "tensor")
     return Tensor(
-        shape=_vector(table, present, _T_SHAPE, "i"),
-        type=table.scalar(_T_TYPE, "b"),
-        buffer=table.scalar(_T_BUFFER, "I"),
-        name=_string(table, present, _T_NAME),
-        quantization=_quantization(table.table(_T_QUANT)),
-        is_variable=bool(table.scalar(_T_VARIABLE, "B")),
-        shape_signature=_vector(table, present, _T_SHAPE_SIGNATURE, "i"),
-        has_rank=bool(table.scalar(_T_HAS_RANK, "B")))
+        shape=_vector(table, present, T_SHAPE, "i"),
+        type=table.scalar(T_TYPE, "b"),
+        buffer=table.scalar(T_BUFFER, "I"),
+        name=_string(table, present, T_NAME),
+        quantization=_quantization(table.table(T_QUANT)),
+        is_variable=bool(table.scalar(T_VARIABLE, "B")),
+        shape_signature=_vector(table, present, T_SHAPE_SIGNATURE, "i"),
+        has_rank=bool(table.scalar(T_HAS_RANK, "B")))
 
 
 def _operator(table: Table) -> Operator:
     present = _check_fields(table, "operator")
     return Operator(
-        opcode=table.scalar(_OP_OPCODE, "I"),
-        inputs=table.scalars(_OP_INPUTS, "i"),
-        outputs=table.scalars(_OP_OUTPUTS, "i"),
-        options=_options(table.table(_OP_OPTIONS), table.scalar(_OP_OPTIONS_TYPE, "B"), False),
-        custom_options=_string(table, present, _OP_CUSTOM_OPTIONS),
-        custom_options_format=table.scalar(_OP_CUSTOM_FORMAT, "b"),
-        mutating_variable_inputs=_vector(table, present, _OP_MUTATING, "?"),
-        intermediates=_vector(table, present, _OP_INTERMEDIATES, "i"),
-        options2=_options(table.table(_OP_OPTIONS2), table.scalar(_OP_OPTIONS2_TYPE, "B"), True),
-        debug_metadata_index=table.scalar(_OP_DEBUG, "i") if _OP_DEBUG in present else None)
+        opcode=table.scalar(OP_OPCODE, "I"),
+        inputs=table.scalars(OP_INPUTS, "i"),
+        outputs=table.scalars(OP_OUTPUTS, "i"),
+        options=_options(table.table(OP_OPTIONS), table.scalar(OP_OPTIONS_TYPE, "B"), False),
+        custom_options=_string(table, present, OP_CUSTOM_OPTIONS),
+        custom_options_format=table.scalar(OP_CUSTOM_FORMAT, "b"),
+        mutating_variable_inputs=_vector(table, present, OP_MUTATING, "?"),
+        intermediates=_vector(table, present, OP_INTERMEDIATES, "i"),
+        options2=_options(table.table(OP_OPTIONS2), table.scalar(OP_OPTIONS2_TYPE, "B"), True),
+        debug_metadata_index=table.scalar(OP_DEBUG, "i") if OP_DEBUG in present else None)
 
 
 def _tensor_maps(tables: list[Table]) -> list[tuple]:
     maps = []
     for table in tables:
         present = _check_fields(table, "tensor map")
-        maps.append((_string(table, present, _MAP_NAME), table.scalar(_MAP_TENSOR, "I")))
+        maps.append((_string(table, present, MAP_NAME), table.scalar(MAP_TENSOR, "I")))
     return maps
 
 
@@ -261,44 +254,44 @@ def read(data: bytes) -> Model:
     root = Table.root(data)
     present = _check_fields(root, "model")
     codes = []
-    for table in root.tables(_MODEL_OPCODES):
+    for table in root.tables(MODEL_OPCODES):
         code_fields = _check_fields(table, "operator code")
         codes.append(OperatorCode(
-            builtin_code=table.scalar(_OC_CODE, "i"), version=table.scalar(_OC_VERSION, "i", 1),
-            custom_code=_string(table, code_fields, _OC_CUSTOM),
-            deprecated_builtin_code=table.scalar(_OC_DEPRECATED_CODE, "b")))
+            builtin_code=table.scalar(OC_CODE, "i"), version=table.scalar(OC_VERSION, "i", 1),
+            custom_code=_string(table, code_fields, OC_CUSTOM),
+            deprecated_builtin_code=table.scalar(OC_DEPRECATED_CODE, "b")))
     subgraphs = []
-    for table in root.tables(_MODEL_SUBGRAPHS):
+    for table in root.tables(MODEL_SUBGRAPHS):
         sg_fields = _check_fields(table, "subgraph")
         subgraphs.append(Subgraph(
-            tensors=[_tensor(t) for t in table.tables(_SG_TENSORS)],
-            inputs=table.scalars(_SG_INPUTS, "i"),
-            outputs=table.scalars(_SG_OUTPUTS, "i"),
-            operators=[_operator(t) for t in table.tables(_SG_OPERATORS)],
-            name=_string(table, sg_fields, _SG_NAME),
-            debug_metadata_index=table.scalar(_SG_DEBUG, "i") if _SG_DEBUG in sg_fields else None))
+            tensors=[_tensor(t) for t in table.tables(SG_TENSORS)],
+            inputs=table.scalars(SG_INPUTS, "i"),
+            outputs=table.scalars(SG_OUTPUTS, "i"),
+            operators=[_operator(t) for t in table.tables(SG_OPERATORS)],
+            name=_string(table, sg_fields, SG_NAME),
+            debug_metadata_index=table.scalar(SG_DEBUG, "i") if SG_DEBUG in sg_fields else None))
     buffers = []
-    for table in root.tables(_MODEL_BUFFERS):
+    for table in root.tables(MODEL_BUFFERS):
         buffer_fields = _check_fields(table, "buffer")
-        if table.scalar(_B_OFFSET, "Q") > 1 or table.scalar(_B_SIZE, "Q"):
+        if table.scalar(B_OFFSET, "Q") > 1 or table.scalar(B_SIZE, "Q"):
             raise ValueError("buffers stored outside the FlatBuffer are not supported")
-        buffers.append(table.bytes(_B_DATA) if _B_DATA in buffer_fields else None)
-    metadata = [] if _MODEL_METADATA in present else None
-    for table in root.tables(_MODEL_METADATA):
+        buffers.append(table.bytes(B_DATA) if B_DATA in buffer_fields else None)
+    metadata = [] if MODEL_METADATA in present else None
+    for table in root.tables(MODEL_METADATA):
         meta_fields = _check_fields(table, "metadata")
-        metadata.append((_string(table, meta_fields, _META_NAME), table.scalar(_META_BUFFER, "I")))
-    signatures = [] if _MODEL_SIGNATURES in present else None
-    for table in root.tables(_MODEL_SIGNATURES):
+        metadata.append((_string(table, meta_fields, META_NAME), table.scalar(META_BUFFER, "I")))
+    signatures = [] if MODEL_SIGNATURES in present else None
+    for table in root.tables(MODEL_SIGNATURES):
         sig_fields = _check_fields(table, "signature")
         signatures.append(Signature(
-            inputs=_tensor_maps(table.tables(_SIG_INPUTS)),
-            outputs=_tensor_maps(table.tables(_SIG_OUTPUTS)),
-            key=_string(table, sig_fields, _SIG_KEY), tag=_string(table, sig_fields, _SIG_TAG),
-            subgraph_index=table.scalar(_SIG_SUBGRAPH, "I")))
+            inputs=_tensor_maps(table.tables(SIG_INPUTS)),
+            outputs=_tensor_maps(table.tables(SIG_OUTPUTS)),
+            key=_string(table, sig_fields, SIG_KEY), tag=_string(table, sig_fields, SIG_TAG),
+            subgraph_index=table.scalar(SIG_SUBGRAPH, "I")))
     return Model(
-        version=root.scalar(_MODEL_VERSION, "I"), operator_codes=codes, subgraphs=subgraphs,
-        buffers=buffers, description=_string(root, present, _MODEL_DESCRIPTION),
-        metadata_buffer=_vector(root, present, _MODEL_METADATA_BUFFER, "i"),
+        version=root.scalar(MODEL_VERSION, "I"), operator_codes=codes, subgraphs=subgraphs,
+        buffers=buffers, description=_string(root, present, MODEL_DESCRIPTION),
+        metadata_buffer=_vector(root, present, MODEL_METADATA_BUFFER, "i"),
         metadata=metadata, signatures=signatures)
 
 
@@ -394,41 +387,41 @@ def _quantization_table(w: _Writer, q: Quantization | None) -> int | None:
         custom = w.numbers(np.frombuffer(q.custom, np.uint8), "B")
         details = w.table([(0, "o", custom)])
     return w.table([
-        (_Q_MIN, "o", w.numbers(q.min, "f")), (_Q_MAX, "o", w.numbers(q.max, "f")),
-        (_Q_SCALE, "o", w.numbers(q.scale, "f")), (_Q_ZERO_POINT, "o", w.numbers(q.zero_point, "q")),
-        (_Q_DETAILS_TYPE, "B", _CUSTOM_QUANTIZATION if details is not None else None),
-        (_Q_DETAILS, "o", details),
-        (_Q_DIMENSION, "i", q.quantized_dimension or None)])
+        (Q_MIN, "o", w.numbers(q.min, "f")), (Q_MAX, "o", w.numbers(q.max, "f")),
+        (Q_SCALE, "o", w.numbers(q.scale, "f")), (Q_ZERO_POINT, "o", w.numbers(q.zero_point, "q")),
+        (Q_DETAILS_TYPE, "B", _CUSTOM_QUANTIZATION if details is not None else None),
+        (Q_DETAILS, "o", details),
+        (Q_DIMENSION, "i", q.quantized_dimension or None)])
 
 
 def _tensor_table(w: _Writer, t: Tensor) -> int:
     return w.table([
-        (_T_SHAPE, "o", w.numbers(t.shape, "i")), (_T_TYPE, "b", t.type or None),
-        (_T_BUFFER, "I", t.buffer or None), (_T_NAME, "o", w.string(t.name)),
-        (_T_QUANT, "o", _quantization_table(w, t.quantization)),
-        (_T_VARIABLE, "?", True if t.is_variable else None),
-        (_T_SHAPE_SIGNATURE, "o", w.numbers(t.shape_signature, "i")),
-        (_T_HAS_RANK, "?", True if t.has_rank else None)])
+        (T_SHAPE, "o", w.numbers(t.shape, "i")), (T_TYPE, "b", t.type or None),
+        (T_BUFFER, "I", t.buffer or None), (T_NAME, "o", w.string(t.name)),
+        (T_QUANT, "o", _quantization_table(w, t.quantization)),
+        (T_VARIABLE, "?", True if t.is_variable else None),
+        (T_SHAPE_SIGNATURE, "o", w.numbers(t.shape_signature, "i")),
+        (T_HAS_RANK, "?", True if t.has_rank else None)])
 
 
 def _operator_table(w: _Writer, op: Operator) -> int:
     custom = (None if op.custom_options is None
               else w.numbers(np.frombuffer(op.custom_options, np.uint8), "B"))
     return w.table([
-        (_OP_OPCODE, "I", op.opcode or None),
-        (_OP_INPUTS, "o", w.numbers(op.inputs, "i")), (_OP_OUTPUTS, "o", w.numbers(op.outputs, "i")),
-        (_OP_OPTIONS_TYPE, "B", op.options.kind if op.options else None),
-        (_OP_OPTIONS, "o", w.options(op.options)), (_OP_CUSTOM_OPTIONS, "o", custom),
-        (_OP_CUSTOM_FORMAT, "b", op.custom_options_format or None),
-        (_OP_MUTATING, "o", w.numbers(op.mutating_variable_inputs, "?")),
-        (_OP_INTERMEDIATES, "o", w.numbers(op.intermediates, "i")),
-        (_OP_OPTIONS2_TYPE, "B", op.options2.kind if op.options2 else None),
-        (_OP_OPTIONS2, "o", w.options(op.options2)),
-        (_OP_DEBUG, "i", op.debug_metadata_index)])
+        (OP_OPCODE, "I", op.opcode or None),
+        (OP_INPUTS, "o", w.numbers(op.inputs, "i")), (OP_OUTPUTS, "o", w.numbers(op.outputs, "i")),
+        (OP_OPTIONS_TYPE, "B", op.options.kind if op.options else None),
+        (OP_OPTIONS, "o", w.options(op.options)), (OP_CUSTOM_OPTIONS, "o", custom),
+        (OP_CUSTOM_FORMAT, "b", op.custom_options_format or None),
+        (OP_MUTATING, "o", w.numbers(op.mutating_variable_inputs, "?")),
+        (OP_INTERMEDIATES, "o", w.numbers(op.intermediates, "i")),
+        (OP_OPTIONS2_TYPE, "B", op.options2.kind if op.options2 else None),
+        (OP_OPTIONS2, "o", w.options(op.options2)),
+        (OP_DEBUG, "i", op.debug_metadata_index)])
 
 
 def _tensor_map_tables(w: _Writer, maps: list[tuple]) -> int:
-    return w.tables([w.table([(_MAP_NAME, "o", w.string(name)), (_MAP_TENSOR, "I", index or None)])
+    return w.tables([w.table([(MAP_NAME, "o", w.string(name)), (MAP_TENSOR, "I", index or None)])
                      for name, index in maps])
 
 
@@ -436,34 +429,34 @@ def write(model: Model) -> bytes:
     """The model as a TFLite FlatBuffer."""
     size = sum(len(b) for b in model.buffers if b) + 1024
     w = _Writer(size)
-    buffers = [w.table([(_B_DATA, "o", w.data(data))]) for data in model.buffers]
+    buffers = [w.table([(B_DATA, "o", w.data(data))]) for data in model.buffers]
     subgraphs = []
     for sg in model.subgraphs:
         tensors = [_tensor_table(w, t) for t in sg.tensors]
         operators = [_operator_table(w, op) for op in sg.operators]
         subgraphs.append(w.table([
-            (_SG_TENSORS, "o", w.tables(tensors)), (_SG_INPUTS, "o", w.numbers(sg.inputs, "i")),
-            (_SG_OUTPUTS, "o", w.numbers(sg.outputs, "i")), (_SG_OPERATORS, "o", w.tables(operators)),
-            (_SG_NAME, "o", w.string(sg.name)), (_SG_DEBUG, "i", sg.debug_metadata_index)]))
+            (SG_TENSORS, "o", w.tables(tensors)), (SG_INPUTS, "o", w.numbers(sg.inputs, "i")),
+            (SG_OUTPUTS, "o", w.numbers(sg.outputs, "i")), (SG_OPERATORS, "o", w.tables(operators)),
+            (SG_NAME, "o", w.string(sg.name)), (SG_DEBUG, "i", sg.debug_metadata_index)]))
     codes = [w.table([
-        (_OC_DEPRECATED_CODE, "b", c.deprecated_builtin_code or None),
-        (_OC_CUSTOM, "o", w.string(c.custom_code)),
-        (_OC_VERSION, "i", c.version if c.version != 1 else None),
-        (_OC_CODE, "i", c.builtin_code or None)]) for c in model.operator_codes]
-    metadata = [w.table([(_META_NAME, "o", w.string(name)), (_META_BUFFER, "I", buffer or None)])
+        (OC_DEPRECATED_CODE, "b", c.deprecated_builtin_code or None),
+        (OC_CUSTOM, "o", w.string(c.custom_code)),
+        (OC_VERSION, "i", c.version if c.version != 1 else None),
+        (OC_CODE, "i", c.builtin_code or None)]) for c in model.operator_codes]
+    metadata = [w.table([(META_NAME, "o", w.string(name)), (META_BUFFER, "I", buffer or None)])
                 for name, buffer in model.metadata or ()]
     signatures = [w.table([
-        (_SIG_INPUTS, "o", _tensor_map_tables(w, s.inputs)),
-        (_SIG_OUTPUTS, "o", _tensor_map_tables(w, s.outputs)),
-        (_SIG_KEY, "o", w.string(s.key)), (_SIG_TAG, "o", w.string(s.tag)),
-        (_SIG_SUBGRAPH, "I", s.subgraph_index or None)]) for s in model.signatures or ()]
+        (SIG_INPUTS, "o", _tensor_map_tables(w, s.inputs)),
+        (SIG_OUTPUTS, "o", _tensor_map_tables(w, s.outputs)),
+        (SIG_KEY, "o", w.string(s.key)), (SIG_TAG, "o", w.string(s.tag)),
+        (SIG_SUBGRAPH, "I", s.subgraph_index or None)]) for s in model.signatures or ()]
     root = w.table([
-        (_MODEL_VERSION, "I", model.version or None), (_MODEL_OPCODES, "o", w.tables(codes)),
-        (_MODEL_SUBGRAPHS, "o", w.tables(subgraphs)),
-        (_MODEL_DESCRIPTION, "o", w.string(model.description)),
-        (_MODEL_BUFFERS, "o", w.tables(buffers)),
-        (_MODEL_METADATA_BUFFER, "o", w.numbers(model.metadata_buffer, "i")),
-        (_MODEL_METADATA, "o", None if model.metadata is None else w.tables(metadata)),
-        (_MODEL_SIGNATURES, "o", None if model.signatures is None else w.tables(signatures))])
+        (MODEL_VERSION, "I", model.version or None), (MODEL_OPCODES, "o", w.tables(codes)),
+        (MODEL_SUBGRAPHS, "o", w.tables(subgraphs)),
+        (MODEL_DESCRIPTION, "o", w.string(model.description)),
+        (MODEL_BUFFERS, "o", w.tables(buffers)),
+        (MODEL_METADATA_BUFFER, "o", w.numbers(model.metadata_buffer, "i")),
+        (MODEL_METADATA, "o", None if model.metadata is None else w.tables(metadata)),
+        (MODEL_SIGNATURES, "o", None if model.signatures is None else w.tables(signatures))])
     w.b.Finish(root, file_identifier=MAGIC)
     return bytes(w.b.Output())

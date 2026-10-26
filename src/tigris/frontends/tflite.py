@@ -5,10 +5,7 @@ TFLite semantics a QDQ ONNX graph states exactly and refuses everything else
 by name, so a model is never compiled with a reinterpreted operator.
 """
 
-import bisect
-import functools
 import json
-import math
 from typing import NamedTuple
 
 import numpy as np
@@ -17,8 +14,15 @@ from onnx import TensorProto, helper
 
 from tigris.frontends.flatbuffer import Table, flexbuffer_map
 from tigris.frontends.qdq import GraphBuilder, same_padding
+from tigris.frontends.tflite_schema import (
+    BUILTIN_OPERATORS, B_DATA, B_OFFSET, B_SIZE, MODEL_BUFFERS, MODEL_DESCRIPTION, MODEL_OPCODES,
+    MODEL_SUBGRAPHS, MODEL_VERSION, OC_CODE, OC_CUSTOM, OC_DEPRECATED_CODE, OC_VERSION,
+    OP_CUSTOM_OPTIONS, OP_INPUTS, OP_OPCODE, OP_OPTIONS, OP_OUTPUTS, Q_DIMENSION, Q_MAX, Q_MIN,
+    Q_SCALE, Q_ZERO_POINT, SAME, SG_INPUTS, SG_NAME, SG_OPERATORS, SG_OUTPUTS, SG_TENSORS,
+    TENSOR_TYPES, T_BUFFER, T_NAME, T_QUANT, T_SHAPE, T_TYPE, T_VARIABLE, VALID, WINDOWED,
+    is_tflite,
+)
 
-MAGIC = b"TFL3"
 # Metadata stating that every model input and output of rank 3 or more is held
 # channels-last, as the TFLite tensor is laid out.
 BOUNDARY_LAYOUT_KEY = "tigris.boundary_layout"
@@ -26,74 +30,14 @@ BOUNDARY_LAYOUT_KEY = "tigris.boundary_layout"
 # {"input", "output", "initial"} value names, one entry per variable.
 STATE_KEY = "tigris.state"
 
-# Field slots in the TFLite schema (tensorflow/lite/schema/schema.fbs).
-_MODEL_VERSION, _MODEL_OPCODES, _MODEL_SUBGRAPHS, _MODEL_DESCRIPTION, _MODEL_BUFFERS = 0, 1, 2, 3, 4
-_SG_TENSORS, _SG_INPUTS, _SG_OUTPUTS, _SG_OPERATORS, _SG_NAME = 0, 1, 2, 3, 4
-_T_SHAPE, _T_TYPE, _T_BUFFER, _T_NAME, _T_QUANT, _T_VARIABLE = 0, 1, 2, 3, 4, 5
-_Q_SCALE, _Q_ZERO_POINT, _Q_DIMENSION = 2, 3, 6
-_B_DATA, _B_OFFSET, _B_SIZE = 0, 1, 2
-_OP_OPCODE, _OP_INPUTS, _OP_OUTPUTS, _OP_OPTIONS, _OP_CUSTOM_OPTIONS = 0, 1, 2, 4, 5
-_OC_DEPRECATED_CODE, _OC_CUSTOM, _OC_VERSION, _OC_CODE = 0, 1, 2, 3
-
-_BUILTIN_OPERATORS = (
-    "ADD", "AVERAGE_POOL_2D", "CONCATENATION", "CONV_2D", "DEPTHWISE_CONV_2D",
-    "DEPTH_TO_SPACE", "DEQUANTIZE", "EMBEDDING_LOOKUP", "FLOOR", "FULLY_CONNECTED",
-    "HASHTABLE_LOOKUP", "L2_NORMALIZATION", "L2_POOL_2D",
-    "LOCAL_RESPONSE_NORMALIZATION", "LOGISTIC", "LSH_PROJECTION", "LSTM", "MAX_POOL_2D",
-    "MUL", "RELU", "RELU_N1_TO_1", "RELU6", "RESHAPE", "RESIZE_BILINEAR", "RNN",
-    "SOFTMAX", "SPACE_TO_DEPTH", "SVDF", "TANH", "CONCAT_EMBEDDINGS", "SKIP_GRAM",
-    "CALL", "CUSTOM", "EMBEDDING_LOOKUP_SPARSE", "PAD", "UNIDIRECTIONAL_SEQUENCE_RNN",
-    "GATHER", "BATCH_TO_SPACE_ND", "SPACE_TO_BATCH_ND", "TRANSPOSE", "MEAN", "SUB",
-    "DIV", "SQUEEZE", "UNIDIRECTIONAL_SEQUENCE_LSTM", "STRIDED_SLICE",
-    "BIDIRECTIONAL_SEQUENCE_RNN", "EXP", "TOPK_V2", "SPLIT", "LOG_SOFTMAX", "DELEGATE",
-    "BIDIRECTIONAL_SEQUENCE_LSTM", "CAST", "PRELU", "MAXIMUM", "ARG_MAX", "MINIMUM",
-    "LESS", "NEG", "PADV2", "GREATER", "GREATER_EQUAL", "LESS_EQUAL", "SELECT", "SLICE",
-    "SIN", "TRANSPOSE_CONV", "SPARSE_TO_DENSE", "TILE", "EXPAND_DIMS", "EQUAL",
-    "NOT_EQUAL", "LOG", "SUM", "SQRT", "RSQRT", "SHAPE", "POW", "ARG_MIN", "FAKE_QUANT",
-    "REDUCE_PROD", "REDUCE_MAX", "PACK", "LOGICAL_OR", "ONE_HOT", "LOGICAL_AND",
-    "LOGICAL_NOT", "UNPACK", "REDUCE_MIN", "FLOOR_DIV", "REDUCE_ANY", "SQUARE",
-    "ZEROS_LIKE", "FILL", "FLOOR_MOD", "RANGE", "RESIZE_NEAREST_NEIGHBOR", "LEAKY_RELU",
-    "SQUARED_DIFFERENCE", "MIRROR_PAD", "ABS", "SPLIT_V", "UNIQUE", "CEIL",
-    "REVERSE_V2", "ADD_N", "GATHER_ND", "COS", "WHERE", "RANK", "ELU",
-    "REVERSE_SEQUENCE", "MATRIX_DIAG", "QUANTIZE", "MATRIX_SET_DIAG", "ROUND",
-    "HARD_SWISH", "IF", "WHILE", "NON_MAX_SUPPRESSION_V4", "NON_MAX_SUPPRESSION_V5",
-    "SCATTER_ND", "SELECT_V2", "DENSIFY", "SEGMENT_SUM", "BATCH_MATMUL",
-    "PLACEHOLDER_FOR_GREATER_OP_CODES", "CUMSUM", "CALL_ONCE", "BROADCAST_TO", "RFFT2D",
-    "CONV_3D", "IMAG", "REAL", "COMPLEX_ABS", "HASHTABLE", "HASHTABLE_FIND",
-    "HASHTABLE_IMPORT", "HASHTABLE_SIZE", "REDUCE_ALL", "CONV_3D_TRANSPOSE",
-    "VAR_HANDLE", "READ_VARIABLE", "ASSIGN_VARIABLE", "BROADCAST_ARGS",
-    "RANDOM_STANDARD_NORMAL", "BUCKETIZE", "RANDOM_UNIFORM", "MULTINOMIAL", "GELU",
-    "DYNAMIC_UPDATE_SLICE", "RELU_0_TO_1", "UNSORTED_SEGMENT_PROD",
-    "UNSORTED_SEGMENT_MAX", "UNSORTED_SEGMENT_SUM", "ATAN2", "UNSORTED_SEGMENT_MIN",
-    "SIGN", "BITCAST", "BITWISE_XOR", "RIGHT_SHIFT", "STABLEHLO_LOGISTIC",
-    "STABLEHLO_ADD", "STABLEHLO_DIVIDE", "STABLEHLO_MULTIPLY", "STABLEHLO_MAXIMUM",
-    "STABLEHLO_RESHAPE", "STABLEHLO_CLAMP", "STABLEHLO_CONCATENATE",
-    "STABLEHLO_BROADCAST_IN_DIM", "STABLEHLO_CONVOLUTION", "STABLEHLO_SLICE",
-    "STABLEHLO_CUSTOM_CALL", "STABLEHLO_REDUCE", "STABLEHLO_ABS", "STABLEHLO_AND",
-    "STABLEHLO_COSINE", "STABLEHLO_EXPONENTIAL", "STABLEHLO_FLOOR", "STABLEHLO_LOG",
-    "STABLEHLO_MINIMUM", "STABLEHLO_NEGATE", "STABLEHLO_OR", "STABLEHLO_POWER",
-    "STABLEHLO_REMAINDER", "STABLEHLO_RSQRT", "STABLEHLO_SELECT", "STABLEHLO_SUBTRACT",
-    "STABLEHLO_TANH", "STABLEHLO_SCATTER", "STABLEHLO_COMPARE", "STABLEHLO_CONVERT",
-    "STABLEHLO_DYNAMIC_SLICE", "STABLEHLO_DYNAMIC_UPDATE_SLICE", "STABLEHLO_PAD",
-    "STABLEHLO_IOTA", "STABLEHLO_DOT_GENERAL", "STABLEHLO_REDUCE_WINDOW",
-    "STABLEHLO_SORT", "STABLEHLO_WHILE", "STABLEHLO_GATHER", "STABLEHLO_TRANSPOSE",
-    "DILATE", "STABLEHLO_RNG_BIT_GENERATOR", "REDUCE_WINDOW", "STABLEHLO_COMPOSITE",
-    "STABLEHLO_SHIFT_LEFT", "STABLEHLO_CBRT",
-)
-_TENSOR_TYPES = (
-    "FLOAT32", "FLOAT16", "INT32", "UINT8", "INT64", "STRING", "BOOL", "INT16",
-    "COMPLEX64", "INT8", "FLOAT64", "COMPLEX128", "UINT64", "RESOURCE", "VARIANT",
-    "UINT32", "UINT16", "INT4", "BFLOAT16",
-)
-
-
 _ACTIVATIONS = {0: "none", 1: "relu", 2: "relu_n1_to_1", 3: "relu6", 4: "tanh", 5: "sign_bit"}
 _NUMPY = {"FLOAT32": np.float32, "INT32": np.int32, "INT8": np.int8, "UINT8": np.uint8,
           "INT16": np.int16, "INT64": np.int64, "BOOL": np.bool_}
-
-
-def is_tflite(data: bytes) -> bool:
-    return len(data) >= 8 and data[4:8] == MAGIC
+# ONNX element types of model boundaries and operator state; the checks admit
+# no other type there.
+_ONNX_TYPES = {"FLOAT32": TensorProto.FLOAT, "INT32": TensorProto.INT32, "INT64": TensorProto.INT64,
+               "INT16": TensorProto.INT16, "INT8": TensorProto.INT8, "UINT8": TensorProto.UINT8,
+               "BOOL": TensorProto.BOOL}
 
 
 class _Model:
@@ -104,47 +48,47 @@ class _Model:
             raise ValueError("not a TFLite FlatBuffer")
         self.data = data
         root = Table.root(data)
-        self.version = root.scalar(_MODEL_VERSION, "I")
-        self.description = root.string(_MODEL_DESCRIPTION)
-        self.buffers = root.tables(_MODEL_BUFFERS)
-        self.subgraphs = root.tables(_MODEL_SUBGRAPHS)
+        self.version = root.scalar(MODEL_VERSION, "I")
+        self.description = root.string(MODEL_DESCRIPTION)
+        self.buffers = root.tables(MODEL_BUFFERS)
+        self.subgraphs = root.tables(MODEL_SUBGRAPHS)
         self.opcodes = []
-        for code in root.tables(_MODEL_OPCODES):
-            builtin = max(code.scalar(_OC_CODE, "i"), code.scalar(_OC_DEPRECATED_CODE, "b"))
-            custom = code.string(_OC_CUSTOM)
+        for code in root.tables(MODEL_OPCODES):
+            builtin = max(code.scalar(OC_CODE, "i"), code.scalar(OC_DEPRECATED_CODE, "b"))
+            custom = code.string(OC_CUSTOM)
             name = (f"CUSTOM:{custom}" if custom else
-                    _BUILTIN_OPERATORS[builtin] if 0 <= builtin < len(_BUILTIN_OPERATORS)
+                    BUILTIN_OPERATORS[builtin] if 0 <= builtin < len(BUILTIN_OPERATORS)
                     else f"BUILTIN_{builtin}")
-            self.opcodes.append((name, code.scalar(_OC_VERSION, "i", 1)))
+            self.opcodes.append((name, code.scalar(OC_VERSION, "i", 1)))
 
     def buffer(self, index: int) -> bytes:
         if not 0 <= index < len(self.buffers):
             return b""
         entry = self.buffers[index]
-        offset = entry.scalar(_B_OFFSET, "Q")
+        offset = entry.scalar(B_OFFSET, "Q")
         if offset > 1:
-            size = entry.scalar(_B_SIZE, "Q")
+            size = entry.scalar(B_SIZE, "Q")
             if offset + size > len(self.data):
                 raise ValueError(f"buffer {index} runs past the file")
             return self.data[offset:offset + size]
-        return entry.bytes(_B_DATA)
+        return entry.bytes(B_DATA)
 
 
 class _Tensor:
     def __init__(self, model: _Model, table: Table):
-        self.name = table.string(_T_NAME)
-        self.shape = table.scalars(_T_SHAPE, "i")
-        code = table.scalar(_T_TYPE, "b")
-        self.type = _TENSOR_TYPES[code] if 0 <= code < len(_TENSOR_TYPES) else f"TYPE_{code}"
-        self.buffer = table.scalar(_T_BUFFER, "I")
-        quant = table.table(_T_QUANT)
-        self.scale = np.asarray(quant.scalars(_Q_SCALE, "f") if quant else [], np.float32)
-        self.zero_point = np.asarray(quant.scalars(_Q_ZERO_POINT, "q") if quant else [], np.int64)
-        self.quantized_dimension = quant.scalar(_Q_DIMENSION, "i") if quant else 0
-        self.minimum = quant.scalars(0, "f") if quant else []
-        self.maximum = quant.scalars(1, "f") if quant else []
+        self.name = table.string(T_NAME)
+        self.shape = table.scalars(T_SHAPE, "i")
+        code = table.scalar(T_TYPE, "b")
+        self.type = TENSOR_TYPES[code] if 0 <= code < len(TENSOR_TYPES) else f"TYPE_{code}"
+        self.buffer = table.scalar(T_BUFFER, "I")
+        quant = table.table(T_QUANT)
+        self.scale = np.asarray(quant.scalars(Q_SCALE, "f") if quant else [], np.float32)
+        self.zero_point = np.asarray(quant.scalars(Q_ZERO_POINT, "q") if quant else [], np.int64)
+        self.quantized_dimension = quant.scalar(Q_DIMENSION, "i") if quant else 0
+        self.minimum = quant.scalars(Q_MIN, "f") if quant else []
+        self.maximum = quant.scalars(Q_MAX, "f") if quant else []
         # A variable tensor keeps what an operator wrote into it for the next invocation.
-        self.variable = bool(table.scalar(_T_VARIABLE, "B"))
+        self.variable = bool(table.scalar(T_VARIABLE, "B"))
         self._model = model
         # The value of a constant the frontend computed itself.
         self.folded: bytes | None = None
@@ -162,13 +106,13 @@ class _Tensor:
 
 class _Operator:
     def __init__(self, model: _Model, table: Table, index: int):
-        opcode = table.scalar(_OP_OPCODE, "I")
+        opcode = table.scalar(OP_OPCODE, "I")
         self.kind, self.version = (model.opcodes[opcode] if opcode < len(model.opcodes)
                                    else (f"OPCODE_{opcode}", 1))
-        self.inputs = table.scalars(_OP_INPUTS, "i")
-        self.outputs = table.scalars(_OP_OUTPUTS, "i")
-        self.options = table.table(_OP_OPTIONS)
-        self.custom_options = table.bytes(_OP_CUSTOM_OPTIONS)
+        self.inputs = table.scalars(OP_INPUTS, "i")
+        self.outputs = table.scalars(OP_OUTPUTS, "i")
+        self.options = table.table(OP_OPTIONS)
+        self.custom_options = table.bytes(OP_CUSTOM_OPTIONS)
         self.index = index
 
     def option(self, slot: int, fmt: str, default=0):
@@ -200,10 +144,10 @@ def _read(data: bytes):
     model = _Model(data)
     graphs = []
     for subgraph in model.subgraphs:
-        tensors = [_Tensor(model, t) for t in subgraph.tables(_SG_TENSORS)]
-        operators = [_Operator(model, op, i) for i, op in enumerate(subgraph.tables(_SG_OPERATORS))]
-        graphs.append((subgraph.string(_SG_NAME), tensors, subgraph.scalars(_SG_INPUTS, "i"),
-                       subgraph.scalars(_SG_OUTPUTS, "i"), operators))
+        tensors = [_Tensor(model, t) for t in subgraph.tables(SG_TENSORS)]
+        operators = [_Operator(model, op, i) for i, op in enumerate(subgraph.tables(SG_OPERATORS))]
+        graphs.append((subgraph.string(SG_NAME), tensors, subgraph.scalars(SG_INPUTS, "i"),
+                       subgraph.scalars(SG_OUTPUTS, "i"), operators))
     for position, (_, tensors, inputs, outputs, operators) in enumerate(graphs):
         prefix = f"subgraph {position} " if position else ""
         _check_indices(f"{prefix or 'model '}inputs", "tensor", inputs, len(tensors))
@@ -434,8 +378,13 @@ def _narrow_index_inputs(graph):
 
 def unsupported(data: bytes) -> list[str]:
     """Why the model cannot be converted, one reason per line; empty when it can."""
-    model, graphs = _read(data)
-    graphs = [_narrow_index_inputs(g) for g in graphs]
+    _, graphs = _read(data)
+    return _reasons([_narrow_index_inputs(g) for g in graphs])
+
+
+def _reasons(graphs) -> list[str]:
+    """The reasons of unsupported() for the subgraphs `_read` gave, after
+    `_narrow_index_inputs`."""
     reasons = []
     init = _initializer_subgraphs(graphs)
     branches = _branch_subgraphs(graphs)
@@ -641,7 +590,6 @@ _BOOL_SLOTS = {**{kind: ((), True) for kind in _COMPARISONS},
                "REDUCE_ALL": ((0,), True)}
 # Operators that keep state in a variable tensor, at this operand.
 _STATEFUL = {"SVDF": (4,), "UNIDIRECTIONAL_SEQUENCE_LSTM": (18, 19)}
-_STATE_TYPES = {"FLOAT32": TensorProto.FLOAT, "INT16": TensorProto.INT16, "INT8": TensorProto.INT8}
 # Resource variables: a handle names a variable, which is read and assigned.
 _VARIABLES = ("CALL_ONCE", "VAR_HANDLE", "READ_VARIABLE", "ASSIGN_VARIABLE")
 # Index outputs: int32 positions, as model outputs or the indices of the operators below.
@@ -651,27 +599,19 @@ _INDEX_SLOTS = {"GATHER": 1, "GATHER_ND": 1, "EMBEDDING_LOOKUP": 0, "DYNAMIC_UPD
 # Reductions over one run of adjacent axes, and the prefix sum over one axis.
 _REDUCTIONS = {"REDUCE_MAX": "ReduceMax", "REDUCE_MIN": "ReduceMin", "SUM": "ReduceSum",
                "REDUCE_ALL": "ReduceAll"}
-_SUPPORTED = (*_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS,
-              *_INDEX, *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N", "IF", "WHILE",
-              "RELU6", "SOFTMAX", "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION",
-              "CUMSUM", "MEAN", "GELU",
-              "TRANSPOSE",
-              "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
-              "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE")
 # The SSD box decoding and non-max suppression TFLite Micro registers as a
 # custom operator.
 _DETECTION = "CUSTOM:TFLite_Detection_PostProcess"
-_SUPPORTED = (*_SUPPORTED, _DETECTION)
+_SUPPORTED = frozenset((
+    *_FUSED_SLOT, *_UNARY, *_SHAPE_ONLY, *_ELEMENTWISE, *_DATA_MOVEMENT, *_REDUCTIONS, *_INDEX,
+    *_BOOL_SLOTS, *_VARIABLES, *_STATEFUL, "ADD_N", "IF", "WHILE", "RELU6", "SOFTMAX",
+    "LOG_SOFTMAX", "LEAKY_RELU", "PRELU", "L2_NORMALIZATION", "CUMSUM", "MEAN", "GELU",
+    "TRANSPOSE", "SPLIT", "SPLIT_V", "PAD", "PADV2", "BATCH_MATMUL", "RESIZE_NEAREST_NEIGHBOR",
+    "RESIZE_BILINEAR", "QUANTIZE", "DEQUANTIZE", _DETECTION))
 # FullyConnectedOptions.quant_spec: a non-empty one names a quantization contract a runtime must refuse unless it knows it.
 _FC_QUANT_SPEC = 5
-# Options slots of the stride and dilation of each windowed operator, width first.
-_WINDOWED = {"CONV_2D": (1, 2, 4, 5), "DEPTHWISE_CONV_2D": (1, 2, 5, 6),
-             "TRANSPOSE_CONV": (1, 2, None, None), "MAX_POOL_2D": (1, 2, None, None),
-             "AVERAGE_POOL_2D": (1, 2, None, None), "L2_POOL_2D": (1, 2, None, None)}
 # Operators whose options set their output shapes from the input shapes.
 _OPTION_SHAPED = ("PACK", "UNPACK", "CONCATENATION", "GATHER", "BATCH_MATMUL", "STRIDED_SLICE")
-# The Padding enum of the windowed operators' options.
-_SAME, _VALID = 0, 1
 # Positions of the data, weights and bias operands of the weighted operators.
 _WEIGHTED = {"CONV_2D": (0, 1, 2), "DEPTHWISE_CONV_2D": (0, 1, 2), "FULLY_CONNECTED": (0, 1, 2),
              "TRANSPOSE_CONV": (2, 1, 3)}
@@ -728,7 +668,7 @@ class Window(NamedTuple):
 
     def outputs(self, extents) -> list[int]:
         """The output height and width the padding gives an input of `extents`."""
-        return [(e + s - 1) // s if self.padding == _SAME else (e - span + s) // s
+        return [(e + s - 1) // s if self.padding == SAME else (e - span + s) // s
                 for e, span, s in zip(extents, self.spans, self.strides)]
 
     def pads(self, extents, outputs) -> list[tuple[int, int]]:
@@ -738,17 +678,22 @@ class Window(NamedTuple):
 
 
 def window(kind: str, option, weights=None) -> Window:
-    """The window of a `_WINDOWED` operator. `option(slot, fmt, default)` reads
+    """The window of a `WINDOWED` operator. `option(slot, fmt, default)` reads
     its options table; a weighted operator's filter is `weights`' dimensions 1 and 2."""
-    slot_w, slot_h, *dilations = _WINDOWED[kind]
+    slot_w, slot_h, *dilations = WINDOWED[kind]
     kernel = tuple(weights[1:3]) if kind in _WEIGHTED else (option(4, "i", 0), option(3, "i", 0))
     dilation_w, dilation_h = (1 if slot is None else option(slot, "i", 1) for slot in dilations)
-    return Window(option(0, "b", _SAME), kernel, (option(slot_h, "i", 0), option(slot_w, "i", 0)),
+    return Window(option(0, "b", SAME), kernel, (option(slot_h, "i", 0), option(slot_w, "i", 0)),
                   (dilation_h, dilation_w))
 
 
 def _is_constant(tensor: _Tensor) -> bool:
     return tensor.buffer > 0 and bool(tensor.data)
+
+
+def _axes(values, rank: int) -> list:
+    """The distinct axes in `values`, each taken modulo `rank`, ascending."""
+    return sorted({a % rank for a in values})
 
 
 def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
@@ -877,14 +822,14 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
     if op.kind == "L2_NORMALIZATION" and op.option(0, "b") != 0:
         return f"fused {_activation(op.option(0, 'b'))}"
     if op.kind in _REDUCTIONS or op.kind == "MEAN":
-        axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
+        axes = _axes(ins[1].array().reshape(-1).tolist(), len(ins[0].shape))
         if not axes or (op.kind != "MEAN" and axes != list(range(axes[0], axes[-1] + 1))):
             return "axes that are not adjacent"
     if op.kind == "SOFTMAX" and op.option(0, "f") != 1.0:
         return "beta other than 1"
     if op.kind == "FULLY_CONNECTED" and op.option(1, "b") != 0:
         return "shuffled weights format"
-    if op.kind in _WINDOWED:
+    if op.kind in WINDOWED:
         reason = _window_reason(op, ins, outs)
         if reason:
             return reason
@@ -895,12 +840,17 @@ def _operator_reason(op: _Operator, tensors: list[_Tensor]) -> str:
         if reason:
             return reason
     if op.kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
-        align, half_pixel = ((op.option(2, "?", False), op.option(3, "?", False))
-                             if op.kind == "RESIZE_BILINEAR" else
-                             (op.option(0, "?", False), op.option(1, "?", False)))
+        align, half_pixel = _resize_flags(op)
         if align and half_pixel:
             return "align_corners and half_pixel_centers together"
     return ""
+
+
+def _resize_flags(op: _Operator) -> tuple:
+    """align_corners and half_pixel_centers of a RESIZE_BILINEAR or a
+    RESIZE_NEAREST_NEIGHBOR."""
+    first = 2 if op.kind == "RESIZE_BILINEAR" else 0
+    return op.option(first, "?", False), op.option(first + 1, "?", False)
 
 
 def _integer_use(op: _Operator) -> bool:
@@ -1094,7 +1044,7 @@ def _spatial_mean(op: _Operator, tensors) -> bool:
     """A MEAN over the height and width of a feature map, which the compiler
     runs as a global average pool."""
     source = tensors[op.inputs[0]]
-    axes = sorted({a % len(source.shape) for a in tensors[op.inputs[1]].array().reshape(-1).tolist()})
+    axes = _axes(tensors[op.inputs[1]].array().reshape(-1).tolist(), len(source.shape))
     return len(source.shape) == 4 and axes == [1, 2]
 
 
@@ -1107,7 +1057,7 @@ def _window_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]) -> st
         if multiplier * channels != produced:
             return f"depth_multiplier {multiplier} for {channels} input and {produced} output channels"
     win = window(op.kind, op.option, ins[1].shape if op.kind in _WEIGHTED else None)
-    if win.padding not in (_SAME, _VALID):
+    if win.padding not in (SAME, VALID):
         return f"padding {win.padding}, neither SAME nor VALID"
     if min(win.strides) < 1:
         return f"a {win.strides[0]}x{win.strides[1]} stride; strides must be at least 1"
@@ -1147,7 +1097,7 @@ def _data_movement_reason(op: _Operator, ins: list[_Tensor], outs: list[_Tensor]
             # TFLite Micro leaves such an output unwritten.
             return "a dropped axis with a negative stride"
     if op.kind == "REVERSE_V2":
-        axes = sorted({a % len(ins[0].shape) for a in ins[1].array().reshape(-1).tolist()})
+        axes = _axes(ins[1].array().reshape(-1).tolist(), len(ins[0].shape))
         if not axes or axes != list(range(axes[0], axes[-1] + 1)):
             return "axes that are not adjacent"
     if op.kind in ("SPACE_TO_DEPTH", "DEPTH_TO_SPACE", "SPACE_TO_BATCH_ND",
@@ -1253,8 +1203,8 @@ def describe(data: bytes) -> dict:
         return {"name": tensor.name, "kind": "tensor", "dtype": _dtype_name(tensor),
                 "shape": list(tensor.shape)}
 
-    constants = [t for t in tensors if t.buffer > 0 and t.data]
-    return {
+    constants = [t for t in tensors if _is_constant(t)]
+    facts = {
         "name": name or model.description,
         "tflite_version": model.version,
         "description": model.description,
@@ -1275,15 +1225,15 @@ def describe(data: bytes) -> dict:
             # Every tensor the operators produce or read that is not a constant.
             "activations": [{"name": t.name, "dtype": _dtype_name(t), "shape": list(t.shape),
                              "variable": t.variable}
-                            for t in tensors if not (t.buffer > 0 and t.data)],
+                            for t in tensors if not _is_constant(t)],
             "sparse_initializers": [],
         },
-        "unsupported": unsupported(data),
     }
+    # After the facts: narrowing rewrites the types of index inputs.
+    facts["unsupported"] = _reasons([_narrow_index_inputs(g) for g in graphs])
+    return facts
 
 
-# ONNX carries tensors of rank 3 and 4 channels-first; TFLite's are
-# channels-last, which is how the compiler stores such a tensor.
 # Ranks 3 and 4 are channels-first in ONNX, as the runtime stores them
 # channels-last; other ranks keep TFLite's order.
 def _to_first(rank: int) -> list[int]:
@@ -1492,12 +1442,9 @@ class _Converter:
         elif kind == "FULLY_CONNECTED":
             y = self._fully_connected(op, tag)
         elif kind in ("MAX_POOL_2D", "AVERAGE_POOL_2D"):
-            win = window(kind, op.option)
-            (top, bottom), (left, right) = win.pads(self.tensors[ins[0]].shape[1:3], out.shape[1:3])
             attributes = {"count_include_pad": 0} if kind == "AVERAGE_POOL_2D" else {}
             y = b.node("MaxPool" if kind == "MAX_POOL_2D" else "AveragePool", [self.value(ins[0])],
-                       tag, kernel_shape=list(win.kernel), strides=list(win.strides),
-                       pads=[top, left, bottom, right], **attributes)
+                       tag, **self._pool_window(op), **attributes)
         elif kind in ("ADD", "SUB", "MUL"):
             y = b.node({"ADD": "Add", "SUB": "Sub", "MUL": "Mul"}[kind], self.operands(op), tag)
         elif kind == "CONCATENATION":
@@ -1551,12 +1498,9 @@ class _Converter:
         elif kind == "L2_NORMALIZATION":
             y = self._l2_normalization(op, tag)
         elif kind == "L2_POOL_2D":
-            win = window(kind, op.option)
-            (top, bottom), (left, right) = win.pads(self.tensors[ins[0]].shape[1:3], out.shape[1:3])
             x = self.value(ins[0])
             pooled = b.node("AveragePool", [b.node("Mul", [x, x], tag + "_square")], tag + "_mean",
-                            kernel_shape=list(win.kernel), strides=list(win.strides),
-                            pads=[top, left, bottom, right], count_include_pad=0)
+                            count_include_pad=0, **self._pool_window(op))
             y = b.node("Sqrt", [pooled], tag)
         elif kind in _REDUCTIONS or kind == "CUMSUM":
             y = self._reduction(op, tag)
@@ -1568,8 +1512,8 @@ class _Converter:
             axes = sorted(_onnx_axis(a, rank) for a in self.ints(ins[1]))
             y = b.node("ReduceMean", [self.value(ins[0])], tag, axes=axes, keepdims=1)
             if len(out.shape) != rank:
-                kept = [1 if i in [a % rank for a in self.ints(ins[1])] else d
-                        for i, d in enumerate(source.shape)]
+                reduced = _axes(self.ints(ins[1]), rank)
+                kept = [1 if i in reduced else d for i, d in enumerate(source.shape)]
                 y = self.reshape(self.held(y, outs[0], tag + "_kept"), kept, out.shape,
                                  tag + "_squeezed", outs[0])
         elif kind in _SHAPE_ONLY:
@@ -1593,11 +1537,7 @@ class _Converter:
                 self.finish(part, index)
             return
         elif kind in ("PAD", "PADV2"):
-            rank = len(out.shape)
-            pairs = np.asarray(self.ints(ins[1])).reshape(rank, 2)
-            order = _to_first(rank)
-            pads = b.constant(np.asarray([pairs[a, 0] for a in order] + [pairs[a, 1] for a in order],
-                                         np.int64), tag + "_pads")
+            pads = self._pads_constant(op, tag)
             source = self.tensors[ins[0]]
             if kind != "PADV2" or len(ins) < 3 or ins[2] < 0:
                 fill = 0.0
@@ -1618,11 +1558,7 @@ class _Converter:
               and _strided_slice_bounds(op, [self.tensors[i] for i in ins]) is None):
             y = self._strided_slice(op, tag)
         elif kind == "MIRROR_PAD":
-            rank = len(out.shape)
-            pairs = np.asarray(self.ints(ins[1])).reshape(rank, 2)
-            order = _to_first(rank)
-            pads = b.constant(np.asarray([pairs[a, 0] for a in order] + [pairs[a, 1] for a in order],
-                                         np.int64), tag + "_pads")
+            pads = self._pads_constant(op, tag)
             if op.option(0, "b") == 0:
                 y = b.node("Pad", [self.value(ins[0]), pads], tag, mode="reflect")
             else:
@@ -1713,14 +1649,7 @@ class _Converter:
             else:
                 split = [n, h, w, block, block, c // (block * block)]
             y = self.last_to_last(self.value(ins[0]), 4, tag + "_nhwc", ins[0], True)
-            y = self.held(b.node("Reshape", [y, b.constant(np.asarray(split, np.int64),
-                                                           tag + "_split")], tag + "_six"),
-                          ins[0], tag + "_six_q")
-            y = self.held(b.node("Transpose", [y], tag + "_swap", perm=[0, 1, 3, 2, 4, 5]),
-                          ins[0], tag + "_swap_q")
-            y = self.held(b.node("Reshape", [y, b.constant(np.asarray(out.shape, np.int64),
-                                                           tag + "_joined")], tag + "_four"),
-                          ins[0], tag + "_four_q")
+            y = self._six(y, split, [0, 1, 3, 2, 4, 5], out.shape, tag, ins[0], "_swap")
             y = b.node("Transpose", [y], tag, perm=_to_first(4))
         elif kind in ("SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND"):
             y = self._batch_space(op, tag)
@@ -1761,8 +1690,7 @@ class _Converter:
                            perm=_to_first(rank))
         elif kind in ("RESIZE_NEAREST_NEIGHBOR", "RESIZE_BILINEAR"):
             sizes = b.constant(np.asarray(_onnx_shape(out.shape), np.int64), tag + "_sizes")
-            align = op.option(2 if kind == "RESIZE_BILINEAR" else 0, "?", False)
-            half_pixel = op.option(3 if kind == "RESIZE_BILINEAR" else 1, "?", False)
+            align, half_pixel = _resize_flags(op)
             if kind == "RESIZE_BILINEAR":
                 coordinate = "align_corners" if align else "half_pixel" if half_pixel else "asymmetric"
                 attributes = {"mode": "linear", "coordinate_transformation_mode": coordinate}
@@ -1809,6 +1737,22 @@ class _Converter:
         total = [1, outer, int(np.prod(shape[axis:]))]
         return self.reshape(joined, total, shape, tag, index)
 
+    def _pool_window(self, op: _Operator) -> dict:
+        """The kernel_shape, strides and pads of a pooling operator's ONNX node."""
+        win = window(op.kind, op.option)
+        (top, bottom), (left, right) = win.pads(self.tensors[op.inputs[0]].shape[1:3],
+                                                self.tensors[op.outputs[0]].shape[1:3])
+        return {"kernel_shape": list(win.kernel), "strides": list(win.strides),
+                "pads": [top, left, bottom, right]}
+
+    def _pads_constant(self, op: _Operator, tag: str) -> str:
+        """The paddings of a PAD, PADV2 or MIRROR_PAD as an ONNX Pad's pads input."""
+        rank = len(self.tensors[op.outputs[0]].shape)
+        pairs = np.asarray(self.ints(op.inputs[1])).reshape(rank, 2)
+        order = _to_first(rank)
+        return self.b.constant(np.asarray([pairs[a, 0] for a in order] + [pairs[a, 1] for a in order],
+                                          np.int64), tag + "_pads")
+
     def _l2_normalization(self, op: _Operator, tag: str) -> str:
         """x / max(sqrt(sum(x * x)), 1e-6) over the last TFLite axis, as TFLite
         Micro computes it; the compiler folds it back into one operator."""
@@ -1829,7 +1773,7 @@ class _Converter:
         ins, source = op.inputs, self.tensors[op.inputs[0]]
         out = self.tensors[op.outputs[0]]
         shape = list(source.shape)
-        axes = sorted({a % len(shape) for a in self.ints(ins[1])})
+        axes = _axes(self.ints(ins[1]), len(shape))
         # Unit axes hold one element each, so reducing over them or not
         # gives the same values; a span they close needs no transpose.
         extent = [a for a in axes if shape[a] != 1] or axes[:1]
@@ -1953,7 +1897,7 @@ class _Converter:
         self.value_info += [
             helper.make_tensor_value_info(y, TensorProto.FLOAT,
                                           list(self.tensors[op.outputs[0]].shape)),
-            helper.make_tensor_value_info(kept, _STATE_TYPES[held.type], list(held.shape))]
+            helper.make_tensor_value_info(kept, _ONNX_TYPES[held.type], list(held.shape))]
         self.held_state[state]["output"] = kept
         return y
 
@@ -2029,7 +1973,7 @@ class _Converter:
                 name = b.node("QuantizeLinear", [name, scale, point], name + "_q")
             else:
                 self.value_info.append(helper.make_tensor_value_info(
-                    name, _STATE_TYPES[held.type], list(held.shape)))
+                    name, _ONNX_TYPES[held.type], list(held.shape)))
             self.held_state[index]["output"] = name
         return self.tflite_order_out(self.held(y, op.outputs[0], tag + "_q"), op.outputs[0], tag)
 
@@ -2061,15 +2005,17 @@ class _Converter:
                        tag + "_dropped")
         return self.tflite_order_out(y, op.outputs[0], tag)
 
-    def _six(self, x: str, split, perm, joined, tag: str, index: int) -> str:
+    def _six(self, x: str, split, perm, joined, tag: str, index: int,
+             middle: str = "_perm") -> str:
         """Reshape to six axes, permute, reshape back, in TFLite's axis order,
-        each step held as tensor `index` is quantized."""
+        each step held as tensor `index` is quantized; `middle` suffixes the
+        permutation's node names."""
         b = self.b
         y = self.held(b.node("Reshape", [x, b.constant(np.asarray(split, np.int64),
                                                        tag + "_split")], tag + "_six"),
                       index, tag + "_six_q")
-        y = self.held(b.node("Transpose", [y], tag + "_perm", perm=list(perm)), index,
-                      tag + "_perm_q")
+        y = self.held(b.node("Transpose", [y], tag + middle, perm=list(perm)), index,
+                      tag + middle + "_q")
         return self.held(b.node("Reshape", [y, b.constant(np.asarray(joined, np.int64),
                                                           tag + "_joined")], tag + "_four"),
                          index, tag + "_four_q")
@@ -2198,12 +2144,12 @@ class _Converter:
 def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     """The model as QDQ ONNX with its TFLite tensor names; raises ValueError
     naming every construct that does not convert."""
-    reasons = unsupported(data)
-    if reasons:
-        raise ValueError("TFLite model does not convert: " + "; ".join(reasons))
     _, graphs = _read(data)
     original_types = {i: graphs[0][1][i].type for i in graphs[0][2]}
     graphs = [_narrow_index_inputs(g) for g in graphs]
+    reasons = _reasons(graphs)
+    if reasons:
+        raise ValueError("TFLite model does not convert: " + "; ".join(reasons))
     _, tensors, inputs, outputs, operators = graphs[0]
     consumed = {i for op in operators for i in op.inputs}
     converter = _Converter(tensors, outputs, consumed)
@@ -2219,8 +2165,6 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         if op.kind == "DEQUANTIZE" and readers.get(op.outputs[0]) == {_DETECTION}
         and op.outputs[0] not in outputs}
     b = converter.b
-    boundary_type = {"INT8": TensorProto.INT8, "UINT8": TensorProto.UINT8, "FLOAT32": TensorProto.FLOAT,
-                     "INT32": TensorProto.INT32, "INT64": TensorProto.INT64, "BOOL": TensorProto.BOOL}
     indices = {i for op in operators if op.kind in _INDEX for i in op.outputs}
 
     # The interface keeps TFLite's dtypes: an int8 input is dequantized straight
@@ -2230,7 +2174,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         tensor = tensors[index]
         b._names.add(tensor.name)
         onnx_inputs.append(helper.make_tensor_value_info(
-            tensor.name, boundary_type[original_types[index]], _onnx_shape(tensor.shape)))
+            tensor.name, _ONNX_TYPES[original_types[index]], _onnx_shape(tensor.shape)))
         if original_types[index] == "INT64" and tensor.type == "INT32":
             converter.values[index] = b.node("Cast", [tensor.name], tensor.name + "_i32", to=TensorProto.INT32)
         elif tensor.type in ("FLOAT32", "BOOL", "INT32"):
@@ -2269,7 +2213,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
         tensor = tensors[index]
         name = b.unique(f"state{len(state)}_{tensor.name}_in")
         onnx_inputs.append(helper.make_tensor_value_info(
-            name, _STATE_TYPES[tensor.type], list(tensor.shape)))
+            name, _ONNX_TYPES[tensor.type], list(tensor.shape)))
         # An int8 variable starts at its zero point and is read through its
         # quantization; an int16 one is passed to its operator as stored.
         zero = int(tensor.zero_point[0]) if tensor.type == "INT8" else 0
@@ -2294,7 +2238,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     for index, held in converter.held_state.items():
         tensor = tensors[index]
         state_outputs.append(helper.make_tensor_value_info(
-            held["output"], _STATE_TYPES[tensor.type], list(tensor.shape)))
+            held["output"], _ONNX_TYPES[tensor.type], list(tensor.shape)))
     for entry, variable in zip(state, shapes):
         current = converter.variables[variable]
         if current["current"] != entry["input"]:
@@ -2304,7 +2248,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     # An index is stored as the operator writes it, in TFLite's axis order.
     onnx_outputs = [helper.make_tensor_value_info(
         tensors[index].name if index in converter.int8_outputs else converter.values[index],
-        boundary_type[tensors[index].type],
+        _ONNX_TYPES[tensors[index].type],
         list(tensors[index].shape) if index in indices else _onnx_shape(tensors[index].shape))
         for index in outputs] + state_outputs
     opsets = [helper.make_opsetid("", 17)]
@@ -2320,447 +2264,3 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
     onnx.helper.set_model_props(model, props)
     onnx.checker.check_model(model)
     return model
-
-
-_ELEMENT_BYTES = {"FLOAT32": 4, "INT32": 4, "UINT32": 4, "INT8": 1, "UINT8": 1, "BOOL": 1,
-                  "INT16": 2, "UINT16": 2, "FLOAT16": 2, "INT64": 8, "UINT64": 8, "FLOAT64": 8}
-# Reference kernels whose scratch buffers tflm_arena places.
-_TFLM_REDUCTIONS = ("MEAN", "SUM", "REDUCE_MAX", "REDUCE_MIN", "REDUCE_ALL")
-
-
-def tflm_tensor_bytes(tensors: list, operators: list = ()) -> list[int] | None:
-    """The bytes TFLite Micro's planner places for each (storage type, shape,
-    placed) tensor, 0 for one not placed, once each RESHAPE among `operators`,
-    (kind, inputs, outputs) in execution order, has resolved a -1 in its output
-    shape from its input's element count; None when a tensor has a storage type
-    the model does not know."""
-    shapes = [list(shape) for _, shape, _ in tensors]
-    for kind, inputs, outputs in operators:
-        if kind != "RESHAPE":
-            continue
-        shape = shapes[outputs[0]]
-        known = math.prod(d for d in shape if d != -1)
-        if shape.count(-1) == 1 and known:
-            shape[shape.index(-1)] = math.prod(shapes[inputs[0]]) // known
-    sizes = []
-    for (dtype, _, placed), shape in zip(tensors, shapes):
-        if dtype not in _ELEMENT_BYTES:
-            return None
-        sizes.append(math.prod(shape) * _ELEMENT_BYTES[dtype] if placed else 0)
-    return sizes
-
-
-def _tflm_scratch(kind: str, tensors: list, inputs: list, outputs: list) -> list[int]:
-    """The bytes of each scratch buffer TFLite Micro's reference kernel for the
-    operator requests, in request order, as TFLite Micro's reduction kernels size them."""
-    if kind not in _TFLM_REDUCTIONS:
-        return []
-    (dtype, shape), axis = tensors[inputs[0]][:2], tensors[inputs[1]][1]
-    # One int32 accumulator per output for int8 and int16 MEAN and SUM.
-    accumulators = [4 * math.prod(tensors[outputs[0]][1])] if kind in ("MEAN", "SUM") and (
-        dtype in ("INT8", "INT16")) else []
-    return [*accumulators, 4 * len(shape), 4 * math.prod(axis)]
-
-
-def tflm_arena(tensors: list, operators: list, inputs, outputs) -> int | None:
-    """TFLite Micro's arena head for one subgraph on its reference kernels:
-    `tensors` holds each tensor's (storage type, shape, placed), placed False
-    for a constant or a variable, and `operators` each operator's (kind,
-    inputs, outputs) in execution order. Its greedy planner places every placed
-    tensor, aligned to 16 bytes and live from the operator that writes it
-    (inputs from the start) to the last that reads it (outputs to the end),
-    and the scratch buffers of MEAN, SUM, REDUCE_MAX, REDUCE_MIN and
-    REDUCE_ALL. Other kernels' scratch buffers and TFLite Micro's persistent
-    allocations come on top. None when a tensor has a storage type the model
-    does not know."""
-    sizes = tflm_tensor_bytes(tensors, operators)
-    if sizes is None:
-        return None
-    scratch = [(k, size) for k, (kind, ins, outs) in enumerate(operators)
-               for size in _tflm_scratch(kind, tensors, ins, outs)]
-    return _greedy_arena(sizes, [(ins, outs) for _, ins, outs in operators], inputs, outputs,
-                         scratch)
-
-
-def _greedy_arena(sizes: list[int], operators: list[tuple], inputs, outputs, scratch) -> int:
-    """TFLite Micro's GreedyMemoryPlanner over one subgraph: `sizes` holds the
-    bytes of each tensor, 0 for one it does not place, `operators` the
-    (inputs, outputs) tensor indices of each operator in execution order, and
-    `scratch` the (operator, bytes) of each kernel scratch buffer in request
-    order, live while its operator runs."""
-    first = [-1] * len(sizes)
-    last = [-1] * len(sizes)
-
-    def created(index, scope):
-        if first[index] == -1:
-            first[index] = scope
-
-    for index in inputs:
-        created(index, 0)
-        last[index] = 0
-    for scope, (op_inputs, op_outputs) in enumerate(operators, start=1):
-        for index in op_outputs:
-            created(index, scope)
-        for index in [*op_inputs, *op_outputs]:
-            if index >= 0:
-                last[index] = scope
-    for index in outputs:
-        created(index, len(operators))
-        last[index] = len(operators)
-    # Requests in tensor order: (size, first, last).
-    requests = [((size + 15) // 16 * 16, first[index], last[index])
-                for index, size in enumerate(sizes) if size]
-    requests += [((size + 15) // 16 * 16, op + 1, op + 1) for op, size in scratch if size]
-    if not requests:
-        return 0
-    # GreedyMemoryPlanner: requests listed in reverse, a stable sort by
-    # decreasing size, then each placed at the lowest offset clear of every
-    # placed buffer whose lifetime overlaps its own.
-    order = sorted(reversed(range(len(requests))), key=lambda i: -requests[i][0])
-    placed = []  # (offset, size, first, last), ascending offset, insertion-stable
-    offsets = []
-    for i in order:
-        size, start, end = requests[i]
-        offset = 0
-        for other_offset, other_size, other_start, other_end in placed:
-            if other_start > end or start > other_end:
-                continue
-            if other_offset - offset >= size:
-                break
-            offset = max(offset, other_offset + other_size)
-        at = bisect.bisect_right(offsets, offset)
-        offsets.insert(at, offset)
-        placed.insert(at, (offset, size, start, end))
-    return max(offset + size for offset, size, _, _ in placed)
-
-
-class TflmTarget(NamedTuple):
-    """The C ABI TFLite Micro is built for: the bytes of a pointer and of a
-    size_t, and whether an enum without a fixed type takes the smallest integer
-    that holds its values (every such enum TFLite Micro stores fits one byte)."""
-    pointer: int
-    short_enums: bool
-
-
-TFLM_TARGETS = {"arm-none-eabi": TflmTarget(4, True), "ilp32": TflmTarget(4, False),
-                "lp64": TflmTarget(8, False)}
-
-# Members of each record TFLite Micro allocates in its arena tail, in declaration order.
-_TFLM_RECORDS = {
-    "SingleArenaBufferAllocator": "pp ppppp z i",
-    "RecordingSingleArenaBufferAllocator": "pp ppppp z i zzzz",
-    "GreedyMemoryPlanner": "p ii pppp ii p c",
-    "MicroAllocator": "p pp p p c z p z",
-    "RecordingMicroAllocator": "p pp p p c z p z p (zzz)7",
-    "MicroBuiltinDataAllocator": "pp",
-    "SubgraphAllocations": "pp",
-    "TfLiteEvalTensor": "pp e",
-    "NodeAndRegistration": "(pppppp i) p",
-    "TfLiteTensor": "(e p) (i i) p p z e e c",
-    "TfLiteAffineQuantization": "pp i",
-    "ScratchBufferHandle": "p",
-    "TfLiteAddParams": "e c",
-    "TfLiteArgMaxParams": "e",
-    "TfLiteArgMinParams": "e",
-    "TfLiteBatchMatMulParams": "ccc",
-    "TfLiteCastParams": "ee",
-    "TfLiteConcatenationParams": "i e",
-    "TfLiteConvParams": "e i i e i i e",
-    "TfLiteCumsumParams": "cc",
-    "TfLiteDepthToSpaceParams": "i",
-    "TfLiteDepthwiseConvParams": "e i i i e i i",
-    "TfLiteDivParams": "e",
-    "TfLiteFullyConnectedParams": "e e c c e p i",
-    "TfLiteGatherParams": "ii",
-    "TfLiteL2NormParams": "e",
-    "TfLiteLeakyReluParams": "i",
-    "TfLiteMulParams": "e",
-    "TfLitePackParams": "ii",
-    "TfLitePoolParams": "e i i i i e (iiii)",
-    "TfLiteReducerParams": "c",
-    "TfLiteReshapeParams": "i8 i",
-    "TfLiteResizeBilinearParams": "cc",
-    "TfLiteResizeNearestNeighborParams": "cc",
-    "TfLiteShapeParams": "e",
-    "TfLiteSoftmaxParams": "i",
-    "TfLiteSpaceToDepthParams": "i",
-    "TfLiteSplitParams": "i",
-    "TfLiteSplitVParams": "i",
-    "TfLiteSqueezeParams": "i8 i",
-    "TfLiteStridedSliceParams": "i5 c",
-    "TfLiteSubParams": "e c",
-    "TfLiteUnpackParams": "ii",
-    "Comparison OpData": "(i7 c)",
-    "Concatenation OpData": "(i p p i i i)",
-    "Cumsum OpData": "i9",
-    "DequantizeOpData": "(q i) i i i",
-    "Elu OpData": "c256",
-    "EmbeddingLookup OpData": "i z",
-    "HardSwishParams": "h h h i h i",
-    "L2NormalizationParams": "i",
-    "LeakyReluOpData": "i6",
-    "LogSoftmaxOpData": "i5 zz",
-    "OpDataAbsRsqrt": "iiii c e e",
-    "OpDataAdd": "c i14",
-    "OpDataBatchMatmul": "ppp ccc",
-    "OpDataConv": "(iiii) i5 pp i3",
-    "OpDataDiv": "i7",
-    "OpDataFullyConnected": "i9 pp c",
-    "OpDataLogistic": "i4",
-    "OpDataMul": "i9",
-    "OpDataPooling": "(iiii) i4",
-    "OpDataQuantizeReference": "(i q) i i i",
-    "OpDataReduce": "i11",
-    "OpDataSub": "c i12",
-    "Tanh OpData": "i4",
-    "Pad OpData": "(c i5 c i5 c) i",
-    "PreluParams": "i7",
-    "QuantizationOpDataBatchMatmul": "i7",
-    "Relu6OpData": "ii",
-    "ReluOpData": "c i i i4",
-    "Select OpData": "c",
-    "SoftmaxParams": "q i7 p5",
-    "SpaceToBatchParams": "i",
-    "SquaredDifference OpData": "c (c i14 q2 h2 i5)",
-    "StridedSliceParams": "c i5 c i5 c i5 h5 c",
-}
-# Members a build with USE_TFLM_COMPRESSION appends to a record.
-_TFLM_COMPRESSION = {"SubgraphAllocations": "p", "OpDataConv": "ii", "OpDataFullyConnected": "ii",
-                     "Concatenation OpData": "i10", "RecordingMicroAllocator": "(zzz)"}
-
-
-@functools.cache
-def _tflm_layout(name: str, target: TflmTarget, compression: bool = False) -> tuple[int, int]:
-    """sizeof and alignof of a TFLite Micro record on the target. Member codes:
-    c one byte, h two, i four (int, int32_t, float), q eight (int64_t, double),
-    p a pointer, z a size_t or intptr_t, e an enum without a fixed type, (...)
-    a nested struct; a count after a member repeats it. A class with virtual
-    functions starts with its vtable pointers."""
-    fields = _TFLM_RECORDS[name] + (" " + _TFLM_COMPRESSION.get(name, "") if compression else "")
-    fields = fields.replace(" ", "")
-    width = {"c": 1, "h": 2, "i": 4, "q": 8, "p": target.pointer, "z": target.pointer,
-             "e": 1 if target.short_enums else 4}
-
-    def members(pos):
-        size, align = 0, 1
-        while pos < len(fields) and fields[pos] != ")":
-            if fields[pos] == "(":
-                (member, member_align), pos = members(pos + 1)
-            else:
-                member = member_align = width[fields[pos]]
-            pos += 1
-            count = ""
-            while pos < len(fields) and fields[pos].isdigit():
-                count, pos = count + fields[pos], pos + 1
-            size = -(-size // member_align) * member_align + member * int(count or 1)
-            align = max(align, member_align)
-        return (-(-size // align) * align, align), pos
-
-    return members(0)[0]
-
-
-def _tflm_dims(rank: int) -> int:
-    """Bytes of a TfLiteIntArray of `rank` elements."""
-    return 4 + 4 * rank
-
-
-def _tflm_quantized(tensor) -> bool:
-    """Whether TFLite Micro gives the tensor affine quantization parameters."""
-    return tensor[3] > 0 and tensor[4] > 0
-
-
-def _tflm_output_dims(tensors, inputs, outputs, options, target):
-    return [_tflm_dims(len(tensors[outputs[0]][1]))]
-
-
-def _tflm_conv(axis):
-    def prepare(tensors, inputs, outputs, options, target):
-        return [4 * tensors[inputs[1]][1][axis]] * 2
-    return prepare
-
-
-def _tflm_fully_connected(tensors, inputs, outputs, options, target):
-    filter_ = tensors[inputs[1]]
-    if tensors[inputs[0]][0] == "FLOAT32" or not _tflm_quantized(filter_) or filter_[3] < 2:
-        return []
-    return [4 * filter_[3]] * 2
-
-
-def _tflm_softmax(tensors, inputs, outputs, options, target):
-    # Two int16 lookup tables of 513 entries for int16 input.
-    return [2 * 513] * 2 if tensors[inputs[0]][0] == "INT16" else []
-
-
-def _tflm_log_softmax(tensors, inputs, outputs, options, target):
-    return [_tflm_layout("LogSoftmaxOpData", target)[0]] if tensors[inputs[0]][0] == "INT8" else []
-
-
-def _tflm_cumsum(tensors, inputs, outputs, options, target):
-    return [_tflm_layout("Cumsum OpData", target)[0]] if tensors[outputs[0]][0] == "INT8" else []
-
-
-def _tflm_embedding_lookup(tensors, inputs, outputs, options, target):
-    return [_tflm_dims(len(tensors[outputs[0]][1])),
-            _tflm_layout("EmbeddingLookup OpData", target)[0]]
-
-
-def _tflm_reshape(tensors, inputs, outputs, options, target):
-    shape = tensors[outputs[0]][1]
-    return [_tflm_dims(len(shape))] if -1 in shape else []
-
-
-def _tflm_batch_matmul(tensors, inputs, outputs, options, target):
-    lhs, rhs = tensors[inputs[0]], tensors[inputs[1]]
-    sizes = [_tflm_layout("QuantizationOpDataBatchMatmul", target)[0]] if lhs[0] in (
-        "INT8", "INT16") else []
-    for (dtype, shape, *_), transposed in ((lhs, options.get("adj_x", False)),
-                                          (rhs, not options.get("adj_y", False))):
-        if transposed:
-            sizes += [_tflm_layout("TfLiteEvalTensor", target)[0], _tflm_dims(len(shape)),
-                      math.prod(shape) * _ELEMENT_BYTES[dtype]]
-    return sizes + [_tflm_dims(len(tensors[outputs[0]][1]))]
-
-
-# Per kind: the parser's builtin data record, the init record, and the prepare allocations.
-_TFLM_KERNELS = {
-    "ABS": (None, "OpDataAbsRsqrt", None),
-    "ADD": ("TfLiteAddParams", "OpDataAdd", None),
-    "ARG_MAX": ("TfLiteArgMaxParams", None, None),
-    "ARG_MIN": ("TfLiteArgMinParams", None, None),
-    "AVERAGE_POOL_2D": ("TfLitePoolParams", "OpDataPooling", None),
-    "BATCH_MATMUL": ("TfLiteBatchMatMulParams", "OpDataBatchMatmul", _tflm_batch_matmul),
-    "BATCH_TO_SPACE_ND": (None, None, None),
-    "BROADCAST_ARGS": (None, None, None),
-    "BROADCAST_TO": (None, None, None),
-    "CAST": ("TfLiteCastParams", None, None),
-    "CEIL": (None, None, None),
-    "CONCATENATION": ("TfLiteConcatenationParams", "Concatenation OpData", None),
-    "CONV_2D": ("TfLiteConvParams", "OpDataConv", _tflm_conv(0)),
-    "COS": (None, None, None),
-    "CUMSUM": ("TfLiteCumsumParams", None, _tflm_cumsum),
-    "DEPTH_TO_SPACE": ("TfLiteDepthToSpaceParams", None, _tflm_output_dims),
-    "DEPTHWISE_CONV_2D": ("TfLiteDepthwiseConvParams", "OpDataConv", _tflm_conv(3)),
-    "DEQUANTIZE": (None, "DequantizeOpData", None),
-    "DIV": ("TfLiteDivParams", "OpDataDiv", None),
-    "DYNAMIC_UPDATE_SLICE": (None, None, None),
-    "ELU": (None, "Elu OpData", None),
-    "EMBEDDING_LOOKUP": (None, None, _tflm_embedding_lookup),
-    "EQUAL": (None, "Comparison OpData", None),
-    "EXP": (None, None, None),
-    "EXPAND_DIMS": (None, None, None),
-    "FILL": (None, None, None),
-    "FLOOR": (None, None, None),
-    "FLOOR_DIV": (None, None, None),
-    "FLOOR_MOD": (None, None, None),
-    "FULLY_CONNECTED": ("TfLiteFullyConnectedParams", "OpDataFullyConnected",
-                        _tflm_fully_connected),
-    "GATHER": ("TfLiteGatherParams", None, _tflm_output_dims),
-    "GATHER_ND": (None, None, _tflm_output_dims),
-    "GREATER": (None, "Comparison OpData", None),
-    "GREATER_EQUAL": (None, "Comparison OpData", None),
-    "HARD_SWISH": (None, "HardSwishParams", None),
-    "L2_NORMALIZATION": ("TfLiteL2NormParams", "L2NormalizationParams", None),
-    "L2_POOL_2D": ("TfLitePoolParams", None, _tflm_output_dims),
-    "LEAKY_RELU": ("TfLiteLeakyReluParams", "LeakyReluOpData", None),
-    "LESS": (None, "Comparison OpData", None),
-    "LESS_EQUAL": (None, "Comparison OpData", None),
-    "LOG": (None, None, None),
-    "LOGICAL_AND": (None, None, None),
-    "LOGICAL_NOT": (None, None, None),
-    "LOGICAL_OR": (None, None, None),
-    "LOGISTIC": (None, "OpDataLogistic", None),
-    "LOG_SOFTMAX": (None, None, _tflm_log_softmax),
-    "MAXIMUM": (None, None, None),
-    "MAX_POOL_2D": ("TfLitePoolParams", "OpDataPooling", None),
-    "MEAN": ("TfLiteReducerParams", "OpDataReduce", None),
-    "MINIMUM": (None, None, None),
-    "MUL": ("TfLiteMulParams", "OpDataMul", None),
-    "NEG": (None, None, None),
-    "NOT_EQUAL": (None, "Comparison OpData", None),
-    "PACK": ("TfLitePackParams", None, None),
-    "PAD": (None, "Pad OpData", None),
-    "PADV2": (None, "Pad OpData", None),
-    "PRELU": (None, "PreluParams", None),
-    "QUANTIZE": (None, "OpDataQuantizeReference", None),
-    "REDUCE_ALL": ("TfLiteReducerParams", "OpDataReduce", None),
-    "REDUCE_MAX": ("TfLiteReducerParams", "OpDataReduce", None),
-    "REDUCE_MIN": ("TfLiteReducerParams", "OpDataReduce", None),
-    "RELU": (None, "ReluOpData", None),
-    "RELU6": (None, "Relu6OpData", None),
-    "RESHAPE": ("TfLiteReshapeParams", None, _tflm_reshape),
-    "RESIZE_BILINEAR": ("TfLiteResizeBilinearParams", None, None),
-    "RESIZE_NEAREST_NEIGHBOR": ("TfLiteResizeNearestNeighborParams", None, None),
-    "REVERSE_V2": (None, None, None),
-    "ROUND": (None, None, None),
-    "RSQRT": (None, "OpDataAbsRsqrt", None),
-    "SELECT_V2": (None, "Select OpData", None),
-    "SHAPE": ("TfLiteShapeParams", None, None),
-    "SIN": (None, None, None),
-    "SLICE": (None, None, None),
-    "SOFTMAX": ("TfLiteSoftmaxParams", "SoftmaxParams", _tflm_softmax),
-    "SPACE_TO_BATCH_ND": (None, "SpaceToBatchParams", None),
-    "SPACE_TO_DEPTH": ("TfLiteSpaceToDepthParams", None, _tflm_output_dims),
-    "SPLIT": ("TfLiteSplitParams", None, None),
-    "SPLIT_V": ("TfLiteSplitVParams", None, None),
-    "SQRT": (None, None, None),
-    "SQUARE": (None, None, None),
-    "SQUARED_DIFFERENCE": (None, "SquaredDifference OpData", None),
-    "SQUEEZE": ("TfLiteSqueezeParams", None, None),
-    "STRIDED_SLICE": ("TfLiteStridedSliceParams", "StridedSliceParams", None),
-    "SUB": ("TfLiteSubParams", "OpDataSub", None),
-    "SUM": ("TfLiteReducerParams", "OpDataReduce", None),
-    "TANH": (None, "Tanh OpData", None),
-    "TRANSPOSE": (None, None, None),
-    "UNPACK": ("TfLiteUnpackParams", None, None),
-    "ZEROS_LIKE": (None, None, None),
-}
-
-
-def tflm_persistent(tensors: list, operators: list, inputs, outputs, target: TflmTarget,
-                    compression: bool = False, recording: bool = False) -> int | None:
-    """TFLite Micro's persistent (tail) bytes for a one-subgraph model on its
-    reference kernels, as a MicroInterpreter built for `target` allocates
-    them: `tensors` holds each tensor's (storage type, shape, variable, scale
-    count, zero point count) and `operators` each operator's (kind, inputs,
-    outputs, options), options holding adj_x and adj_y of BATCH_MATMUL.
-    `compression` is a build with USE_TFLM_COMPRESSION, `recording` a
-    RecordingMicroAllocator in place of MicroAllocator. The arena end is
-    16-byte aligned. None when an operator kind or a tensor's storage type is
-    not modelled."""
-    if any(kind not in _TFLM_KERNELS for kind, *_ in operators) or any(
-            t[0] not in _ELEMENT_BYTES for t in tensors):
-        return None
-
-    def record(name, count=1):
-        size, align = _tflm_layout(name, target, compression)
-        return size * count, align
-
-    recording_prefix = "Recording" if recording else ""
-    allocations = [record(f"{recording_prefix}SingleArenaBufferAllocator"),
-                   record("GreedyMemoryPlanner"), record(f"{recording_prefix}MicroAllocator"),
-                   record("MicroBuiltinDataAllocator"), record("SubgraphAllocations"),
-                   record("TfLiteEvalTensor", len(tensors)),
-                   record("NodeAndRegistration", len(operators))]
-    allocations += [record(_TFLM_KERNELS[kind][0]) for kind, *_ in operators
-                    if _TFLM_KERNELS[kind][0]]
-    allocations += [(record(_TFLM_KERNELS[kind][1])[0], 16) for kind, *_ in operators
-                    if _TFLM_KERNELS[kind][1]]
-    for kind, ins, outs, options in operators:
-        prepare = _TFLM_KERNELS[kind][2]
-        if prepare is not None:
-            allocations += [(size, 16) for size in prepare(tensors, ins, outs, options, target)]
-    requests = sum(len(_tflm_scratch(kind, tensors, ins, outs)) for kind, ins, outs, _ in operators)
-    if requests:
-        allocations.append(record("ScratchBufferHandle", requests))
-    allocations += [(math.prod(t[1]) * _ELEMENT_BYTES[t[0]], 16) for t in tensors if t[2]]
-    for boundary in (inputs, outputs):
-        allocations.append((target.pointer * len(boundary), 16))
-        for index in boundary:
-            allocations.append(record("TfLiteTensor"))
-            if _tflm_quantized(tensors[index]):
-                allocations += [record("TfLiteAffineQuantization"),
-                                (_tflm_dims(tensors[index][3]), 4)]
-    used = 0
-    for size, align in allocations:
-        used = -(-(used + size) // align) * align
-    return used

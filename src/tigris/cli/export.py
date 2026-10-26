@@ -5,8 +5,8 @@ from pathlib import Path
 import click
 
 from tigris.cli import cli, text
-from tigris.frontends.tflite import TFLM_TARGETS
 from tigris.frontends.tflite_export import DEFAULT_TARGET
+from tigris.frontends.tflm import TFLM_TARGETS
 from tigris.utils import fmt_bytes
 
 

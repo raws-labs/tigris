@@ -13,6 +13,7 @@ from tigris.frontends import not_a_model, tflite
 from tigris import SCHEMA_VERSION_INTERFACE_DTYPE, SCHEMA_VERSION_TENSOR_LAYOUT
 from tigris.emitters.binary import defs
 from tigris.emitters.binary.reader import read_binary_plan
+from tigris.operator_contract import OP_TYPE_BY_CODE
 
 
 def _dtype(code: int) -> str:
@@ -144,9 +145,8 @@ def _plan(data: bytes) -> dict:
                 "model order" if tensor["flags"] & defs.TENSOR_FLAG_LINEAR else
                 {4: "NHWC", 3: "NLC"}.get(tensor["ndim"], "model order")
             )
-    op_names = {code: name for name, code in defs.OP_TYPE_MAP.items()}
     for op in plan["ops"]:
-        op["type"] = op_names.get(op["op_type"], f"unknown({op['op_type']})")
+        op["type"] = OP_TYPE_BY_CODE.get(op["op_type"], f"unknown({op['op_type']})")
         op["fused_activation"] = {0: "none", 1: "Relu", 2: "Relu6"}.get(
             op["fused_act"], f"unknown({op['fused_act']})")
         for index in op["inputs"] + op["outputs"]:

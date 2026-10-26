@@ -1,8 +1,5 @@
-"""Building blocks for expressing a quantized source graph as QDQ ONNX.
-
-A frontend that reads another format builds its ONNX graph from these, so the
-Q/DQ conventions the compiler folds are written the same way for every format.
-"""
+"""QDQ ONNX graph building for the TFLite importer, and TensorFlow's split of
+SAME padding into explicit begin and end pads."""
 
 import numpy as np
 from onnx import helper, numpy_helper

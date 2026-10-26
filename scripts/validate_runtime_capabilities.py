@@ -7,8 +7,8 @@ import argparse
 import re
 from pathlib import Path
 
-from tigris.capabilities import EXECUTOR_OPERATORS, KERNEL_CAPABILITIES
-from tigris.operator_contract import OP_C_NAMES, OP_TYPE_MAP
+from tigris.capabilities import KERNEL_CAPABILITIES
+from tigris.operator_contract import EXECUTOR_OPERATORS, OP_C_NAMES, OP_TYPE_BY_CODE, OP_TYPE_MAP
 
 if __package__:
     from .generate_operator_contract import render, render_config
@@ -85,7 +85,6 @@ def validate(runtime: Path) -> list[str]:
         "esp-nn": "tigris_dispatch_kernel_esp_nn",
         "cmsis-nn": "tigris_dispatch_kernel_cmsis_nn",
     }
-    code_to_operator = {value: key for key, value in OP_TYPE_MAP.items()}
     for backend, function in functions.items():
         try:
             body = _function_body(sources[backend], function)
@@ -104,8 +103,8 @@ def validate(runtime: Path) -> list[str]:
         if actual != expected:
             errors.append(
                 f"{backend} dispatch differs from compiler capabilities: "
-                f"runtime-only={[code_to_operator[code] for code in sorted(actual - expected)]}, "
-                f"compiler-only={[code_to_operator[code] for code in sorted(expected - actual)]}"
+                f"runtime-only={[OP_TYPE_BY_CODE[code] for code in sorted(actual - expected)]}, "
+                f"compiler-only={[OP_TYPE_BY_CODE[code] for code in sorted(expected - actual)]}"
             )
 
     names = {value: name for name, value in enum_values.items()}
