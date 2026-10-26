@@ -12,6 +12,7 @@ from tigris.analysis.partition_spatial import (
     _chain_fast_bytes,
     _external_outputs_keep_their_rows,
     _get_stage_spatial_params,
+    _ops_read_the_running_band,
     detect_and_solve_chains,
     detect_chains,
     partition_spatial,
@@ -358,6 +359,160 @@ class TestCarriedOperand:
             for index in group[:-1]:
                 for name in ag.stages[index].output_tensors:
                     assert readers.get(name, set()) <= inside
+
+
+def _branch_model(path, *, strided):
+    """A stem, then a convolution whose input a second convolution also reads.
+
+    Strided, it is the root of a DLA: Conv(stride 2) -> MaxPool -> Conv 1x1,
+    and a Conv 1x1 off the strided output that a stride-2 Conv takes to the
+    Add. At unit stride both the middle op and the branch are 3x3 Convs.
+    Ops: 0 and 1 the stem, 2 the shared producer, 3 and 4 the main path, 5
+    the branch, 6 and 7 the join.
+    """
+    if strided:
+        side, c0, c1, c2, stride, branch = 32, 16, 32, 64, 2, 1
+    else:
+        side, c0, c1, c2, stride, branch = 32, 4, 8, 8, 1, 3
+    rng = np.random.default_rng(0)
+    inits = []
+
+    def weight(name, shape):
+        values = rng.standard_normal(shape).astype(np.float32) * 0.3
+        inits.append(helper.make_tensor(name, TensorProto.FLOAT, shape, values.ravel().tolist()))
+        return name
+
+    def conv(source, name, cin, cout, kernel, output, step=1):
+        return helper.make_node(
+            "Conv", [source, weight(name, [cout, cin, kernel, kernel])], [output],
+            kernel_shape=[kernel, kernel], strides=[step, step], pads=[kernel // 2] * 4)
+
+    middle = (helper.make_node("MaxPool", ["shared"], ["pooled"], kernel_shape=[2, 2], strides=[2, 2])
+              if strided else conv("shared", "wm", c1, c1, 3, "pooled"))
+    nodes = [
+        conv("input", "w0", 3, c0, 7, "a"),
+        conv("a", "w1", c0, c0, 3, "b"),
+        conv("b", "w2", c0, c1, 3, "shared", stride),
+        middle,
+        conv("pooled", "w3", c1, c2, 1, "main"),
+        conv("shared", "w4", c1, c2, branch, "branch"),
+        conv("branch", "w5", c2, c2, 3, "joined", stride),
+        helper.make_node("Add", ["main", "joined"], ["output"]),
+    ]
+    out = side // stride // stride
+    graph = helper.make_graph(
+        nodes, "branch",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, side, side])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, c2, out, out])],
+        inits)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.save(model, str(path))
+    return path
+
+
+def _fire_model(path):
+    """A Conv stem, then a SqueezeNet fire module: Conv 1x1 squeeze, Conv 1x1
+    and Conv 3x3 expands that both read the squeeze, Concat, then a Conv.
+    Ops: 0 the stem, 1 the squeeze, 2 and 3 the expands, 4 the Concat, 5 the Conv.
+    """
+    rng = np.random.default_rng(0)
+    inits = []
+
+    def conv(source, name, cin, cout, kernel, output):
+        values = rng.standard_normal((cout, cin, kernel, kernel)).astype(np.float32) * 0.3
+        inits.append(helper.make_tensor(name, TensorProto.FLOAT, values.shape, values.ravel().tolist()))
+        return helper.make_node("Conv", [source, name], [output], kernel_shape=[kernel, kernel],
+                                pads=[kernel // 2] * 4)
+
+    nodes = [
+        conv("input", "w0", 3, 8, 3, "stem"),
+        conv("stem", "w1", 8, 4, 1, "squeeze"),
+        conv("squeeze", "w2", 4, 8, 1, "wide"),
+        conv("squeeze", "w3", 4, 8, 3, "deep"),
+        helper.make_node("Concat", ["wide", "deep"], ["joined"], axis=1),
+        conv("joined", "w4", 16, 8, 3, "output"),
+    ]
+    graph = helper.make_graph(
+        nodes, "fire",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 32, 32])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 32, 32])],
+        inits)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.save(model, str(path))
+    return path
+
+
+_RUNNING_BAND_MODELS = {
+    "strided": lambda path: _branch_model(path, strided=True),
+    "unit_stride": lambda path: _branch_model(path, strided=False),
+    "fire": _fire_model,
+}
+
+
+class TestRunningBand:
+    """Every op of a chained stage reads the band the chain executor holds."""
+
+    @pytest.mark.parametrize("strided", [True, False])
+    def test_a_branch_off_an_earlier_band_is_refused(self, tmp_path, strided):
+        ag = load_model(_branch_model(tmp_path / "branch.onnx", strided=strided))
+        stage = Stage(0, [2, 3, 4, 5], ["b"], ["main", "branch"])
+        assert not _ops_read_the_running_band(ag, stage)
+        assert _ops_read_the_running_band(ag, Stage(0, [2, 3, 4], ["b"], ["shared", "main"]))
+
+    def test_a_one_to_one_convolution_keeps_the_band(self, tmp_path):
+        """The 1x1 expand leaves the rows where they are, so the 3x3 expand
+        after it still reads the band; the Concat then joins the 1x1 output,
+        which holds the 3x3's input rows, with the 3x3 output."""
+        ag = load_model(_fire_model(tmp_path / "fire.onnx"))
+        assert _ops_read_the_running_band(ag, Stage(0, [1, 2, 3], ["stem"], ["wide", "deep"]))
+        assert not _ops_read_the_running_band(ag, Stage(0, [1, 2, 3, 4], ["stem"], ["joined"]))
+
+    def test_a_residual_operand_is_carried(self, chain_with_fanout_path):
+        """The Add reads the Relu's output from before the second Conv; the
+        executor offsets a binary op's operand to the band's rows."""
+        ag = load_model(chain_with_fanout_path)
+        stage = Stage(0, list(range(len(ag.ops))), ["input"], ["output"])
+        assert ag.ops[-1].op_type == "Add"
+        assert _ops_read_the_running_band(ag, stage)
+
+    def test_the_strided_branch_stage_is_not_chained(self, tmp_path):
+        ag, chains = _stages_then_chains(
+            _branch_model(tmp_path / "branch.onnx", strided=True), budget=120 * 1024)
+        stage = next(i for i, s in enumerate(ag.stages) if 3 in s.op_indices)
+        assert {3, 5} <= set(ag.stages[stage].op_indices)
+        assert all(stage not in group for group in chains)
+
+    @pytest.mark.parametrize("model, cuts, budget, chained", [
+        ("strided", frozenset(), 120 * 1024, [1]),
+        ("unit_stride", frozenset({1, 2, 6}), 100 * 1024, [1]),
+        ("fire", frozenset({1, 5}), 160 * 1024, None),
+        ("fire", frozenset({1, 5}), 96 * 1024, [1, 2, 3]),
+    ])
+    def test_the_plan_runs_as_the_model(self, tmp_path, require_host_library,
+                                        model, cuts, budget, chained):
+        """Chained, the strided branch stage would stop the run with a tiling
+        error, the unit-stride one would read its branch rows one row off,
+        and the fire module would join two bands that start on different
+        rows. The fire module without its Concat still streams. `chained`
+        names the ops of a stage the plan chains."""
+        import onnxruntime as ort
+        from tigris.runtime import Session
+
+        path = _RUNNING_BAND_MODELS[model](tmp_path / "model.onnx")
+        ag = compute_memory_timeline(compute_lifetimes(load_model(path)))
+        ag = detect_and_solve_chains(partition_spatial(partition_temporal(ag, budget, cuts)))
+        if chained is not None:
+            assert any(s.op_indices == chained and s.chain_len >= 2 for s in ag.stages)
+        plan = tmp_path / "model.tgrs"
+        plan.write_bytes(emit_binary_bytes(ag))
+        x = np.random.default_rng(1).standard_normal((1, 3, 32, 32)).astype(np.float32)
+        expected = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]).run(
+            None, {"input": x})[0].transpose(0, 2, 3, 1)
+        with Session(plan) as session:
+            actual = session.run({"input": np.ascontiguousarray(x.transpose(0, 2, 3, 1))})["output"]
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5 * np.abs(expected).max())
 
 
 def _strided_stem_model(path):
