@@ -3,9 +3,7 @@
 
 from __future__ import annotations
 
-import argparse
 import json
-from pathlib import Path
 
 from tigris import SCHEMA_VERSION
 from tigris.capabilities import (
@@ -17,6 +15,11 @@ from tigris.capabilities import (
     describe_codegen_route,
     resolve_kernel_backend,
 )
+
+if __package__:
+    from .generate_schema_package import artifact_main
+else:
+    from generate_schema_package import artifact_main
 
 
 DTYPES = ("float32", "int8")
@@ -88,24 +91,5 @@ def encoded_matrix() -> str:
     return json.dumps(capability_matrix(), indent=2, sort_keys=True) + "\n"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--check", type=Path, metavar="PATH")
-    group.add_argument("--output", type=Path, metavar="PATH")
-    args = parser.parse_args()
-    encoded = encoded_matrix()
-    if args.check:
-        if not args.check.is_file() or args.check.read_text() != encoded:
-            parser.error(f"capability artifact is stale: {args.check}")
-        print(f"Capability artifact is current: {args.check}")
-    elif args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(encoded)
-    else:
-        print(encoded, end="")
-    return 0
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(artifact_main(encoded_matrix(), "capability"))

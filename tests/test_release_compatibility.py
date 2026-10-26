@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 from tigris import SCHEMA_VERSION
-from scripts.generate_capability_matrix import capability_matrix
-from scripts.generate_schema_package import schema_package
+from scripts.generate_capability_matrix import encoded_matrix
+from scripts.generate_schema_package import encoded_package
 from scripts.validate_compatibility import validate
 from scripts.validate_runtime_capabilities import validate as validate_capabilities
 
@@ -26,15 +26,12 @@ SCHEMA_ARTIFACT = f"schema/tigris-plan-v{SCHEMA_VERSION}.json"
 
 
 def test_schema_package_matches_compiler_definitions():
-    artifact = json.loads((ROOT / "src/tigris" / SCHEMA_ARTIFACT).read_text())
-    assert artifact == schema_package()
+    assert (ROOT / "src/tigris" / SCHEMA_ARTIFACT).read_text() == encoded_package()
 
 
 def test_capability_artifact_matches_compiler_definitions():
-    artifact = json.loads(
-        (ROOT / "src/tigris/schema/operator-capabilities-v1.json").read_text()
-    )
-    assert artifact == capability_matrix()
+    artifact = ROOT / "src/tigris/schema/operator-capabilities-v1.json"
+    assert artifact.read_text() == encoded_matrix()
 
 
 def test_capability_audit_imports_from_an_uninstalled_source_checkout():

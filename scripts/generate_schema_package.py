@@ -153,17 +153,17 @@ def encoded_package() -> str:
     return json.dumps(schema_package(), indent=2, sort_keys=True) + "\n"
 
 
-def main() -> int:
+def artifact_main(encoded: str, name: str) -> int:
+    """Print the artifact, write it with --output PATH, or compare it with --check PATH."""
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--check", type=Path, metavar="PATH")
     group.add_argument("--output", type=Path, metavar="PATH")
     args = parser.parse_args()
-    encoded = encoded_package()
     if args.check:
         if not args.check.is_file() or args.check.read_text() != encoded:
-            parser.error(f"schema artifact is stale: {args.check}")
-        print(f"Schema artifact is current: {args.check}")
+            parser.error(f"{name} artifact is stale: {args.check}")
+        print(f"{name.capitalize()} artifact is current: {args.check}")
     elif args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(encoded)
@@ -173,4 +173,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(artifact_main(encoded_package(), "schema"))
