@@ -36,6 +36,8 @@ class OperatorContract:
 
 @dataclass(frozen=True)
 class AttributeContract:
+    """Payload lengths from minimum to maximum in steps of step; lengths lists them when few."""
+
     name: str
     lengths: tuple[int, ...]
     minimum: int
@@ -55,15 +57,15 @@ ATTRIBUTES: dict[int, AttributeContract] = {
     9: AttributeContract('CONSTANT_OPERAND', (), 4, 252, 4),
     10: AttributeContract('RESIZE_SCALES', (8,), 8, 8, 1),
     11: AttributeContract('CUMSUM_OPTIONS', (2,), 2, 2, 1),
-    12: AttributeContract('MOVEMENT', (), 0, 255, 1),
+    12: AttributeContract('MOVEMENT', (), 4, 76, 4),
     13: AttributeContract('COMPARISON_REQUANT', (20,), 20, 20, 1),
     14: AttributeContract('CONSTANTS', (), 2, 254, 2),
-    15: AttributeContract('SVDF', (4, 24), 4, 24, 1),
-    16: AttributeContract('LSTM', (8, 112), 8, 112, 1),
+    15: AttributeContract('SVDF', (4, 24), 4, 24, 20),
+    16: AttributeContract('LSTM', (8, 112), 8, 112, 104),
     17: AttributeContract('SUBGRAPHS', (4,), 4, 4, 1),
     18: AttributeContract('DETECTION', (32,), 32, 32, 1),
     19: AttributeContract('GELU_APPROXIMATE', (1,), 1, 1, 1),
-    20: AttributeContract('TABLE_SHAPE', (), 4, 252, 4),
+    20: AttributeContract('TABLE_SHAPE', (), 4, 24, 4),
 }
 
 
@@ -101,7 +103,7 @@ OPERATOR_CONTRACT: dict[str, OperatorContract] = {
     'ReduceMean': OperatorContract(26, 'TIGRIS_OP_REDUCE_MEAN', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (6,), (6,), frozenset(()), frozenset(('reference', 's8_ref')), False, 'validate_contract_arg_max'),
     'Squeeze': OperatorContract(27, 'TIGRIS_OP_SQUEEZE', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(()), frozenset(()), False, None),
     'Unsqueeze': OperatorContract(28, 'TIGRIS_OP_UNSQUEEZE', (1, 1), (1, 1), DTypeSignature((0, 0, 0), (0,)), 'none', 'none', (), (), frozenset(()), frozenset(()), False, None),
-    'Transpose': OperatorContract(29, 'TIGRIS_OP_TRANSPOSE', (1, 1), (1, 1), DTypeSignature((255, 255, 255), (255,)), 'none', 'none', (1,), (1,), frozenset(()), frozenset(('reference', 's8_ref')), False, 'validate_contract_transpose'),
+    'Transpose': OperatorContract(29, 'TIGRIS_OP_TRANSPOSE', (1, 1), (1, 1), DTypeSignature((255, 255, 255), (255,)), 'none', 'none', (1,), (1,), frozenset(()), frozenset(('reference', 's8_ref')), False, 'validate_contract_reshape'),
     # Resampling bands only along the height axis and only on its own stage,
     # because the chain executor does not compose a fractional stride through
     # the rest of a run, so it carries the resample mode and not the height mode.
