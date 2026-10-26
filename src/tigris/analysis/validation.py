@@ -16,7 +16,7 @@ from tigris.analysis.partition_spatial import (
     _row_view,
     _stage_is_row_tiled,
 )
-from tigris.analysis.broadcast import COMPARISONS, DENSE, LOGICAL_BINARY, PERIODIC, stored_operands
+from tigris.analysis.broadcast import COMPARISONS, DENSE, LOGICAL_BINARY, PERIODIC, is_constant, stored_operands
 from tigris.capabilities import effective_operators
 from tigris.operator_contract import OPERATOR_CONTRACT
 from tigris.graph.ir import state_tensor_names
@@ -27,12 +27,31 @@ from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
     OpNode,
+    QuantParam,
     Stage,
 )
 
 
+# ONNX TensorProto data types.
 _FLOAT32 = 1
 _INT8 = 3
+_INT32 = 6
+_BOOL = 9
+
+
+def _per_tensor(quant: QuantParam | None) -> bool:
+    """Whether a quantization states one scale and one zero point."""
+    return quant is not None and quant.scale.size == 1 and quant.zero_point.size == 1
+
+
+def _same_quant(a: QuantParam, b: QuantParam) -> bool:
+    """Whether two quantizations share their first scale and zero point."""
+    return float(a.scale[0]) == float(b.scale[0]) and int(a.zero_point[0]) == int(b.zero_point[0])
+
+
+def _stage_of(ag: AnalyzedGraph, op: OpNode) -> Stage | None:
+    return next((stage for stage in ag.stages if stage.stage_id == op.stage), None)
+
 
 # ONNX expresses static quantization two ways. QDQ keeps float operators and
 # brackets them with QuantizeLinear/DequantizeLinear pairs, which normalize.py
@@ -75,33 +94,32 @@ def _qoperator_op_types(ag: AnalyzedGraph) -> list[str]:
     return seen
 
 
+class _Issues:
+    """A validation result: supported when it found no issue."""
+
+    _SEPARATOR = "; "
+
+    @property
+    def supported(self) -> bool:
+        return not self.issues
+
+    def describe(self) -> str:
+        return self._SEPARATOR.join(map(str, self.issues))
+
+
 @dataclass(frozen=True)
-class ExecutionDTypeValidation:
+class ExecutionDTypeValidation(_Issues):
     """Result of validating the runtime's graph-wide dispatcher dtype."""
 
     dtype: str | None
     issues: tuple[str, ...]
 
-    @property
-    def supported(self) -> bool:
-        return not self.issues
-
-    def describe(self) -> str:
-        return "; ".join(self.issues)
-
 
 @dataclass(frozen=True)
-class ModelOutputValidation:
+class ModelOutputValidation(_Issues):
     """Result of checking that the plan computes every declared output."""
 
     issues: tuple[str, ...]
-
-    @property
-    def supported(self) -> bool:
-        return not self.issues
-
-    def describe(self) -> str:
-        return "; ".join(self.issues)
 
 
 def validate_model_outputs(ag: AnalyzedGraph) -> ModelOutputValidation:
@@ -190,19 +208,16 @@ class UnsupportedOperatorIssue:
             return f"{self.op_name} ({self.op_type}: {self.reason})"
         return f"{self.op_name} ({self.op_type})"
 
+    __str__ = describe
+
 
 @dataclass(frozen=True)
-class OperatorSupportValidation:
+class OperatorSupportValidation(_Issues):
     """Result of validating normalized operators against the plan schema."""
 
+    _SEPARATOR = ", "
+
     issues: tuple[UnsupportedOperatorIssue, ...]
-
-    @property
-    def supported(self) -> bool:
-        return not self.issues
-
-    def describe(self) -> str:
-        return ", ".join(issue.describe() for issue in self.issues)
 
 
 def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
@@ -236,7 +251,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
 
         if op.op_type == "GlobalAveragePool" and op.inputs:
             source = ag.tensors.get(op.inputs[0])
-            if (source is not None and source.dtype == 3 and len(source.shape) == 4
+            if (source is not None and source.dtype == _INT8 and len(source.shape) == 4
                     and math.prod(source.shape[2:]) > ((1 << 31) - 1) // 255):
                 issues.append(UnsupportedOperatorIssue(op_name=op.name, op_type=op.op_type))
                 continue
@@ -247,12 +262,12 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         # readers ignore, so a per-axis encoding could not be told apart.
         for name in (*op.inputs, *op.outputs):
             info = ag.tensors.get(name)
-            if (info is not None and info.dtype == 3 and info.quant is not None
+            if (info is not None and info.dtype == _INT8 and info.quant is not None
                     and not info.is_constant and name not in ag.weight_data
-                    and (info.quant.scale.size != 1 or info.quant.zero_point.size != 1)):
+                    and not _per_tensor(info.quant)):
                 reasons.append(f"int8 activation {name!r} is not quantized per tensor")
         reasons.extend(_bool_and_sum_reasons(ag, op))
-        quantized_op = any(ag.tensors[n].dtype == 3 for n in (*op.inputs, *op.outputs)
+        quantized_op = any(ag.tensors[n].dtype == _INT8 for n in (*op.inputs, *op.outputs)
                            if n in ag.tensors and not ag.tensors[n].is_constant)
         # The int8 products add an int32 bias to the accumulator; another
         # dtype would be read as int32 bytes.
@@ -273,7 +288,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         constant_operand = (
             op.op_type in elementwise_binary
             and len(op.inputs) == 2
-            and sum(_is_constant_operand(ag, name) for name in op.inputs) == 1
+            and sum(is_constant(ag, name) for name in op.inputs) == 1
         )
         if constant_operand:
             reasons.extend(_constant_operand_reasons(ag, op))
@@ -291,18 +306,14 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 reasons.append("each operand must broadcast to the output, a tensor "
                                "operand at the output's rank")
             elif quantized_op:
-                if any(t.quant is None or t.quant.scale.size != 1
-                       or t.quant.zero_point.size != 1 for t in tensors):
+                if not all(_per_tensor(t.quant) for t in tensors):
                     reasons.append("elementwise int8 requires per-tensor quantization")
                 elif op.op_type in {"Max", "Min"} and any(
-                    t.quant.scale[0] != tensors[0].quant.scale[0]
-                    or t.quant.zero_point[0] != tensors[0].quant.zero_point[0]
-                    for t in tensors[1:]
-                ):
+                        not _same_quant(t.quant, tensors[0].quant) for t in tensors[1:]):
                     reasons.append("Max/Min requires identical input and output quantization")
         if op.op_type == "PRelu":
             if (len(op.inputs) != 2 or not constant_operand
-                    or _is_constant_operand(ag, op.inputs[0])):
+                    or is_constant(ag, op.inputs[0])):
                 reasons.append("PRelu requires a tensor followed by a constant alpha")
             elif (len(op.outputs) != 1 or op.outputs[0] not in ag.tensors
                   or len(ag.tensors[op.inputs[0]].shape) not in range(1, 5)
@@ -321,9 +332,8 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
         if quantized_op and op.op_type in {"LogSoftmax", "L2Normalization"}:
             output = ag.tensors.get(op.outputs[0]) if op.outputs else None
             scale, zero = ((1 / 16, 127) if op.op_type == "LogSoftmax" else (1 / 128, 0))
-            if (output is None or output.quant is None or output.quant.scale.size != 1
-                    or float(output.quant.scale[0]) != scale
-                    or output.quant.zero_point.size != 1 or int(output.quant.zero_point[0]) != zero):
+            if (output is None or not _per_tensor(output.quant)
+                    or float(output.quant.scale[0]) != scale or int(output.quant.zero_point[0]) != zero):
                 reasons.append(f"{op.op_type} requires output scale {scale} and zero point {zero}")
         if op.op_type in {"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "CumSum", "ArgMax", "ArgMin",
                           "ReduceAll"}:
@@ -351,11 +361,9 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     reasons.append("output shape does not match the reduction axis")
                 if quantized_op and op.op_type not in {"ArgMax", "ArgMin", "ReduceAll"}:
                     quants = [source.quant, output.quant]
-                    if any(q is None or q.scale.size != 1 or q.zero_point.size != 1 for q in quants):
+                    if not all(_per_tensor(q) for q in quants):
                         reasons.append("int8 reductions require per-tensor quantization")
-                    elif op.op_type in {"ReduceMax", "ReduceMin"} and (
-                            quants[0].scale[0] != quants[1].scale[0]
-                            or quants[0].zero_point[0] != quants[1].zero_point[0]):
+                    elif op.op_type in {"ReduceMax", "ReduceMin"} and not _same_quant(*quants):
                         reasons.append("ReduceMax/ReduceMin requires identical input and output quantization")
                     elif op.op_type == "CumSum":
                         if int(quants[0].zero_point[0]) != 0 and not op.attrs.get("tflite_seeded"):
@@ -370,7 +378,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
             if "movement" not in op.attrs:
                 reasons.append("requires normalized indices or bounds")
         if op.op_type in {"ArgMax", "ArgMin"}:
-            if (len(op.outputs) != 1 or output is None or output.dtype != 6 or output.quant is not None):
+            if (len(op.outputs) != 1 or output is None or output.dtype != _INT32 or output.quant is not None):
                 reasons.append("index tensor must be unquantized int32")
             if int(op.attrs.get("select_last_index", 0)) != 0:
                 reasons.append("select_last_index=1 is unsupported")
@@ -492,9 +500,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                     len(amounts) != 2 * len(source.shape) or min(amounts) < 0:
                 reasons.append("Pad requires constant, non-negative widths and fill")
             elif source.quant is not None and (
-                    result.quant is None
-                    or float(result.quant.scale[0]) != float(source.quant.scale[0])
-                    or int(result.quant.zero_point[0]) != int(source.quant.zero_point[0])):
+                    result.quant is None or not _same_quant(result.quant, source.quant)):
                 reasons.append("int8 Pad keeps its quantization")
 
         if op.op_type == "Concat":
@@ -612,12 +618,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 for name in op.inputs
                 if name in ag.tensors and not ag.tensors[name].is_constant
             ]
-            constant_names = [
-                name
-                for name in op.inputs
-                if name in ag.weight_data
-                or (name in ag.tensors and ag.tensors[name].is_constant)
-            ]
+            constant_names = [name for name in op.inputs if is_constant(ag, name)]
             output = ag.tensors.get(op.outputs[0]) if len(op.outputs) == 1 else None
 
             if len(dynamic_inputs) not in {1, 2} or (
@@ -639,11 +640,7 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                         "operand at the output's rank"
                     )
                 elif per_channel:
-                    stage = next(
-                        (candidate for candidate in ag.stages
-                         if candidate.stage_id == op.stage),
-                        None,
-                    )
+                    stage = _stage_of(ag, op)
                     # One row high, a per-channel operand is loaded whole
                     # for every band of a rank-4 height stripe. No other tile
                     # executor has that rule.
@@ -837,18 +834,6 @@ class SlowMemoryUsage:
     def fits(self) -> bool:
         return not self.overflow_stage_ids
 
-    def describe(self) -> str:
-        from tigris.utils import fmt_bytes
-        return (
-            f"{len(self.overflow_stage_ids)} stage(s) overflow slow memory "
-            f"({fmt_bytes(self.slow_peak_bytes)} needed, "
-            f"{fmt_bytes(self.slow_budget)} available)"
-        )
-
-
-def _is_constant_operand(ag: AnalyzedGraph, name: str) -> bool:
-    return name in ag.weight_data or (name in ag.tensors and ag.tensors[name].is_constant)
-
 
 def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     """Why a binary operator's constant operand is not expressible.
@@ -858,9 +843,8 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     int8, and its shape where the length alone does not say it. Dense constants
     need an independent band with a global origin to run tiled.
     """
-    constants = [name for name in op.inputs if _is_constant_operand(ag, name)]
-    dynamic = [ag.tensors.get(name) for name in op.inputs
-               if not _is_constant_operand(ag, name)]
+    constants = [name for name in op.inputs if is_constant(ag, name)]
+    dynamic = [ag.tensors.get(name) for name in op.inputs if not is_constant(ag, name)]
     if len(constants) != 1 or len(dynamic) != 1 or dynamic[0] is None:
         return [f"{op.op_type} takes one operand that is not a constant and at most one constant"]
     name = constants[0]
@@ -871,19 +855,15 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     if constant is None:
         return [f"constant operand {name!r} has no data"]
     reasons = []
-    if dynamic[0].dtype == 6:
+    if dynamic[0].dtype == _INT32:
         if str(constant.dtype) != "int32":
             reasons.append(f"constant operand {name!r} is not int32 like its operator")
-    elif dynamic[0].dtype == 3:
+    elif dynamic[0].dtype == _INT8:
         quant = ag.tensors[name].quant if name in ag.tensors else None
         if str(constant.dtype) != "int8" or quant is None or quant.scale.size != 1:
             reasons.append(f"constant operand {name!r} is not per-tensor int8")
         elif op.op_type in {"Max", "Min"} and any(
-            info.quant is None
-            or float(info.quant.scale[0]) != float(quant.scale[0])
-            or int(info.quant.zero_point[0]) != int(quant.zero_point[0])
-            for info in (dynamic[0], output)
-        ):
+                info.quant is None or not _same_quant(info.quant, quant) for info in (dynamic[0], output)):
             reasons.append("Max/Min requires identical input and output quantization")
     elif str(constant.dtype) != "float32":
         reasons.append(f"constant operand {name!r} is not float data")
@@ -892,8 +872,7 @@ def _constant_operand_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     if how is None:
         reasons.append(f"constant operand {name!r} does not broadcast to the output")
     elif how == DENSE and constant.size != 1:
-        stage = next((candidate for candidate in ag.stages
-                      if candidate.stage_id == op.stage), None)
+        stage = _stage_of(ag, op)
         if stage is not None and (
                 stage.chain_id != 0xFFFF
                 or (stage.tile_plan is not None and stage.tile_plan.tileable)):
@@ -973,11 +952,6 @@ def untiled_stage_spill(
             return 0
         return align_up(info.size_bytes)
 
-    def root(name: str) -> str:
-        while name in alias:
-            name = alias[name]
-        return name
-
     ops = [ag.ops[i] for i in stage.op_indices]
     outputs = set(stage.output_tensors)
     last_use: dict[str, int] = {}
@@ -994,8 +968,9 @@ def untiled_stage_spill(
     # dies at its last read, and survives the stage with any member that does.
     group_last: dict[str, int] = {}
     for name, position in last_use.items():
-        group_last[root(name)] = max(group_last.get(root(name), position), position)
-    kept = {root(name) for name in outputs}
+        group = alias.get(name, name)
+        group_last[group] = max(group_last.get(group, position), position)
+    kept = {alias.get(name, name) for name in outputs}
 
     # The runtime keeps a stage within its serialized working set even when
     # the arena is larger.
@@ -1027,7 +1002,7 @@ def untiled_stage_spill(
                 spilled += size
             placed.add(name)
         for name in [*op.inputs, *op.outputs]:
-            group = root(name)
+            group = alias.get(name, name)
             if group_last.get(group) == position and group not in kept:
                 live.pop(group, None)
     return spilled
@@ -1078,8 +1053,8 @@ def row_band_aliases(ag: AnalyzedGraph, fast_total: int) -> dict[str, str]:
             continue
         if _row_view(in_info) != _row_view(out_info):
             continue
-        total_io = in_info.size_bytes + out_info.size_bytes
-        if total_io <= fast_total:
+        # Chain members carry no tile plan, so only _runs_whole's total-I/O rule decides.
+        if _runs_whole(ag, stage, fast_total):
             continue
         aliases[dst] = src
     return aliases
@@ -1250,19 +1225,19 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     if any(t is None for t in tensors):
         return ["missing operand metadata"]
     inputs, output = tensors[:-1], tensors[-1]
-    data_dtype = next((t.dtype for t in inputs + [output] if t.dtype in {1, 3}),
-                      3 if ag.is_quantized else 1)
+    data_dtype = next((t.dtype for t in inputs + [output] if t.dtype in {_FLOAT32, _INT8}),
+                      _INT8 if ag.is_quantized else _FLOAT32)
     # Comparisons of int32 give bool; a CAST of int32 gives float32.
-    integer = kind in COMPARISONS | {"Cast"} and inputs[0].dtype == 6
-    expected = ([6] * len(inputs) if integer
-                else [9, data_dtype, data_dtype] if kind == "Where"
-                else [9] * len(inputs) if kind in LOGICAL_BINARY | {"Not", "Cast"}
+    integer = kind in COMPARISONS | {"Cast"} and inputs[0].dtype == _INT32
+    expected = ([_INT32] * len(inputs) if integer
+                else [_BOOL, data_dtype, data_dtype] if kind == "Where"
+                else [_BOOL] * len(inputs) if kind in LOGICAL_BINARY | {"Not", "Cast"}
                 else [data_dtype] * len(inputs))
-    out_type = (9 if kind in COMPARISONS | LOGICAL_BINARY | {"Not"} else 1 if integer
+    out_type = (_BOOL if kind in COMPARISONS | LOGICAL_BINARY | {"Not"} else _FLOAT32 if integer
                 else data_dtype)
     if [t.dtype for t in inputs] != expected or output.dtype != out_type:
         return ["operand dtypes do not match the operator signature"]
-    if kind == "Cast" and int(op.attrs.get("to", output.dtype)) not in {1, 3}:
+    if kind == "Cast" and int(op.attrs.get("to", output.dtype)) not in {_FLOAT32, _INT8}:
         return ["Cast only supports bool to float32 or int8"]
     constants = [t for t in inputs if t.is_constant]
     if kind in {"Sum", "Cast", "Not"}:
@@ -1279,19 +1254,18 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
         if any(how == "general" for *_, how in operands) and len(output.shape) > (5 if kind == "Where" else 4):
             return ["broadcast rank exceeds the reference kernel limit"]
     for t in tensors:
-        if t.dtype == 9 and t.quant is not None:
+        if t.dtype == _BOOL and t.quant is not None:
             return ["bool tensors cannot carry quantization"]
-        if t.dtype == 3 and (t.quant is None or t.quant.scale.size != 1 or t.quant.zero_point.size != 1
-                            or not 0 < float(t.quant.scale[0]) < float("inf")
-                            or not -128 <= int(t.quant.zero_point[0]) <= 127):
+        if t.dtype == _INT8 and (not _per_tensor(t.quant)
+                                or not 0 < float(t.quant.scale[0]) < float("inf")
+                                or not -128 <= int(t.quant.zero_point[0]) <= 127):
             return ["int8 operands require valid per-tensor quantization"]
-    if data_dtype != 3:
+    if data_dtype != _INT8:
         return []
     if kind in COMPARISONS and not integer and any(not 0 < float(t.quant.scale[0]) < 1 for t in inputs):
         return ["int8 comparison input scales must be strictly between 0 and 1"]
     data = inputs[1:] + [output] if kind == "Where" else inputs if kind == "Sum" else []
-    if data and any(float(t.quant.scale[0]) != float(data[0].quant.scale[0])
-                    or int(t.quant.zero_point[0]) != int(data[0].quant.zero_point[0]) for t in data):
+    if data and any(not _same_quant(t.quant, data[0].quant) for t in data):
         return [f"{kind} requires identical quantization"]
     if kind == "Sum":
         zero = int(inputs[0].quant.zero_point[0])
