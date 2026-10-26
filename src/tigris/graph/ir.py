@@ -36,6 +36,11 @@ class QuantParam:
     zero_point: np.ndarray  # int8 or int32, shape [1] or [num_channels]
     axis: int = -1          # channel axis for per-channel (-1 = per-tensor)
 
+    def same_scale_and_zero_point(self, other: "QuantParam") -> bool:
+        """Whether both state equal scales and equal zero points; the axis is not compared."""
+        return (np.array_equal(np.asarray(self.scale), np.asarray(other.scale))
+                and np.array_equal(np.asarray(self.zero_point), np.asarray(other.zero_point)))
+
 
 class Layout(Enum):
     """How a tensor's IR axes map onto the order the runtime stores them.
