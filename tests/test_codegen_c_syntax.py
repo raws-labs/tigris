@@ -520,9 +520,9 @@ def test_runtime_derives_every_stated_tile_fact(sanitized_runtime, tmp_path):
     from tigris.emitters.binary.reader import read_binary_plan
 
     facts = ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis")
-    fields = ("tileable", "axis", "band_on_columns", "tile_height", "tile_width", "num_tiles",
-              "original_height", "halo", "band_axis", "input_channel_group",
-              "input_spatial_interval", "tiled_peak_bytes")
+    fields = ("tileable", "axis", "band_on_columns", "band_in_output_rows", "tile_height",
+              "tile_width", "num_tiles", "original_height", "halo", "band_axis",
+              "input_channel_group", "input_spatial_interval", "tiled_peak_bytes")
     expected, paths = [], []
     fixtures = Path(__file__).parent / "fixtures" / "tflite" / "ops"
     for model in sorted(fixtures.glob("*.tflite")):

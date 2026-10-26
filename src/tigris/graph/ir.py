@@ -178,6 +178,8 @@ class TilePlan:
     # The runtime used to derive it from the extents, which agrees with the
     # solver only by coincidence when the two axes are equal.
     band_on_columns: bool = False
+    # The band, its count and its extent are in output rows (height stripes and Resize).
+    band_in_output_rows: bool = False
     input_channel_group: int = 0
     input_spatial_interval: int = 0
     # Serialized axis the bands run along: on the input they cut, or the first output for output rows.

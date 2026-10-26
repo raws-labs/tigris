@@ -1021,7 +1021,7 @@ def _stage_is_row_tiled(
 
 def _solve_row_tile(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int, view_of=_row_view,
-    independent: bool = False, *, band_axis: int,
+    independent: bool = False, *, band_axis: int, output_rows: bool = False,
 ) -> TilePlan:
     """Size the band of rows a matrix pipeline takes at a time.
 
@@ -1099,6 +1099,7 @@ def _solve_row_tile(
         overhead_bytes=0,
         warnings=[],
         band_axis=band_axis,
+        band_in_output_rows=output_rows,
     )
 
 
@@ -1738,7 +1739,7 @@ def _solve_resize_height(ag: AnalyzedGraph, stage: Stage, ops: list[OpNode], bud
     return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
                     tile_height=best, num_tiles=math.ceil(oh / best), original_height=oh,
                     receptive_field=taps, halo=taps - 1, tiled_peak_bytes=working_set(best),
-                    band_axis=1)
+                    band_axis=1, band_in_output_rows=True)
 
 
 def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -1782,9 +1783,10 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
                                               band_axis=_row_band_axis(ag, stage, stage_ops))
             continue
 
+        # The runtime runs this band as a height stripe, so it counts the output's rows.
         if len(stage_ops) == 1 and _independent_band(ag, stage_ops[0], row_tiled=False):
             stage.tile_plan = _solve_row_tile(ag, stage, stage_ops, budget, _height_view,
-                                              band_axis=1)
+                                              band_axis=1, output_rows=True)
             continue
 
         if (len(stage_ops) == 1 and not stage.chain_len and
@@ -1856,7 +1858,8 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.
         input_h = _find_input_extent(ag, stage, tile_axis)
-        if input_h <= 0:
+        output_h = _find_output_extent(ag, stage)
+        if input_h <= 0 or output_h <= 0:
             stage.tile_plan = TilePlan(
                 tileable=False,
                 warnings=[f"Stage {stage.stage_id}: cannot determine spatial height"],
@@ -1877,7 +1880,13 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         while tile_h > 1 and band_peak(tile_h) > budget:
             tile_h -= 1
 
-        num_tiles = math.ceil(input_h / tile_h)
+        # The plan states the band in output rows: those tile_h input rows and the halo produce.
+        band = tile_h + halo
+        weight_shapes = _ag_weight_shapes(ag)
+        for op in stage_ops:
+            band = _op_band_rows(op, band, weight_shapes)
+        band = min(band, output_h)
+        num_tiles = math.ceil(output_h / band)
 
         # Estimate tiled peak memory
         tiled_peak = band_peak(tile_h)
@@ -1928,11 +1937,12 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             tileable=True,
             axis=tile_axis,
             band_axis=1,
-            tile_height=tile_h,
+            band_in_output_rows=True,
+            tile_height=band,
             num_tiles=num_tiles,
             halo=halo,
             receptive_field=rf_h,
-            original_height=input_h,
+            original_height=output_h,
             tiled_peak_bytes=tiled_peak,
             overhead_bytes=overhead,
             warnings=warnings,
@@ -2391,6 +2401,14 @@ def _align_up(x: int, align: int) -> int:
     return (x + align - 1) & ~(align - 1)
 
 
+def _op_band_rows(op: OpNode, rows: int, weight_shapes) -> int:
+    """Rows an operator writes from `rows` input rows of a height band."""
+    if op_category(op) not in (TileCategory.CONV, TileCategory.POOL):
+        return rows
+    ekh = _get_dilation_h(op) * (_get_kernel_h(op, weight_shapes) - 1) + 1
+    return max((rows - ekh) // _get_stride_h(op) + 1, 1)
+
+
 def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int) -> int:
     """Fast memory one band of a height-striped stage takes, as the runtime
     allocates it: every stage input and every op output its own aligned band,
@@ -2416,10 +2434,7 @@ def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int) -> int:
     rows = in_rows
     for op_i in stage.op_indices:
         op = ag.ops[op_i]
-        if op_category(op) in (TileCategory.CONV, TileCategory.POOL):
-            kh = _get_kernel_h(op, weight_shapes)
-            ekh = _get_dilation_h(op) * (kh - 1) + 1
-            rows = max((rows - ekh) // _get_stride_h(op) + 1, 1)
+        rows = _op_band_rows(op, rows, weight_shapes)
         for name in op.outputs:
             info = ag.tensors.get(name)
             if info is not None:

@@ -622,3 +622,22 @@ def test_row_band_operators_are_the_contract_row_mode():
     from tigris.operator_contract import OPERATOR_CONTRACT
 
     assert _ROW_TILING_OPS == {name for name, row in OPERATOR_CONTRACT.items() if "row" in row.modes}
+
+
+def test_a_strided_stripe_states_the_output_band_it_runs(strided_conv_path):
+    """Three input rows and the halo give a stride-2 conv two output rows, so the plan states
+    eight bands of two of the sixteen output rows, not eleven bands of the 32 input rows."""
+    from tigris.cli import _run_pipeline
+    from tigris.emitters.binary.reader import read_binary_plan
+    from tigris.emitters.binary.writer import emit_binary_bytes
+
+    ag, _ = _run_pipeline(str(strided_conv_path), ("1280",), report_bindings=False)
+    (stage,) = ag.stages
+    tp = stage.tile_plan
+    assert (tp.tile_height, tp.num_tiles, tp.original_height, tp.halo) == (2, 8, 16, 2)
+    # The band priced is still three input rows plus the halo; seven boundaries read the halo again.
+    assert (tp.tiled_peak_bytes, tp.overhead_bytes) == (1280, 7 * 256)
+    (record,) = read_binary_plan(emit_binary_bytes(ag))["tile_plans"]
+    assert (record["input_band_extent"], record["output_band_extent"]) == (0, 2)
+    assert (record["tile_extent"], record["num_tiles"], record["original_extent"],
+            record["halo"], record["band_axis"]) == (2, 8, 16, 2, 1)

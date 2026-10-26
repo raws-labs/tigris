@@ -84,7 +84,8 @@ def schema_package() -> dict[str, object]:
             ),
             "tile_facts_v11": (
                 "a tile record states the band axis, the extent the bands divide, the band, "
-                "the tile count and the halo; the runtime's loader derives them from the plan "
+                "the tile count and the halo; a height stripe states its band in output rows, "
+                "as Resize and 2D records do; the runtime's loader derives them from the plan "
                 "and refuses a record that disagrees"
             ),
             "state_v10": "state, subgraphs and grouped tiles need schema 10 or later",
