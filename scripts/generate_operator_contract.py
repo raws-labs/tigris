@@ -46,7 +46,6 @@ def render() -> str:
         "    uint8_t min_len;",
         "    uint8_t max_len;",
         "    uint8_t step;",
-        "    uint8_t exact_len;",
         "} tigris_attribute_contract_t;",
         "",
     ]
@@ -95,9 +94,9 @@ def render() -> str:
         f"    static const tigris_attribute_contract_t rows[{max(ATTRIBUTES) + 1}u] = {{",
     ]
     for code, attr in sorted(ATTRIBUTES.items()):
-        exact = attr.lengths[0] if len(attr.lengths) == 1 else 0
-        output.append(f"        [{code}] = {{{attr.minimum}u, {attr.maximum}u, "
-                      f"{attr.step}u, {exact}u}},")
+        if attr.lengths and attr.lengths != tuple(range(attr.minimum, attr.maximum + 1, attr.step)):
+            raise ValueError(f"attribute {attr.name}: lengths {attr.lengths} differ from its range")
+        output.append(f"        [{code}] = {{{attr.minimum}u, {attr.maximum}u, {attr.step}u}},")
     output += [
         "    };",
         "    const tigris_attribute_contract_t *result = NULL;",
