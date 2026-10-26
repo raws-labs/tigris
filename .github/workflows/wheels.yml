@@ -91,8 +91,12 @@ jobs:
           MKL_NUM_THREADS: "2"
         run: |
           python -m pip install dist/*.whl pytest onnxruntime
-          mkdir -p "$RUNNER_TEMP/wheel-tests/schema_compat" "$RUNNER_TEMP/wheel-tests/fixtures"
+          mkdir -p "$RUNNER_TEMP/wheel-tests/schema_compat" "$RUNNER_TEMP/wheel-tests/fixtures" \
+            "$RUNNER_TEMP/wheel-tests/scripts/contract_cases"
           cp tests/conftest.py tests/test_host_runtime.py tests/test_inspect.py "$RUNNER_TEMP/wheel-tests/"
+          cp scripts/__init__.py "$RUNNER_TEMP/wheel-tests/scripts/"
+          cp scripts/contract_cases/__init__.py scripts/contract_cases/fixtures.py \
+            "$RUNNER_TEMP/wheel-tests/scripts/contract_cases/"
           cp tests/schema_compat/*.tgrs "$RUNNER_TEMP/wheel-tests/schema_compat/"
           cp -r tests/fixtures/tflite "$RUNNER_TEMP/wheel-tests/fixtures/"
           cd "$RUNNER_TEMP/wheel-tests"
@@ -123,8 +127,11 @@ jobs:
           TIGRIS_TEST_HOST_LIBRARY: ${{ github.workspace }}/runtime-source/build-host-ci/host/libtigris_host.so
         run: |
           python -m pip install dist/*-py3-none-any.whl pytest
-          mkdir -p "$RUNNER_TEMP/pure-tests/fixtures/tflite"
+          mkdir -p "$RUNNER_TEMP/pure-tests/fixtures/tflite" "$RUNNER_TEMP/pure-tests/scripts/contract_cases"
           cp tests/conftest.py tests/test_pure_wheel.py "$RUNNER_TEMP/pure-tests/"
+          cp scripts/__init__.py "$RUNNER_TEMP/pure-tests/scripts/"
+          cp scripts/contract_cases/__init__.py scripts/contract_cases/fixtures.py \
+            "$RUNNER_TEMP/pure-tests/scripts/contract_cases/"
           cp tests/fixtures/tflite/vww_96_int8.tflite "$RUNNER_TEMP/pure-tests/fixtures/tflite/"
           cd "$RUNNER_TEMP/pure-tests"
           python -m pytest -q

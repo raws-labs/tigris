@@ -33,7 +33,7 @@ def _reference(case, inputs=None):
 
 @pytest.mark.parametrize("kind,axis,quantized,keep", [("ArgMax", 1, False, False), ("ArgMin", 2, True, True)])
 def test_arg_output_interface(tmp_path, kind, axis, quantized, keep):
-    from scripts.crossrepo_contract import _arg_case
+    from scripts.contract_cases.reduction import _arg_case
     from tigris.emitters.binary.reader import read_binary_plan
     from tigris.emitters.codegen import generate_c
 
@@ -59,7 +59,8 @@ def test_arg_output_interface(tmp_path, kind, axis, quantized, keep):
                                                    ("Gather", 0, True), ("MirrorPad", 0, False),
                                                    ("ReverseV2", 0, True), ("DynamicUpdateSlice", 0, False)])
 def test_movement_output_is_exact(tmp_path, kind, variant, quantized):
-    from scripts.crossrepo_contract import _movement_case, _to_runtime_layout
+    from scripts.contract_cases.movement import _movement_case
+    from scripts.crossrepo_contract import _to_runtime_layout
 
     case = _movement_case(kind, quantized, variant)
     path = tmp_path / "movement.tgrs"
@@ -75,7 +76,8 @@ def test_movement_output_is_exact(tmp_path, kind, variant, quantized):
 @pytest.mark.parametrize("kind,variant", [("Gather", 1), ("GatherND", 0), ("DynamicUpdateSlice", 1)])
 @pytest.mark.parametrize("quantized", [False, True])
 def test_runtime_indices(tmp_path, kind, variant, quantized):
-    from scripts.crossrepo_contract import _runtime_index_case, _to_runtime_layout
+    from scripts.contract_cases.movement import _runtime_index_case
+    from scripts.crossrepo_contract import _to_runtime_layout
     from tigris.emitters.codegen import generate_c
 
     case = _runtime_index_case(kind, quantized, variant)
@@ -102,7 +104,8 @@ def test_runtime_indices(tmp_path, kind, variant, quantized):
 @pytest.mark.parametrize("kind,quantized,tiled", [("Where", True, True), ("Less", True, True),
                                                    ("And", False, False)])
 def test_bool_model_boundaries_and_codegen(tmp_path, kind, quantized, tiled):
-    from scripts.crossrepo_contract import _bool_case, _to_runtime_layout
+    from scripts.contract_cases.elementwise import _bool_case
+    from scripts.crossrepo_contract import _to_runtime_layout
     from tigris.emitters.codegen import generate_c
 
     case = _bool_case(kind, quantized, tiled)
@@ -125,7 +128,7 @@ def test_bool_model_boundaries_and_codegen(tmp_path, kind, quantized, tiled):
     *[(kind, True) for kind in ("Max", "Min", "SquaredDifference")]])
 def test_rank2_row_band_equals_one_pass(tmp_path, kind, constant):
     import onnx
-    from scripts.crossrepo_contract import _rank2_row_band_case
+    from scripts.contract_cases.elementwise import _rank2_row_band_case
     from tigris.analysis.partition_spatial import _stage_is_row_tiled
 
     case = _rank2_row_band_case(kind, constant=constant)

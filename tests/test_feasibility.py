@@ -317,7 +317,7 @@ def test_int8_global_pool_refuses_an_overflowing_sum(tmp_path, budget):
     from tigris.analysis.validation import validate_operator_support
     from tigris.emitters.binary.reader import read_binary_plan
     from tigris.runtime import Session, RuntimeError as HostError
-    from scripts.crossrepo_contract import _model, _qdq, _scalars
+    from scripts.contract_cases.common import _model, _qdq, _scalars
 
     count = ((1 << 31) - 1) // 255 + 1
     model = _model("large_mean", [*_qdq("input", "x_s", "x_z", "x"),

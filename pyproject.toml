@@ -65,6 +65,7 @@ version_file = "src/tigris/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff.lint]
 # Keep the repository's established correctness-focused baseline explicit.

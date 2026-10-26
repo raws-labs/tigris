@@ -12,8 +12,8 @@ from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import detect_and_solve_chains, partition_spatial
 from tigris.analysis.partition_temporal import partition_temporal
-from tigris.fixtures import build_conv_relu_chain, build_linear_3op
 from tigris.loaders import load_model
+from scripts.contract_cases.fixtures import build_conv_relu_chain, build_linear_3op
 
 
 def vi(name, shape):

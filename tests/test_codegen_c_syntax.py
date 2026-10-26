@@ -218,7 +218,7 @@ def test_named_generated_cores_link_together(qdq_conv_path, tmp_path):
 @pytest.mark.parametrize("quantized", [False, True])
 def test_bool_harness_and_core_are_valid_c99(tmp_path, kind, quantized):
     import onnx
-    from scripts.crossrepo_contract import _bool_case
+    from scripts.contract_cases.elementwise import _bool_case
     from tigris.cli import _run_pipeline
 
     case = _bool_case(kind, quantized)
