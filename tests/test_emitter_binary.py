@@ -99,7 +99,7 @@ def test_v3_quant_param_rejects_arrays_that_cannot_fit_one_page():
         ]),
     )
 
-    with pytest.raises(ValueError, match="v3 per-param limit"):
+    with pytest.raises(ValueError, match="quantization channels for .too_large. exceed the per-param limit \\(32769 > 32768\\)"):
         _build_quant_params(ag)
 
 
