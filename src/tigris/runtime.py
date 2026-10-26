@@ -39,6 +39,13 @@ TRACE_PATHS = {0: "normal", 1: "tiled", 2: "tiled_2d", 3: "by_input", 4: "transp
                6: "reshape", 7: "chain", 8: "control"}
 _NONE_U16 = 0xFFFF
 
+# A platform wheel stages the host library here; a pure wheel has no such directory.
+_NATIVE = Path(__file__).with_name("native")
+
+# What tigris_host_check reports a plan needs, in its order.
+_BUILD_LIMITS = ("TIGRIS_MAX_TENSORS", "TIGRIS_MAX_STAGE_INPUTS", "TIGRIS_MAX_STAGE_OUTPUTS",
+                 "TIGRIS_MAX_CHAIN_STAGES", "TIGRIS_MAX_SPATIAL_OPS_PER_STAGE")
+
 
 def _library():
     override = os.environ.get("TIGRIS_HOST_LIBRARY")
@@ -54,7 +61,7 @@ def _library():
             raise RuntimeError(f"Cannot load TIGRIS_HOST_LIBRARY={override!r}: {exc}") from exc
         source = f"TIGRIS_HOST_LIBRARY={path}"
     else:
-        directory = Path(__file__).with_name("native")
+        directory = _NATIVE
         try:
             manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
             name = manifest["library"]
@@ -71,6 +78,7 @@ def _library():
         "abi": (ct.c_uint32, []), "version": (ct.c_char_p, []),
         "create": (ct.c_char_p, [ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.POINTER(ct.c_void_p)]),
         "destroy": (None, [ct.c_void_p]),
+        "check": (ct.c_char_p, [ct.c_void_p, ct.c_uint32, ct.POINTER(ct.c_uint16)]),
         "tensor_count": (ct.c_uint32, [ct.c_void_p, ct.c_int]),
         "tensor_name": (ct.c_char_p, [ct.c_void_p, ct.c_int, ct.c_uint32]),
         "tensor_bytes": (ct.c_uint32, [ct.c_void_p, ct.c_int, ct.c_uint32]),
@@ -111,6 +119,27 @@ def runtime_info() -> dict[str, str]:
 def runtime_version() -> str:
     """Return the loaded host runtime's version."""
     return runtime_info()["version"]
+
+
+def check_plan(data: bytes) -> dict[str, int] | None:
+    """Load a plan with the host runtime's loader without running it.
+
+    Return the build limits the plan asks of a target, by name, or None when
+    no host runtime is installed: a pure wheel with TIGRIS_HOST_LIBRARY unset.
+    The host runtime allows every limit at its maximum, so a refusal is never
+    about the build. Raise RuntimeError with the loader's reason when it
+    refuses the plan.
+    """
+    if "TIGRIS_HOST_LIBRARY" not in os.environ and not _NATIVE.exists():
+        return None
+    lib, _ = _library()
+    if len(data) > 0xFFFFFFFF:
+        raise RuntimeError("Plan exceeds the runtime file-size limit")
+    required = (ct.c_uint16 * len(_BUILD_LIMITS))()
+    error = lib.tigris_host_check(data, len(data), required)
+    if error:
+        raise RuntimeError(f"the runtime loader refuses the plan: {error.decode('utf-8', 'replace')}")
+    return dict(zip(_BUILD_LIMITS, required))
 
 
 class Session:
