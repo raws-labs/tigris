@@ -4,11 +4,8 @@ import numpy as np
 from onnx import helper, numpy_helper
 
 from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import (
-    _axis_broadcast_size,
-    _bias_broadcast_size,
-    normalize,
-)
+from tigris.loaders.onnx.normalize import normalize
+from tigris.loaders.onnx.normalize.fusion import _axis_broadcast_size, _bias_broadcast_size
 
 from conftest import save_onnx, vi
 

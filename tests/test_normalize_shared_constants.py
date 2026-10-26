@@ -13,11 +13,8 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.cli import cli
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
-from tigris.loaders.onnx.normalize import (
-    _adopt_detection,
-    _decompose_silu,
-    _transpose_product_weights,
-)
+from tigris.loaders.onnx.normalize.adoption import _adopt_detection
+from tigris.loaders.onnx.normalize.relabels import _decompose_silu, _transpose_product_weights
 
 
 def _f32(name, value):

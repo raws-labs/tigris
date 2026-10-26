@@ -54,7 +54,7 @@ def _stage_of(ag: AnalyzedGraph, op: OpNode) -> Stage | None:
 
 
 # ONNX expresses static quantization two ways. QDQ keeps float operators and
-# brackets them with QuantizeLinear/DequantizeLinear pairs, which normalize.py
+# brackets them with QuantizeLinear/DequantizeLinear pairs, which normalization
 # folds into the operator. QOperator replaces the operator itself with a fused
 # integer one, and carries the scales as operator inputs, so there is nothing
 # to fold and the graph never becomes quantized as far as the rest of the

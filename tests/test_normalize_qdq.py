@@ -7,7 +7,8 @@ from onnx import TensorProto, helper, numpy_helper
 
 from tigris.loaders import load_model
 from tigris.loaders.onnx.loader import load_model as load_raw
-from tigris.loaders.onnx.normalize import normalize, _fold_qdq
+from tigris.loaders.onnx.normalize import normalize
+from tigris.loaders.onnx.normalize.quantization import _fold_qdq
 from tigris.graph.ir import QuantParam
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline

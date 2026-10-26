@@ -9,7 +9,8 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
-from tigris.loaders.onnx.normalize import _decompose_silu, normalize
+from tigris.loaders.onnx.normalize import normalize
+from tigris.loaders.onnx.normalize.relabels import _decompose_silu
 
 from conftest import save_onnx
 
