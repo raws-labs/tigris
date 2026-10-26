@@ -490,6 +490,28 @@ def test_session_trace_reports_events_in_order(linear_plan):
     assert sum(event["bytes"] for event in events if event["kind"] == "load") == counters["load_bytes"]
 
 
+def test_a_trace_that_outgrows_its_buffer_reruns_from_the_session_state(tmp_path, monkeypatch):
+    """A trace whose first buffer holds too few events runs again from the
+    variables the session held before the call, so its outputs, events and the
+    state it leaves are those of a trace whose buffer fits."""
+    model = Path(__file__).parent / "fixtures" / "tflite" / "ops" / "float_variable_window.tflite"
+    x = np.load(model.with_suffix(".npz"))["input_0"]
+    plan = tmp_path / "window.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    with Session(plan) as fits, Session(plan) as retried:
+        name, output = fits.inputs[0]["name"], fits.outputs[0]["name"]
+        for session in (fits, retried):
+            session.run({name: x[0]})
+        expected = fits.trace({name: x[1]})
+        monkeypatch.setattr(runtime, "_TRACE_EVENTS", 1)
+        traced = retried.trace({name: x[1]})
+        assert len(traced[1]) > 1
+        np.testing.assert_array_equal(traced[0][output], expected[0][output])
+        assert traced[1:] == expected[1:]
+        np.testing.assert_array_equal(retried.run({name: x[2]})[output], fits.run({name: x[2]})[output])
+
+
 @pytest.mark.parametrize("axes_input", [False, True])
 def test_spatial_mean_without_kept_axes_runs_as_a_global_pool(tmp_path, axes_input):
     """ReduceMean over H and W with keepdims=0, as ShuffleNet and MNASNet end."""
