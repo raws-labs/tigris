@@ -3,11 +3,14 @@
 from tigris.graph.ir import AnalyzedGraph, MemorySnapshot
 
 
-def _aligned_size(size_bytes: int, alignment: int) -> int:
-    """Match the runtime bump allocator's power-of-two size rounding."""
-    if alignment <= 0 or alignment & (alignment - 1):
-        raise ValueError("tensor_alignment must be a positive power of two")
-    return (size_bytes + alignment - 1) & ~(alignment - 1)
+# The runtime rounds every allocation up to TIGRIS_TENSOR_ALIGN (tigris_mem.h).
+# 32 covers every value that macro takes except an SVE build, which uses 64.
+TENSOR_ALIGN = 32
+
+
+def align_up(size_bytes: int, alignment: int = TENSOR_ALIGN) -> int:
+    """Round a size up to a multiple of the allocation alignment."""
+    return (size_bytes + alignment - 1) // alignment * alignment
 
 
 def compute_memory_timeline(
@@ -40,7 +43,7 @@ def compute_memory_timeline(
         freed_at = lt.death_step + 1    # freed *after* the last consumer
         # For model inputs (birth=-1): alive_from=0
         # For model outputs (death=num_ops): freed_at=num_ops+1 (never freed during exec)
-        size = _aligned_size(lt.size_bytes, ag.tensor_alignment)
+        size = align_up(lt.size_bytes)
         events.append((alive_from, size, lt.tensor_name))
         events.append((freed_at, -size, lt.tensor_name))
 

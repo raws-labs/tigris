@@ -3,7 +3,7 @@
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorLifetime
 from tigris.loaders import load_model
 from tigris.analysis.lifetime import compute_lifetimes
-from tigris.analysis.memory import compute_memory_timeline
+from tigris.analysis.memory import TENSOR_ALIGN, align_up, compute_memory_timeline
 
 
 def test_diamond_peak_higher(diamond_path):
@@ -39,6 +39,12 @@ def test_final_output_counted_in_peak(linear_3op_path):
     assert "output" in ag.timeline[-1].live_tensors
 
 
+def test_align_up_rounds_to_multiples():
+    assert TENSOR_ALIGN == 32
+    assert [align_up(n) for n in (0, 1, 31, 32, 33, 64)] == [0, 32, 32, 32, 64, 64]
+    assert [align_up(n, 4) for n in (0, 1, 4, 5)] == [0, 4, 4, 8]
+
+
 def test_peak_accounts_for_allocator_alignment():
     """The planner must model physical bump allocations, not raw byte sums."""
     ag = AnalyzedGraph(
@@ -47,7 +53,6 @@ def test_peak_accounts_for_allocator_alignment():
             "input": TensorLifetime("input", -1, 0, 5),
             "output": TensorLifetime("output", 0, 1, 5),
         },
-        tensor_alignment=32,
     )
 
     ag = compute_memory_timeline(ag)

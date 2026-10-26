@@ -299,13 +299,6 @@ class AnalyzedGraph:
     # Populated by partitioner / CLI. Single source of truth for all tiers.
     budget: MemoryBudget = field(default_factory=MemoryBudget)
 
-    # Physical allocation alignment used by the deployment memory model.
-    # 32 bytes is conservative for the currently supported Cortex-M, ESP32-S3,
-    # and host SIMD runtimes; target runtimes that need less simply have spare
-    # arena capacity.  The planner must never sum raw tensor byte counts when
-    # the bump allocator rounds every live allocation up.
-    tensor_alignment: int = 32
-
     # Quantization
     is_quantized: bool = False
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from tigris.analysis.memory import align_up
 from tigris.graph.ir import AnalyzedGraph
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.utils import fmt_bytes, source_shape
@@ -126,7 +127,7 @@ def _aligned_weight_blob_size(sizes: list[int], alignment: int) -> int:
     """Mirror the per-weight padding used by the uncompressed writer."""
     size = 0
     for weight_size in sizes:
-        size = (size + alignment - 1) // alignment * alignment
+        size = align_up(size, alignment)
         size += weight_size
     return size
 

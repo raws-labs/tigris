@@ -3,15 +3,8 @@
 from dataclasses import replace
 
 from tigris.analysis.lifetime import RESHAPE_OPS
+from tigris.analysis.memory import align_up
 from tigris.graph.ir import AnalyzedGraph, Stage
-
-
-def _aligned_size(size_bytes: int, alignment: int) -> int:
-    if alignment <= 0 or alignment & (alignment - 1):
-        raise ValueError("tensor_alignment must be a positive power of two")
-    return (size_bytes + alignment - 1) & ~(alignment - 1)
-
-
 
 
 class _StageCost:
@@ -33,7 +26,6 @@ class _StageCost:
     def __init__(self, ag: AnalyzedGraph, start: int) -> None:
         self._ag = ag
         self._start = start
-        self._align = ag.tensor_alignment
         self._bytes_at: dict[int, int] = {}
         self._produced_open = 0
         self._dying: dict[int, int] = {}
@@ -49,7 +41,7 @@ class _StageCost:
         size = lt.size_bytes
         if size == 0 and lt.birth_step < self._start:
             size = self._ag.tensors[name].size_bytes
-        return _aligned_size(size, self._align)
+        return align_up(size)
 
     def _charge(self, step: int, size: int) -> None:
         total = self._bytes_at.get(step, 0) + size

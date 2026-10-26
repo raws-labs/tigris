@@ -6,6 +6,7 @@ import math
 import numpy as np
 
 from tigris import SCHEMA_VERSION_TILE_AXIS, TILE_AXIS_HEIGHT_OR_LENGTH
+from tigris.analysis.memory import align_up
 from tigris.analysis.lifetime import compute_lifetimes, pure_reinterpretations
 from tigris.analysis.partition_spatial import (
     _ag_weight_shapes,
@@ -965,13 +966,12 @@ def untiled_stage_spill(
     slow memory, so one that lands there counts too.
     """
     alias = pure_reinterpretations(ag)
-    align = ag.tensor_alignment
 
     def sized(name: str) -> int:
         info = ag.tensors.get(name)
         if info is None:
             return 0
-        return (info.size_bytes + align - 1) & ~(align - 1)
+        return align_up(info.size_bytes)
 
     def root(name: str) -> str:
         while name in alias:
@@ -1123,11 +1123,7 @@ def slow_pool_usage(ag: AnalyzedGraph, *, body: bool = False) -> SlowMemoryUsage
         return SlowMemoryUsage(peak, slow_budget,
                                (0,) if slow_budget > 0 and peak > slow_budget else ())
     ag = compute_lifetimes(ag)
-    # The runtime rounds every allocation up to the tensor alignment.
-    align = ag.tensor_alignment
-
-    def aligned(size: int) -> int:
-        return (size + align - 1) & ~(align - 1)
+    aligned = align_up
 
     # Stages execute one group at a time: a chain runs as a unit, everything
     # else on its own. Slow residency is held for the whole group, so a chain

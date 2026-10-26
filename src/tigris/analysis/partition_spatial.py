@@ -32,6 +32,7 @@ from tigris.emitters.binary.defs import (
     TILE_BAND_MODE_TIME_MAJOR_BATCH,
     TILE_BAND_MODE_TRAILING,
 )
+from tigris.analysis.memory import TENSOR_ALIGN, align_up
 from tigris.operator_contract import operators_with
 from tigris.graph.ir import (
     AnalyzedGraph,
@@ -93,14 +94,10 @@ _BINARY_OPS = operators_with("axis_binary")
 _RANK3_AXIS1_UNARY_OPS = operators_with("axis_unary")
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
-# Conservative per-tile allocation alignment for the backend-agnostic tiled
-# working-set model. The runtime rounds every fast-arena tile allocation up to
-# its target's TIGRIS_TENSOR_ALIGN (Xtensa 8, aarch64 16, x86_64 32, default 4);
-# 32 is the maximum of that standard set, so aligning the compiler's estimate to
-# it never under-counts against any of them (align_up is monotonic in the
-# alignment). Under-counting would let the solver emit a tile the runtime's
-# stage_2d_fast_bytes check rejects, which is exactly the bug this guards.
-_CONSERVATIVE_TENSOR_ALIGN = 32
+# The band-axis cost search rounds each tensor's per-band bytes to 32, the
+# literal in the runtime loader's band-axis search (tigris_loader.c). It picks
+# the band axis, so it must equal that literal whatever TIGRIS_TENSOR_ALIGN is.
+_BAND_COST_ALIGN = 32
 
 # tigris_tile_plan_t carries tile_height, num_tiles and original_height in
 # uint16 fields (TILE_PLAN_STRUCT in emitters/binary/defs.py). Every solver
@@ -599,19 +596,18 @@ def _reshape_band(ag: AnalyzedGraph, stage: Stage):
     return None
 
 
-def _reshape_tile_for_bytes(mapping, budget: int, alignment: int, element: int) -> TilePlan:
+def _reshape_tile_for_bytes(mapping, budget: int, element: int) -> TilePlan:
     blocks, rows, width, _, output_width, axis = mapping
     step = output_width // math.gcd(width, output_width)
     # One buffer holds both views of exactly the same interval of bytes.
-    alignment = max(alignment, _CONSERVATIVE_TENSOR_ALIGN)
-    minimum = _align_up(blocks * step * width * element, alignment)
-    band = min(rows, (budget // alignment * alignment) // (blocks * width * element))
+    minimum = align_up(blocks * step * width * element)
+    band = min(rows, (budget // TENSOR_ALIGN * TENSOR_ALIGN) // (blocks * width * element))
     band = band // step * step
     if band == 0 or not _plan_extents_fit(band, math.ceil(rows / max(1, band)), rows):
         return TilePlan(tileable=False, min_tile_bytes=minimum)
     return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
                     tile_height=band, num_tiles=math.ceil(rows / band), original_height=rows,
-                    tiled_peak_bytes=_align_up(blocks * band * width * element, alignment),
+                    tiled_peak_bytes=align_up(blocks * band * width * element),
                     band_axis=axis)
 
 
@@ -778,7 +774,7 @@ def _independent_mode(ag: AnalyzedGraph, op: OpNode) -> int:
                     continue
                 stored = serialized_shape(tensor.shape, tensor.layout)
                 extent = stored[axis] if len(stored) == len(shape) else 1
-                total += _align_up(tensor.size_bytes // extent, _CONSERVATIVE_TENSOR_ALIGN)
+                total += align_up(tensor.size_bytes // extent, _BAND_COST_ALIGN)
             return total, -shape[axis], axis
         for axis in sorted(range(len(shape)), key=cost):
             if _independent_band(ag, op, leading=axis + 3):
@@ -931,7 +927,6 @@ def _solve_row_tile(
     """
     first_output = stage_ops[0].outputs[0]
     batch, rows, _ = view_of(ag.tensors[first_output])
-    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
     # A tensor the band cuts costs its row size for every row in the band, on
     # every batch. One it does not cut is resident whole for the whole stage,
@@ -953,10 +948,10 @@ def _solve_row_tile(
                 and view[1] == rows and (independent or view[0] == batch)):
             per_row.append(view[0] * view[2] * info.elem_size)
         else:
-            whole += _align_up(info.size_bytes, align)
+            whole += align_up(info.size_bytes)
 
     def working_set(band: int) -> int:
-        return whole + sum(_align_up(row * band, align) for row in per_row)
+        return whole + sum(align_up(row * band) for row in per_row)
 
     if working_set(1) > budget:
         return TilePlan(
@@ -1037,18 +1032,17 @@ def _solve_grouped_global_reduction(ag: AnalyzedGraph, stage: Stage, budget: int
     result = ag.tensors[stage.output_tensors[0]]
     batch, channels, height, width = map(int, source.shape)
     spatial = height * width
-    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
     best = None
-    minimum = 3 * align
+    minimum = 3 * TENSOR_ALIGN
     for group in range(1, min(channels, budget // (4 + source.elem_size + result.elem_size)) + 1):
-        fixed = _align_up(group * 4, align) + _align_up(group * result.elem_size, align)
-        available = max(0, (budget - fixed) // align * align)
+        fixed = align_up(group * 4) + align_up(group * result.elem_size)
+        available = max(0, (budget - fixed) // TENSOR_ALIGN * TENSOR_ALIGN)
         interval = min(spatial, available // (group * source.elem_size))
         if interval == 0:
             continue
         count = batch * math.ceil(channels / group) * math.ceil(spatial / interval)
         cost = (count, math.ceil(channels / group), -group, -interval)
-        peak = fixed + _align_up(group * interval * source.elem_size, align)
+        peak = fixed + align_up(group * interval * source.elem_size)
         if best is None or cost < best[0]:
             best = cost, group, interval, peak
     if best is None:
@@ -1086,19 +1080,16 @@ def _solve_global_reduction(
     full_h = int(source.shape[2])
     full_w = int(source.shape[3])
 
-    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
     # The accumulator is int32 for the int8 kernels and float for the float32
     # ones, four bytes either way.
-    acc_bytes = _align_up(batch * channels * 4, align)
-    out_bytes = _align_up(
-        batch * channels * result.elem_size, align
-    )
+    acc_bytes = align_up(batch * channels * 4)
+    out_bytes = align_up(batch * channels * result.elem_size)
     row_elems = batch * full_w * channels
 
     def working_set(rows: int) -> int:
         return (
             acc_bytes
-            + _align_up(rows * row_elems * source.elem_size, align)
+            + align_up(rows * row_elems * source.elem_size)
             + out_bytes
         )
 
@@ -1189,12 +1180,11 @@ def _solve_layout_conversion(
     banded = cols if band_on_columns else rows
     other = rows if band_on_columns else cols
 
-    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
     # A transposed position includes the unchanged trailing dimensions.
     position_bytes = source.size_bytes // (batch * rows * cols)
 
     def working_set(band: int) -> int:
-        return 2 * _align_up(batch * other * band * position_bytes, align)
+        return 2 * align_up(batch * other * band * position_bytes)
 
     if working_set(1) > budget:
         return TilePlan(
@@ -1341,16 +1331,14 @@ def _solve_output_tile_2d(
     tile any other way, for example by a proportional share of the stage peak
     over the input extent, emits tiles the runtime rejects.
     """
-    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
     def working_set(th: int, tw: int) -> int:
         in_tile_h, in_tile_w = input_tile(th, tw)
         total = 0
         for info in in_infos:
-            total += _align_up(
+            total += align_up(
                 int(info.shape[0]) * in_tile_h * in_tile_w
-                * int(info.shape[1]) * info.elem_size,
-                align,
+                * int(info.shape[1]) * info.elem_size
             )
         # The running tile extent starts at the input tile, the spatial op
         # resizes it to the output tile, pointwise ops keep it.
@@ -1362,10 +1350,9 @@ def _solve_output_tile_2d(
             for name in op.outputs:
                 info = ag.tensors.get(name)
                 if info and len(info.shape) == 4:
-                    total += _align_up(
+                    total += align_up(
                         int(info.shape[0]) * ah * aw
-                        * int(info.shape[1]) * info.elem_size,
-                        align,
+                        * int(info.shape[1]) * info.elem_size
                     )
             if is_spatial:
                 cur_h, cur_w = th, tw
@@ -1555,7 +1542,6 @@ def _solve_resize_height(ag: AnalyzedGraph, stage: Stage, ops: list[OpNode], bud
     scale_10 = (math.floor(1024.0 / explicit[0] + 0.5) if explicit and coordinate != "align_corners"
                 else (1024 * ni + no // 2) // no)
     taps = 2 if resize.op_type == "ResizeLinear" else 1
-    alignment = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
     def working_set(rows):
         span = taps
@@ -1566,7 +1552,7 @@ def _solve_resize_height(ag: AnalyzedGraph, stage: Stage, ops: list[OpNode], bud
 
         def size(name, extent):
             info = ag.tensors[name]
-            return _align_up(info.size_bytes // int(info.shape[2]) * extent, alignment)
+            return align_up(info.size_bytes // int(info.shape[2]) * extent)
 
         total = sum(size(name, input_rows) for name in stage.input_tensors)
         current = input_rows
@@ -1605,7 +1591,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         reshape = _reshape_band(ag, stage)
         if reshape is not None:
             stage.tile_plan = _banded(_reshape_tile_for_bytes(
-                reshape, budget, ag.tensor_alignment, ag.tensors[stage.input_tensors[0]].elem_size),
+                reshape, budget, ag.tensors[stage.input_tensors[0]].elem_size),
                 TILE_BAND_KIND_RESHAPE)
             continue
 
@@ -2206,11 +2192,6 @@ def _back_propagate_tile_heights(
     return heights
 
 
-def _align_up(x: int, align: int) -> int:
-    """Round up to the deployment memory model's tensor alignment."""
-    return (x + align - 1) & ~(align - 1)
-
-
 def _op_band_rows(op: OpNode, rows: int, weight_shapes) -> int:
     """Rows an operator writes from `rows` input rows of a height band."""
     if op_category(op) not in (TileCategory.CONV, TileCategory.POOL):
@@ -2231,17 +2212,16 @@ def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int, weight_shap
     """Fast memory one band of a height-striped stage takes, as the runtime
     allocates it: every stage input and every op output its own aligned band,
     op heights carried forward through the spatial ops."""
-    align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
 
     def band(info, rows: int) -> int:
         # The band cuts serialized axis 1, whichever model axis that holds.
         if len(info.shape) not in (3, 4):
-            return _align_up(info.size_bytes, align)
+            return align_up(info.size_bytes)
         axis_map = serialized_axis_map(len(info.shape), info.layout)
         height = int(info.shape[axis_map.index(1)])
         if height <= 0:
-            return _align_up(info.size_bytes, align)
-        return _align_up(-(-info.size_bytes * min(rows, height) // height), align)
+            return align_up(info.size_bytes)
+        return align_up(-(-info.size_bytes * min(rows, height) // height))
 
     total = 0
     for name in stage.input_tensors:
@@ -2286,8 +2266,7 @@ def _chain_fast_bytes(
         info = ag.tensors.get(name)
         if info and len(info.shape) == 4:
             N, C, H, W = info.shape  # NCHW in Python IR
-            total += _align_up(N * in_h * W * C * info.elem_size,
-                               ag.tensor_alignment)
+            total += align_up(N * in_h * W * C * info.elem_size)
 
     # All op output tiles - forward-compute height through spatial ops
     for s_idx, stage in enumerate(chain_stages):
@@ -2303,8 +2282,7 @@ def _chain_fast_bytes(
                 info = ag.tensors.get(out_name)
                 if info and len(info.shape) == 4:
                     N, C, H, W = info.shape
-                    total += _align_up(N * cur_h * W * C * info.elem_size,
-                                       ag.tensor_alignment)
+                    total += align_up(N * cur_h * W * C * info.elem_size)
 
     return total
 
