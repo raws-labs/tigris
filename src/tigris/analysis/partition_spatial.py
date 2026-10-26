@@ -15,6 +15,7 @@ import numpy as np
 
 from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.analysis.lifetime import _same_stored_bytes
+from tigris.analysis.broadcast import is_constant, stored_operands
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.graph.ir import (
@@ -966,6 +967,23 @@ def _leading_band_axis(ag: AnalyzedGraph, op: OpNode, mode: int) -> int:
     return mode - 3
 
 
+def _constant_repeats_every_row(ag: AnalyzedGraph, op: OpNode) -> bool:
+    """Whether a rank-2 binary operator's constant operands read alike in every row.
+
+    A row band hands a constant to the kernel whole and unshifted, so one that
+    varies along the rows meets the wrong rows. At rank 2 the runtime prefers
+    the row band to the leading band, which offsets the constant, so such an
+    operator has to leave the row band. Mirrors constant_repeats_every_row in
+    the runtime's loader.
+    """
+    output = ag.tensors.get(op.outputs[0]) if op.outputs else None
+    if (op.op_type not in _BAND_BINARY or output is None or len(output.shape) != 2
+            or not any(name and is_constant(ag, name) for name in op.inputs)):
+        return True
+    operands = stored_operands(ag, op)
+    return operands is not None and all(not constant or stored[0] == 1 for _, constant, stored, _ in operands)
+
+
 def _stage_is_row_tiled(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]
 ) -> bool:
@@ -1000,7 +1018,8 @@ def _stage_is_row_tiled(
     whole_operands = _whole_band_operands(stage_ops)
     for op in stage_ops:
         if ((op.op_type not in _ROW_TILING_OPS and not _independent_band(ag, op))
-                or len(op.inputs) < 1 or len(op.outputs) != 1):
+                or len(op.inputs) < 1 or len(op.outputs) != 1
+                or not _constant_repeats_every_row(ag, op)):
             return False
         for position, name in enumerate(op.inputs):
             if not name:

@@ -600,3 +600,17 @@ def test_leading_bands_do_not_extend_chains_or_combined_stages(combined):
     graph = AnalyzedGraph(tensors=tensors, ops=ops, stages=[stage], budget=MemoryBudget(fast=256))
     _assign_tile_plans(graph)
     assert stage.tile_plan is not None and not stage.tile_plan.tileable
+
+
+@pytest.mark.parametrize("kind", ["Add", "Sub", "Mul"])
+@pytest.mark.parametrize("constant,row_band", [
+    ((64, 8), False), ((64, 1), False), ((8,), True), ((1, 8), True), ((), True)])
+def test_row_band_takes_only_a_constant_every_row_reads_alike(kind, constant, row_band):
+    from tigris.analysis.partition_spatial import _stage_is_row_tiled
+
+    tensors = {n: TensorInfo(n, (64, 8), dtype=1) for n in ("x", "y")}
+    tensors["k"] = TensorInfo("k", constant, dtype=1, is_constant=True)
+    op = OpNode("op", kind, ["x", "k"], ["y"])
+    graph = AnalyzedGraph(tensors=tensors, ops=[op],
+                          weight_data={"k": np.ones(constant, dtype=np.float32)})
+    assert _stage_is_row_tiled(graph, Stage(0, [0], ["x"], ["y"]), [op]) is row_band
