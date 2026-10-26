@@ -112,14 +112,12 @@ def _weight_sizes(ag: AnalyzedGraph) -> tuple[list[int], list[int], int]:
                   for arr, raw in zip(ag.weight_data.values(), raws)]
 
     # LZ4 on the actual weight data (meaningful for the current dtype only)
+    import lz4.block
+
     lz4_total = 0
-    try:
-        import lz4.block
-        blob = b"".join(raws)
-        if blob:
-            lz4_total = len(lz4.block.compress(blob, store_size=False))
-    except ImportError:
-        pass
+    blob = b"".join(raws)
+    if blob:
+        lz4_total = len(lz4.block.compress(blob, store_size=False))
 
     return [len(raw) for raw in raws], int8_sizes, lz4_total
 

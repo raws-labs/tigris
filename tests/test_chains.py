@@ -10,6 +10,7 @@ from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import (
     _back_propagate_tile_heights,
     _chain_fast_bytes,
+    _ag_weight_shapes,
     _external_outputs_keep_their_rows,
     _get_stage_spatial_params,
     _ops_read_the_running_band,
@@ -216,7 +217,7 @@ def test_pool_stage_is_chained_with_spatial_geometry(chain_with_pool_path):
 
     assert pooled_stages, "expected the MaxPool stage in a streamable chain"
     for si in pooled_stages:
-        assert _get_stage_spatial_params(ag, ag.stages[si]) == (2, 2, 1)
+        assert _get_stage_spatial_params(ag, ag.stages[si], _ag_weight_shapes(ag)) == (2, 2)
 
 
 def test_chain_does_not_span_model_output(chain_with_model_output_mid_path):
@@ -559,13 +560,14 @@ def test_chain_geometry_takes_the_kernel_from_the_weight(tmp_path):
     ag.stages = [Stage(stage_id=0, op_indices=[0], input_tensors=["input"], output_tensors=["a"]),
                  Stage(stage_id=1, op_indices=[1], input_tensors=["a"], output_tensors=["output"])]
 
-    assert _get_stage_spatial_params(ag, ag.stages[1]) == (5, 2, 1)
+    weight_shapes = _ag_weight_shapes(ag)
+    assert _get_stage_spatial_params(ag, ag.stages[1], weight_shapes) == (5, 2)
     heights = _back_propagate_tile_heights(
-        [_get_stage_spatial_params(ag, s) for s in ag.stages], 1)
+        [_get_stage_spatial_params(ag, s, weight_shapes) for s in ag.stages], 1)
     assert heights == [(5, 5), (5, 1)]
     # Five input rows of 8 channels, five rows of the 16-channel 1x1 output,
     # one output row of the depthwise, each 32-byte aligned.
-    assert _chain_fast_bytes(ag, ag.stages, heights) == (
+    assert _chain_fast_bytes(ag, ag.stages, heights, weight_shapes) == (
         5 * 32 * 8 * 4 + 5 * 32 * 16 * 4 + 16 * 16 * 4)
 
 
@@ -681,13 +683,13 @@ class TestDetectChains:
 class TestChainTileSolver:
     @pytest.mark.parametrize("params, out_h, expected", [
         # Pointwise: tile heights are identical throughout.
-        ([(1, 1, 1), (1, 1, 1), (1, 1, 1)], 4, [(4, 4), (4, 4), (4, 4)]),
+        ([(1, 1), (1, 1), (1, 1)], 4, [(4, 4), (4, 4), (4, 4)]),
         # Conv3x3(s=1): each stage adds 2 rows of halo.
-        ([(3, 1, 1), (3, 1, 1)], 4, [(8, 6), (6, 4)]),
+        ([(3, 1), (3, 1)], 4, [(8, 6), (6, 4)]),
         # Conv3x3(s=2): out_h rows need stride*out_h + kernel-stride input rows.
-        ([(3, 2, 1)], 3, [(7, 3)]),
+        ([(3, 2)], 3, [(7, 3)]),
         # Pool2x2(s=2) uses the same spatial range algebra as convolution.
-        ([(2, 2, 1)], 3, [(6, 3)]),
+        ([(2, 2)], 3, [(6, 3)]),
     ], ids=["pointwise", "conv3x3-stride1", "conv3x3-stride2", "pool2x2-stride2"])
     def test_back_propagate(self, params, out_h, expected):
         assert list(_back_propagate_tile_heights(params, out_h)) == expected
@@ -767,9 +769,11 @@ class TestChainExecution:
                 chain_indices = list(range(s.chain_id, s.chain_id + s.chain_len))
                 chain_stages = [ag.stages[i] for i in chain_indices]
                 assert s.chain_tile_h > 0
-                chain_params = [_get_stage_spatial_params(ag, cs) for cs in chain_stages]
+                weight_shapes = _ag_weight_shapes(ag)
+                chain_params = [_get_stage_spatial_params(ag, cs, weight_shapes)
+                                for cs in chain_stages]
                 heights = _back_propagate_tile_heights(chain_params, s.chain_tile_h)
-                needed = _chain_fast_bytes(ag, chain_stages, heights)
+                needed = _chain_fast_bytes(ag, chain_stages, heights, weight_shapes)
                 assert needed <= ag.mem_budget, (
                     f"Chain tile buffer {needed} exceeds budget {ag.mem_budget}"
                 )

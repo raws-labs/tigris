@@ -157,7 +157,7 @@ def compute_receptive_field(
 ) -> tuple[int, int]:
     """Compute the height and width receptive fields for a sequence of ops.
 
-    Walks the ops in execution order once, accumulating RF and jump (the
+    Walks the ops in execution order, accumulating RF and jump (the
     product of the strides so far) independently for the height and width
     axes: a kernel widens the field by its extent times the jump before it.
     Returns (rf_h, rf_w).
@@ -169,11 +169,19 @@ def compute_receptive_field(
     the ONNX ``kernel_shape`` attribute recover its kernel from the weight,
     matching the emitter; without it such ops fall back to a 1x1 kernel.
     """
-    rf_h = 1
-    jump_h = 1
-    rf_w = 1
-    jump_w = 1
+    return (_compose_windows(ops, 0, weight_shapes)[0],
+            _compose_windows(ops, 1, weight_shapes)[0])
 
+
+def _compose_windows(
+    ops: list[OpNode],
+    axis: int,
+    weight_shapes: dict[str, tuple[int, ...]] | None,
+) -> tuple[int, int]:
+    """Receptive field and jump of ``ops`` composed in execution order along
+    one axis (0 height or length, 1 width)."""
+    field = 1
+    jump = 1
     for op in ops:
         cat = op_category(op)
         if cat is TileCategory.UPSAMPLE:
@@ -185,27 +193,12 @@ def compute_receptive_field(
                 lead = op.attrs.get(
                     "coordinate_transformation_mode", "half_pixel"
                 ) == "half_pixel"
-                rf_h += jump_h * (2 if lead else 1)
-                rf_w += jump_w * (2 if lead else 1)
-            continue
-        if cat in (TileCategory.CONV, TileCategory.POOL):
-            kernel_h = _get_kernel_h(op, weight_shapes)
-            stride_h = _get_stride_h(op)
-            dilation_h = _get_dilation_h(op)
-
-            effective_kh = dilation_h * (kernel_h - 1) + 1
-            rf_h = rf_h + (effective_kh - 1) * jump_h
-            jump_h = jump_h * stride_h
-
-            kernel_w = _get_kernel_w(op, weight_shapes)
-            stride_w = _get_stride_w(op)
-            dilation_w = _get_dilation_w(op)
-
-            effective_kw = dilation_w * (kernel_w - 1) + 1
-            rf_w = rf_w + (effective_kw - 1) * jump_w
-            jump_w = jump_w * stride_w
-
-    return rf_h, rf_w
+                field += jump * (2 if lead else 1)
+        elif cat in (TileCategory.CONV, TileCategory.POOL):
+            kernel, stride = _window(op, axis, weight_shapes)
+            field += (kernel - 1) * jump
+            jump *= stride
+    return field, jump
 
 
 # Ops whose kernel extent the emitter infers from the weight tensor when the
@@ -238,71 +231,27 @@ def _infer_kernel_shape(
     return ()
 
 
-def _get_kernel_h(
-    op: OpNode, weight_shapes: dict[str, tuple[int, ...]] | None = None
-) -> int:
-    """Get the height dimension of the kernel (first element of kernel_shape).
+def _per_axis(values, axis: int) -> int:
+    """The entry of a per-axis attribute at ``axis``, 1 when it has none."""
+    return int(values[axis]) if values and len(values) > axis else 1
 
-    Falls back to the constant weight shape when ``kernel_shape`` is absent,
-    matching the emitter, so a recomputing chain that omits the attribute is
-    not silently treated as a 1x1 kernel.
+
+def _window(
+    op: OpNode,
+    axis: int,
+    weight_shapes: dict[str, tuple[int, ...]] | None = None,
+) -> tuple[int, int]:
+    """(effective kernel, stride) of a spatial op along one axis.
+
+    ``axis`` indexes kernel_shape, strides and dilations: 0 is the height or
+    length, 1 the width. Without ``kernel_shape`` the kernel comes from the
+    constant weight shape, matching the emitter, so a recomputing chain that
+    omits the attribute is not treated as a 1x1 kernel. A one-element
+    ``kernel_shape`` keeps width 1.
     """
-    ks = op.attrs.get("kernel_shape")
-    if ks:
-        return int(ks[0])
-    inferred = _infer_kernel_shape(op, weight_shapes)
-    if len(inferred) >= 1:
-        return int(inferred[0])
-    return 1
-
-
-def _get_stride_h(op: OpNode) -> int:
-    """Get the height dimension of the stride."""
-    strides = op.attrs.get("strides")
-    if strides and len(strides) >= 1:
-        return int(strides[0])
-    return 1
-
-
-def _get_dilation_h(op: OpNode) -> int:
-    """Get the height dimension of the dilation."""
-    dilations = op.attrs.get("dilations")
-    if dilations and len(dilations) >= 1:
-        return int(dilations[0])
-    return 1
-
-
-def _get_kernel_w(
-    op: OpNode, weight_shapes: dict[str, tuple[int, ...]] | None = None
-) -> int:
-    """Get the width dimension of the kernel (second element of kernel_shape).
-
-    Falls back to the constant weight shape when ``kernel_shape`` is absent,
-    matching the emitter. A present-but-1D ``kernel_shape`` keeps width 1.
-    """
-    ks = op.attrs.get("kernel_shape")
-    if ks:
-        return int(ks[1]) if len(ks) >= 2 else 1
-    inferred = _infer_kernel_shape(op, weight_shapes)
-    if len(inferred) >= 2:
-        return int(inferred[1])
-    return 1
-
-
-def _get_stride_w(op: OpNode) -> int:
-    """Get the width dimension of the stride."""
-    strides = op.attrs.get("strides")
-    if strides and len(strides) >= 2:
-        return int(strides[1])
-    return 1
-
-
-def _get_dilation_w(op: OpNode) -> int:
-    """Get the width dimension of the dilation."""
-    dilations = op.attrs.get("dilations")
-    if dilations and len(dilations) >= 2:
-        return int(dilations[1])
-    return 1
+    kernel = op.attrs.get("kernel_shape") or _infer_kernel_shape(op, weight_shapes)
+    dilation = _per_axis(op.attrs.get("dilations"), axis)
+    return dilation * (_per_axis(kernel, axis) - 1) + 1, _per_axis(op.attrs.get("strides"), axis)
 
 
 def _ag_weight_shapes(ag: AnalyzedGraph) -> dict[str, tuple[int, ...]]:
@@ -311,6 +260,20 @@ def _ag_weight_shapes(ag: AnalyzedGraph) -> dict[str, tuple[int, ...]]:
 
 
 # Tile solver
+
+
+def _largest_fitting(fits, high: int, none: int) -> int:
+    """The largest n in 1..high for which ``fits(n)`` holds, by bisection over
+    a ``fits`` that holds up to some n and fails above it; ``none`` when no
+    probed n fits."""
+    low, best = 1, none
+    while low <= high:
+        middle = (low + high) // 2
+        if fits(middle):
+            best, low = middle, middle + 1
+        else:
+            high = middle - 1
+    return best
 
 
 def _cotileable_skip_operands(
@@ -409,6 +372,7 @@ def _stage_2d_eligible(
         if op.op_type in _BINARY_OPS or op.op_type == "Concat":
             if not _cotileable_skip_operands(ag, stage, op):
                 return False
+    # Not asked for a resample: _assign_tile_plans bands a stage holding one by height first.
     return all(_op_supports_axis(op, TILE_AXIS_HW)
                and not _has_unequal_binary_operands(ag, op)
                for op in stage_ops)
@@ -438,7 +402,8 @@ def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
     ct = convtranspose[0]
     if int(ct.attrs.get("group", 1)) != 1:
         return False
-    if _get_dilation_h(ct) != 1 or _get_dilation_w(ct) != 1:
+    dilations = ct.attrs.get("dilations")
+    if _per_axis(dilations, 0) != 1 or _per_axis(dilations, 1) != 1:
         return False
     for op in stage_ops:
         if op is ct:
@@ -1003,15 +968,7 @@ def _solve_row_tile(
             ],
         )
 
-    low, high, band = 1, rows, 1
-    while low <= high:
-        candidate = low + (high - low) // 2
-        if working_set(candidate) <= budget:
-            band = candidate
-            low = candidate + 1
-        else:
-            high = candidate - 1
-
+    band = _largest_fitting(lambda n: working_set(n) <= budget, rows, 1)
     num_tiles = math.ceil(rows / band)
     if not _plan_extents_fit(band, num_tiles, rows):
         return TilePlan(
@@ -1148,15 +1105,7 @@ def _solve_global_reduction(
     if working_set(1) > budget:
         return _solve_grouped_global_reduction(ag, stage, budget)
 
-    low, high, rows = 1, full_h, 1
-    while low <= high:
-        candidate = low + (high - low) // 2
-        if working_set(candidate) <= budget:
-            rows = candidate
-            low = candidate + 1
-        else:
-            high = candidate - 1
-
+    rows = _largest_fitting(lambda n: working_set(n) <= budget, full_h, 1)
     return TilePlan(
         tileable=True,
         axis=TILE_AXIS_HEIGHT_OR_LENGTH,
@@ -1234,15 +1183,7 @@ def _solve_layout_conversion(
     result = ag.tensors[op.outputs[0]]
     stored_perm = serialized_transpose_perm(
         op.attrs["perm"], source.layout, result.layout)
-    extents = _transpose_band_extents(source, stored_perm)
-    if extents is None:  # guarded by _stage_is_tiled_transpose; defensive
-        return TilePlan(
-            tileable=False,
-            warnings=[
-                f"Stage {stage.stage_id}: cannot determine conversion extents"
-            ],
-        )
-    batch, rows, cols = extents
+    batch, rows, cols = _transpose_band_extents(source, stored_perm)
     prefix, split, _ = _transpose_band_groups(stored_perm)
     band_on_columns = cols >= rows
     banded = cols if band_on_columns else rows
@@ -1265,15 +1206,7 @@ def _solve_layout_conversion(
             ],
         )
 
-    low, high, band = 1, banded, 1
-    while low <= high:
-        candidate = low + (high - low) // 2
-        if working_set(candidate) <= budget:
-            band = candidate
-            low = candidate + 1
-        else:
-            high = candidate - 1
-
+    band = _largest_fitting(lambda n: working_set(n) <= budget, banded, 1)
     num_tiles = math.ceil(banded / band)
     if not _plan_extents_fit(band, num_tiles, banded):
         return TilePlan(
@@ -1334,15 +1267,9 @@ def _solve_convtranspose_2d(
     Fails closed (a non-tileable TilePlan) when the output/input extent cannot
     be determined, or when no output tile - not even a 1x1 core - fits budget.
     """
-    ct = next((op for op in stage_ops if op.op_type == "ConvTranspose"), None)
-    if ct is None:  # guarded by _stage_is_convtranspose_2d; defensive
-        return TilePlan(
-            tileable=False,
-            warnings=[f"Stage {stage.stage_id}: no ConvTranspose op in stage"],
-        )
-
-    out_h = _find_output_extent(ag, stage)
-    out_w = _find_output_extent_width(ag, stage)
+    ct = next(op for op in stage_ops if op.op_type == "ConvTranspose")
+    out_h = _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
+    out_w = _find_output_dim_extent(ag, stage, dim=3, ranks={4})
     if out_h <= 0 or out_w <= 0:
         return TilePlan(
             tileable=False,
@@ -1367,10 +1294,8 @@ def _solve_convtranspose_2d(
     # group == 1 and unit dilation are enforced by _stage_is_convtranspose_2d;
     # compute eff_k with dilation folded in anyway to match the runtime exactly.
     weight_shapes = _ag_weight_shapes(ag)
-    eff_kh = _get_dilation_h(ct) * (_get_kernel_h(ct, weight_shapes) - 1) + 1
-    eff_kw = _get_dilation_w(ct) * (_get_kernel_w(ct, weight_shapes) - 1) + 1
-    stride_h = _get_stride_h(ct)
-    stride_w = _get_stride_w(ct)
+    eff_kh, stride_h = _window(ct, 0, weight_shapes)
+    eff_kw, stride_w = _window(ct, 1, weight_shapes)
     if full_in_h <= 0 or full_in_w <= 0 or stride_h <= 0 or stride_w <= 0:
         return TilePlan(
             tileable=False,
@@ -1463,14 +1388,7 @@ def _solve_output_tile_2d(
     for th in range(1, out_h + 1):
         if working_set(th, 1) > budget:
             break
-        lo, hi, tw_for_th = 1, out_w, 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if working_set(th, mid) <= budget:
-                tw_for_th = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
+        tw_for_th = _largest_fitting(lambda n: working_set(th, n) <= budget, out_w, 1)
         if th * tw_for_th > best_area:
             best_area, best_th, best_tw = th * tw_for_th, th, tw_for_th
 
@@ -1492,7 +1410,7 @@ def _solve_output_tile_2d(
 
 def _solve_forward_2d(
     ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], budget: int,
-    receptive_field: int,
+    receptive_field: int, weight_shapes: dict[str, tuple[int, ...]],
 ) -> TilePlan:
     """2D (HW) tile plan for a stage whose single spatial op is a Conv or Pool.
 
@@ -1505,8 +1423,8 @@ def _solve_forward_2d(
          if op_category(op) in (TileCategory.CONV, TileCategory.POOL)),
         None,
     )
-    out_h = _find_output_extent(ag, stage)
-    out_w = _find_output_extent_width(ag, stage)
+    out_h = _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
+    out_w = _find_output_dim_extent(ag, stage, dim=3, ranks={4})
     in_infos = _stage_rank4_input_infos(ag, stage)
     if out_h <= 0 or out_w <= 0 or not in_infos:
         return TilePlan(
@@ -1519,10 +1437,8 @@ def _solve_forward_2d(
         def input_tile(th: int, tw: int) -> tuple[int, int]:
             return min(th, full_in_h), min(tw, full_in_w)
     else:
-        weight_shapes = _ag_weight_shapes(ag)
-        eff_kh = _get_dilation_h(spatial) * (_get_kernel_h(spatial, weight_shapes) - 1) + 1
-        eff_kw = _get_dilation_w(spatial) * (_get_kernel_w(spatial, weight_shapes) - 1) + 1
-        stride_h, stride_w = _get_stride_h(spatial), _get_stride_w(spatial)
+        eff_kh, stride_h = _window(spatial, 0, weight_shapes)
+        eff_kw, stride_w = _window(spatial, 1, weight_shapes)
 
         def input_tile(th: int, tw: int) -> tuple[int, int]:
             return (
@@ -1664,13 +1580,7 @@ def _solve_resize_height(ag: AnalyzedGraph, stage: Stage, ops: list[OpNode], bud
     if minimum > budget:
         return TilePlan(tileable=False, min_tile_bytes=minimum,
                         warnings=[f"Stage {stage.stage_id} minimum Resize band exceeds budget ({budget:,} bytes)"])
-    low, high, best = 1, oh, 1
-    while low <= high:
-        rows = (low + high) // 2
-        if working_set(rows) <= budget:
-            best, low = rows, rows + 1
-        else:
-            high = rows - 1
+    best = _largest_fitting(lambda n: working_set(n) <= budget, oh, 1)
     return TilePlan(tileable=True, axis=TILE_AXIS_HEIGHT_OR_LENGTH,
                     tile_height=best, num_tiles=math.ceil(oh / best), original_height=oh,
                     receptive_field=taps, halo=taps - 1, tiled_peak_bytes=working_set(best),
@@ -1729,8 +1639,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
                 TILE_BAND_KIND_STRIPE)
             continue
 
-        if (len(stage_ops) == 1 and not stage.chain_len and
-                _independent_mode(ag, stage_ops[0])):
+        if len(stage_ops) == 1 and _independent_mode(ag, stage_ops[0]):
             op = stage_ops[0]
             mode = _independent_mode(ag, op)
             view = (lambda info: _batch_view(info, op.attrs.get("time_major", False))) \
@@ -1793,13 +1702,13 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             )
             continue
 
-        # Compute receptive field
-        rf_h, _ = compute_receptive_field(stage_ops, _ag_weight_shapes(ag))
+        weight_shapes = _ag_weight_shapes(ag)
+        rf_h, _ = compute_receptive_field(stage_ops, weight_shapes)
         halo = rf_h - 1
 
-        # Axis 1 in the serialized NHWC/NLC layout maps to H/L at source dim 2.
-        input_h = _find_input_extent(ag, stage, tile_axis)
-        output_h = _find_output_extent(ag, stage)
+        # Serialized axis 1 of NHWC/NLC is the height or length, source NCHW/NCL dim 2.
+        input_h = _find_source_dim_extent(ag, stage, dim=2, ranks={3, 4})
+        output_h = _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
         if input_h <= 0 or output_h <= 0:
             stage.tile_plan = TilePlan(
                 tileable=False,
@@ -1808,13 +1717,11 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         # The largest output band whose working set, as the runtime allocates it, fits.
-        weight_shapes = _ag_weight_shapes(ag)
-
         def band_peak(band: int) -> int:
             rows = band
             for op in reversed(stage_ops):
                 rows = _op_input_rows(op, rows, weight_shapes)
-            return _stage_band_bytes(ag, stage, rows)
+            return _stage_band_bytes(ag, stage, rows, weight_shapes)
 
         band, largest = 1, output_h
         while band < largest:
@@ -1838,8 +1745,8 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             and tiled_peak > budget
             and _stage_2d_eligible(ag, stage, stage_ops)
         ):
-            if _find_input_extent_width(ag, stage) > 0:
-                plan_2d = _solve_forward_2d(ag, stage, stage_ops, budget, rf_h)
+            if _find_source_dim_extent(ag, stage, dim=3, ranks={4}) > 0:
+                plan_2d = _solve_forward_2d(ag, stage, stage_ops, budget, rf_h, weight_shapes)
                 if plan_2d.tileable:
                     stage.tile_plan = _banded(plan_2d, TILE_BAND_KIND_HW)
                     continue
@@ -1937,8 +1844,6 @@ def _stage_tile_axis(
 def _op_supports_axis(op: OpNode, axis: int) -> bool:
     """Fail closed unless an operator implements the selected tile contract."""
     if axis == TILE_AXIS_HEIGHT_OR_LENGTH:
-        if op.op_type == "Conv1D":
-            return True
         return op.op_type in _OP_CATEGORY
     if axis == TILE_AXIS_HW:
         # Rank-4 spatial/pointwise/channel-Concat set only; Conv1D is rank-3
@@ -1947,44 +1852,28 @@ def _op_supports_axis(op: OpNode, axis: int) -> bool:
         # explicitly rather than relying on the membership check alone.
         if op.op_type == "Conv1D":
             return False
-        # A resample is cut along its height only; the 2D tiler does not
-        # invert its rectangle.
-        if op_category(op) is TileCategory.UPSAMPLE:
-            return False
         return op.op_type in _OP_CATEGORY
     return False
 
 
-def _find_input_extent(ag: AnalyzedGraph, stage: Stage, axis: int) -> int:
-    """Find the H/L extent that serializes as axis 1 (source NCHW/NCL dim 2)."""
-    if axis not in (TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW):
-        return 0
-    return _find_source_dim_extent(ag, stage, dim=2, ranks={3, 4})
-
-
-def _find_input_extent_width(ag: AnalyzedGraph, stage: Stage) -> int:
-    """Find the W extent that serializes as axis 2 (source NCHW dim 3).
-
-    Only rank-4 tensors carry a width dimension; HW tiling never applies to
-    the rank-3 NCL layout.
-    """
-    return _find_source_dim_extent(ag, stage, dim=3, ranks={4})
+def _stage_candidates(ag: AnalyzedGraph, stage: Stage, outputs: bool = False) -> list[str]:
+    """The stage's external inputs, else the first op's inputs that are tensors;
+    with ``outputs``, its external outputs, else the last op's outputs."""
+    names = stage.output_tensors if outputs else stage.input_tensors
+    if names:
+        return list(names)
+    op = ag.ops[stage.op_indices[-1 if outputs else 0]]
+    return [n for n in (op.outputs if outputs else op.inputs) if n in ag.tensors]
 
 
 def _find_source_dim_extent(
     ag: AnalyzedGraph, stage: Stage, dim: int, ranks: set[int]
 ) -> int:
-    """Find a stage's source-shape extent at ``dim`` among candidate tensors."""
-    # Check stage input tensors first, then look at first op's inputs
-    candidates = stage.input_tensors.copy()
-    if not candidates:
-        first_op = ag.ops[stage.op_indices[0]]
-        candidates = [n for n in first_op.inputs if n in ag.tensors]
-
+    """A stage's input extent at source-shape ``dim`` among tensors of ``ranks``."""
     # A one-row operand is broadcast over every band (a per-channel gate), so
     # it does not say how far the band runs while another input does.
     one_row = False
-    for name in candidates:
+    for name in _stage_candidates(ag, stage):
         info = ag.tensors.get(name)
         if info and len(info.shape) in ranks:
             if int(info.shape[dim]) == 1:
@@ -1997,35 +1886,13 @@ def _find_source_dim_extent(
     return 0
 
 
-def _find_output_extent(ag: AnalyzedGraph, stage: Stage) -> int:
-    """Find the H extent of the stage OUTPUT (source NCHW/NCL dim 2)."""
-    return _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
-
-
-def _find_output_extent_width(ag: AnalyzedGraph, stage: Stage) -> int:
-    """Find the W extent of the stage OUTPUT (source NCHW dim 3).
-
-    Only rank-4 tensors carry a width dimension, so this mirrors the rank
-    restriction of _find_input_extent_width.
-    """
-    return _find_output_dim_extent(ag, stage, dim=3, ranks={4})
-
-
 def _find_output_dim_extent(
     ag: AnalyzedGraph, stage: Stage, dim: int, ranks: set[int]
 ) -> int:
-    """Find a stage's OUTPUT-shape extent at ``dim`` among candidate tensors.
-
-    Mirrors _find_source_dim_extent but reads the stage's output tensors
-    (falling back to the last op's outputs), so ConvTranspose tiling grids over
-    the expanded output extent rather than the pre-upsample input.
-    """
-    candidates = stage.output_tensors.copy()
-    if not candidates:
-        last_op = ag.ops[stage.op_indices[-1]]
-        candidates = [n for n in last_op.outputs if n in ag.tensors]
-
-    for name in candidates:
+    """A stage's OUTPUT extent at source-shape ``dim`` among tensors of ``ranks``,
+    so ConvTranspose tiling grids over the expanded output extent rather than
+    the pre-upsample input."""
+    for name in _stage_candidates(ag, stage, outputs=True):
         info = ag.tensors.get(name)
         if info and len(info.shape) in ranks:
             return int(info.shape[dim])
@@ -2035,12 +1902,7 @@ def _find_output_dim_extent(
 
 def _estimate_halo_bytes(ag: AnalyzedGraph, stage, halo: int, input_h: int) -> int:
     """Estimate bytes for one halo region of the stage's input tensor."""
-    candidates = stage.input_tensors.copy()
-    if not candidates:
-        first_op = ag.ops[stage.op_indices[0]]
-        candidates = [n for n in first_op.inputs if n in ag.tensors]
-
-    for name in candidates:
+    for name in _stage_candidates(ag, stage):
         info = ag.tensors.get(name)
         if info and len(info.shape) in {3, 4}:
             # bytes per row = total_bytes / H
@@ -2069,9 +1931,7 @@ def _external_outputs_keep_their_rows(
     for op in stage_ops:
         if seen_external:
             cat = op_category(op)
-            if cat in (TileCategory.CONV, TileCategory.POOL) and (
-                _get_stride_h(op) != 1
-            ):
+            if cat in (TileCategory.CONV, TileCategory.POOL) and _window(op, 0)[1] != 1:
                 return False
         if any(name in external for name in op.outputs):
             seen_external = True
@@ -2081,7 +1941,7 @@ def _external_outputs_keep_their_rows(
 def _maps_rows_one_to_one(op: OpNode, weight_shapes) -> bool:
     """A convolution or pool whose output row r reads input row r only."""
     pads = op.attrs.get("pads") or []
-    return (_get_kernel_h(op, weight_shapes) == 1 and _get_stride_h(op) == 1
+    return (_window(op, 0, weight_shapes) == (1, 1)
             and (int(pads[0]) if len(pads) >= 1 else 0) == 0
             and (int(pads[2]) if len(pads) >= 3 else 0) == 0)
 
@@ -2151,15 +2011,6 @@ def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
     return _external_outputs_keep_their_rows(
         stage, [ag.ops[i] for i in stage.op_indices]
     )
-
-
-def _tensor_consumer_count(ag: AnalyzedGraph) -> dict[str, int]:
-    """Count how many stages consume each tensor as an input."""
-    counts: dict[str, int] = {}
-    for stage in ag.stages:
-        for name in stage.input_tensors:
-            counts[name] = counts.get(name, 0) + 1
-    return counts
 
 
 def _stage_consumers(ag: AnalyzedGraph) -> dict[str, list[int]]:
@@ -2314,39 +2165,21 @@ def detect_chains(ag: AnalyzedGraph) -> list[list[int]]:
     return chains
 
 
-def _get_stage_spatial_params(ag: AnalyzedGraph, stage: Stage) -> tuple[int, int, int]:
-    """Compose (eff_kh, stride_h, 1) across ALL spatial ops in a stage.
+def _get_stage_spatial_params(
+    ag: AnalyzedGraph, stage: Stage, weight_shapes: dict[str, tuple[int, ...]]
+) -> tuple[int, int]:
+    """(effective kernel height, stride) of a stage's spatial ops composed.
 
     The runtime executor composes receptive fields from Conv, DepthwiseConv,
     MaxPool, and AveragePool ops in a stage when validating chain tile heights,
-    so the compiler must match by composing here too.
-
-    Returns (1, 1, 1) for pointwise-only stages.
+    so the compiler must match by composing here too. A pointwise-only stage
+    is (1, 1).
     """
-    comp_stride = 1
-    comp_eff_kh = 1
-    found = False
-    weight_shapes = _ag_weight_shapes(ag)
-    for op_i in stage.op_indices:
-        op = ag.ops[op_i]
-        cat = op_category(op)
-        if cat in (TileCategory.CONV, TileCategory.POOL):
-            kh = _get_kernel_h(op, weight_shapes)
-            sh = _get_stride_h(op)
-            dh = _get_dilation_h(op)
-            ekh = dh * (kh - 1) + 1
-            # Compose: eff_kh_new = eff_kh + (ekh - 1) * stride
-            comp_eff_kh = comp_eff_kh + (ekh - 1) * comp_stride
-            comp_stride = comp_stride * sh
-            found = True
-    if not found:
-        return 1, 1, 1
-    # Return composed params as (eff_kh, stride, 1) - dilation already folded in
-    return comp_eff_kh, comp_stride, 1
+    return _compose_windows([ag.ops[i] for i in stage.op_indices], 0, weight_shapes)
 
 
 def _back_propagate_tile_heights(
-    chain_params: list[tuple[int, int, int]],
+    chain_params: list[tuple[int, int]],
     last_out_h: int,
 ) -> list[tuple[int, int]]:
     """Back-propagate tile heights through a chain.
@@ -2355,7 +2188,7 @@ def _back_propagate_tile_heights(
     each stage from last to first.
 
     Args:
-        chain_params: [(kernel_h, stride_h, dilation_h)] per stage.
+        chain_params: [(effective kernel height, stride)] per stage.
         last_out_h: output tile height for the last stage.
 
     Returns:
@@ -2364,8 +2197,7 @@ def _back_propagate_tile_heights(
     heights: list[tuple[int, int]] = []
     out_h = last_out_h
 
-    for kh, sh, dh in reversed(chain_params):
-        eff_kh = dh * (kh - 1) + 1
+    for eff_kh, sh in reversed(chain_params):
         in_h = out_h * sh + max(eff_kh - sh, 0)
         heights.append((in_h, out_h))
         out_h = in_h  # this stage's input = previous stage's output
@@ -2383,24 +2215,23 @@ def _op_band_rows(op: OpNode, rows: int, weight_shapes) -> int:
     """Rows an operator writes from `rows` input rows of a height band."""
     if op_category(op) not in (TileCategory.CONV, TileCategory.POOL):
         return rows
-    ekh = _get_dilation_h(op) * (_get_kernel_h(op, weight_shapes) - 1) + 1
-    return max((rows - ekh) // _get_stride_h(op) + 1, 1)
+    ekh, stride = _window(op, 0, weight_shapes)
+    return max((rows - ekh) // stride + 1, 1)
 
 
 def _op_input_rows(op: OpNode, rows: int, weight_shapes) -> int:
     """Input rows an operator reads to write `rows` rows of a height band."""
     if op_category(op) not in (TileCategory.CONV, TileCategory.POOL):
         return rows
-    ekh = _get_dilation_h(op) * (_get_kernel_h(op, weight_shapes) - 1) + 1
-    return (rows - 1) * _get_stride_h(op) + ekh
+    ekh, stride = _window(op, 0, weight_shapes)
+    return (rows - 1) * stride + ekh
 
 
-def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int) -> int:
+def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int, weight_shapes) -> int:
     """Fast memory one band of a height-striped stage takes, as the runtime
     allocates it: every stage input and every op output its own aligned band,
     op heights carried forward through the spatial ops."""
     align = max(ag.tensor_alignment, _CONSERVATIVE_TENSOR_ALIGN)
-    weight_shapes = _ag_weight_shapes(ag)
 
     def band(info, rows: int) -> int:
         # The band cuts serialized axis 1, whichever model axis that holds.
@@ -2432,6 +2263,7 @@ def _chain_fast_bytes(
     ag: AnalyzedGraph,
     chain_stages: list[Stage],
     heights: list[tuple[int, int]],
+    weight_shapes: dict[str, tuple[int, ...]],
 ) -> int:
     """Compute total fast memory needed for one tile iteration of a chain.
 
@@ -2458,7 +2290,6 @@ def _chain_fast_bytes(
                                ag.tensor_alignment)
 
     # All op output tiles - forward-compute height through spatial ops
-    weight_shapes = _ag_weight_shapes(ag)
     for s_idx, stage in enumerate(chain_stages):
         cur_h = heights[s_idx][0]  # start with stage input height
         for op_i in stage.op_indices:
@@ -2466,10 +2297,7 @@ def _chain_fast_bytes(
             cat = op_category(op)
             # Spatial ops reduce height
             if cat in (TileCategory.CONV, TileCategory.POOL):
-                kh = _get_kernel_h(op, weight_shapes)
-                sh = _get_stride_h(op)
-                dh = _get_dilation_h(op)
-                ekh = dh * (kh - 1) + 1
+                ekh, sh = _window(op, 0, weight_shapes)
                 cur_h = (cur_h - max(ekh - sh, 0)) // sh
             for out_name in op.outputs:
                 info = ag.tensors.get(out_name)
@@ -2498,7 +2326,8 @@ def solve_chain_tile_height(
         return 0
 
     chain_stages = [ag.stages[i] for i in chain_stage_indices]
-    chain_params = [_get_stage_spatial_params(ag, s) for s in chain_stages]
+    weight_shapes = _ag_weight_shapes(ag)
+    chain_params = [_get_stage_spatial_params(ag, s, weight_shapes) for s in chain_stages]
 
     # Find the output height of the last stage
     last_stage = chain_stages[-1]
@@ -2511,21 +2340,11 @@ def solve_chain_tile_height(
     if last_out_h <= 0:
         return 0
 
-    # Binary search for maximum out_tile_h
-    lo, hi = 1, last_out_h
-    best = 0
+    def fits(out_tile_h: int) -> bool:
+        heights = _back_propagate_tile_heights(chain_params, out_tile_h)
+        return _chain_fast_bytes(ag, chain_stages, heights, weight_shapes) <= budget
 
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        heights = _back_propagate_tile_heights(chain_params, mid)
-        needed = _chain_fast_bytes(ag, chain_stages, heights)
-        if needed <= budget:
-            best = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    return best
+    return _largest_fitting(fits, last_out_h, 0)
 
 
 def _carries_only_its_own_tensors(
@@ -2594,6 +2413,7 @@ def detect_and_solve_chains(ag: AnalyzedGraph) -> AnalyzedGraph:
         for piece in _split_into_fitting_chains(ag, run, readers, producer)
     ]
 
+    weight_shapes = _ag_weight_shapes(ag)
     for chain, tile_h in chains:
         head_id = chain[0]
         chain_len = len(chain)
@@ -2614,8 +2434,8 @@ def detect_and_solve_chains(ag: AnalyzedGraph) -> AnalyzedGraph:
         # redundantly recomputing them per tile. Memory-neutral, no threshold.
         recomputes = any(
             (eff_kh - stride) > 0
-            for eff_kh, stride, _dh in (
-                _get_stage_spatial_params(ag, ag.stages[s_idx]) for s_idx in chain
+            for eff_kh, stride in (
+                _get_stage_spatial_params(ag, ag.stages[s_idx], weight_shapes) for s_idx in chain
             )
         )
         if recomputes:

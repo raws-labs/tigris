@@ -8,6 +8,7 @@ import numpy as np
 from tigris import SCHEMA_VERSION_TILE_AXIS, TILE_AXIS_HEIGHT_OR_LENGTH
 from tigris.analysis.lifetime import compute_lifetimes, pure_reinterpretations
 from tigris.analysis.partition_spatial import (
+    _ag_weight_shapes,
     _back_propagate_tile_heights,
     _chain_fast_bytes,
     _get_stage_spatial_params,
@@ -800,9 +801,11 @@ def _execution_unit_requirement(
         ):
             return stage.peak_bytes, "internal error: invalid chain metadata", True
 
-        params = [_get_stage_spatial_params(ag, candidate) for candidate in chain_stages]
+        weight_shapes = _ag_weight_shapes(ag)
+        params = [_get_stage_spatial_params(ag, candidate, weight_shapes)
+                  for candidate in chain_stages]
         heights = _back_propagate_tile_heights(params, stage.chain_tile_h)
-        required = _chain_fast_bytes(ag, chain_stages, heights)
+        required = _chain_fast_bytes(ag, chain_stages, heights, weight_shapes)
         return required, f"smallest tile of a chain of {len(chain_stages)} stages", False
 
     tile_plan = stage.tile_plan

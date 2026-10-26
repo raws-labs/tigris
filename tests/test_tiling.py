@@ -578,7 +578,8 @@ def test_leading_band_requires_one_block_before_its_axis(source, target):
 
 @pytest.mark.parametrize("combined", [False, True])
 def test_leading_bands_do_not_extend_chains_or_combined_stages(combined):
-    from tigris.analysis.partition_spatial import _assign_tile_plans
+    from tigris.analysis.partition_spatial import _assign_tile_plans, _is_stage_tileable
+    from tigris.emitters.binary.defs import TILE_BAND_KIND_LEADING
     from tigris.graph.ir import Layout, MemoryBudget, Stage
 
     tensors = {n: TensorInfo(n, shape, dtype=1, layout=Layout.LINEAR)
@@ -586,11 +587,15 @@ def test_leading_bands_do_not_extend_chains_or_combined_stages(combined):
     ops = [OpNode("max", "ReduceMax", ["x"], ["y"], attrs={"axes": [2]})]
     if combined:
         ops.append(OpNode("relu", "Relu", ["y"], ["z"]))
-    stage = Stage(0, list(range(len(ops))), ["x"], ["z" if combined else "y"], peak_bytes=1024,
-                  chain_len=0 if combined else 2)
+    stage = Stage(0, list(range(len(ops))), ["x"], ["z" if combined else "y"], peak_bytes=1024)
     graph = AnalyzedGraph(tensors=tensors, ops=ops, stages=[stage], budget=MemoryBudget(fast=256))
     _assign_tile_plans(graph)
-    assert stage.tile_plan is not None and not stage.tile_plan.tileable
+    if combined:
+        assert stage.tile_plan is not None and not stage.tile_plan.tileable
+    else:
+        # Chains are detected after tile plans, from stages detect_chains finds tileable only.
+        assert stage.tile_plan.tileable and stage.tile_plan.band_kind == TILE_BAND_KIND_LEADING
+        assert not _is_stage_tileable(graph, stage)
 
 
 @pytest.mark.parametrize("kind", ["Add", "Sub", "Mul", "Div", "FloorDiv", "FloorMod",
