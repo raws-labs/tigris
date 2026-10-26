@@ -17,7 +17,10 @@ class RuntimeError(ValueError):
 
 
 # The host library interface this package speaks; the bundled manifest records it.
-HOST_ABI = 2
+HOST_ABI = 3
+
+# Events the first trace buffer holds.
+_TRACE_EVENTS = 1 << 14
 
 
 class TraceEvent(ct.Structure):
@@ -78,6 +81,9 @@ def _library():
                               ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint32), ct.c_uint32]),
         "metric": (ct.c_uint64, [ct.c_void_p, ct.c_uint32]),
         "reset_state": (ct.c_char_p, [ct.c_void_p]),
+        "state_bytes": (ct.c_uint32, [ct.c_void_p]),
+        "save_state": (ct.c_char_p, [ct.c_void_p, ct.c_void_p, ct.c_uint32]),
+        "restore_state": (ct.c_char_p, [ct.c_void_p, ct.c_void_p, ct.c_uint32]),
         "trace_buffer": (None, [ct.c_void_p, ct.c_void_p, ct.c_uint32]),
         "trace_count": (ct.c_uint32, [ct.c_void_p]),
     }
@@ -223,7 +229,10 @@ class Session:
         with self._lock:
             if not self._handle:
                 raise RuntimeError("Session is closed")
-            capacity = 1 << 14
+            size = self._lib.tigris_host_state_bytes(self._handle)
+            state = (ct.c_uint8 * size)()
+            self._check(self._lib.tigris_host_save_state(self._handle, state, size))
+            capacity = _TRACE_EVENTS
             while True:
                 buffer = (TraceEvent * capacity)()
                 self._lib.tigris_host_trace_buffer(self._handle, buffer, capacity)
@@ -235,7 +244,7 @@ class Session:
                 if count <= capacity:
                     break
                 capacity = count
-                self.reset_state()
+                self._check(self._lib.tigris_host_restore_state(self._handle, state, size))
             events = []
             for event in buffer[:count]:
                 item = {"kind": TRACE_KINDS.get(event.kind, f"unknown({event.kind})")}
