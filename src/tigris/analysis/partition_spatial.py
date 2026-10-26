@@ -1904,30 +1904,24 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             )
             continue
 
-        # Solve for tile height. The proportional share of the stage peak
-        # ignores each band buffer's alignment, which dominates small bands,
-        # so the band also has to fit as the runtime allocates it.
-        peak = stage.peak_bytes
-
-        def band_peak(rows: int) -> int:
-            return max(int(peak * (rows + halo) / input_h),
-                       _stage_band_bytes(ag, stage, rows + halo))
-
-        tile_h = math.floor(budget * input_h / peak) - halo
-        tile_h = max(min(tile_h, input_h), 1)
-        while tile_h > 1 and band_peak(tile_h) > budget:
-            tile_h -= 1
-
-        # The plan states the band in output rows: those tile_h input rows and the halo produce.
-        band = tile_h + halo
+        # The largest output band whose working set, as the runtime allocates it, fits.
         weight_shapes = _ag_weight_shapes(ag)
-        for op in stage_ops:
-            band = _op_band_rows(op, band, weight_shapes)
-        band = min(band, output_h)
-        num_tiles = math.ceil(output_h / band)
 
-        # Estimate tiled peak memory
-        tiled_peak = band_peak(tile_h)
+        def band_peak(band: int) -> int:
+            rows = band
+            for op in reversed(stage_ops):
+                rows = _op_input_rows(op, rows, weight_shapes)
+            return _stage_band_bytes(ag, stage, rows)
+
+        band, largest = 1, output_h
+        while band < largest:
+            middle = (band + largest + 1) // 2
+            if band_peak(middle) <= budget:
+                band = middle
+            else:
+                largest = middle - 1
+        num_tiles = math.ceil(output_h / band)
+        tiled_peak = band_peak(band)
 
         # A single-row height tile that still overflows the budget cannot be
         # rescued by any smaller height-only tile: height is already at its
@@ -1937,7 +1931,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         min_2d_tile_infeasible = False
         min_2d_bytes = 0
         if (
-            tile_h == 1
+            band == 1
             and tiled_peak > budget
             and _stage_2d_eligible(ag, stage, stage_ops)
         ):
@@ -2446,6 +2440,14 @@ def _op_band_rows(op: OpNode, rows: int, weight_shapes) -> int:
         return rows
     ekh = _get_dilation_h(op) * (_get_kernel_h(op, weight_shapes) - 1) + 1
     return max((rows - ekh) // _get_stride_h(op) + 1, 1)
+
+
+def _op_input_rows(op: OpNode, rows: int, weight_shapes) -> int:
+    """Input rows an operator reads to write `rows` rows of a height band."""
+    if op_category(op) not in (TileCategory.CONV, TileCategory.POOL):
+        return rows
+    ekh = _get_dilation_h(op) * (_get_kernel_h(op, weight_shapes) - 1) + 1
+    return (rows - 1) * _get_stride_h(op) + ekh
 
 
 def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int) -> int:
