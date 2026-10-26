@@ -65,6 +65,29 @@ def _run_compressed_pipeline(
     )
 
 
+def plan_model(
+    model: str,
+    mem: tuple[str, ...],
+    *,
+    compress: str | None,
+    input_shapes: dict[str, tuple[int, ...]] | None = None,
+    report_bindings: bool = True,
+):
+    """Plan a model the way ``tigris compile`` does.
+
+    Returns the graph, the caller's total fast budget, and the fast bytes
+    reserved for decompressed weights (0 without ``compress="lz4"``).
+    """
+    if compress == "lz4":
+        ag, budget, _, weight_reserve = _run_compressed_pipeline(model, mem, input_shapes)
+        if report_bindings:
+            _report_shape_bindings(ag)
+        return ag, budget, weight_reserve
+    ag, budget = _run_pipeline(model, mem, input_shapes=input_shapes,
+                               report_bindings=report_bindings)
+    return ag, budget, 0
+
+
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
 @click.option("--mem", "-m", multiple=True, required=True, callback=_memory_sizes,
@@ -93,12 +116,8 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     compress_arg = compress if compress != "none" else None
-    if compress_arg:
-        ag, budget, _, weight_reserve = _run_compressed_pipeline(model, mem, input_shape)
-        _report_shape_bindings(ag)
-    else:
-        ag, budget = _run_pipeline(model, mem, input_shapes=input_shape)
-        weight_reserve = 0
+    ag, budget, weight_reserve = plan_model(model, mem, compress=compress_arg,
+                                            input_shapes=input_shape)
 
     ag.budget = replace(ag.budget, flash=_parse_size(flash) if flash else 0)
 

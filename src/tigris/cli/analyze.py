@@ -128,10 +128,11 @@ def _lz4_compiles(model: str, mem: tuple[str, ...], input_shape) -> bool:
     """Whether compile -c lz4 writes a plan at these budgets: the fast arena
     also holds each stage's decompressed weights, which can leave too little."""
     from tigris.analysis.validation import validate_budget
-    from tigris.cli.compile import _run_compressed_pipeline
+    from tigris.cli.compile import plan_model
 
     try:
-        graph, _, _, _ = _run_compressed_pipeline(model, mem, input_shape)
+        graph, _, _ = plan_model(model, mem, compress="lz4", input_shapes=input_shape,
+                                 report_bindings=False)
     except click.ClickException:
         return False
     result = validate_budget(graph)

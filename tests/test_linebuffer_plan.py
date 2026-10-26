@@ -1,45 +1,19 @@
 """Compiler marks recomputing chain heads as line_buffered and serializes
-the flag into the head stage's _reserved1 field.
+the flag into the head stage's flags field.
 
 Compile-side only: this test verifies the compiler model (Stage.line_buffered)
 and the emitted binary bytes, not any runtime behavior.
 """
 
 from tigris.cli import _run_pipeline
-from tigris.emitters.binary.defs import (
-    HEADER_STRUCT,
-    SEC_STAGES,
-    SECTION_ENTRY_STRUCT,
-    STAGE_FLAG_LINE_BUFFERED,
-    STAGE_STRUCT,
-)
+from tigris.emitters.binary.defs import STAGE_FLAG_LINE_BUFFERED
+from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.fixtures import build_ds_cnn
 
 
 def _chain_heads(ag):
     return [s for s in ag.stages if s.chain_len >= 2 and s.chain_id == s.stage_id]
-
-
-def _stage_reserved1(plan_bytes: bytes, stage_index: int) -> int:
-    """Decode the _reserved1 field (offset 26 in the 28-byte record) of the
-    stage at ``stage_index`` directly from the emitted binary plan bytes."""
-    header = HEADER_STRUCT.unpack_from(plan_bytes, 0)
-    section_dir_off = header[3]
-
-    sections: dict[int, int] = {}
-    off = section_dir_off
-    while off + SECTION_ENTRY_STRUCT.size <= len(plan_bytes):
-        sec_type, sec_off = SECTION_ENTRY_STRUCT.unpack_from(plan_bytes, off)
-        off += SECTION_ENTRY_STRUCT.size
-        if sec_type == 0:
-            break
-        sections[sec_type] = sec_off
-
-    s_base = sections[SEC_STAGES]
-    pos = s_base + stage_index * STAGE_STRUCT.size
-    fields = STAGE_STRUCT.unpack_from(plan_bytes, pos)
-    return fields[-1]  # _reserved1 is the last packed field
 
 
 def test_recomputing_chain_head_is_line_buffered(tmp_path):
@@ -57,11 +31,11 @@ def test_recomputing_chain_head_is_line_buffered(tmp_path):
         if not (s.chain_len >= 2 and s.chain_id == s.stage_id)
     )
 
-    plan_bytes = emit_binary_bytes(ag)
+    stages = read_binary_plan(emit_binary_bytes(ag))["stages"]
     for stage in ag.stages:
-        reserved1 = _stage_reserved1(plan_bytes, stage.stage_id)
+        flags = stages[stage.stage_id]["flags"]
         if stage.line_buffered:
-            assert reserved1 & STAGE_FLAG_LINE_BUFFERED
+            assert flags & STAGE_FLAG_LINE_BUFFERED
         else:
-            assert not (reserved1 & STAGE_FLAG_LINE_BUFFERED)
+            assert not (flags & STAGE_FLAG_LINE_BUFFERED)
 
