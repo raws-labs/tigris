@@ -222,7 +222,5 @@ from tigris.cli.codegen import codegen  # noqa: E402, F401
 from tigris.cli.compile import compile  # noqa: E402, F401
 from tigris.cli.export import export  # noqa: E402, F401
 from tigris.cli.inspect import inspect  # noqa: E402, F401
-from tigris.cli.plan import plan  # noqa: E402, F401
 from tigris.cli.run import run  # noqa: E402, F401
-from tigris.cli.simulate import simulate  # noqa: E402, F401
 from tigris.cli.zoo import zoo  # noqa: E402, F401

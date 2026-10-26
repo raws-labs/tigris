@@ -10,7 +10,6 @@ venv/
 *.pt
 *.html
 !examples/*.html
-*.plan.yaml
 *.tgrs
 !tests/schema_compat/
 !tests/schema_compat/*.tgrs

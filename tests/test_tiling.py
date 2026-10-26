@@ -1,7 +1,6 @@
 """Tests for tigris.analysis.partition_spatial - op classification, receptive field, tile solver."""
 
 import pytest
-import json
 import numpy as np
 from onnx import TensorProto, helper, numpy_helper
 
@@ -13,7 +12,6 @@ from tigris.analysis.partition_spatial import (
     _stage_tile_axis,
 )
 from tigris.analysis.validation import validate_memory_plan
-from tigris.emitters.plan_json import plan_json_str
 from tigris.fixtures import build_tcn
 
 from conftest import full_pipeline
@@ -320,23 +318,16 @@ class TestTilingIntegration:
         assert validation.scheduled_peak_bytes <= 16 * 1024
 
 
-# The JSON plan includes tile_plan
-
-
-class TestTilingYaml:
-    def test_yaml_includes_tile_plan(self, conv_relu_chain_path):
-        """YAML output should include tile_plan for oversized stages."""
+class TestOversizedStagesCarryTilePlan:
+    def test_oversized_stages_carry_tile_plan(self, conv_relu_chain_path):
         ag = full_pipeline(conv_relu_chain_path, budget=1024)
-        text = plan_json_str(ag)
-        plan = json.loads(text)
 
-        stages_with_tp = [s for s in plan["stages"] if "tile_plan" in s]
-        assert len(stages_with_tp) == 2
-        for s in stages_with_tp:
-            tp = s["tile_plan"]
-            assert "tileable" in tp
-            assert "tile_height" in tp
-            assert "halo" in tp
+        tiled = [s for s in ag.stages if s.tile_plan is not None]
+        assert len(tiled) == 2
+        for s in tiled:
+            assert s.tile_plan.tileable
+            assert s.tile_plan.tile_height > 0
+            assert s.tile_plan.halo > 0
 
 
 def _gated_map_path(tmp_path, channels=16, side=12):
