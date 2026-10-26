@@ -602,7 +602,8 @@ def test_leading_bands_do_not_extend_chains_or_combined_stages(combined):
     assert stage.tile_plan is not None and not stage.tile_plan.tileable
 
 
-@pytest.mark.parametrize("kind", ["Add", "Sub", "Mul"])
+@pytest.mark.parametrize("kind", ["Add", "Sub", "Mul", "Div", "FloorDiv", "FloorMod",
+                                  "Max", "Min", "SquaredDifference"])
 @pytest.mark.parametrize("constant,row_band", [
     ((64, 8), False), ((64, 1), False), ((8,), True), ((1, 8), True), ((), True)])
 def test_row_band_takes_only_a_constant_every_row_reads_alike(kind, constant, row_band):
@@ -614,3 +615,10 @@ def test_row_band_takes_only_a_constant_every_row_reads_alike(kind, constant, ro
     graph = AnalyzedGraph(tensors=tensors, ops=[op],
                           weight_data={"k": np.ones(constant, dtype=np.float32)})
     assert _stage_is_row_tiled(graph, Stage(0, [0], ["x"], ["y"]), [op]) is row_band
+
+
+def test_row_band_operators_are_the_contract_row_mode():
+    from tigris.analysis.partition_spatial import _ROW_TILING_OPS
+    from tigris.operator_contract import OPERATOR_CONTRACT
+
+    assert _ROW_TILING_OPS == {name for name, row in OPERATOR_CONTRACT.items() if "row" in row.modes}
