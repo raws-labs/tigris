@@ -56,8 +56,7 @@ def _wheel_tail(data: bytes) -> int:
     return persistent(tw.read(data), TFLM_TARGETS["lp64"], compression=True, recording=True)
 
 
-@pytest.fixture
-def tflite_micro():
+def _require_tflite_micro():
     """Skip without the tflite-micro package; fail under CI, which installs it."""
     try:
         import tflite_micro  # noqa: F401
@@ -65,6 +64,11 @@ def tflite_micro():
         if os.environ.get("CI"):
             pytest.fail("tflite-micro is not installed")
         pytest.skip("tflite-micro is not installed")
+
+
+@pytest.fixture
+def tflite_micro():
+    _require_tflite_micro()
 
 
 # Runs a model in a child process: TFLite Micro prints its arena from C.
@@ -90,6 +94,22 @@ np.savez(sys.argv[3], **outputs)
 """
 
 
+# Allocates every model given as an argument in one process, a marker line before each.
+_ARENA_CHILD = r"""
+import os, sys
+from tflite_micro.python.tflite_micro import runtime
+for index, path in enumerate(sys.argv[1:]):
+    os.write(2, f"\n@@model {index}\n".encode())
+    interpreter = runtime.Interpreter.from_bytes(open(path, 'rb').read(), arena_size=16 << 20)
+    interpreter.print_allocations()
+"""
+
+
+def _arena(printed: str) -> tuple[int, int]:
+    return tuple(int(re.search(rf"Arena allocation {kind} (\d+) bytes", printed).group(1))
+                 for kind in ("head", "tail"))
+
+
 def _tflm(data: bytes, inputs: list, tmp_path: Path, name: str):
     """TFLite Micro's arena head and tail and the outputs of each input."""
     model, given, taken = (tmp_path / f"{name}{suffix}" for suffix in (".tflite", "_in.npz", "_out.npz"))
@@ -99,8 +119,7 @@ def _tflm(data: bytes, inputs: list, tmp_path: Path, name: str):
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     printed = result.stdout + result.stderr
-    head, tail = (int(re.search(rf"Arena allocation {kind} (\d+) bytes", printed).group(1))
-                  for kind in ("head", "tail"))
+    head, tail = _arena(printed)
     stored = np.load(taken)
     return head, tail, {key: stored[key] for key in stored.files}
 
@@ -659,10 +678,29 @@ def test_the_persistent_model_reproduces_tflite_micros_tail(name):
     assert (*predicted, wheel) == _MEASURED_TAILS[name]
 
 
+@pytest.fixture(scope="module")
+def installed_arenas(tmp_path_factory):
+    """Head and tail of every measured model, allocated by one TFLite Micro process."""
+    _require_tflite_micro()
+    names = sorted(_MEASURED_TAILS)
+    directory = tmp_path_factory.mktemp("arenas")
+    paths = []
+    for index, name in enumerate(names):
+        paths.append(directory / f"{index}.tflite")
+        paths[-1].write_bytes(_measured(name))
+    result = subprocess.run([sys.executable, "-c", _ARENA_CHILD, *map(str, paths)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    sections = re.split(r"^@@model (\d+)$", result.stderr, flags=re.MULTILINE)[1:]
+    printed = {names[int(index)]: text for index, text in zip(sections[::2], sections[1::2])}
+    assert sorted(printed) == names, result.stderr
+    return {name: _arena(text) for name, text in printed.items()}
+
+
 @pytest.mark.parametrize("name", sorted(_MEASURED_TAILS))
-def test_the_installed_package_allocates_head_and_tail_as_modelled(name, tflite_micro, tmp_path):
+def test_the_installed_package_allocates_head_and_tail_as_modeled(name, installed_arenas):
     data = _measured(name)
-    head, tail, _ = _tflm(data, [], tmp_path, "model")
+    head, tail = installed_arenas[name]
     assert (head, tail) == (arena(tw.read(data)), _wheel_tail(data))
 
 
