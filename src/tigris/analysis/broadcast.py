@@ -7,11 +7,11 @@ coordinate, for any other broadcast. The last is never tiled.
 """
 
 from tigris.graph.ir import AnalyzedGraph, OpNode, serialized_shape
+from tigris.operator_contract import operators_with
 
-BINARY_OPS = frozenset({"Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min",
-                        "FloorDiv", "FloorMod", "PRelu",
-                        "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
-                        "And", "Or", "Where"})
+BINARY_OPS = operators_with("binary")
+COMPARISONS = frozenset({"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"})
+LOGICAL_BINARY = frozenset({"And", "Or"})
 
 DENSE, PERIODIC, GENERAL = "dense", "periodic", "general"
 
@@ -72,8 +72,7 @@ def stored_operands(ag: AnalyzedGraph, op: OpNode):
         else:
             if info is None or len(info.shape) > len(output.shape):
                 return None
-            if len(info.shape) != len(output.shape) and op.op_type not in {
-                    "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Where"}:
+            if len(info.shape) != len(output.shape) and op.op_type not in COMPARISONS | LOGICAL_BINARY | {"Where"}:
                 return None
             if len(info.shape) != len(output.shape) and ((len(info.shape) >= 3 and info.layout.value != "linear") or (len(output.shape) >= 3 and output.layout.value != "linear")):
                 return None

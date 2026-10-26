@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+from tigris.analysis.lifetime import RESHAPE_OPS
 from tigris.graph.ir import AnalyzedGraph, Stage
 
 
@@ -67,7 +68,7 @@ class _StageCost:
             size = self._size(name)
             if size is None:
                 continue
-            if size == 0 and op.op_type in {"Reshape", "Flatten"}:
+            if size == 0 and op.op_type in RESHAPE_OPS:
                 source = next(n for n in op.inputs if n in self._ag.lifetimes)
                 self._storage[name] = self._storage.get(source, source)
             self._produced_open += size

@@ -4015,11 +4015,11 @@ def _chained_normalization_case() -> ContractCase:
 def _tiled_rank4_binary_case(*, op_type: str) -> ContractCase:
     """A rank-4 binary pointwise stage the solver has to tile.
 
-    The height-stripe contract is stated in four places: the compiler's op
-    category table, the loader's rank-4 operator list, the executor's
-    is_height_tiling_op, and the accelerator routing policy. Sub was in three
-    of them, so a model with one compiled and then failed to load. One case
-    per binary operator keeps each of the four honest.
+    The height-stripe contract is read in four places: the compiler's op
+    categories, the loader's stripe check, the executor's chain enumeration,
+    and the accelerator routing policy. Sub was once missing from one of them,
+    so a model with one compiled and then failed to load. One case per binary
+    operator keeps each of the four honest.
     """
     shape = [1, 4, 32, 32]
     model = _model(

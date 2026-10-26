@@ -14,7 +14,7 @@ from tigris.analysis.partition_spatial import (
     _row_view,
     _stage_is_row_tiled,
 )
-from tigris.analysis.broadcast import DENSE, PERIODIC, stored_operands
+from tigris.analysis.broadcast import COMPARISONS, DENSE, LOGICAL_BINARY, PERIODIC, stored_operands
 from tigris.capabilities import effective_operators
 from tigris.operator_contract import OPERATOR_CONTRACT
 from tigris.graph.ir import state_tensor_names
@@ -1240,15 +1240,11 @@ def validate_budget(ag: AnalyzedGraph) -> BudgetValidation:
     return BudgetValidation(fast=validate_memory_plan(ag), slow=slow_pool_usage(ag))
 
 
-_COMPARISONS = {"Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual"}
-_LOGICAL_BINARY = {"And", "Or"}
-
-
 def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
-    if op.op_type not in _COMPARISONS | _LOGICAL_BINARY | {"Not", "Where", "Cast", "Sum"}:
+    if op.op_type not in COMPARISONS | LOGICAL_BINARY | {"Not", "Where", "Cast", "Sum"}:
         return []
     kind = op.op_type
-    count = 3 if kind == "Where" else 2 if kind in _COMPARISONS | _LOGICAL_BINARY else 1
+    count = 3 if kind == "Where" else 2 if kind in COMPARISONS | LOGICAL_BINARY else 1
     if len(op.outputs) != 1 or (len(op.inputs) != count if kind != "Sum" else not op.inputs):
         return ["invalid operand count"]
     tensors = [ag.tensors.get(n) for n in op.inputs + op.outputs]
@@ -1258,12 +1254,12 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     data_dtype = next((t.dtype for t in inputs + [output] if t.dtype in {1, 3}),
                       3 if ag.is_quantized else 1)
     # Comparisons of int32 give bool; a CAST of int32 gives float32.
-    integer = kind in _COMPARISONS | {"Cast"} and inputs[0].dtype == 6
+    integer = kind in COMPARISONS | {"Cast"} and inputs[0].dtype == 6
     expected = ([6] * len(inputs) if integer
                 else [9, data_dtype, data_dtype] if kind == "Where"
-                else [9] * len(inputs) if kind in _LOGICAL_BINARY | {"Not", "Cast"}
+                else [9] * len(inputs) if kind in LOGICAL_BINARY | {"Not", "Cast"}
                 else [data_dtype] * len(inputs))
-    out_type = (9 if kind in _COMPARISONS | _LOGICAL_BINARY | {"Not"} else 1 if integer
+    out_type = (9 if kind in COMPARISONS | LOGICAL_BINARY | {"Not"} else 1 if integer
                 else data_dtype)
     if [t.dtype for t in inputs] != expected or output.dtype != out_type:
         return ["operand dtypes do not match the operator signature"]
@@ -1292,7 +1288,7 @@ def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
             return ["int8 operands require valid per-tensor quantization"]
     if data_dtype != 3:
         return []
-    if kind in _COMPARISONS and not integer and any(not 0 < float(t.quant.scale[0]) < 1 for t in inputs):
+    if kind in COMPARISONS and not integer and any(not 0 < float(t.quant.scale[0]) < 1 for t in inputs):
         return ["int8 comparison input scales must be strictly between 0 and 1"]
     data = inputs[1:] + [output] if kind == "Where" else inputs if kind == "Sum" else []
     if data and any(float(t.quant.scale[0]) != float(data[0].quant.scale[0])

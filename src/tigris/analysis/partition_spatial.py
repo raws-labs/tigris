@@ -14,8 +14,8 @@ from enum import Enum
 import numpy as np
 
 from tigris.graph.subgraphs import CONTROL_FLOW
-from tigris.analysis.lifetime import _same_stored_bytes
-from tigris.analysis.broadcast import is_constant, stored_operands
+from tigris.analysis.lifetime import RESHAPE_OPS, _same_stored_bytes
+from tigris.analysis.broadcast import BINARY_OPS, is_constant, stored_operands
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary.defs import (
@@ -32,7 +32,7 @@ from tigris.emitters.binary.defs import (
     TILE_BAND_MODE_TIME_MAJOR_BATCH,
     TILE_BAND_MODE_TRAILING,
 )
-from tigris.operator_contract import OPERATOR_CONTRACT
+from tigris.operator_contract import operators_with
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
@@ -60,83 +60,18 @@ class TileCategory(Enum):
 
 
 # Spatial tiling is an execution contract, not a purely mathematical
-# classification.  Keep this list aligned with exec_stage_tiled in the runtime:
-# every listed op is only accepted on a stage axis audited below. Unknown and
+# classification, so the categories are read from the operator contract the
+# runtime's loader checks: spatial operators are convolutions or pools,
+# resampling ones upsample, and height-mode ones are shape-preserving and
+# halo-free. Conv1D carries no spatial mode because the rank-4 executors do
+# not run it; it is the rank-3 length executor's convolution. Unknown and
 # unaudited ops fail closed as UNTILEABLE.
 _OP_CATEGORY: dict[str, TileCategory] = {
-    # Spatial ops whose height geometry the runtime propagates.
-    "Conv": TileCategory.CONV,
+    **dict.fromkeys(operators_with("height"), TileCategory.POINTWISE),
+    **dict.fromkeys(operators_with("resample"), TileCategory.UPSAMPLE),
+    **{name: TileCategory.CONV if name in {"Conv", "DepthwiseConv"} else TileCategory.POOL
+       for name in operators_with("spatial")},
     "Conv1D": TileCategory.CONV,
-    "DepthwiseConv": TileCategory.CONV,
-    "MaxPool": TileCategory.POOL,
-    "AveragePool": TileCategory.POOL,
-    "L2Pool": TileCategory.POOL,
-    # Audited, shape-preserving runtime kernels.
-    "Relu": TileCategory.POINTWISE,
-    "Relu6": TileCategory.POINTWISE,
-    "Sigmoid": TileCategory.POINTWISE,
-    "Tanh": TileCategory.POINTWISE,
-    "Add": TileCategory.POINTWISE,
-    "Sub": TileCategory.POINTWISE,
-    "Mul": TileCategory.POINTWISE,
-    "Concat": TileCategory.POINTWISE,
-    # Softmax normalizes along the final stored dimension, which is the channel
-    # axis in both NHWC and NLC. Neither tile axis cuts it: the height/length
-    # axis and the width axis are both ahead of it, so a tile always holds
-    # whole normalization rows and the kernel needs nothing from its
-    # neighbours. Shape-preserving and halo-free, which is what POINTWISE means
-    # here, even though the operator itself is a reduction.
-    "Softmax": TileCategory.POINTWISE,
-    "LeakyRelu": TileCategory.POINTWISE,
-    "PRelu": TileCategory.POINTWISE,
-    "Elu": TileCategory.POINTWISE,
-    "LogSoftmax": TileCategory.POINTWISE,
-    "L2Normalization": TileCategory.POINTWISE,
-    # Erf is elementwise. LayerNormalization reduces along the final stored
-    # dimension, which both tile axes are ahead of, so a tile holds whole
-    # normalization rows and needs nothing from its neighbours: the same
-    # argument that admits Softmax.
-    "Erf": TileCategory.POINTWISE,
-    "Gelu": TileCategory.POINTWISE,
-    "HardSwish": TileCategory.POINTWISE,
-    "Quantize": TileCategory.POINTWISE,
-    "Dequantize": TileCategory.POINTWISE,
-    "Abs": TileCategory.POINTWISE,
-    "Rsqrt": TileCategory.POINTWISE,
-    "Neg": TileCategory.POINTWISE,
-    "Exp": TileCategory.POINTWISE,
-    "Log": TileCategory.POINTWISE,
-    "Sqrt": TileCategory.POINTWISE,
-    "Square": TileCategory.POINTWISE,
-    "Floor": TileCategory.POINTWISE,
-    "Ceil": TileCategory.POINTWISE,
-    "Round": TileCategory.POINTWISE,
-    "Sin": TileCategory.POINTWISE,
-    "Cos": TileCategory.POINTWISE,
-    "Div": TileCategory.POINTWISE,
-    "SquaredDifference": TileCategory.POINTWISE,
-    "Max": TileCategory.POINTWISE,
-    "Min": TileCategory.POINTWISE,
-    "FloorDiv": TileCategory.POINTWISE,
-    "FloorMod": TileCategory.POINTWISE,
-    "LayerNormalization": TileCategory.POINTWISE,
-    "Equal": TileCategory.POINTWISE,
-    "Less": TileCategory.POINTWISE,
-    "LessOrEqual": TileCategory.POINTWISE,
-    "Greater": TileCategory.POINTWISE,
-    "GreaterOrEqual": TileCategory.POINTWISE,
-    "And": TileCategory.POINTWISE,
-    "Or": TileCategory.POINTWISE,
-    "Not": TileCategory.POINTWISE,
-    "Where": TileCategory.POINTWISE,
-    "Cast": TileCategory.POINTWISE,
-    "Sum": TileCategory.POINTWISE,
-    # Resampling along the height: the runtime cuts the output into bands and
-    # reads the source band each one needs. Only the height axis, and only on
-    # its own stage, because the chain executor does not compose a fractional
-    # stride through the rest of a run.
-    "Resize": TileCategory.UPSAMPLE,
-    "ResizeLinear": TileCategory.UPSAMPLE,
 }
 
 
@@ -148,43 +83,14 @@ _OP_CATEGORY: dict[str, TileCategory] = {
 # the wrong region or size from its second operand. Safe only in stages with
 # no spatial op. Shared between the rank-3 and rank-4 eligibility checks
 # below since the hazard is the same in both.
-_BINARY_OPS = frozenset({
-    "Add", "Sub", "Mul", "Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod", "PRelu",
-    "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual", "And", "Or", "Where", "Sum",
-})
+_BINARY_OPS = operators_with("axis_binary")
 
 # Rank-3 NLC stages have a deliberately narrower axis-1 contract than rank-4
 # NHWC stages.  Unary pointwise operators preserve the current length and may
 # surround one Conv1D.  Dynamic binary operators are safe only in a
 # pointwise-only stage: combining them with a strided Conv1D could expose
 # external operands at different length resolutions.
-_RANK3_AXIS1_UNARY_OPS = frozenset({
-    "Relu",
-    "Relu6",
-    "Sigmoid",
-    "Tanh",
-    "Softmax",
-    "LeakyRelu",
-    "Elu",
-    "LogSoftmax",
-    "L2Normalization",
-    "Erf",
-    "Gelu",
-    "HardSwish",
-    "Abs",
-    "Rsqrt",
-    "Neg",
-    "Exp",
-    "Log",
-    "Sqrt",
-    "Square",
-    "Floor",
-    "Ceil",
-    "Round",
-    "Sin",
-    "Cos",
-    "LayerNormalization", "Not", "Cast", "Quantize", "Dequantize",
-})
+_RANK3_AXIS1_UNARY_OPS = operators_with("axis_unary")
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
 # Conservative per-tile allocation alignment for the backend-agnostic tiled
@@ -621,14 +527,14 @@ def _transpose_band_extents(
 # against a constant reads one row to write one row, and the pointwise
 # operators beside it preserve rows outright. Read from the contract's row
 # mode, as tigris_row_tiling_op in the runtime does.
-_ROW_TILING_OPS = frozenset(name for name, row in OPERATOR_CONTRACT.items() if "row" in row.modes)
+_ROW_TILING_OPS = operators_with("row")
 
 # The operators that may read an operand the band does not cut. A matrix
 # product reads every row of its second operand to produce one row of its
 # output, so that operand is resident whole exactly as a weight is. Nothing
 # else here has an operand it would make sense to leave whole: an elementwise
 # pair whose rows do not match is not an elementwise pair.
-_ROW_TILING_WHOLE_OPERAND_OPS = frozenset({"Gemm", "MatMul"})
+_ROW_TILING_WHOLE_OPERAND_OPS = operators_with("whole_operand")
 
 
 def _row_view(info) -> tuple[int, int, int] | None:
@@ -685,9 +591,6 @@ _ROW_REDUCTIONS = frozenset({"ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum"
                              "CumSum", "ArgMax", "ArgMin"})
 _ROW_MOVEMENT = frozenset({"Gather", "GatherND", "EmbeddingLookup", "StridedSlice",
                           "MirrorPad", "ReverseV2", "DynamicUpdateSlice", "Split", "Concat", "Pad", "Transpose"})
-_BAND_BINARY = frozenset({"Add", "Sub", "Mul", "Div", "Max", "Min", "SquaredDifference",
-                          "FloorDiv", "FloorMod", "PRelu", "Equal", "Less", "LessOrEqual",
-                          "Greater", "GreaterOrEqual", "And", "Or", "Where"})
 
 
 
@@ -704,7 +607,7 @@ def _reshape_band(ag: AnalyzedGraph, stage: Stage):
             len(stage.input_tensors) != 1 or len(stage.output_tensors) != 1):
         return None
     op = ag.ops[stage.op_indices[0]]
-    if op.op_type not in {"Reshape", "Flatten"} or len(op.inputs) != 1 or len(op.outputs) != 1:
+    if op.op_type not in RESHAPE_OPS or len(op.inputs) != 1 or len(op.outputs) != 1:
         return None
     if stage.input_tensors != op.inputs or stage.output_tensors != op.outputs:
         return None
@@ -769,7 +672,7 @@ def _batch_view(info, time_major=False):
 def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True,
                       leading: int = 0) -> bool:
     """The selected stored band axis survives the operation unchanged."""
-    if op.op_type in _BAND_BINARY:
+    if op.op_type in BINARY_OPS:
         if leading < 3 or len(op.outputs) != 1 or not op.attrs.get("broadcast_untileable", False):
             return False
         target = ag.tensors[op.outputs[0]]
@@ -897,11 +800,11 @@ def _independent_mode(ag: AnalyzedGraph, op: OpNode) -> int:
     if any(name not in ag.tensors for name in [*op.inputs, *op.outputs]):
         return 0
     dynamic_metadata = any(not ag.tensors[n].is_constant for n in _whole_band_operands([op]))
-    if op.op_type in {"Split", "Concat", "Pad", "Transpose"} | _BAND_BINARY or dynamic_metadata:
-        info = ag.tensors[op.outputs[0] if op.op_type in _BAND_BINARY else op.inputs[0]]
+    if op.op_type in {"Split", "Concat", "Pad", "Transpose"} | BINARY_OPS or dynamic_metadata:
+        info = ag.tensors[op.outputs[0] if op.op_type in BINARY_OPS else op.inputs[0]]
         shape = serialized_shape(info.shape, info.layout)
         def cost(axis):
-            if op.op_type not in _BAND_BINARY:
+            if op.op_type not in BINARY_OPS:
                 return 0, -shape[axis], axis
             total = 0
             for name in dict.fromkeys([*op.inputs, *op.outputs]):
@@ -974,7 +877,7 @@ def _constant_repeats_every_row(ag: AnalyzedGraph, op: OpNode) -> bool:
     the runtime's loader.
     """
     output = ag.tensors.get(op.outputs[0]) if op.outputs else None
-    if (op.op_type not in _BAND_BINARY or output is None or len(output.shape) != 2
+    if (op.op_type not in BINARY_OPS or output is None or len(output.shape) != 2
             or not any(name and is_constant(ag, name) for name in op.inputs)):
         return True
     operands = stored_operands(ag, op)
