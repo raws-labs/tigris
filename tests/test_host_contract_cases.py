@@ -118,3 +118,32 @@ def test_bool_model_boundaries_and_codegen(tmp_path, kind, quantized, tiled):
         actual = session.run({name: _to_runtime_layout(value) for name, value in case.inputs.items()})["output"]
     assert actual.dtype == expected.dtype and actual.shape == expected.shape
     assert actual.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("kind,constant", [
+    *[(kind, False) for kind in ("Div", "Max", "Min", "SquaredDifference", "FloorDiv", "FloorMod")],
+    *[(kind, True) for kind in ("Max", "Min", "SquaredDifference")]])
+def test_rank2_row_band_equals_one_pass(tmp_path, kind, constant):
+    import onnx
+    from scripts.crossrepo_contract import _rank2_row_band_case
+    from tigris.analysis.partition_spatial import _stage_is_row_tiled
+
+    case = _rank2_row_band_case(kind, constant=constant)
+    model_path = tmp_path / "case.onnx"
+    onnx.save(case.compile_model, model_path)
+    outputs = []
+    for budgets in ((case.mem_budget, case.slow_budget), ("64K",)):
+        graph, _ = _run_pipeline(str(model_path), budgets)
+        [stage] = graph.stages
+        ops = [graph.ops[i] for i in stage.op_indices]
+        assert [op.op_type for op in ops] == [kind]
+        assert _stage_is_row_tiled(graph, stage, ops)
+        tile = stage.tile_plan
+        banded = tile is not None and tile.tileable and tile.num_tiles > 1
+        assert banded is (budgets[0] == case.mem_budget)
+        path = tmp_path / f"{budgets[0]}.tgrs"
+        path.write_bytes(emit_binary_bytes(graph))
+        with Session(path) as session:
+            outputs.append(session.run(case.inputs)["output"])
+    assert outputs[0].tobytes() == outputs[1].tobytes()
+    np.testing.assert_allclose(outputs[0], _reference(case), rtol=1e-5, atol=1e-5)

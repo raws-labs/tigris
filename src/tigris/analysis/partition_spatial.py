@@ -18,6 +18,7 @@ from tigris.analysis.lifetime import _same_stored_bytes
 from tigris.analysis.broadcast import is_constant, stored_operands
 from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW, TILE_AXIS_NONE
 from tigris.analysis.partition_temporal import partition_temporal
+from tigris.operator_contract import OPERATOR_CONTRACT
 from tigris.graph.ir import (
     AnalyzedGraph,
     Layout,
@@ -604,45 +605,9 @@ def _transpose_band_extents(
 
 # Operators that keep a rank-2 matrix's rows independent: a matrix product
 # against a constant reads one row to write one row, and the pointwise
-# operators beside it preserve rows outright. Mirrors tigris_row_tiling_op in the
-# runtime.
-_ROW_TILING_OPS = frozenset({
-    "Equal", "Less", "LessOrEqual", "Greater", "GreaterOrEqual",
-    "And", "Or", "Not", "Where", "Cast", "Sum", "Quantize", "Dequantize",
-    "Gemm",
-    "MatMul",
-    "Relu",
-    "Relu6",
-    "Sigmoid",
-    "Tanh",
-    "Erf",
-    "Gelu",
-    "HardSwish",
-    "Abs",
-    "Rsqrt",
-    "Neg",
-    "Exp",
-    "Log",
-    "Sqrt",
-    "Square",
-    "Floor",
-    "Ceil",
-    "Round",
-    "Sin",
-    "Cos",
-    "Softmax",
-    "LeakyRelu",
-    "Elu",
-    "LogSoftmax",
-    "L2Normalization",
-    "LayerNormalization",
-    "Reshape",
-    "Flatten",
-    "Add",
-    "Sub",
-    "Mul",
-    "PRelu",
-})
+# operators beside it preserve rows outright. Read from the contract's row
+# mode, as tigris_row_tiling_op in the runtime does.
+_ROW_TILING_OPS = frozenset(name for name, row in OPERATOR_CONTRACT.items() if "row" in row.modes)
 
 # The operators that may read an operand the band does not cut. A matrix
 # product reads every row of its second operand to produce one row of its

@@ -662,6 +662,34 @@ def _scalars(**values: tuple[float, int]) -> list[onnx.TensorProto]:
     return tensors
 
 
+def _elementwise_nodes(kind: str, a: str, b: str | None,
+                       output: str) -> tuple[list[onnx.NodeProto], list[onnx.TensorProto]]:
+    """The ONNX nodes, and their initializers, that the compiler reads as one `kind` operator."""
+    if kind == "Rsqrt":
+        return [helper.make_node("Sqrt", [a], ["root"]),
+                helper.make_node("Reciprocal", ["root"], [output])], []
+    if kind == "Square":
+        return [helper.make_node("Mul", [a, a], [output])], []
+    if kind == "SquaredDifference":
+        return [helper.make_node("Sub", [a, b], ["difference"]),
+                helper.make_node("Mul", ["difference", "difference"], [output])], []
+    if kind == "FloorDiv":
+        return [helper.make_node("Div", [a, b], ["quotient"]),
+                helper.make_node("Floor", ["quotient"], [output])], []
+    if kind == "FloorMod":
+        nodes = [helper.make_node("Mod", [a, b], ["remainder"], fmod=1),
+                 helper.make_node("Equal", ["remainder", "zero"], ["is_zero"]),
+                 helper.make_node("Not", ["is_zero"], ["nonzero"]),
+                 helper.make_node("Less", [b, "zero"], ["negative_b"]),
+                 helper.make_node("Less", ["remainder", "zero"], ["negative_r"]),
+                 helper.make_node("Xor", ["negative_b", "negative_r"], ["different"]),
+                 helper.make_node("And", ["nonzero", "different"], ["adjust"]),
+                 helper.make_node("Add", ["remainder", b], ["shifted"]),
+                 helper.make_node("Where", ["adjust", "shifted", "remainder"], [output])]
+        return nodes, [numpy_helper.from_array(np.array(0, dtype=np.float32), "zero")]
+    return [helper.make_node(kind, [a] if b is None else [a, b], [output])], []
+
+
 def _elementwise_case(kind: str, *, quantized: bool = False) -> ContractCase:
     shape = [1, 4, 16, 16]
     binary = kind in {"Div", "SquaredDifference", "Max", "Min", "FloorDiv", "FloorMod"}
@@ -690,30 +718,9 @@ def _elementwise_case(kind: str, *, quantized: bool = False) -> ContractCase:
             nodes += _qdq(b, "b_s", "b_z", "b_float")
             b = "b_float"
     output = "raw" if quantized else "output"
-    if kind == "Rsqrt":
-        nodes += [helper.make_node("Sqrt", [a], ["root"]),
-                  helper.make_node("Reciprocal", ["root"], [output])]
-    elif kind == "Square":
-        nodes += [helper.make_node("Mul", [a, a], [output])]
-    elif kind == "SquaredDifference":
-        nodes += [helper.make_node("Sub", [a, b], ["difference"]),
-                  helper.make_node("Mul", ["difference", "difference"], [output])]
-    elif kind == "FloorDiv":
-        nodes += [helper.make_node("Div", [a, b], ["quotient"]),
-                  helper.make_node("Floor", ["quotient"], [output])]
-    elif kind == "FloorMod":
-        initializers.append(numpy_helper.from_array(np.array(0, dtype=np.float32), "zero"))
-        nodes += [helper.make_node("Mod", [a, b], ["remainder"], fmod=1),
-                  helper.make_node("Equal", ["remainder", "zero"], ["is_zero"]),
-                  helper.make_node("Not", ["is_zero"], ["nonzero"]),
-                  helper.make_node("Less", [b, "zero"], ["negative_b"]),
-                  helper.make_node("Less", ["remainder", "zero"], ["negative_r"]),
-                  helper.make_node("Xor", ["negative_b", "negative_r"], ["different"]),
-                  helper.make_node("And", ["nonzero", "different"], ["adjust"]),
-                  helper.make_node("Add", ["remainder", b], ["shifted"]),
-                  helper.make_node("Where", ["adjust", "shifted", "remainder"], [output])]
-    else:
-        nodes += [helper.make_node(kind, [a, b] if binary else [a], [output])]
+    more_nodes, more_initializers = _elementwise_nodes(kind, a, b if binary else None, output)
+    nodes += more_nodes
+    initializers += more_initializers
     if quantized:
         nodes += _qdq("raw", "y_s", "y_z", "output")
     label = f"{'int8' if quantized else 'float'}_elementwise_{kind.lower()}"
@@ -4492,6 +4499,32 @@ def _rank2_dense_constant_case(op_type: str) -> ContractCase:
                         mem_budget="4K", slow_budget="64K", expect_tiled=True, exact_untiled=True)
 
 
+def _rank2_row_band_case(kind: str, *, constant: bool = False) -> ContractCase:
+    """A rank-2 binary operator the row band cuts, against a second input or one row of constants.
+
+    The banded plan has to equal the one-pass plan bit for bit.
+    """
+    rows, cols = 128, 16
+    rng = np.random.default_rng(13)
+    data = {"input": rng.uniform(-3, 3, size=(rows, cols)).astype(np.float32)}
+    second = rng.uniform(0.5, 3, size=(cols,) if constant else (rows, cols)).astype(np.float32)
+    second.reshape(-1)[::2] *= -1
+    inputs = [helper.make_tensor_value_info("input", TensorProto.FLOAT, [rows, cols])]
+    initializers = []
+    if constant:
+        initializers.append(numpy_helper.from_array(second, "second"))
+    else:
+        inputs.append(helper.make_tensor_value_info("second", TensorProto.FLOAT, [rows, cols]))
+        data["second"] = second
+    nodes, more = _elementwise_nodes(kind, "input", "second", "output")
+    label = f"rank2_row_band_{kind.lower()}{'_constant' if constant else ''}"
+    model = _model(label, nodes, inputs,
+                   [helper.make_tensor_value_info("output", TensorProto.FLOAT, [rows, cols])],
+                   initializers + more)
+    return ContractCase(f"float_{label}", model, model, data, (kind,),
+                        mem_budget="4K", slow_budget="64K", expect_tiled=True, exact_untiled=True)
+
+
 def _tiled_matrix_rows_case() -> ContractCase:
     """A projection pipeline the solver has to band along its rows.
 
@@ -8237,6 +8270,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         _tiled_erf_case(),
         _tiled_matrix_rows_case(),
         *[_rank2_dense_constant_case(op_type) for op_type in ("Add", "Max", "Less", "Where")],
+        *[_rank2_row_band_case(kind) for kind in (
+            "Div", "Max", "Min", "SquaredDifference", "FloorDiv", "FloorMod")],
+        *[_rank2_row_band_case(kind, constant=True) for kind in ("Max", "Min", "SquaredDifference")],
         _tiled_attention_transpose_case(),
         _normalized_classifier_case(),
         _two_input_compressed_case(),
