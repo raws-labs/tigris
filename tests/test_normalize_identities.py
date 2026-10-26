@@ -4,27 +4,18 @@ import numpy as np
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize
+from tigris.loaders import load_model
 from tigris.loaders.onnx.normalize.layout import _stored_extent
 
-from conftest import save_onnx, vi
-
-
-def _compile_graph(tmp_path, name, nodes, inputs, outputs, init=(), opset=13):
-    path = save_onnx(tmp_path, name, nodes, inputs, outputs, init, opset=opset)
-    return normalize(load_model(str(path)))
+from conftest import normalized, save_onnx, vi
 
 
 def test_dropout_and_identity_are_removed(tmp_path):
-    ag = _compile_graph(
-        tmp_path, "identities",
-        [
-            helper.make_node("Identity", ["x"], ["a"], name="id1"),
-            helper.make_node("Dropout", ["a"], ["b"], ratio=0.5, name="drop1"),
-            helper.make_node("Relu", ["b"], ["y"], name="relu1"),
-        ],
-        [vi("x", [1, 8])], [vi("y", [1, 8])], opset=11)
+    ag = normalized(tmp_path, "identities",
+                    [helper.make_node("Identity", ["x"], ["a"], name="id1"),
+                     helper.make_node("Dropout", ["a"], ["b"], ratio=0.5, name="drop1"),
+                     helper.make_node("Relu", ["b"], ["y"], name="relu1")], [vi("x", [1, 8])],
+                    [vi("y", [1, 8])], opset=11)
 
     types = [op.op_type for op in ag.ops]
     assert types == ["Relu"], types
@@ -34,13 +25,10 @@ def test_dropout_and_identity_are_removed(tmp_path):
 
 def test_removed_identity_keeps_the_declared_output_name(tmp_path):
     """An Identity feeding the graph output goes, but the output keeps its name."""
-    ag = _compile_graph(
-        tmp_path, "trailing_identity",
-        [
-            helper.make_node("Relu", ["x"], ["activation"], name="relu1"),
-            helper.make_node("Identity", ["activation"], ["y"], name="id1"),
-        ],
-        [vi("x", [1, 8])], [vi("y", [1, 8])])
+    ag = normalized(tmp_path, "trailing_identity",
+                    [helper.make_node("Relu", ["x"], ["activation"], name="relu1"),
+                     helper.make_node("Identity", ["activation"], ["y"], name="id1")],
+                    [vi("x", [1, 8])], [vi("y", [1, 8])])
 
     assert [op.op_type for op in ag.ops] == ["Relu"]
     assert ag.model_outputs == ["y"]
@@ -50,13 +38,10 @@ def test_removed_identity_keeps_the_declared_output_name(tmp_path):
 
 def test_output_that_passes_an_input_through_gets_its_own_tensor(tmp_path):
     """One tensor cannot carry two names, so the output is lowered to a same-shape copy of the input."""
-    ag = _compile_graph(
-        tmp_path, "passthrough",
-        [
-            helper.make_node("Identity", ["x"], ["y"], name="id1"),
-            helper.make_node("Relu", ["x"], ["z"], name="relu1"),
-        ],
-        [vi("x", [1, 8])], [vi("y", [1, 8]), vi("z", [1, 8])])
+    ag = normalized(tmp_path, "passthrough",
+                    [helper.make_node("Identity", ["x"], ["y"], name="id1"),
+                     helper.make_node("Relu", ["x"], ["z"], name="relu1")], [vi("x", [1, 8])],
+                    [vi("y", [1, 8]), vi("z", [1, 8])])
 
     assert ag.model_outputs == ["y", "z"]
     assert [(op.name, op.op_type, op.inputs) for op in ag.ops if "y" in op.outputs] == [("y_copy", "Reshape", ["x"])]
@@ -64,27 +49,21 @@ def test_output_that_passes_an_input_through_gets_its_own_tensor(tmp_path):
 
 def test_dropout_keeping_its_mask_is_left_alone(tmp_path):
     """The mask output only exists for training; an op whose mask is read stays."""
-    ag = _compile_graph(
-        tmp_path, "dropout_mask",
-        [
-            helper.make_node("Dropout", ["x"], ["b", "mask"], name="drop1"),
-            helper.make_node("Relu", ["b"], ["y"], name="relu1"),
-        ],
-        [vi("x", [1, 8])],
-        [vi("y", [1, 8]), helper.make_tensor_value_info(
-            "mask", TensorProto.BOOL, [1, 8])],
-        opset=12)
+    ag = normalized(tmp_path, "dropout_mask",
+                    [helper.make_node("Dropout", ["x"], ["b", "mask"], name="drop1"),
+                     helper.make_node("Relu", ["b"], ["y"], name="relu1")], [vi("x", [1, 8])],
+                    [vi("y", [1, 8]),
+                     helper.make_tensor_value_info("mask", TensorProto.BOOL, [1, 8])], opset=12)
 
     assert "Dropout" in [op.op_type for op in ag.ops]
 
 
 def test_squeeze_becomes_reshape_when_element_order_survives(tmp_path):
     """Dropping the trailing unit axes of a pooled tensor is a pure reshape."""
-    ag = _compile_graph(
-        tmp_path, "squeeze_safe",
-        [helper.make_node("Squeeze", ["x", "axes"], ["y"], name="sq1")],
-        [vi("x", [1, 6, 1, 1])], [vi("y", [1, 6])],
-        [numpy_helper.from_array(np.array([2, 3], np.int64), "axes")])
+    ag = normalized(tmp_path, "squeeze_safe",
+                    [helper.make_node("Squeeze", ["x", "axes"], ["y"], name="sq1")],
+                    [vi("x", [1, 6, 1, 1])], [vi("y", [1, 6])],
+                    [numpy_helper.from_array(np.array([2, 3], np.int64), "axes")])
 
     assert [op.op_type for op in ag.ops] == ["Reshape"]
     # The axes operand is gone: the plan takes the shape from the tensor table.
@@ -92,11 +71,10 @@ def test_squeeze_becomes_reshape_when_element_order_survives(tmp_path):
 
 
 def test_unsqueeze_becomes_reshape_when_element_order_survives(tmp_path):
-    ag = _compile_graph(
-        tmp_path, "unsqueeze_safe",
-        [helper.make_node("Unsqueeze", ["x", "axes"], ["y"], name="un1")],
-        [vi("x", [1, 6])], [vi("y", [1, 6, 1, 1])],
-        [numpy_helper.from_array(np.array([2, 3], np.int64), "axes")])
+    ag = normalized(tmp_path, "unsqueeze_safe",
+                    [helper.make_node("Unsqueeze", ["x", "axes"], ["y"], name="un1")],
+                    [vi("x", [1, 6])], [vi("y", [1, 6, 1, 1])],
+                    [numpy_helper.from_array(np.array([2, 3], np.int64), "axes")])
 
     assert [op.op_type for op in ag.ops] == ["Reshape"]
 
@@ -110,11 +88,10 @@ def test_a_squeeze_that_would_transpose_is_converted_first(tmp_path):
     nothing. The conversions are explicit Transposes around the reshape, and
     the last one puts the model output back in the layout callers expect.
     """
-    ag = _compile_graph(
-        tmp_path, "squeeze_unsafe",
-        [helper.make_node("Squeeze", ["x", "axes"], ["y"], name="sq1")],
-        [vi("x", [1, 1, 8, 4])], [vi("y", [1, 8, 4])],
-        [numpy_helper.from_array(np.array([1], np.int64), "axes")])
+    ag = normalized(tmp_path, "squeeze_unsafe",
+                    [helper.make_node("Squeeze", ["x", "axes"], ["y"], name="sq1")],
+                    [vi("x", [1, 1, 8, 4])], [vi("y", [1, 8, 4])],
+                    [numpy_helper.from_array(np.array([1], np.int64), "axes")])
 
     types = [op.op_type for op in ag.ops]
     assert types.count("Reshape") == 1
@@ -140,17 +117,12 @@ def test_a_gather_of_one_index_becomes_a_cut(tmp_path, index, parts):
     starts a contiguous run, which is what a Split cuts.
     """
     proj = np.eye(8, dtype=np.float32)
-    ag = _compile_graph(
-        tmp_path, "gather_one",
-        [
-            helper.make_node("MatMul", ["x", "proj"], ["mixed"], name="mix"),
-            helper.make_node("Gather", ["mixed", "index"], ["y"], axis=1,
-                             name="pick"),
-        ],
-        [vi("x", [1, 4, 8])], [vi("y", [1, 8])],
-        init=[numpy_helper.from_array(proj, "proj"),
-              numpy_helper.from_array(np.array(index, dtype=np.int64), "index")],
-    )
+    ag = normalized(tmp_path, "gather_one",
+                    [helper.make_node("MatMul", ["x", "proj"], ["mixed"], name="mix"),
+                     helper.make_node("Gather", ["mixed", "index"], ["y"], axis=1, name="pick")],
+                    [vi("x", [1, 4, 8])], [vi("y", [1, 8])],
+                    init=[numpy_helper.from_array(proj, "proj"),
+                          numpy_helper.from_array(np.array(index, dtype=np.int64), "index")])
     types = [op.op_type for op in ag.ops]
     assert "Gather" not in types
     assert "Split" in types
@@ -161,17 +133,12 @@ def test_a_gather_of_one_index_becomes_a_cut(tmp_path, index, parts):
 def test_a_gather_on_an_axis_something_precedes_is_left_alone(tmp_path):
     """The wanted index is then scattered through the stored bytes."""
     proj = np.eye(8, dtype=np.float32)
-    ag = _compile_graph(
-        tmp_path, "gather_inner",
-        [
-            helper.make_node("MatMul", ["x", "proj"], ["mixed"], name="mix"),
-            helper.make_node("Gather", ["mixed", "first"], ["y"], axis=2,
-                             name="pick"),
-        ],
-        [vi("x", [1, 4, 8])], [vi("y", [1, 4])],
-        init=[numpy_helper.from_array(proj, "proj"),
-              numpy_helper.from_array(np.array(0, dtype=np.int64), "first")],
-    )
+    ag = normalized(tmp_path, "gather_inner",
+                    [helper.make_node("MatMul", ["x", "proj"], ["mixed"], name="mix"),
+                     helper.make_node("Gather", ["mixed", "first"], ["y"], axis=2, name="pick")],
+                    [vi("x", [1, 4, 8])], [vi("y", [1, 4])],
+                    init=[numpy_helper.from_array(proj, "proj"),
+                          numpy_helper.from_array(np.array(0, dtype=np.int64), "first")])
     assert "Gather" in [op.op_type for op in ag.ops]
 
 
@@ -208,7 +175,7 @@ def test_quantized_boundaries_fold_onto_int8_tensors(tmp_path):
     declares stays recorded so the plan converts at the boundary instead of
     carrying a float copy of the image.
     """
-    ag = normalize(load_model(str(_boundary_model(tmp_path))))
+    ag = load_model(_boundary_model(tmp_path))
     assert not [op for op in ag.ops if op.op_type in ("QuantizeLinear", "DequantizeLinear")]
     image = ag.tensors[ag.model_inputs[0]]
     mask = ag.tensors[ag.model_outputs[0]]
@@ -225,8 +192,7 @@ def test_quantized_boundaries_fold_onto_int8_tensors(tmp_path):
     ({"kernel_shape": [5, 5], "strides": [5, 5]}, "AveragePool"),
 ], ids=["whole_map", "partial_window"])
 def test_only_a_whole_map_average_pool_becomes_the_global_pool(tmp_path, attrs, op_type):
-    path = save_onnx(
-        tmp_path, "avg_pool",
-        [helper.make_node("AveragePool", ["input"], ["output"], **attrs)],
-        [vi("input", [1, 3, 5, 7])], [vi("output", [1, 3, 1, 1])], ir_version=8)
-    assert [op.op_type for op in normalize(load_model(str(path))).ops] == [op_type]
+    ag = normalized(tmp_path, "avg_pool",
+                    [helper.make_node("AveragePool", ["input"], ["output"], **attrs)],
+                    [vi("input", [1, 3, 5, 7])], [vi("output", [1, 3, 1, 1])], ir_version=8)
+    assert [op.op_type for op in ag.ops] == [op_type]

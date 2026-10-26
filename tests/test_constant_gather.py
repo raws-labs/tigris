@@ -14,11 +14,14 @@ from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.frontends import tflite
 from tigris.runtime import RuntimeError, Session
 
+from conftest import save_onnx
+
 FIXTURES = Path(__file__).parent / "fixtures/tflite/ops"
 
 
 @pytest.mark.parametrize('kind,index_type', [('Gather', TensorProto.INT32),
                                            ('Gather', TensorProto.INT64), ('GatherND', TensorProto.INT64)])
+@pytest.mark.usefixtures("require_host_library")
 def test_constant_gather_matches_onnx_with_bounded_bands(kind, index_type, tmp_path):
     shape = (32, 16) if kind == 'Gather' else (6, 6, 16)
     data = np.random.default_rng(15).normal(size=shape).astype(np.float32)
@@ -62,6 +65,7 @@ def test_constant_gather_matches_onnx_with_bounded_bands(kind, index_type, tmp_p
 
 @pytest.mark.parametrize('name', ['embedding_table', 'gather_nd_table', 'float_embedding_table',
                                   'float_gather_nd_table', 'float_embedding_table_cast', 'float_embedding_table_int64'])
+@pytest.mark.usefixtures("require_host_library")
 def test_constant_table_matches_micro(name, tmp_path):
     source = FIXTURES / f'{name}.tflite'
     assert not tflite.unsupported(source.read_bytes())
@@ -100,19 +104,18 @@ def test_int64_tflite_input_is_narrowed_only_for_an_index_chain(monkeypatch):
 
 
 @pytest.mark.parametrize('kind', ['Gather', 'GatherND'])
+@pytest.mark.usefixtures("require_host_library")
 def test_constant_indices_and_data_feed_a_runtime_consumer(kind, tmp_path):
     shape = (6, 16) if kind == 'Gather' else (6, 6, 16)
     table = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) * 0.125
     indices = np.array([1, 3], np.int64) if kind == 'Gather' else np.array([[1, 2], [3, 5]], np.int64)
-    model = helper.make_model(helper.make_graph([
-        helper.make_node(kind, ['table', 'indices'], ['selected']),
-        helper.make_node('Add', ['selected', 'input'], ['output'])], 'constant_indices',
-        [helper.make_tensor_value_info('input', TensorProto.FLOAT, [2, 16])],
-        [helper.make_tensor_value_info('output', TensorProto.FLOAT, [2, 16])],
-        [numpy_helper.from_array(table, 'table'), numpy_helper.from_array(indices, 'indices')]),
-        opset_imports=[helper.make_opsetid('', 17)], ir_version=8)
-    source = tmp_path / 'constants.onnx'
-    onnx.save(model, source)
+    source = save_onnx(tmp_path, "constant_indices",
+                       [helper.make_node(kind, ['table', 'indices'], ['selected']),
+                        helper.make_node('Add', ['selected', 'input'], ['output'])],
+                       [helper.make_tensor_value_info('input', TensorProto.FLOAT, [2, 16])],
+                       [helper.make_tensor_value_info('output', TensorProto.FLOAT, [2, 16])],
+                       [numpy_helper.from_array(table, 'table'), numpy_helper.from_array(indices, 'indices')],
+                       opset=17, ir_version=8, filename="constants.onnx")
     values = np.arange(32, dtype=np.float32).reshape(2, 16) * 0.25
     expected = table[indices] if kind == 'Gather' else table[tuple(indices.T)]
     expected = expected + values

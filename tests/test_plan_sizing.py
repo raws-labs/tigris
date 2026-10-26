@@ -4,14 +4,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.findings import compute_findings
-from tigris.analysis.lifetime import compute_lifetimes
-from tigris.analysis.memory import compute_memory_timeline
-from tigris.analysis.partition_spatial import partition_spatial
-from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary.defs import (
     HEADER_SIZE,
     HEADER_STRUCT,
@@ -37,41 +32,21 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.loaders import load_model
 
-from conftest import save_onnx
+from conftest import full_pipeline, save_onnx
 
 OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
-
-
-def _analyze(path, budget=65536):
-    graph = load_model(path)
-    graph = compute_lifetimes(graph)
-    graph = compute_memory_timeline(graph)
-    graph = partition_temporal(graph, budget)
-    return partition_spatial(graph)
 
 
 @pytest.fixture
 def transpose_path(tmp_path):
     model_input = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2, 3])
     model_output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [3, 1, 2])
-    graph = helper.make_graph(
-        [
-            helper.make_node("Relu", ["input"], ["middle"], name="relu"),
-            helper.make_node(
-                "Transpose", ["middle"], ["output"], name="transpose", perm=[2, 0, 1]
-            ),
-        ],
-        "transpose_sizing",
-        [model_input],
-        [model_output],
-    )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    path = tmp_path / "transpose.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(tmp_path, "transpose_sizing",
+                     [helper.make_node("Relu", ["input"], ["middle"], name="relu"),
+                      helper.make_node("Transpose", ["middle"], ["output"], name="transpose",
+                                       perm=[2, 0, 1])], [model_input], [model_output],
+                     ir_version=8, filename="transpose.onnx")
 
 
 def test_exported_record_sizes_are_derived_from_canonical_layouts():
@@ -100,7 +75,7 @@ def test_exported_record_sizes_are_derived_from_canonical_layouts():
     ],
 )
 def test_float_plan_estimate_matches_serialized_size(request, fixture_name, budget):
-    graph = _analyze(request.getfixturevalue(fixture_name), budget=budget)
+    graph = full_pipeline(request.getfixturevalue(fixture_name), budget=budget)
     findings = compute_findings(graph)
 
     if fixture_name == "conv_relu_chain_path":
@@ -112,7 +87,7 @@ def test_float_plan_estimate_matches_serialized_size(request, fixture_name, budg
 
 
 def test_plan_estimate_scales_past_the_old_fixed_string_allowance(linear_3op_path):
-    graph = _analyze(linear_3op_path)
+    graph = full_pipeline(linear_3op_path, 65536)
     graph.model_name = "large-model-" + "x" * 5000
     findings = compute_findings(graph)
 
@@ -120,7 +95,7 @@ def test_plan_estimate_scales_past_the_old_fixed_string_allowance(linear_3op_pat
 
 
 def test_quantized_plan_estimate_includes_quant_section(qdq_conv_path):
-    graph = _analyze(qdq_conv_path, budget=4096)
+    graph = full_pipeline(qdq_conv_path, budget=4096)
     findings = compute_findings(graph)
 
     assert graph.is_quantized
@@ -128,7 +103,7 @@ def test_quantized_plan_estimate_includes_quant_section(qdq_conv_path):
 
 
 def test_plan_estimate_includes_typed_attributes(transpose_path):
-    graph = _analyze(transpose_path, budget=4096)
+    graph = full_pipeline(transpose_path, budget=4096)
     findings = compute_findings(graph)
 
     assert findings.plan_size_bytes == len(emit_binary_bytes(graph))
@@ -148,7 +123,7 @@ def _assert_weights_sized_as_stored(graph, weight_bytes):
 
 @pytest.mark.parametrize(("name", "weight_bytes"), [("svdf", 160), ("svdf_batch", 54)])
 def test_int16_weights_are_sized_as_the_plan_stores_them(name, weight_bytes):
-    _assert_weights_sized_as_stored(_analyze(OPS / f"{name}.tflite", budget=262144), weight_bytes)
+    _assert_weights_sized_as_stored(full_pipeline(OPS / f"{name}.tflite", budget=262144), weight_bytes)
 
 
 def test_bool_weights_are_sized_as_the_plan_stores_them(tmp_path):
@@ -159,7 +134,7 @@ def test_bool_weights_are_sized_as_the_plan_stores_them(tmp_path):
          helper.make_node("Where", ["mask", "x", "negated"], ["y"])],
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8])],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8])], [mask])
-    graph = _analyze(path, budget=4096)
+    graph = full_pipeline(path, budget=4096)
 
     assert graph.weight_data["mask"].dtype == np.bool_
     _assert_weights_sized_as_stored(graph, 8)
@@ -175,7 +150,7 @@ def test_no_lz4_estimate_when_the_writer_cannot_group_weights_by_stage(tmp_path)
          helper.make_node("Conv", ["b", "w"], ["y"], pads=[1, 1, 1, 1])],
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 16, 16])],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 16, 16])], [weight])
-    graph = _analyze(path, budget=12288)
+    graph = full_pipeline(path, budget=12288)
 
     assert len(graph.stages) == 2
     with pytest.raises(ValueError, match="shared across stages"):

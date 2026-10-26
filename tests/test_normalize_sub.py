@@ -5,15 +5,12 @@ import pytest
 from onnx import helper, numpy_helper
 
 from tigris.analysis.validation import validate_operator_support
-from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize
 
-from conftest import save_onnx, vi
+from conftest import normalized, vi
 
 
 def _normalized(tmp_path, nodes, inputs, outputs, init=()):
-    path = save_onnx(tmp_path, "sub", nodes, inputs, outputs, init)
-    return normalize(load_model(str(path)))
+    return normalized(tmp_path, "sub", nodes, inputs, outputs, init)
 
 
 def _constant(values, name="constant"):

@@ -3,42 +3,25 @@
 from types import SimpleNamespace
 
 import numpy as np
-import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris.analysis.lifetime import compute_lifetimes
-from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import (
     _row_view,
     _transpose_band_extents,
     _transpose_band_groups,
     conversion_cut_points,
-    partition_spatial,
 )
 from tigris.graph.ir import Layout
-from tigris.analysis.partition_temporal import partition_temporal
-from tigris.loaders import load_model
+
+from conftest import full_pipeline, save_onnx
 
 
 def _planned(tmp_path, nodes, shapes, budget, name="split", initializers=()):
-    graph = helper.make_graph(
-        nodes,
-        name,
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shapes[0])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shapes[1])],
-        initializer=list(initializers),
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)]
-    )
-    path = tmp_path / f"{name}.onnx"
-    onnx.save(model, str(path))
-
-    ag = load_model(path)
-    ag = compute_lifetimes(ag)
-    ag = compute_memory_timeline(ag, capture_live_tensors=False)
-    ag = partition_temporal(ag, budget)
-    return partition_spatial(ag)
+    path = save_onnx(tmp_path, name, nodes,
+                     [helper.make_tensor_value_info("x", TensorProto.FLOAT, shapes[0])],
+                     [helper.make_tensor_value_info("y", TensorProto.FLOAT, shapes[1])],
+                     list(initializers))
+    return full_pipeline(path, budget)
 
 
 def _stage_op_types(ag):

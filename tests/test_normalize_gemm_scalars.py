@@ -1,13 +1,12 @@
 """Gemm's alpha and beta, which the plan has no field for."""
 
 import numpy as np
-import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.validation import validate_operator_support
-from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize
+
+from conftest import normalized
 
 
 def _normalized(tmp_path, with_bias=True, **attrs):
@@ -20,17 +19,9 @@ def _normalized(tmp_path, with_bias=True, **attrs):
             numpy_helper.from_array(
                 np.array([1.0, 2.0, 3.0, 4.0], np.float32), "bias"))
     node = helper.make_node("Gemm", inputs, ["y"], name="gemm1", **attrs)
-    graph = helper.make_graph(
-        [node], "gemm",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])],
-        init,
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "gemm.onnx"
-    onnx.save(model, str(path))
-    return normalize(load_model(str(path)))
+    return normalized(tmp_path, "gemm", [node],
+                      [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3])],
+                      [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])], init)
 
 
 def test_alpha_scales_the_weight(tmp_path):
@@ -66,19 +57,11 @@ def test_an_unfoldable_scalar_is_refused(tmp_path, attr):
     """A dynamic weight leaves alpha with nothing constant to fold into."""
     node = helper.make_node(
         "Gemm", ["x", "w"], ["y"], name="gemm1", transB=1, **{attr: 2.0})
-    graph = helper.make_graph(
-        [node], "gemm",
-        [
-            helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3]),
-            helper.make_tensor_value_info("w", TensorProto.FLOAT, [4, 3]),
-        ],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "gemm_dynamic.onnx"
-    onnx.save(model, str(path))
-    ag = normalize(load_model(str(path)))
+    ag = normalized(tmp_path, "gemm", [node],
+                    [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3]),
+                     helper.make_tensor_value_info("w", TensorProto.FLOAT, [4, 3])],
+                    [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])],
+                    filename="gemm_dynamic.onnx")
 
     if attr == "beta":
         # beta scales C, and this graph has none.

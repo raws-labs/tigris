@@ -27,20 +27,12 @@ from tigris.graph.ir import Stage
 from conftest import full_pipeline
 
 
-def _compressed_pipeline(path, budget: str = "32K"):
-    """Use the production fixed-point planner for compressed plans."""
-    ag, total, planned_reserve, required_reserve = _run_compressed_pipeline(
-        str(path), (budget,)
-    )
-    return ag, total, planned_reserve, required_reserve
-
-
 # Compressed weight data matches uncompressed
 
 
 def test_compressed_weight_data_matches(conv_relu_chain_path):
     """Decompressed weight data from compressed plan matches uncompressed plan."""
-    ag, _, _, _ = _compressed_pipeline(conv_relu_chain_path)
+    ag, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("32K",))
 
     data_plain = emit_binary_bytes(ag)
     data_lz4 = emit_binary_bytes(ag, compress="lz4")
@@ -74,7 +66,7 @@ def test_compressed_weight_data_matches(conv_relu_chain_path):
 
 
 def test_stored_weight_blocks_hold_the_lz4_blocks_decompressed(conv_relu_chain_path):
-    ag, _, _, _ = _compressed_pipeline(conv_relu_chain_path)
+    ag, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("32K",))
     stored = read_binary_plan(emit_binary_bytes(ag, compress="none"))
     lz4 = read_binary_plan(emit_binary_bytes(ag, compress="lz4"))
 
@@ -184,7 +176,7 @@ def test_a_listed_constant_shared_across_stages_is_refused(tmp_path):
 
 
 def test_a_weight_no_stage_reads_is_refused(conv_relu_chain_path):
-    ag, _, _, _ = _compressed_pipeline(conv_relu_chain_path)
+    ag, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("32K",))
     ag.weight_data["unread"] = np.zeros(4, np.float32)
     with pytest.raises(ValueError, match=f"weight {len(ag.weight_data) - 1} belongs to no stage"):
         emit_binary_bytes(ag, compress="lz4")
@@ -207,8 +199,8 @@ def test_uncompressed_plan_unchanged(conv_relu_chain_path):
 def test_compressed_plan_budget_excludes_exact_weight_reservation(
     conv_relu_chain_path,
 ):
-    ag, total, planned_reserve, required_reserve = _compressed_pipeline(
-        conv_relu_chain_path
+    ag, total, planned_reserve, required_reserve = _run_compressed_pipeline(
+        str(conv_relu_chain_path), ("32K",)
     )
     reserve = compressed_weight_reserve_bytes(ag)
     data = emit_binary_bytes(ag, compress="lz4")

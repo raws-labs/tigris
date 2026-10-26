@@ -15,6 +15,8 @@ from tigris.analysis.partition_spatial import (
 from tigris.graph.ir import AnalyzedGraph, MemoryBudget, OpNode, Stage, TensorInfo
 from tigris.analysis.validation import validate_memory_plan
 
+from conftest import save_onnx
+
 
 # 2D tile solver
 #
@@ -26,7 +28,6 @@ from tigris.analysis.validation import validate_memory_plan
 
 def _strided_depthwise_stages(tmp_path, budget):
     import numpy as np
-    import onnx
     from onnx import helper
 
     from tigris.analysis.lifetime import compute_lifetimes
@@ -37,15 +38,12 @@ def _strided_depthwise_stages(tmp_path, budget):
     weight = helper.make_tensor(
         "w", TensorProto.FLOAT, [96, 1, 3, 3],
         np.ones((96, 1, 3, 3), dtype=np.float32).ravel().tolist())
-    graph = helper.make_graph(
-        [helper.make_node("Conv", ["input", "w"], ["output"], group=96,
-                          kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1])],
-        "dw",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 96, 34, 34])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 96, 17, 17])],
-        [weight])
-    path = str(tmp_path / "dw.onnx")
-    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+    path = save_onnx(tmp_path, "dw",
+                     [helper.make_node("Conv", ["input", "w"], ["output"], group=96,
+                                       kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1])],
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 96, 34, 34])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 96, 17, 17])],
+                     [weight])
     ag = compute_memory_timeline(compute_lifetimes(load_model(path)))
     return partition_spatial(partition_temporal(ag, budget))
 

@@ -12,6 +12,7 @@ from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.analysis.partition_spatial import detect_and_solve_chains, partition_spatial
 from tigris.analysis.partition_temporal import partition_temporal
+from tigris.emitters.binary import defs
 from tigris.loaders import load_model
 from scripts.contract_cases.fixtures import build_conv_relu_chain, build_linear_3op
 
@@ -21,7 +22,7 @@ def vi(name, shape):
 
 
 def save_onnx(tmp_path, name, nodes, inputs, outputs, init=(), opset=13,
-              ir_version=None, filename=None):
+              ir_version=None, filename=None, check=False):
     """Save a one-graph model as tmp_path/<filename or name.onnx>; return the path."""
     model = helper.make_model(
         helper.make_graph(nodes, name, inputs, outputs, list(init)),
@@ -29,9 +30,23 @@ def save_onnx(tmp_path, name, nodes, inputs, outputs, init=(), opset=13,
     )
     if ir_version is not None:
         model.ir_version = ir_version
+    if check:
+        onnx.checker.check_model(model)
     path = tmp_path / (filename or f"{name}.onnx")
     onnx.save(model, str(path))
     return path
+
+
+def section_entries(data):
+    """Map each section kind of a plan to (directory entry offset, payload offset)."""
+    entries = {}
+    offset = defs.HEADER_STRUCT.unpack_from(data)[3]
+    while True:
+        kind, start = defs.SECTION_ENTRY_STRUCT.unpack_from(data, offset)
+        if not kind:
+            return entries
+        entries[kind] = (offset, start)
+        offset += defs.SECTION_ENTRY_SIZE
 
 
 @pytest.fixture
@@ -43,6 +58,11 @@ def require_host_library(monkeypatch):
         if os.environ.get("TIGRIS_REQUIRE_HOST"):
             pytest.fail("Host library is not staged in the tigris package")
         pytest.skip("Host library has not been staged in this source checkout")
+
+
+def normalized(tmp_path, name, nodes, inputs, outputs, init=(), **kwargs):
+    """Save a one-graph model and load it through the normalizer."""
+    return load_model(save_onnx(tmp_path, name, nodes, inputs, outputs, init, **kwargs))
 
 
 def full_pipeline(path, budget=0, spatial=True, chains=False):

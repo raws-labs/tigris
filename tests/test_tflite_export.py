@@ -13,7 +13,6 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-import onnx
 import pytest
 from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
@@ -43,6 +42,8 @@ from tigris.frontends.tflite_schema import (
     WINDOWED,
 )
 from tigris.frontends.tflm import TFLM_TARGETS
+
+from conftest import save_onnx
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tflite"
 _FLOAT32, _INT32, _INT16, _INT8 = 0, 2, 7, 9
@@ -837,12 +838,10 @@ def _onnx_conv_chain(path):
                                       kernel_shape=[kernel, kernel], strides=[stride, stride],
                                       pads=pads))
         x = f"y{k}"
-    graph = helper.make_graph(nodes, "chain", [helper.make_tensor_value_info(
-        "x", TensorProto.FLOAT, [1, 4, 33, 33])], [helper.make_tensor_value_info(
-            x, TensorProto.FLOAT, [1, 4, 8, 8])], weights)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.save(model, str(path))
+    save_onnx(path.parent, "chain", nodes,
+              [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4, 33, 33])],
+              [helper.make_tensor_value_info(x, TensorProto.FLOAT, [1, 4, 8, 8])], weights,
+              ir_version=8, filename=path.name)
     # (stride, kernel, pad_top, input rows, output rows) of each convolution.
     return [(2, 3, 1, 33, 17), (1, 5, 2, 17, 17), (2, 3, 0, 17, 8)]
 

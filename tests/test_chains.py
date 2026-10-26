@@ -25,7 +25,7 @@ from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import OpNode, Stage
 from tigris.loaders import load_model
 
-from conftest import full_pipeline
+from conftest import full_pipeline, save_onnx
 
 
 # Fixtures
@@ -69,15 +69,8 @@ def three_conv_chain_path(tmp_path):
     conv2 = helper.make_node("Conv", ["t3", "w2", "b2"], ["output"], name="conv2",
                              kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
 
-    graph = helper.make_graph(
-        [conv0, relu0, conv1, relu1, conv2], "three_conv_chain",
-        [X], [Y], initializer=[w0, b0, w1, b1, w2, b2])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "three_conv_chain.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(tmp_path, "three_conv_chain", [conv0, relu0, conv1, relu1, conv2], [X], [Y],
+                     [w0, b0, w1, b1, w2, b2], opset=17, ir_version=8)
 
 
 @pytest.fixture
@@ -106,15 +99,8 @@ def chain_with_fanout_path(tmp_path):
     # Add uses t1 (fan-out) and t2
     add = helper.make_node("Add", ["t1", "t2"], ["output"], name="add0")
 
-    graph = helper.make_graph(
-        [conv0, relu, conv1, add], "chain_fanout",
-        [X], [Y], initializer=[w0, b0, w1, b1])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-
-    path = tmp_path / "chain_fanout.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(tmp_path, "chain_fanout", [conv0, relu, conv1, add], [X], [Y],
+                     [w0, b0, w1, b1], opset=17, ir_version=8)
 
 
 @pytest.fixture
@@ -139,13 +125,8 @@ def chain_with_pool_path(tmp_path):
                             kernel_shape=[2, 2], strides=[2, 2])
     conv1 = helper.make_node("Conv", ["t2", "w1", "b1"], ["output"], name="conv1",
                              kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
-    graph = helper.make_graph([conv0, relu, pool, conv1], "chain_pool",
-                              [X], [Y], initializer=[w0, b0, w1, b1])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "chain_pool.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(tmp_path, "chain_pool", [conv0, relu, pool, conv1], [X], [Y], [w0, b0, w1, b1],
+                     opset=17, ir_version=8)
 
 
 @pytest.fixture
@@ -173,13 +154,8 @@ def chain_with_model_output_mid_path(tmp_path):
                              kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
     conv2 = helper.make_node("Conv", ["t2", "w2", "b2"], ["output"], name="conv2",
                              kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
-    graph = helper.make_graph([conv0, relu, conv1, conv2], "chain_mid_output",
-                              [X], [Y, Y2], initializer=[w0, b0, w1, b1, w2, b2])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    path = tmp_path / "chain_mid_output.onnx"
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(tmp_path, "chain_mid_output", [conv0, relu, conv1, conv2], [X], [Y, Y2],
+                     [w0, b0, w1, b1, w2, b2], opset=17, ir_version=8)
 
 
 _POOL_OP_TYPES = {"MaxPool", "AveragePool"}
@@ -303,18 +279,10 @@ def _gate_model(path, *, between_changes_rows: bool, gate_escapes: bool = False)
     else:
         nodes.append(helper.make_node("Relu", ["convolved"], ["output"]))
 
-    graph = helper.make_graph(
-        nodes, "gate",
-        [helper.make_tensor_value_info(
-            "input", TensorProto.FLOAT, [1, c, side, side])],
-        [helper.make_tensor_value_info(
-            "output", TensorProto.FLOAT, [1, c, side, side])],
-        initializer=inits)
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
-    onnx.save(model, str(path))
-    return path
+    return save_onnx(path.parent, "gate", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, c, side, side])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, c, side, side])],
+                     inits, opset=17, ir_version=8, filename=path.name)
 
 
 class TestCarriedOperand:
@@ -516,7 +484,7 @@ class TestRunningBand:
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5 * np.abs(expected).max())
 
 
-def _strided_stem_model(path):
+def _strided_stem_model(tmp_path):
     """Three stride-2 convolutions down to 16x16, then three wide layers."""
     rng = np.random.default_rng(0)
     layers = [(3, 8, 3, 2), (8, 16, 3, 2), (16, 32, 3, 2), (32, 128, 1, 1), (128, 128, 3, 1), (128, 16, 1, 1)]
@@ -530,13 +498,10 @@ def _strided_stem_model(path):
             "Conv", [previous, f"w{index}"], [out], kernel_shape=[kernel, kernel],
             strides=[stride, stride], pads=[kernel // 2] * 4))
         previous = out
-    graph = helper.make_graph(
-        nodes, "stem",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 128, 128])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 16, 16, 16])],
-        inits)
-    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
-    return path
+    return save_onnx(tmp_path, "stem", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 128, 128])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 16, 16, 16])],
+                     inits)
 
 
 def test_chain_geometry_takes_the_kernel_from_the_weight(tmp_path):
@@ -546,16 +511,13 @@ def test_chain_geometry_takes_the_kernel_from_the_weight(tmp_path):
                             rng.standard_normal((16, 8, 1, 1)).astype(np.float32).ravel().tolist())
     w2 = helper.make_tensor("w2", TensorProto.FLOAT, [16, 1, 5, 5],
                             rng.standard_normal((16, 1, 5, 5)).astype(np.float32).ravel().tolist())
-    graph = helper.make_graph(
-        [helper.make_node("Conv", ["input", "w1"], ["a"]),
-         helper.make_node("Conv", ["a", "w2"], ["output"], group=16,
-                          strides=[2, 2], pads=[1, 1, 2, 2])],
-        "k5",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 8, 32, 32])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 16, 16, 16])],
-        [w1, w2])
-    path = str(tmp_path / "k5.onnx")
-    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+    path = save_onnx(tmp_path, "k5",
+                     [helper.make_node("Conv", ["input", "w1"], ["a"]),
+                      helper.make_node("Conv", ["a", "w2"], ["output"], group=16, strides=[2, 2],
+                                       pads=[1, 1, 2, 2])],
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 8, 32, 32])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 16, 16, 16])],
+                     [w1, w2])
     ag = load_model(path)
     ag.stages = [Stage(stage_id=0, op_indices=[0], input_tensors=["input"], output_tensors=["a"]),
                  Stage(stage_id=1, op_indices=[1], input_tensors=["a"], output_tensors=["output"])]
@@ -577,7 +539,7 @@ class TestSplitChains:
     budget = 48000
 
     def _stages(self, tmp_path):
-        ag = load_model(_strided_stem_model(str(tmp_path / "stem.onnx")))
+        ag = load_model(_strided_stem_model(tmp_path))
         ag = compute_memory_timeline(compute_lifetimes(ag))
         return partition_spatial(partition_temporal(ag, self.budget))
 
@@ -621,13 +583,10 @@ def test_padded_chain_fits_two_rows_without_unused_output_rows(tmp_path):
         nodes.append(helper.make_node(
             "Conv", [source, name], [output], kernel_shape=[3, 3], pads=[1] * 4))
         source = output
-    graph = helper.make_graph(
-        nodes, "padded_chain",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
-        initializers)
-    path = tmp_path / "chain.onnx"
-    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), path)
+    path = save_onnx(tmp_path, "padded_chain", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
+                     initializers, filename="chain.onnx")
     ag = full_pipeline(path, budget=32768, chains=True)
     head = ag.stages[0]
     assert head.chain_len == 4

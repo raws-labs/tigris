@@ -1,14 +1,13 @@
 """Which binary broadcasts a tile can carry."""
 
 import numpy as np
-import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.broadcast import DENSE, GENERAL, PERIODIC, access
 from tigris.analysis.partition_spatial import TileCategory, op_category
-from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize
+
+from conftest import normalized
 
 
 @pytest.mark.parametrize("stored, how", [
@@ -32,13 +31,9 @@ def _binary(tmp_path, first_shape, second_shape, constant=False):
     else:
         inputs.append(helper.make_tensor_value_info("b", TensorProto.FLOAT, second_shape))
     output = [max(x, y) for x, y in zip(first_shape, second_shape)]
-    model = helper.make_model(
-        helper.make_graph([helper.make_node("Add", ["a", "b"], ["y"])], "g", inputs,
-                          [helper.make_tensor_value_info("y", TensorProto.FLOAT, output)], init),
-        opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "m.onnx"
-    onnx.save(model, str(path))
-    ag = normalize(load_model(str(path)))
+    ag = normalized(tmp_path, "g", [helper.make_node("Add", ["a", "b"], ["y"])], inputs,
+                    [helper.make_tensor_value_info("y", TensorProto.FLOAT, output)], init,
+                    filename="m.onnx")
     return next(op for op in ag.ops if op.op_type == "Add")
 
 

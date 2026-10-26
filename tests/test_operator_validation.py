@@ -21,6 +21,8 @@ from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, Stage, TensorInfo, TilePlan
 
+from conftest import normalized, save_onnx
+
 
 @pytest.fixture
 def acos_model_path(tmp_path):
@@ -34,18 +36,8 @@ def acos_model_path(tmp_path):
     node = helper.make_node(
         "Acos", ["input"], ["output"], name="unsupported_acos"
     )
-    graph = helper.make_graph(
-        [node], "unsupported_acos", [model_input], [model_output]
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)]
-    )
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-
-    path = tmp_path / "unsupported_acos.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(tmp_path, "unsupported_acos", [node], [model_input], [model_output],
+                     ir_version=8, check=True)
 
 
 @pytest.fixture
@@ -91,21 +83,8 @@ def mixed_dtype_model_path(tmp_path):
         ),
         helper.make_node("Relu", ["float_input"], ["float_output"]),
     ]
-    graph = helper.make_graph(
-        nodes,
-        "mixed_dtype",
-        [quant_input, float_input],
-        [quant_output, float_output],
-        [scale, zero_point],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)]
-    )
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "mixed_dtype.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(tmp_path, "mixed_dtype", nodes, [quant_input, float_input],
+                     [quant_output, float_output], [scale, zero_point], ir_version=8, check=True)
 
 
 def test_normalized_unknown_operator_is_reported(acos_model_path):
@@ -213,12 +192,7 @@ def _constant_output_model(tmp_path, source):
                  n("QuantizeLinear", ["g", "s", "z"], ["gq"]), n("DequantizeLinear", ["gq", "s", "z"], ["y"])]
         returned = helper.make_tensor_value_info("k", TensorProto.FLOAT, [8, 8])
         init = [f32("s", 0.05), int8("z", 0), int8("wq", np.arange(64).reshape(8, 8) - 32), f32("ws", 0.01)]
-    model = helper.make_model(helper.make_graph(nodes, source, [x], [returned, y], init),
-                              opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    path = tmp_path / f"{source}.onnx"
-    onnx.save(model, path)
-    return path
+    return save_onnx(tmp_path, source, nodes, [x], [returned, y], init, ir_version=8)
 
 
 @pytest.mark.parametrize("source", ["constant", "shape", "dequantized_weight"])
@@ -259,13 +233,10 @@ def test_ceil_mode_whose_last_window_lies_in_the_padding_is_rejected(tmp_path):
     """Kernel 1, stride 3 over five rows: rounding up adds a window that starts
     past the input, which no end padding can state."""
     node = helper.make_node("MaxPool", ["input"], ["output"], kernel_shape=[1, 1], strides=[3, 3], ceil_mode=1)
-    model = helper.make_model(helper.make_graph(
-        [node], "ceil_past_input", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 5, 5])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 3, 3])]),
-        opset_imports=[helper.make_opsetid("", 19)])
-    model.ir_version = 9
-    path = tmp_path / "ceil_past_input.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "ceil_past_input", [node],
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 5, 5])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 3, 3])],
+                     opset=19, ir_version=9)
     graph, _ = _run_pipeline(str(path), ("4K",))
     assert "ceil_mode=1 is not encoded" in validate_operator_support(graph).describe()
 
@@ -296,15 +267,8 @@ def test_unrepresentable_pool_attributes_are_rejected(
         pads=[1, 1, 1, 1],
         **attrs,
     )
-    model = helper.make_model(
-        helper.make_graph(
-            [node], "unsupported_pool_attrs", [model_input], [model_output]
-        ),
-        opset_imports=[helper.make_opsetid("", 19)],
-    )
-    model.ir_version = 9
-    path = tmp_path / "unsupported_pool_attrs.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "unsupported_pool_attrs", [node], [model_input], [model_output],
+                     opset=19, ir_version=9)
     graph, _ = _run_pipeline(str(path), ("4K",))
 
     validation = validate_operator_support(graph)
@@ -791,8 +755,6 @@ def test_a_per_row_constant_is_accepted():
 def test_qoperator_model_names_the_format_and_the_fix(tmp_path):
     """A QOperator graph must say what it is and how to re-export it."""
     from tigris.analysis.validation import QOPERATOR_OP_TYPES
-    from tigris.loaders.onnx.loader import load_model
-    from tigris.loaders.onnx.normalize import normalize
 
     init = [
         numpy_helper.from_array(np.float32(0.02), "x_scale"),
@@ -808,17 +770,10 @@ def test_qoperator_model_names_the_format_and_the_fix(tmp_path):
         "QLinearConv",
         ["x", "x_scale", "x_zp", "W", "w_scale", "w_zp", "y_scale", "y_zp", "B"],
         ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1], name="qconv1")
-    graph = helper.make_graph(
-        [node], "qop",
-        [helper.make_tensor_value_info("x", TensorProto.INT8, [1, 4, 16, 16])],
-        [helper.make_tensor_value_info("y", TensorProto.INT8, [1, 8, 16, 16])],
-        init)
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "qoperator.onnx"
-    onnx.save(model, str(path))
-
-    ag = normalize(load_model(str(path)))
+    ag = normalized(tmp_path, "qop", [node],
+                    [helper.make_tensor_value_info("x", TensorProto.INT8, [1, 4, 16, 16])],
+                    [helper.make_tensor_value_info("y", TensorProto.INT8, [1, 8, 16, 16])], init,
+                    filename="qoperator.onnx")
     assert "QLinearConv" in QOPERATOR_OP_TYPES
 
     support = validate_operator_support(ag)
@@ -849,15 +804,8 @@ def test_non_qoperator_dtype_mismatch_is_still_reported():
 
 
 def _save(tmp_path, name, nodes, inputs, outputs, initializers=(), opset=13):
-    model = helper.make_model(
-        helper.make_graph(nodes, name, inputs, outputs, list(initializers)),
-        opset_imports=[helper.make_opsetid("", opset)],
-    )
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"{name}.onnx"
-    path.write_bytes(model.SerializeToString())
-    return path
+    return save_onnx(tmp_path, name, nodes, inputs, outputs, initializers, opset=opset,
+                     ir_version=8, check=True)
 
 
 def _avg_pool_path(tmp_path, pads):
@@ -993,17 +941,11 @@ def test_grouped_convolution_compiles_as_one_convolution_per_group(tmp_path):
     """group=2 over four channels is neither ordinary nor depthwise: a Split,
     one convolution per group and a Concat."""
     weight = np.ones((4, 2, 1, 1), dtype=np.float32)
-    graph = helper.make_graph(
-        [helper.make_node("Conv", ["input", "weight"], ["output"], name="grouped", group=2)],
-        "grouped_conv",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 2, 2])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 2, 2])],
-        [numpy_helper.from_array(weight, "weight")])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "grouped_conv.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "grouped_conv",
+                     [helper.make_node("Conv", ["input", "weight"], ["output"], name="grouped", group=2)],
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4, 2, 2])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4, 2, 2])],
+                     [numpy_helper.from_array(weight, "weight")], ir_version=8, check=True)
     output = tmp_path / "grouped_conv.tgrs"
 
     result = CliRunner().invoke(cli, ["compile", str(path), "-m", "4K", "-o", str(output)])

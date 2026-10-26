@@ -13,7 +13,7 @@ import pytest
 
 from tigris import SCHEMA_VERSION
 from tigris.cli import _run_pipeline
-from tigris.emitters.binary.defs import HEADER_SIZE, MAGIC, OP_SIZE
+from tigris.emitters.binary.defs import HEADER_SIZE, MAGIC
 from tigris.emitters.binary.writer import emit_binary_bytes
 from scripts.contract_cases.fixtures import build_linear_3op, build_conv_relu_chain, build_ds_cnn
 
@@ -56,7 +56,7 @@ CONTRACT = {
     "linear_3op": {
         "builder": build_linear_3op,
         "budget_str": "4K",
-        "version": 11,
+        "version": SCHEMA_VERSION,
         "num_tensors": 4,
         "num_ops": 3,
         "num_stages": 1,
@@ -73,7 +73,7 @@ CONTRACT = {
         # would (correctly) force multi-stage slow-overflow; 64K keeps this a
         # clean single-stage plan, which is what this format contract checks.
         "budget_str": "64K",
-        "version": 11,
+        "version": SCHEMA_VERSION,
         "num_tensors": 3,
         "num_ops": 2,        # Relu fused into first Conv
         "num_stages": 1,
@@ -86,7 +86,7 @@ CONTRACT = {
     "ds_cnn": {
         "builder": build_ds_cnn,
         "budget_str": "256K",
-        "version": 11,
+        "version": SCHEMA_VERSION,
         "num_tensors": 13,
         "num_ops": 12,
         "num_stages": 1,
@@ -102,19 +102,9 @@ CONTRACT = {
 # Tests
 
 
-def test_header_size():
-    """File header must be exactly 48 bytes."""
-    assert HEADER_SIZE == 48
-
-
 def test_schema_version():
     """Schema version constant must match the current runtime contract."""
     assert SCHEMA_VERSION == 11
-
-
-def test_op_size():
-    """The stable operator-record layout is exactly 38 bytes."""
-    assert OP_SIZE == 38
 
 
 @pytest.mark.parametrize("name", CONTRACT)

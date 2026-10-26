@@ -8,14 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from tigris.analysis.lifetime import compute_lifetimes
-from tigris.analysis.memory import compute_memory_timeline
-from tigris.analysis.partition_spatial import partition_spatial
-from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.emitters.codegen import generate_c, generate_core_header
-from tigris.loaders import load_model
 
+from conftest import full_pipeline, save_onnx
 
 _ROOT = Path(__file__).resolve().parents[1]
 # With TIGRIS_RUNTIME_SOURCE set or under CI, a missing compiler or header fails.
@@ -39,8 +35,7 @@ _RUNTIME_INCLUDE = next(
 _CC = shutil.which("cc")
 
 
-@pytest.fixture(autouse=True)
-def require_toolchain():
+def _check_toolchain():
     if _CC is None or _RUNTIME_INCLUDE is None:
         message = "C compiler and tigris-runtime headers are required"
         if _RUNTIME_SOURCE or os.environ.get("CI"):
@@ -48,13 +43,9 @@ def require_toolchain():
         pytest.skip(message)
 
 
-def _plan_bytes(path, *, compress=None):
-    graph = load_model(path)
-    graph = compute_lifetimes(graph)
-    graph = compute_memory_timeline(graph)
-    graph = partition_temporal(graph, 4096)
-    graph = partition_spatial(graph)
-    return emit_binary_bytes(graph, compress=compress)
+@pytest.fixture(autouse=True)
+def require_toolchain():
+    _check_toolchain()
 
 
 def _write_esp_stubs(include_dir: Path) -> None:
@@ -124,11 +115,11 @@ def test_generated_harness_is_valid_c99(
     linear_3op_path, qdq_conv_path, tmp_path, backend, quantized
 ):
     if backend == "cmsis-nn":
-        data = _plan_bytes(qdq_conv_path, compress="lz4")
+        data = emit_binary_bytes(full_pipeline(qdq_conv_path, 4096), compress="lz4")
     elif quantized:
-        data = _plan_bytes(qdq_conv_path)
+        data = emit_binary_bytes(full_pipeline(qdq_conv_path, 4096))
     else:
-        data = _plan_bytes(linear_3op_path)
+        data = emit_binary_bytes(full_pipeline(linear_3op_path, 4096))
 
     mode = "int8" if quantized else "float32"
     source_path = tmp_path / f"generated-{backend}-{mode}.c"
@@ -162,11 +153,11 @@ def test_generated_core_is_valid_c99(qdq_conv_path, tmp_path, backend):
     header_path = tmp_path / "generated_core.h"
     source_path.write_text(
         generate_c(
-            _plan_bytes(qdq_conv_path), backend, output_format="core",
+            emit_binary_bytes(full_pipeline(qdq_conv_path, 4096)), backend, output_format="core",
             core_header=header_path.name,
         )
     )
-    plan_data = _plan_bytes(qdq_conv_path)
+    plan_data = emit_binary_bytes(full_pipeline(qdq_conv_path, 4096))
     header_path.write_text(generate_core_header(plan_data))
 
     command = [
@@ -183,7 +174,7 @@ def test_generated_core_is_valid_c99(qdq_conv_path, tmp_path, backend):
 
 
 def test_named_generated_cores_link_together(qdq_conv_path, tmp_path):
-    plan_data = _plan_bytes(qdq_conv_path)
+    plan_data = emit_binary_bytes(full_pipeline(qdq_conv_path, 4096))
     cores = [("tigris_codegen", "default"), ("audio_codegen", "audio")]
     objects = []
     for core_name, stem in cores:
@@ -293,7 +284,7 @@ def test_generated_code_stops_on_older_runtime_headers(
     header.write_text(stripped)
 
     for path in (qdq_conv_path, conv_relu_chain_path):
-        data = _plan_bytes(path)
+        data = emit_binary_bytes(full_pipeline(path, 4096))
         core_header = tmp_path / "generated_core.h"
         core_header.write_text(generate_core_header(data))
         source = tmp_path / f"generated-{fmt}.c"
@@ -393,8 +384,7 @@ int main(int argc, char **argv)
 @pytest.fixture(scope="module")
 def sanitized_runtime(tmp_path_factory):
     """The runtime sources compiled once with address and undefined-behavior sanitizers."""
-    if _CC is None or _RUNTIME_INCLUDE is None:
-        pytest.skip("C compiler and tigris-runtime headers are required")
+    _check_toolchain()
     build = tmp_path_factory.mktemp("sanitized-runtime")
     objects = []
     for source in sorted((_RUNTIME_INCLUDE.parent / "src").glob("*.c")):
@@ -438,7 +428,7 @@ def test_generated_code_runs_on_the_host(
         assert result.exit_code == 0, result.output
         data = (tmp_path / "compiled.tgrs").read_bytes()
     else:
-        data = _plan_bytes(conv_relu_chain_path)
+        data = emit_binary_bytes(full_pipeline(conv_relu_chain_path, 4096))
     plan_path = tmp_path / "model.tgrs"
     plan_path.write_bytes(data)
     (tmp_path / "generated_core.h").write_text(generate_core_header(data))
@@ -535,7 +525,7 @@ def _rank2_dense_constant_model(directory: Path, op_type: str) -> Path:
     """y = op(x, k) with x [256, 64] and k a constant of the same shape."""
     import numpy as np
     from onnx import helper, numpy_helper
-    from conftest import save_onnx, vi
+    from conftest import vi
 
     constant = np.linspace(1.0, 2.0, 256 * 64, dtype=np.float32).reshape(256, 64)
     return save_onnx(directory, f"{op_type.lower()}_dense_constant",

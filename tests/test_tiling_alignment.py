@@ -1,23 +1,20 @@
 """A height stripe is sized by its band buffers as the runtime aligns them."""
 
-import onnx
 import pytest
 from onnx import TensorProto, helper
 
 from tigris.cli import _run_pipeline
 from tigris.analysis.validation import validate_memory_plan
 
+from conftest import save_onnx
+
 
 def _mul(tmp_path):
     shape = [1, 4, 5, 5]
-    model = helper.make_model(
-        helper.make_graph([helper.make_node("Mul", ["x", "y"], ["z"])], "mul",
-                          [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape),
-                           helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)],
-                          [helper.make_tensor_value_info("z", TensorProto.FLOAT, shape)]),
-        opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "mul.onnx"
-    onnx.save(model, str(path))
+    path = save_onnx(tmp_path, "mul", [helper.make_node("Mul", ["x", "y"], ["z"])],
+                     [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape),
+                      helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)],
+                     [helper.make_tensor_value_info("z", TensorProto.FLOAT, shape)])
     return str(path)
 
 
@@ -42,13 +39,10 @@ def test_a_band_that_does_not_fit_aligned_narrows_to_a_2d_tile(tmp_path):
 def test_transpose_band_counts_unchanged_trailing_block(tmp_path, budget, feasible):
     shape = [1, 2, 2, 3, 2, 3]
     perm = [0, 1, 3, 2, 4, 5]
-    model = helper.make_model(helper.make_graph(
-        [helper.make_node("Transpose", ["x"], ["y"], perm=perm)], "transpose",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [shape[i] for i in perm])],
-    ), opset_imports=[helper.make_opsetid("", 13)])
-    path = tmp_path / "transpose.onnx"
-    onnx.save(model, path)
+    path = save_onnx(tmp_path, "transpose",
+                     [helper.make_node("Transpose", ["x"], ["y"], perm=perm)],
+                     [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+                     [helper.make_tensor_value_info("y", TensorProto.FLOAT, [shape[i] for i in perm])])
     graph, _ = _run_pipeline(str(path), (str(budget),), report_bindings=False)
     assert validate_memory_plan(graph).feasible == feasible
     plan = graph.stages[0].tile_plan

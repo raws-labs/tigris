@@ -3,7 +3,6 @@
 import json
 
 import numpy as np
-import onnx
 import pytest
 from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
@@ -12,16 +11,15 @@ from tigris.analysis.findings import compute_findings
 from tigris.analysis.validation import validate_memory_plan
 from tigris.cli import _run_pipeline, cli
 
+from conftest import save_onnx
+
 
 def _global_pool(path, channels=64, side=8):
-    graph = helper.make_graph(
-        [helper.make_node("GlobalAveragePool", ["input"], ["output"], name="gap")],
-        "gap",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 1, 1])])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.save(model, path)
+    save_onnx(path.parent, "gap",
+              [helper.make_node("GlobalAveragePool", ["input"], ["output"], name="gap")],
+              [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, channels, side, side])],
+              [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, channels, 1, 1])],
+              ir_version=8, filename=path.name)
 
 
 def test_a_pool_groups_below_its_full_row_floor(tmp_path):
@@ -77,10 +75,8 @@ def _conv_model(path, branched=False):
                                       else_branch=branch("else")))
         inputs.append(helper.make_tensor_value_info("cond", TensorProto.BOOL, [1]))
         output = act("y", 256)
-    model = helper.make_model(helper.make_graph(nodes, "conv", inputs, [output], weights),
-                              opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.save(model, path)
+    save_onnx(path.parent, "conv", nodes, inputs, [output], weights, ir_version=8,
+              filename=path.name)
 
 
 def _tiling_counts(path, budget):

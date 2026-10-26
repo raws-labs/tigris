@@ -30,6 +30,8 @@ from tigris.graph.ir import (
     TilePlan,
 )
 
+from conftest import save_onnx
+
 
 def _aligned(size: int) -> int:
     """The size the runtime's slow allocator takes for a tensor."""
@@ -210,23 +212,14 @@ def _attention_model(path):
     """
     heads, tokens, width = 4, 64, 16
     shape = [1, heads, tokens, width]
-    graph = helper.make_graph(
-        [
-            helper.make_node(
-                "Transpose", ["input"], ["keys"], perm=[0, 1, 3, 2]),
-            helper.make_node("MatMul", ["input", "keys"], ["scores"]),
-            helper.make_node("Softmax", ["scores"], ["probs"], axis=-1),
-            helper.make_node("MatMul", ["probs", "input"], ["output"]),
-        ],
-        "attention",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    onnx.save(model, str(path))
+    save_onnx(path.parent, "attention",
+              [helper.make_node("Transpose", ["input"], ["keys"], perm=[0, 1, 3, 2]),
+               helper.make_node("MatMul", ["input", "keys"], ["scores"]),
+               helper.make_node("Softmax", ["scores"], ["probs"], axis=-1),
+               helper.make_node("MatMul", ["probs", "input"], ["output"])],
+              [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+              [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)], ir_version=8,
+              check=True, filename=path.name)
     return np.zeros(shape, dtype=np.float32)
 
 
@@ -335,13 +328,10 @@ def test_a_banded_stage_never_writes_over_an_output(tmp_path, require_host_libra
 
 
 def _softmax_model(path, shape):
-    model = helper.make_model(helper.make_graph(
-        [helper.make_node("Softmax", ["input"], ["output"], axis=-1)], "softmax",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)]),
-        opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.save(model, path)
+    save_onnx(path.parent, "softmax", [helper.make_node("Softmax", ["input"], ["output"], axis=-1)],
+              [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
+              [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)], ir_version=8,
+              filename=path.name)
 
 
 def test_slow_requirement_counts_allocation_alignment(tmp_path):
