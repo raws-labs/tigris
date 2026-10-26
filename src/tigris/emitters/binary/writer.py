@@ -109,6 +109,10 @@ from .defs import (
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
     TENSOR_STRUCT,
+    TILE_BAND_KIND_LEADING,
+    TILE_BAND_KIND_RESHAPE,
+    TILE_BAND_KIND_STRIPE,
+    TILE_BAND_MODE_LEADING,
     TILE_FLAG_BAND_ON_COLUMNS,
     TILE_PLAN_V11_STRUCT,
     WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
@@ -1421,11 +1425,18 @@ def _build_tile_plans(ag: AnalyzedGraph) -> tuple[bytes, dict[int, int]]:
         for field, value, bits in zip(("tile_extent", "num_tiles", "original_extent", "halo", "band_axis"),
                                       facts, (32, 32, 32, 16, 8)):
             _require_uint(int(value), bits, f"stage {stage.stage_id} tile plan {field}")
+        band = 0
+        if tp.tileable:
+            leading = tp.band_kind == TILE_BAND_KIND_LEADING
+            if (not TILE_BAND_KIND_RESHAPE <= tp.band_kind <= TILE_BAND_KIND_STRIPE
+                    or not (TILE_BAND_MODE_LEADING <= tp.band_mode <= 0xF if leading else tp.band_mode == 0)):
+                raise ValueError(f"stage {stage.stage_id} tile plan states no band kind the runtime runs")
+            band = tp.band_kind | tp.band_mode << 4
         buf.extend(TILE_PLAN_V11_STRUCT.pack(
             int(tp.tileable), tp.axis,
             TILE_FLAG_BAND_ON_COLUMNS if tp.band_on_columns else 0,
             input_band, output_band, tp.tile_width, tp.input_channel_group,
-            tp.input_spatial_interval, 0, tp.tiled_peak_bytes, *facts, 0,
+            tp.input_spatial_interval, 0, tp.tiled_peak_bytes, *facts, band,
         ))
 
     return bytes(buf), stage_to_tile

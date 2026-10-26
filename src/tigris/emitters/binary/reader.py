@@ -298,15 +298,16 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
             names = ("tileable", "axis", "flags", "input_band_extent", "output_band_extent",
                      "output_width_extent", "input_channel_group", "input_spatial_interval",
                      "output_linear_segment", "tiled_peak_bytes")
-            names += ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis", "_reserved")
+            names += ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis", "band")
             if version >= SCHEMA_VERSION_TILE_FACTS:
                 values = TILE_PLAN_V11_STRUCT.unpack_from(data, tp_base + i * TILE_PLAN_V11_SIZE)
             else:
                 # A schema 10 record states its scheduling choices only.
                 values = TILE_PLAN_V10_STRUCT.unpack_from(data, tp_base + i * TILE_PLAN_V10_SIZE)
-                values += (None, None, None, None, None, 0)
+                values += (None,) * 6
             tile = dict(zip(names, values))
-            del tile["_reserved"]
+            band = tile.pop("band")
+            tile["band_kind"], tile["band_mode"] = (None, None) if band is None else (band & 0xF, band >> 4)
             tile["tileable"] = bool(tile["tileable"])
             tile["band_on_columns"] = bool(tile["flags"] & TILE_FLAG_BAND_ON_COLUMNS)
             tile_plans.append(tile)

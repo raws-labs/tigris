@@ -63,6 +63,20 @@ OP_ATTR_AXES = 6             # uint8[n], the axes a reduction collapses
 # Which of the two swapped axes a layout conversion's band runs along, in the
 # tile plan's flags field.
 TILE_FLAG_BAND_ON_COLUMNS = 0x0001
+# The last byte of a schema 11 tile record: the band kind in the low four bits
+# and, for a leading band, its band mode in the high four.
+TILE_BAND_KIND_RESHAPE = 1
+TILE_BAND_KIND_LEADING = 2
+TILE_BAND_KIND_ROWS = 3
+TILE_BAND_KIND_TRANSPOSE = 4
+TILE_BAND_KIND_BY_INPUT = 5
+TILE_BAND_KIND_HW = 6
+TILE_BAND_KIND_STRIPE = 7
+TILE_BAND_MODE_LEADING = 2           # the first axis whose extent is not 1
+TILE_BAND_MODE_BATCH = 3             # axis 0
+TILE_BAND_MODE_TIME_MAJOR_BATCH = 4  # axis 1 of a rank-3 tensor, else axis 0
+TILE_BAND_MODE_TRAILING = 5          # the last axis of each tensor
+TILE_BAND_MODE_AXIS_BASE = 6         # plus the serialized axis
 
 OP_ATTR_BINARY_REQUANT = 7   # int32[6], three Q0.31 (multiplier, shift) pairs:
                              # the first operand's, the second's, the result's
@@ -161,7 +175,7 @@ OP_ACTIVATION_STRUCT = struct.Struct("<Bbbx")
 STAGE_STRUCT = struct.Struct("<I12H")
 TILE_PLAN_STRUCT = struct.Struct("<BB5H2I2H")
 TILE_PLAN_V10_STRUCT = struct.Struct("<BBH7I")
-# The schema 10 fields, then the stated tiling: extent, tiles, original (u32), halo (u16), axis (u8), 0.
+# The schema 10 fields, then the stated tiling: extent, tiles, original (u32), halo (u16), axis (u8), band (u8).
 TILE_PLAN_V11_STRUCT = struct.Struct("<BBH7I3IHBB")
 WEIGHT_ENTRY_STRUCT = struct.Struct("<III")
 QUANT_PARAM_STRUCT = struct.Struct("<fiHHHH")

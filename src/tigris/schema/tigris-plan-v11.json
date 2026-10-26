@@ -177,9 +177,29 @@
     "width_reserved": 2
   },
   "tile_plan_v11": {
+    "band_kinds": {
+      "by_input": 5,
+      "hw": 6,
+      "leading": 2,
+      "reshape": 1,
+      "rows": 3,
+      "stripe": 7,
+      "transpose": 4
+    },
+    "band_modes": {
+      "axis_base": 6,
+      "batch": 3,
+      "leading": 2,
+      "time_major_batch": 4,
+      "trailing": 5
+    },
     "fields": {
       "axis": [
         1,
+        1
+      ],
+      "band": [
+        47,
         1
       ],
       "band_axis": [
@@ -226,10 +246,6 @@
         12,
         4
       ],
-      "reserved": [
-        47,
-        1
-      ],
       "tile_extent": [
         32,
         4
@@ -253,6 +269,7 @@
     "state_int16": "int16 (ONNX dtype 5) is stored only on state tensors",
     "state_v10": "state, subgraphs and grouped tiles need schema 10 or later",
     "subgraphs_v10": "control flow needs schema 10 or later; graph 0 is the main graph",
+    "tile_band_v11": "a tileable record states the band kind the runtime runs the stage by in the low four bits of its band byte, and a leading band's mode in the high four; the loader refuses a kind the stage does not meet, and an untileable record states 0",
     "tile_facts_v11": "a tile record states the band axis, the extent the bands divide, the band, the tile count and the halo; a height stripe states its band in output rows, as Resize and 2D records do; the runtime's loader derives them from the plan and refuses a record that disagrees"
   }
 }

@@ -28,6 +28,9 @@ from tigris.emitters.binary.defs import (
     TENSOR_FLAG_LINEAR,
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
+    TILE_BAND_KIND_LEADING,
+    TILE_BAND_KIND_STRIPE,
+    TILE_BAND_MODE_LEADING,
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import (
@@ -198,6 +201,8 @@ def test_roundtrip_conv_pool(conv_pool_chain_path):
         assert tp_bin["halo"] == tp.halo
         assert tp_bin["original_extent"] == tp.original_height
         assert tp_bin["band_axis"] == tp.band_axis
+        assert (tp_bin["band_kind"], tp_bin["band_mode"]) == (tp.band_kind, tp.band_mode)
+        assert tp.band_kind == TILE_BAND_KIND_STRIPE
 
 
 # Tensor validation
@@ -266,6 +271,17 @@ def test_writer_rejects_reserved_width_axis(conv_pool_chain_path):
     stage.tile_plan.axis = 2
 
     with pytest.raises(ValueError, match="unsupported tile axis 2"):
+        emit_binary_bytes(ag)
+
+
+@pytest.mark.parametrize("kind,mode", [(0, 0), (8, 0), (TILE_BAND_KIND_STRIPE, TILE_BAND_MODE_LEADING),
+                                       (TILE_BAND_KIND_LEADING, 0), (TILE_BAND_KIND_LEADING, 16)])
+def test_writer_rejects_a_tile_plan_without_a_band_kind(conv_pool_chain_path, kind, mode):
+    ag = full_pipeline(conv_pool_chain_path, budget=4096)
+    stage = next(item for item in ag.stages if item.tile_plan is not None)
+    stage.tile_plan.band_kind, stage.tile_plan.band_mode = kind, mode
+
+    with pytest.raises(ValueError, match="states no band kind the runtime runs"):
         emit_binary_bytes(ag)
 
 
@@ -367,7 +383,7 @@ def test_immutable_supported_schema_fixtures():
         (
             11,
             "schema-v11-scheduled-peak.tgrs",
-            "6f5bcdcf014a99e794f7a0aa02064b8b5f473e3d1f2b29bf6ac715c2b5dd65bb",
+            "f4b2101c500eea2adbe418a990714374e68e7015043d3ffa1cb7997a3309c26b",
             2,
             0,
         ),
@@ -404,6 +420,7 @@ def test_immutable_supported_schema_fixtures():
             (tile,) = plan["tile_plans"]
             assert (tile["tile_extent"], tile["num_tiles"], tile["original_extent"],
                     tile["halo"], tile["band_axis"]) == (1, 7, 7, 2, 1)
+            assert (tile["band_kind"], tile["band_mode"]) == (TILE_BAND_KIND_STRIPE, 0)
         else:
             assert plan["scheduled_peak"] is None
         if version == 5:
@@ -930,8 +947,9 @@ def test_tile_wire_layout(tmp_path, state):
     assert fields[3] == tile.tile_height
     assert fields[4:9] == (0, 0, 0, 0, 0)
     assert fields[9] == tile.tiled_peak_bytes
+    # The last byte is the band kind: a global reduction walked along its input.
     assert fields[10:] == (tile.tile_height, tile.num_tiles, tile.original_height,
-                           tile.halo, tile.band_axis, 0)
+                           tile.halo, tile.band_axis, defs.TILE_BAND_KIND_BY_INPUT)
     assert defs.TILE_PLAN_V11_SIZE == 48
 
 

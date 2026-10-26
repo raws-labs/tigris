@@ -82,6 +82,7 @@ def test_tile_records_list_the_fields_their_schema_states(tmp_path):
     assert (tile["input_band_extent"], tile["output_band_extent"], tile["tile_extent"],
             tile["num_tiles"], tile["original_extent"], tile["halo"],
             tile["band_axis"]) == (0, 1, 1, 7, 7, 2, 1)
+    assert (tile["band_kind"], tile["band_mode"]) == (defs.TILE_BAND_KIND_STRIPE, 0)
     assert not {"tile_height", "original_height", "receptive_field", "overhead_bytes"} & set(tile)
 
     # The same plan at schema 10: its one record's first 32 bytes are the schema 10 record.
@@ -99,7 +100,7 @@ def test_tile_records_list_the_fields_their_schema_states(tmp_path):
     (tile,) = inspect_file(path)["plan"]["tile_plans"]
     assert tile["input_band_extent"] == 1
     assert [tile[key] for key in ("tile_extent", "num_tiles", "original_extent", "halo",
-                                  "band_axis")] == [None] * 5
+                                  "band_axis", "band_kind", "band_mode")] == [None] * 7
     read = graph_from_plan(read_binary_plan(bytes(older))).stages[0].tile_plan
     assert (read.tile_height, read.num_tiles, read.original_height) == (1, 0, 0)
     verbose = CliRunner().invoke(cli, ["inspect", str(path), "-v"])
