@@ -8,7 +8,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from .common import ContractCase, _model, _qdq, _scalars
+from .common import ContractCase, _model, _qdq, _scalars, _vi
 
 
 def _constant_add_case() -> ContractCase:
@@ -635,45 +635,21 @@ def _traced_shape_scale_case() -> ContractCase:
 
 def _math_normalization_case() -> ContractCase:
     """Constant folding, Clip->Relu6, unary math, Mul, and Softmax."""
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 4]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 4]
-    )
     nodes = [
-        helper.make_node(
-            "Constant",
-            [],
-            ["clip_min"],
-            value=numpy_helper.from_array(np.array(0.0, dtype=np.float32)),
-        ),
-        helper.make_node(
-            "Constant",
-            [],
-            ["clip_max"],
-            value=numpy_helper.from_array(np.array(6.0, dtype=np.float32)),
-        ),
-        helper.make_node(
-            "Clip", ["input", "clip_min", "clip_max"], ["clipped"]
-        ),
+        helper.make_node("Constant", [], ["clip_min"],
+                         value=numpy_helper.from_array(np.array(0.0, dtype=np.float32))),
+        helper.make_node("Constant", [], ["clip_max"],
+                         value=numpy_helper.from_array(np.array(6.0, dtype=np.float32))),
+        helper.make_node("Clip", ["input", "clip_min", "clip_max"], ["clipped"]),
         helper.make_node("Tanh", ["clipped"], ["tanh"]),
         helper.make_node("Sigmoid", ["clipped"], ["sigmoid"]),
         helper.make_node("Mul", ["tanh", "sigmoid"], ["product"]),
         helper.make_node("Softmax", ["product"], ["output"], axis=1),
     ]
-    model = _model(
-        "math_normalization", nodes, [model_input], [model_output]
-    )
+    model = _model("math_normalization", nodes, [_vi("input", [1, 4])], [_vi("output", [1, 4])])
     return ContractCase(
-        "float_math_normalization",
-        model,
-        model,
-        {
-            "input": np.array(
-                [[-3.0, 0.25, 2.0, 9.0]], dtype=np.float32
-            )
-        },
+        "float_math_normalization", model, model,
+        {"input": np.array([[-3.0, 0.25, 2.0, 9.0]], dtype=np.float32)},
         ("Relu6", "Tanh", "Sigmoid", "Mul", "Softmax"),
     )
 

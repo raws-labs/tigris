@@ -104,20 +104,63 @@ def _unread_input_case(case: ContractCase, state: bool) -> ContractCase:
                    inputs=inputs)
 
 
-def _qdq(tensor: str, scale: str, zero: str, out: str) -> list[onnx.NodeProto]:
-    """A QuantizeLinear/DequantizeLinear pair, the way a QDQ export marks a tensor int8."""
+def _vi(name: str, shape: list[int], dtype: int = TensorProto.FLOAT) -> onnx.ValueInfoProto:
+    """A graph input or output, float unless `dtype` says otherwise."""
+    return helper.make_tensor_value_info(name, dtype, shape)
+
+
+def _qdq(tensor: str, scale: str, zero: str, out: str, quantized: str | None = None,
+         **attrs) -> list[onnx.NodeProto]:
+    """A QuantizeLinear/DequantizeLinear pair, the way a QDQ export marks a tensor int8.
+
+    The int8 tensor is named `quantized`, <out>_q unless given; `attrs` go on both nodes.
+    """
+    quantized = quantized or f"{out}_q"
     return [
-        helper.make_node("QuantizeLinear", [tensor, scale, zero], [f"{out}_q"]),
-        helper.make_node("DequantizeLinear", [f"{out}_q", scale, zero], [out]),
+        helper.make_node("QuantizeLinear", [tensor, scale, zero], [quantized], **attrs),
+        helper.make_node("DequantizeLinear", [quantized, scale, zero], [out], **attrs),
+    ]
+
+
+def _qparams(scale_name: str, zero_name: str, scale: float | list[float], zero: int | list[int],
+             dtype: type = np.int8) -> list[onnx.TensorProto]:
+    """A scale and a zero-point initializer; a list makes a 1-element or per-channel tensor."""
+    return [
+        numpy_helper.from_array(np.array(scale, dtype=np.float32), scale_name),
+        numpy_helper.from_array(np.array(zero, dtype=dtype), zero_name),
     ]
 
 
 def _scalars(**values: tuple[float, int]) -> list[onnx.TensorProto]:
     """Scale and int8 zero-point initializers, named <key>_s and <key>_z."""
-    tensors = []
-    for key, (scale, zero) in values.items():
-        tensors.append(numpy_helper.from_array(
-            np.array(scale, dtype=np.float32), f"{key}_s"))
-        tensors.append(numpy_helper.from_array(
-            np.array(zero, dtype=np.int8), f"{key}_z"))
-    return tensors
+    return [tensor for key, (scale, zero) in values.items()
+            for tensor in _qparams(f"{key}_s", f"{key}_z", scale, zero)]
+
+
+def _qdq_named(prefix: str, tensor: str | None = None, out: str | None = None,
+               **attrs) -> list[onnx.NodeProto]:
+    """`_qdq` over <prefix>_scale and <prefix>_zero_point through <prefix>_q, from `tensor`
+    (default `prefix`) to `out` (default <prefix>_dq)."""
+    return _qdq(tensor or prefix, f"{prefix}_scale", f"{prefix}_zero_point",
+                out or f"{prefix}_dq", f"{prefix}_q", **attrs)
+
+
+def _qdq_operator_model(
+    graph_name: str, op_type: str, input_shape: list[int], output_shape: list[int],
+    input_q: tuple, output_q: tuple, weight: Array | None = None, weight_q: tuple = (),
+    weight_axis: int | None = None, **attrs,
+) -> onnx.ModelProto:
+    """input -> Q/DQ -> `op_type` (with a Q/DQ `weight` operand when given) -> raw -> Q/DQ ->
+    output, with the names of `_qdq_named`. `attrs` go on the operator node, `name` included."""
+    initializers = (_qparams("input_scale", "input_zero_point", *input_q)
+                    + _qparams("output_scale", "output_zero_point", *output_q))
+    nodes, operands = _qdq_named("input"), ["input_dq"]
+    if weight is not None:
+        initializers += [numpy_helper.from_array(weight, "weight"),
+                         *_qparams("weight_scale", "weight_zero_point", *weight_q)]
+        nodes += _qdq_named("weight", axis=weight_axis)
+        operands.append("weight_dq")
+    nodes += [helper.make_node(op_type, operands, ["raw"], **attrs),
+              *_qdq_named("output", "raw", "output")]
+    return _model(graph_name, nodes, [_vi("input", input_shape)], [_vi("output", output_shape)],
+                  initializers)

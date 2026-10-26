@@ -8,7 +8,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from .common import ContractCase, _model, _qdq, _scalars
+from .common import ContractCase, _model, _qdq, _qparams, _scalars, _vi
 
 
 def _split_chain_case(*, quantized: bool) -> ContractCase:
@@ -298,205 +298,75 @@ def _tiled_pool_chain_case() -> ContractCase:
     )
 
 
+def _three_conv_chain(graph_name: str, height: int, **conv) -> onnx.ModelProto:
+    """Three padded 3x3 Convs, 3 -> 4 -> 4 -> 8 channels, on a [1, 3, height, 64] input."""
+    rng = np.random.default_rng(7)
+    weights = [
+        numpy_helper.from_array(rng.normal(0.0, 0.05, size=shape).astype(np.float32), name)
+        for name, shape in (("w0", (4, 3, 3, 3)), ("w1", (4, 4, 3, 3)), ("w2", (8, 4, 3, 3)))
+    ]
+    nodes = [
+        helper.make_node("Conv", [source, weight], [out], pads=[1, 1, 1, 1], **conv)
+        for source, weight, out in (("input", "w0", "mid0"), ("mid0", "w1", "mid1"),
+                                    ("mid1", "w2", "output"))
+    ]
+    return _model(graph_name, nodes, [_vi("input", [1, 3, height, 64])],
+                  [_vi("output", [1, 8, height, 64])], weights)
+
+
 def _tiled_chain_case(*, compression: str | None = None, xip: bool = False) -> ContractCase:
     """Three padded Conv stages force the streamable-chain executor.
 
     The convolutions take their 3x3 kernel from the weights, so the chain
     recomputes a halo and runs line-buffered.
     """
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 3, 64, 64]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 8, 64, 64]
-    )
-    rng = np.random.default_rng(7)
-    weights = [
-        numpy_helper.from_array(
-            rng.normal(0.0, 0.05, size=shape).astype(np.float32), name
-        )
-        for name, shape in (
-            ("w0", (4, 3, 3, 3)),
-            ("w1", (4, 4, 3, 3)),
-            ("w2", (8, 4, 3, 3)),
-        )
-    ]
-    nodes = [
-        helper.make_node(
-            "Conv", ["input", "w0"], ["mid0"], pads=[1, 1, 1, 1]
-        ),
-        helper.make_node(
-            "Conv", ["mid0", "w1"], ["mid1"], pads=[1, 1, 1, 1]
-        ),
-        helper.make_node(
-            "Conv", ["mid1", "w2"], ["output"], pads=[1, 1, 1, 1]
-        ),
-    ]
-    model = _model("tiled_chain", nodes, [model_input], [model_output], weights)
+    model = _three_conv_chain("tiled_chain", 64)
     suffix = "lz4" if compression else "xip"
     return ContractCase(
-        f"float_tiled_chain_{suffix}",
-        model,
-        model,
+        f"float_tiled_chain_{suffix}", model, model,
         {"input": np.linspace(-1.0, 1.0, 12288, dtype=np.float32).reshape(1, 3, 64, 64)},
-        ("Conv", "Conv", "Conv"),
-        mem_budget="32K",
-        compression=compression,
-        xip=xip,
-        expect_tiled=True,
-        expect_chain=True,
-        expect_line_buffered=True,
+        ("Conv", "Conv", "Conv"), mem_budget="32K", compression=compression, xip=xip,
+        expect_tiled=True, expect_chain=True, expect_line_buffered=True,
     )
 
 
 def _linebuffer_conv_chain_case() -> ContractCase:
     """Padded Conv chain with a partial last band under either buffer bound."""
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 3, 67, 64]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 8, 67, 64]
-    )
-    rng = np.random.default_rng(7)
-    weights = [
-        numpy_helper.from_array(
-            rng.normal(0.0, 0.05, size=shape).astype(np.float32), name
-        )
-        for name, shape in (
-            ("w0", (4, 3, 3, 3)),
-            ("w1", (4, 4, 3, 3)),
-            ("w2", (8, 4, 3, 3)),
-        )
-    ]
-    nodes = [
-        helper.make_node(
-            "Conv", ["input", "w0"], ["mid0"], pads=[1, 1, 1, 1], kernel_shape=[3, 3]
-        ),
-        helper.make_node(
-            "Conv", ["mid0", "w1"], ["mid1"], pads=[1, 1, 1, 1], kernel_shape=[3, 3]
-        ),
-        helper.make_node(
-            "Conv", ["mid1", "w2"], ["output"], pads=[1, 1, 1, 1], kernel_shape=[3, 3]
-        ),
-    ]
-    model = _model(
-        "linebuffer_conv_chain", nodes, [model_input], [model_output], weights
-    )
+    model = _three_conv_chain("linebuffer_conv_chain", 67, kernel_shape=[3, 3])
     return ContractCase(
-        "float_linebuffer_conv_chain",
-        model,
-        model,
+        "float_linebuffer_conv_chain", model, model,
         {"input": np.linspace(-1.0, 1.0, 12864, dtype=np.float32).reshape(1, 3, 67, 64)},
-        ("Conv", "Conv", "Conv"),
-        mem_budget="32K",
-        expect_tiled=True,
-        expect_chain=True,
-        expect_line_buffered=True,
-        recompute_metric=True,
+        ("Conv", "Conv", "Conv"), mem_budget="32K", expect_tiled=True, expect_chain=True,
+        expect_line_buffered=True, recompute_metric=True,
     )
 
 
 def _qdq_conv_chain_case() -> ContractCase:
     """Int8 padded chain with a partial last band and recomputation checks."""
-    input_shape = [1, 3, 67, 64]
-    output_shape = [1, 8, 67, 64]
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, input_shape
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, output_shape
-    )
-
-    initializers: list[onnx.TensorProto] = [
-        numpy_helper.from_array(np.array([0.25], dtype=np.float32), "act_scale"),
-        numpy_helper.from_array(np.array([0], dtype=np.int8), "act_zero_point"),
-    ]
-    nodes = [
-        helper.make_node(
-            "QuantizeLinear",
-            ["input", "act_scale", "act_zero_point"],
-            ["input_q"],
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["input_q", "act_scale", "act_zero_point"],
-            ["act_0"],
-        ),
-    ]
+    initializers = _qparams("act_scale", "act_zero_point", [0.25], [0])
+    nodes = _qdq("input", "act_scale", "act_zero_point", "act_0", "input_q")
     rng = np.random.default_rng(11)
     channels = ((4, 3), (4, 4), (8, 4))
-    previous = "act_0"
     for index, (out_channels, in_channels) in enumerate(channels):
-        weight_name = f"w{index}"
-        weight_scale = f"w_scale{index}"
-        weight_zero = f"w_zero{index}"
-        initializers.extend(
-            [
-                numpy_helper.from_array(
-                    rng.normal(
-                        0.0, 0.05, size=(out_channels, in_channels, 3, 3)
-                    ).astype(np.float32),
-                    weight_name,
-                ),
-                numpy_helper.from_array(
-                    np.array([0.02], dtype=np.float32), weight_scale
-                ),
-                numpy_helper.from_array(np.array([0], dtype=np.int8), weight_zero),
-            ]
-        )
+        scale, zero = f"w_scale{index}", f"w_zero{index}"
+        initializers += [
+            numpy_helper.from_array(
+                rng.normal(0.0, 0.05, size=(out_channels, in_channels, 3, 3)).astype(np.float32),
+                f"w{index}"),
+            *_qparams(scale, zero, [0.02], [0]),
+        ]
         activation = "output" if index == len(channels) - 1 else f"act_{index + 1}"
-        int8_activation = f"act_q{index}"
-        nodes.extend(
-            [
-                helper.make_node(
-                    "QuantizeLinear",
-                    [weight_name, weight_scale, weight_zero],
-                    [f"w_q{index}"],
-                ),
-                helper.make_node(
-                    "DequantizeLinear",
-                    [f"w_q{index}", weight_scale, weight_zero],
-                    [f"w_dq{index}"],
-                ),
-                helper.make_node(
-                    "Conv",
-                    [previous, f"w_dq{index}"],
-                    [f"conv{index}"],
-                    pads=[1, 1, 1, 1],
-                    kernel_shape=[3, 3],
-                ),
-                helper.make_node(
-                    "QuantizeLinear",
-                    [f"conv{index}", "act_scale", "act_zero_point"],
-                    [int8_activation],
-                ),
-                helper.make_node(
-                    "DequantizeLinear",
-                    [int8_activation, "act_scale", "act_zero_point"],
-                    [activation],
-                ),
-            ]
-        )
-        previous = activation
-
-    compile_model = _model(
-        "qdq_conv_chain", nodes, [model_input], [model_output], initializers
-    )
-    reference_model = copy.deepcopy(compile_model)
-    onnx.checker.check_model(reference_model)
+        nodes += [
+            *_qdq(f"w{index}", scale, zero, f"w_dq{index}", f"w_q{index}"),
+            helper.make_node("Conv", [f"act_{index}", f"w_dq{index}"], [f"conv{index}"],
+                             pads=[1, 1, 1, 1], kernel_shape=[3, 3]),
+            *_qdq(f"conv{index}", "act_scale", "act_zero_point", activation, f"act_q{index}"),
+        ]
+    model = _model("qdq_conv_chain", nodes, [_vi("input", [1, 3, 67, 64])],
+                   [_vi("output", [1, 8, 67, 64])], initializers)
     return ContractCase(
-        "int8_linebuffer_conv_chain",
-        compile_model,
-        reference_model,
-        {
-            "input": np.linspace(
-                -1.0, 1.0, 3 * 67 * 64, dtype=np.float32
-            ).reshape(1, 3, 67, 64)
-        },
-        ("Conv", "Conv", "Conv"),
-        mem_budget="8K",
-        expect_tiled=True,
-        expect_chain=True,
-        expect_line_buffered=True,
-        recompute_metric=True,
+        "int8_linebuffer_conv_chain", model, model,
+        {"input": np.linspace(-1.0, 1.0, 3 * 67 * 64, dtype=np.float32).reshape(1, 3, 67, 64)},
+        ("Conv", "Conv", "Conv"), mem_budget="8K", expect_tiled=True, expect_chain=True,
+        expect_line_buffered=True, recompute_metric=True,
     )

@@ -11,7 +11,7 @@ from onnx import TensorProto, helper, numpy_helper
 
 from tigris.frontends.tflite import STATE_KEY
 
-from .common import ContractCase, _model, _qdq, _scalars
+from .common import ContractCase, _model, _qdq, _scalars, _vi
 from .fixtures import build_ds_cnn, build_fc_autoencoder, build_tcn
 
 
@@ -344,158 +344,53 @@ def _fc_autoencoder_256k_case() -> ContractCase:
 
 def _normalized_classifier_case() -> ContractCase:
     """BN, Relu6 fusion, shape folding, pooling, reshape, FC, flatten."""
-    model_input = helper.make_tensor_value_info(
-        "input", TensorProto.FLOAT, [1, 1, 4, 4]
-    )
-    model_output = helper.make_tensor_value_info(
-        "output", TensorProto.FLOAT, [1, 4]
-    )
     initializers = [
+        numpy_helper.from_array(np.array([[[[0.75]]], [[[-0.5]]]], dtype=np.float32), "conv_weights"),
+        numpy_helper.from_array(np.array([0.1, -0.2], dtype=np.float32), "conv_bias"),
+        numpy_helper.from_array(np.array([1.2, 0.8], dtype=np.float32), "bn_scale"),
+        numpy_helper.from_array(np.array([0.1, -0.1], dtype=np.float32), "bn_bias"),
+        numpy_helper.from_array(np.array([0.2, -0.3], dtype=np.float32), "bn_mean"),
+        numpy_helper.from_array(np.array([0.5, 0.25], dtype=np.float32), "bn_var"),
         numpy_helper.from_array(
-            np.array([[[[0.75]]], [[[-0.5]]]], dtype=np.float32),
-            "conv_weights",
-        ),
-        numpy_helper.from_array(
-            np.array([0.1, -0.2], dtype=np.float32), "conv_bias"
-        ),
-        numpy_helper.from_array(
-            np.array([1.2, 0.8], dtype=np.float32), "bn_scale"
-        ),
-        numpy_helper.from_array(
-            np.array([0.1, -0.1], dtype=np.float32), "bn_bias"
-        ),
-        numpy_helper.from_array(
-            np.array([0.2, -0.3], dtype=np.float32), "bn_mean"
-        ),
-        numpy_helper.from_array(
-            np.array([0.5, 0.25], dtype=np.float32), "bn_var"
-        ),
-        numpy_helper.from_array(
-            np.linspace(-0.4, 0.5, 32, dtype=np.float32).reshape(4, 8),
-            "fc_weights",
-        ),
-        numpy_helper.from_array(
-            np.array([0.05, -0.1, 0.15, 0.2], dtype=np.float32),
-            "fc_bias",
-        ),
+            np.linspace(-0.4, 0.5, 32, dtype=np.float32).reshape(4, 8), "fc_weights"),
+        numpy_helper.from_array(np.array([0.05, -0.1, 0.15, 0.2], dtype=np.float32), "fc_bias"),
     ]
-    nodes = [
-        helper.make_node(
-            "Constant",
-            [],
-            ["clip_min"],
-            value=numpy_helper.from_array(np.array(0.0, dtype=np.float32)),
-        ),
-        helper.make_node(
-            "Constant",
-            [],
-            ["clip_max"],
-            value=numpy_helper.from_array(np.array(6.0, dtype=np.float32)),
-        ),
-        helper.make_node(
-            "Constant",
-            [],
-            ["shape_index"],
-            value=numpy_helper.from_array(np.array(0, dtype=np.int64)),
-        ),
-        helper.make_node(
-            "Constant",
-            [],
-            ["unsqueeze_axes"],
-            value=numpy_helper.from_array(np.array([0], dtype=np.int64)),
-        ),
-        helper.make_node(
-            "Constant",
-            [],
-            ["flat_tail"],
-            value=numpy_helper.from_array(np.array([-1], dtype=np.int64)),
-        ),
-        helper.make_node(
-            "Conv",
-            ["input", "conv_weights", "conv_bias"],
-            ["conv"],
-            kernel_shape=[1, 1],
-        ),
-        helper.make_node(
-            "BatchNormalization",
-            ["conv", "bn_scale", "bn_bias", "bn_mean", "bn_var"],
-            ["normalized"],
-        ),
-        helper.make_node(
-            "Clip",
-            ["normalized", "clip_min", "clip_max"],
-            ["activated"],
-        ),
-        helper.make_node(
-            "MaxPool",
-            ["activated"],
-            ["pooled"],
-            kernel_shape=[2, 2],
-            strides=[2, 2],
-        ),
+    constants = [
+        helper.make_node("Constant", [], [name], value=numpy_helper.from_array(value))
+        for name, value in (
+            ("clip_min", np.array(0.0, dtype=np.float32)),
+            ("clip_max", np.array(6.0, dtype=np.float32)),
+            ("shape_index", np.array(0, dtype=np.int64)),
+            ("unsqueeze_axes", np.array([0], dtype=np.int64)),
+            ("flat_tail", np.array([-1], dtype=np.int64)),
+        )
+    ]
+    nodes = constants + [
+        helper.make_node("Conv", ["input", "conv_weights", "conv_bias"], ["conv"], kernel_shape=[1, 1]),
+        helper.make_node("BatchNormalization", ["conv", "bn_scale", "bn_bias", "bn_mean", "bn_var"],
+                         ["normalized"]),
+        helper.make_node("Clip", ["normalized", "clip_min", "clip_max"], ["activated"]),
+        helper.make_node("MaxPool", ["activated"], ["pooled"], kernel_shape=[2, 2], strides=[2, 2]),
         helper.make_node("Shape", ["pooled"], ["pool_shape"]),
-        helper.make_node(
-            "Gather", ["pool_shape", "shape_index"], ["batch"], axis=0
-        ),
-        helper.make_node(
-            "Unsqueeze", ["batch", "unsqueeze_axes"], ["batch_vector"]
-        ),
-        helper.make_node(
-            "Concat",
-            ["batch_vector", "flat_tail"],
-            ["target_shape"],
-            axis=0,
-        ),
-        helper.make_node(
-            "Reshape", ["pooled", "target_shape"], ["reshaped"]
-        ),
-        helper.make_node(
-            "Gemm",
-            ["reshaped", "fc_weights", "fc_bias"],
-            ["classified"],
-            transB=1,
-        ),
+        helper.make_node("Gather", ["pool_shape", "shape_index"], ["batch"], axis=0),
+        helper.make_node("Unsqueeze", ["batch", "unsqueeze_axes"], ["batch_vector"]),
+        helper.make_node("Concat", ["batch_vector", "flat_tail"], ["target_shape"], axis=0),
+        helper.make_node("Reshape", ["pooled", "target_shape"], ["reshaped"]),
+        helper.make_node("Gemm", ["reshaped", "fc_weights", "fc_bias"], ["classified"], transB=1),
         helper.make_node("Flatten", ["classified"], ["output"], axis=1),
     ]
-    model = _model(
-        "normalized_classifier",
-        nodes,
-        [model_input],
-        [model_output],
-        initializers,
-    )
+    model = _model("normalized_classifier", nodes, [_vi("input", [1, 1, 4, 4])],
+                   [_vi("output", [1, 4])], initializers)
     # The deployment shape is static even though the ONNX graph computes its
     # Reshape input through Shape/Gather/Unsqueeze/Concat. Preserve the
     # compiler's fail-closed dynamic-shape rule by declaring that known value.
-    model.graph.value_info.extend(
-        [
-            helper.make_tensor_value_info(
-                "reshaped", TensorProto.FLOAT, [1, 8]
-            )
-        ]
-    )
+    model.graph.value_info.append(_vi("reshaped", [1, 8]))
     onnx.checker.check_model(model)
     return ContractCase(
-        "float_normalized_classifier",
-        model,
-        model,
-        {
-            "input": np.array(
-                [
-                    [
-                        [
-                            [-1.0, 0.0, 1.0, 2.0],
-                            [3.0, 4.0, 5.0, 6.0],
-                            [2.5, 1.5, 0.5, -0.5],
-                            [4.5, 3.5, 2.5, 1.5],
-                        ]
-                    ]
-                ],
-                dtype=np.float32,
-            )
-        },
-        ("Conv", "MaxPool", "Reshape", "Gemm", "Flatten"),
-        compression="lz4",
+        "float_normalized_classifier", model, model,
+        {"input": np.array([[[[-1.0, 0.0, 1.0, 2.0], [3.0, 4.0, 5.0, 6.0],
+                              [2.5, 1.5, 0.5, -0.5], [4.5, 3.5, 2.5, 1.5]]]], dtype=np.float32)},
+        ("Conv", "MaxPool", "Reshape", "Gemm", "Flatten"), compression="lz4",
     )
 
 
