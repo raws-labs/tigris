@@ -157,21 +157,9 @@ def render_config() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", type=Path, required=True)
-    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    generated = {
-        args.runtime / "src/tigris_op_contract.h": render(),
-        args.runtime / "src/tigris_op_config.h": render_config(),
-    }
-    if args.check:
-        for path, content in generated.items():
-            if not path.exists() or path.read_text() != content:
-                print(f"stale operator contract: {path}")
-                return 1
-        print("Operator contract headers are current.")
-    else:
-        for path, content in generated.items():
-            path.write_text(content)
+    (args.runtime / "src/tigris_op_contract.h").write_text(render())
+    (args.runtime / "src/tigris_op_config.h").write_text(render_config())
     return 0
 
 

@@ -42,6 +42,23 @@ def _binary(fn, a, b):
     return [a, b], lambda x, y: fn(x, y)
 
 
+def _unpack(model: bytes):
+    return schema.ModelT.InitFromPackedBuf(model, 0)
+
+
+def _pack(tree) -> bytes:
+    builder = flatbuffers.Builder(4096)
+    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
+    return bytes(builder.Output())
+
+
+def _set_opcode(code, kind) -> None:
+    """Sets a builtin operator at version 1; the deprecated byte field caps at 127."""
+    code.builtinCode = kind
+    code.deprecatedBuiltinCode = min(kind, 127)
+    code.version = 1
+
+
 CASES = {
     "max_pool_valid": _unary(lambda x: tf.nn.max_pool2d(x, 2, 2, "VALID"), (1, 8, 8, 4)),
     "max_pool_same": _unary(lambda x: tf.nn.max_pool2d(x, 3, 2, "SAME"), (1, 9, 9, 4)),
@@ -216,13 +233,11 @@ def _as_operator(kind: str):
     """Rewrites the converter's one RESHAPE into SQUEEZE or EXPAND_DIMS, which
     the converter never emits itself, keeping its tensors."""
     def rewrite(model: bytes) -> bytes:
-        tree = schema.ModelT.InitFromPackedBuf(model, 0)
+        tree = _unpack(model)
         graph = tree.subgraphs[0]
         op = graph.operators[0]
         code = tree.operatorCodes[op.opcodeIndex]
-        code.builtinCode = getattr(schema.BuiltinOperator, kind)
-        code.deprecatedBuiltinCode = min(code.builtinCode, 127)
-        code.version = 1
+        _set_opcode(code, getattr(schema.BuiltinOperator, kind))
         source = graph.tensors[op.inputs[0]].shape
         target = graph.tensors[op.outputs[0]].shape
         if kind == "SQUEEZE":
@@ -244,9 +259,7 @@ def _as_operator(kind: str):
             op.inputs = np.array([op.inputs[0], len(graph.tensors) - 1], np.int32)
             op.builtinOptionsType = schema.BuiltinOptions.ExpandDimsOptions
             op.builtinOptions = schema.ExpandDimsOptionsT()
-        builder = flatbuffers.Builder(4096)
-        builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
-        return bytes(builder.Output())
+        return _pack(tree)
     return rewrite
 
 
@@ -317,14 +330,10 @@ BROKEN_REFERENCE = {"sum_channels", "sum_spatial"}
 
 def _recode(kind: str):
     def rewrite(model: bytes) -> bytes:
-        tree = schema.ModelT.InitFromPackedBuf(model, 0)
+        tree = _unpack(model)
         code = tree.operatorCodes[tree.subgraphs[0].operators[0].opcodeIndex]
-        code.builtinCode = getattr(schema.BuiltinOperator, kind)
-        code.deprecatedBuiltinCode = min(code.builtinCode, 127)
-        code.version = 1
-        builder = flatbuffers.Builder(4096)
-        builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
-        return bytes(builder.Output())
+        _set_opcode(code, getattr(schema.BuiltinOperator, kind))
+        return _pack(tree)
     return rewrite
 
 
@@ -339,7 +348,7 @@ def _int8_island(centered: bool = False, shared: bool = False):
     zero point to 0; `shared` gives every data tensor the first input's
     quantization, as a kernel that copies raw bytes requires."""
     def rewrite(model: bytes) -> bytes:
-        tree = schema.ModelT.InitFromPackedBuf(model, 0)
+        tree = _unpack(model)
         graph = tree.subgraphs[0]
         operators = list(graph.operators)
         quantize = operators.pop() if tree.operatorCodes[operators[-1].opcodeIndex].builtinCode \
@@ -357,9 +366,7 @@ def _int8_island(centered: bool = False, shared: bool = False):
             for index in [*sources.values(), *op.outputs]:
                 graph.tensors[index].quantization.scale = np.array(first.scale)
                 graph.tensors[index].quantization.zeroPoint = np.array(first.zeroPoint)
-        builder = flatbuffers.Builder(4096)
-        builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
-        return bytes(builder.Output())
+        return _pack(tree)
     return rewrite
 
 
@@ -492,15 +499,11 @@ CASES.update(BOOLEAN)
 def _select_v2(model: bytes) -> bytes:
     """The converter's SELECT for operands of one shape, recoded as the
     SELECT_V2 TFLite Micro registers; the two agree without broadcasting."""
-    tree = schema.ModelT.InitFromPackedBuf(model, 0)
+    tree = _unpack(model)
     for code in tree.operatorCodes:
         if code.builtinCode == schema.BuiltinOperator.SELECT:
-            code.builtinCode = schema.BuiltinOperator.SELECT_V2
-            code.deprecatedBuiltinCode = min(code.builtinCode, 127)
-            code.version = 1
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
-    return bytes(builder.Output())
+            _set_opcode(code, schema.BuiltinOperator.SELECT_V2)
+    return _pack(tree)
 
 
 REWRITES["select_v2"] = _select_v2
@@ -509,7 +512,7 @@ REWRITES["select_v2"] = _select_v2
 def _embedding_lookup(model: bytes) -> bytes:
     """GATHER on axis 0 recoded as EMBEDDING_LOOKUP, which takes the ids first
     and the table second; the converter emits it for no TensorFlow operation."""
-    tree = schema.ModelT.InitFromPackedBuf(model, 0)
+    tree = _unpack(model)
     graph = tree.subgraphs[0]
     op = graph.operators[0]
     code = tree.operatorCodes[op.opcodeIndex]
@@ -519,9 +522,7 @@ def _embedding_lookup(model: bytes) -> bytes:
     op.inputs = np.array([op.inputs[1], op.inputs[0]], np.int32)
     op.builtinOptionsType = schema.BuiltinOptions.NONE
     op.builtinOptions = None
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
-    return bytes(builder.Output())
+    return _pack(tree)
 
 
 REWRITES["embedding_lookup"] = _embedding_lookup
@@ -546,15 +547,13 @@ def _embedding_table_int64():
 
 
 def _int32_embedding_reference(model):
-    tree = schema.ModelT.InitFromPackedBuf(model, 0)
+    tree = _unpack(model)
     graph = tree.subgraphs[0]
     cast = graph.operators.pop(0)
     graph.tensors[graph.inputs[0]].type = schema.TensorType.INT32
     for op in graph.operators:
         op.inputs = np.where(op.inputs == cast.outputs[0], cast.inputs[0], op.inputs).astype(np.int32)
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
-    return bytes(builder.Output())
+    return _pack(tree)
 
 
 def _one_operator(code, options_type, options, tensors, op_inputs, op_outputs, inputs, outputs):
@@ -613,13 +612,9 @@ def _operators(operators, tensors, inputs, outputs):
         if isinstance(code, str):
             opcode.customCode = code.encode()
             code = schema.BuiltinOperator.CUSTOM
-        opcode.builtinCode = code
-        opcode.deprecatedBuiltinCode = min(code, 127)
-        opcode.version = 1
+        _set_opcode(opcode, code)
         tree.operatorCodes.append(opcode)
-    builder = flatbuffers.Builder(4096)
-    builder.Finish(tree.Pack(builder), file_identifier=b"TFL3")
-    return bytes(builder.Output())
+    return _pack(tree)
 
 
 def _quantize(values, scale, dtype):
