@@ -175,6 +175,7 @@ OPERATOR_CONTRACT: dict[str, OperatorContract] = {
 }
 
 OP_TYPE_MAP = {name: row.opcode for name, row in OPERATOR_CONTRACT.items()}
+OP_TYPE_BY_CODE = {opcode: name for name, opcode in OP_TYPE_MAP.items()}
 OP_C_NAMES = {row.opcode: row.c_name.removeprefix("TIGRIS_OP_")
               for row in OPERATOR_CONTRACT.values()}
 OP_DTYPE_SIGNATURES = {name: row.signature for name, row in OPERATOR_CONTRACT.items()}

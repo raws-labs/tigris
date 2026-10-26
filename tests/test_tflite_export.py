@@ -23,7 +23,7 @@ from tigris.cli.export import export_report
 from tigris.frontends import tflite
 from tigris.frontends import tflite_writer as tw
 from tigris.frontends.flatbuffer import Table
-from tigris.frontends.tflite import _BUILTIN_OPERATORS, TFLM_TARGETS, Window, window
+from tigris.frontends.tflite import Window, window
 from tigris.frontends.tflite_export import (
     Export,
     _conv_geometry,
@@ -35,6 +35,14 @@ from tigris.frontends.tflite_export import (
     persistent,
     tflm_tensor_arena,
 )
+from tigris.frontends.tflite_schema import (
+    BUILTIN_OPERATORS,
+    MODEL_BUFFERS,
+    SG_OPERATORS,
+    SG_TENSORS,
+    WINDOWED,
+)
+from tigris.frontends.tflm import TFLM_TARGETS
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tflite"
 _FLOAT32, _INT32, _INT16, _INT8 = 0, 2, 7, 9
@@ -119,7 +127,7 @@ class _Builder:
         return len(self.tensors) - 1
 
     def operator(self, kind, inputs, output, options=None, fields=None):
-        code = _BUILTIN_OPERATORS.index(kind)
+        code = BUILTIN_OPERATORS.index(kind)
         if code not in [c.builtin_code for c in self.codes]:
             self.codes.append(tw.OperatorCode(code, 1, None, min(code, 127)))
         opcode = [c.builtin_code for c in self.codes].index(code)
@@ -446,7 +454,7 @@ def _external_buffers(data: bytes) -> bytes:
     model = tw.read(data)
     contents, model.buffers = model.buffers, [None] * len(model.buffers)
     out = bytearray(tw.write(model))
-    vector, _ = Table.root(bytes(out))._vector(tflite._MODEL_BUFFERS)
+    vector, _ = Table.root(bytes(out))._vector(MODEL_BUFFERS)
     for index, content in enumerate(contents):
         if not content:
             continue
@@ -765,10 +773,10 @@ def test_the_importer_and_export_read_the_same_window_from_a_file():
         data = path.read_bytes()
         model, written = tflite._Model(data), tw.read(data)
         for table, graph in zip(model.subgraphs, written.subgraphs):
-            tensors = [tflite._Tensor(model, t) for t in table.tables(tflite._SG_TENSORS)]
-            for i, op_table in enumerate(table.tables(tflite._SG_OPERATORS)):
+            tensors = [tflite._Tensor(model, t) for t in table.tables(SG_TENSORS)]
+            for i, op_table in enumerate(table.tables(SG_OPERATORS)):
                 op, kind = tflite._Operator(model, op_table, i), _kind(written, graph.operators[i])
-                if op.kind not in tflite._WINDOWED:
+                if op.kind not in WINDOWED:
                     continue
                 assert kind == op.kind
                 weights = tensors[op.inputs[1]].shape if kind in tflite._WEIGHTED else None
@@ -991,7 +999,7 @@ def _variable_in_one_subgraph(path: Path) -> Path:
     subgraph that keeps a RESOURCE tensor."""
     model = tw.read((FIXTURES / "ops" / "float_variable_window.tflite").read_bytes())
     assert model.operator_codes[model.subgraphs[0].operators[0].opcode].builtin_code == \
-        _BUILTIN_OPERATORS.index("CALL_ONCE")
+        BUILTIN_OPERATORS.index("CALL_ONCE")
     model.subgraphs = model.subgraphs[:1]
     model.subgraphs[0].operators = model.subgraphs[0].operators[1:]
     path.write_bytes(tw.write(model))

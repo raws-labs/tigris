@@ -19,6 +19,7 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.frontends import tflite
 from tigris.frontends import tflite_writer as tw
 from tigris.frontends.flatbuffer import Table
+from tigris.frontends.tflite_schema import BUILTIN_OPERATORS, MAGIC, SG_OPERATORS
 
 OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
 _FLOAT32, _INT32, _INT64, _BOOL, _INT16, _INT8 = 0, 2, 4, 6, 7, 9
@@ -76,7 +77,7 @@ def _constant(graph, model, values, type_: int, quantization=None) -> int:
 
 def _code(model, kind: str) -> int:
     """The opcode of builtin `kind`, added to the model when it has none."""
-    code = tflite._BUILTIN_OPERATORS.index(kind)
+    code = BUILTIN_OPERATORS.index(kind)
     codes = [max(c.builtin_code, c.deprecated_builtin_code) for c in model.operator_codes]
     if code not in codes:
         model.operator_codes.append(tw.OperatorCode(code, 1, None, min(code, 127)))
@@ -587,7 +588,7 @@ def _with_external_buffer(model: tw.Model, index: int, overstated: int = 0) -> b
                  for c in model.operator_codes]
         root = w.table([(0, "I", model.version), (1, "o", w.tables(codes)),
                         (2, "o", w.tables([subgraph])), (4, "o", w.tables(buffers))])
-        w.b.Finish(root, file_identifier=tflite.MAGIC)
+        w.b.Finish(root, file_identifier=MAGIC)
         return bytes(w.b.Output())
 
     # The offset is a fixed-width field, so its value does not change the length.
@@ -731,7 +732,7 @@ def _first_of_each_kind():
     for path in sorted(OPS.glob("*.tflite")):
         model = tflite._Model(path.read_bytes())
         for position, subgraph in enumerate(model.subgraphs):
-            for index, table in enumerate(subgraph.tables(tflite._SG_OPERATORS)):
+            for index, table in enumerate(subgraph.tables(SG_OPERATORS)):
                 kind = tflite._Operator(model, table, index).kind
                 if kind not in seen:
                     seen.add(kind)

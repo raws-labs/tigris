@@ -20,19 +20,16 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from tigris.frontends import tflite_writer as tw
-from tigris.frontends.tflite import (
-    _BUILTIN_OPERATORS,
-    _SAME,
-    _TENSOR_TYPES,
-    _TFLM_KERNELS,
-    _VALID,
+from tigris.frontends.tflite import _check_indices, window
+from tigris.frontends.tflite_schema import BUILTIN_OPERATORS, SAME, TENSOR_TYPES, VALID
+from tigris.frontends.tflm import (
+    TFLM_KERNELS,
     TFLM_TARGETS,
     TflmTarget,
-    _check_indices,
     tflm_arena,
+    tflm_lifetimes,
     tflm_persistent,
     tflm_tensor_bytes,
-    window,
 )
 
 # CONCATENATION takes at most this many inputs in TFLite Micro.
@@ -42,8 +39,8 @@ MAX_REGION = 12
 # The TFLM_TARGETS entry export plans for unless told otherwise.
 DEFAULT_TARGET = "arm-none-eabi"
 
-_INT8, _INT32 = _TENSOR_TYPES.index("INT8"), _TENSOR_TYPES.index("INT32")
-_CODES = {name: code for code, name in enumerate(_BUILTIN_OPERATORS)}
+_INT8, _INT32 = TENSOR_TYPES.index("INT8"), TENSOR_TYPES.index("INT32")
+_CODES = {name: code for code, name in enumerate(BUILTIN_OPERATORS)}
 # BuiltinOptions union types of the operators the rewrite adds.
 _OPTION_TYPES = {"CONCATENATION": 10, "PAD": 22, "PADV2": 43, "SLICE": 48}
 _CONVS = ("CONV_2D", "DEPTHWISE_CONV_2D")
@@ -127,7 +124,7 @@ def _code_kind(model: tw.Model, index: int) -> str:
     if code.custom_code is not None:
         return "CUSTOM"
     builtin = max(code.builtin_code, code.deprecated_builtin_code)
-    return _BUILTIN_OPERATORS[builtin] if 0 <= builtin < len(_BUILTIN_OPERATORS) else "UNKNOWN"
+    return BUILTIN_OPERATORS[builtin] if 0 <= builtin < len(BUILTIN_OPERATORS) else "UNKNOWN"
 
 
 def _option(op: tw.Operator, slot: int, fmt: str, default):
@@ -148,7 +145,7 @@ def _is_constant(model: tw.Model, tensor: tw.Tensor) -> bool:
 
 
 def _values(model: tw.Model, tensor: tw.Tensor) -> np.ndarray | None:
-    dtype = {_INT32: "<i4", _TENSOR_TYPES.index("INT64"): "<i8"}.get(tensor.type)
+    dtype = {_INT32: "<i4", TENSOR_TYPES.index("INT64"): "<i8"}.get(tensor.type)
     data = _data(model, tensor)
     if dtype is None or not data:
         return None
@@ -177,10 +174,10 @@ def _conv_geometry(model: tw.Model, sg: tw.Subgraph, op: tw.Operator, kind: str)
             return None
         weights = w.shape
     win = window(kind, functools.partial(_option, op), weights)
-    if win.padding not in (_SAME, _VALID) or min(*win.kernel, *win.strides, *win.dilations) < 1:
+    if win.padding not in (SAME, VALID) or min(*win.kernel, *win.strides, *win.dilations) < 1:
         return None
     (h, w_), (oh, ow) = x.shape[1:3], y.shape[1:3]
-    if win.padding == _VALID and (h < win.spans[0] or w_ < win.spans[1]):
+    if win.padding == VALID and (h < win.spans[0] or w_ < win.spans[1]):
         return None
     if [oh, ow] != win.outputs((h, w_)):
         return None
@@ -419,7 +416,7 @@ def _band_region(model: tw.Model, nodes: list, a: int, b: int, bands: int) -> _R
                 copy.inputs[1] = edit.constant([[0, 0], [above, below], [g.left, g.right], [0, 0]],
                                                 _INT32)
             elif node.geometry is not None:
-                copy.options = replace(op.options, fields={**op.options.fields, 0: ("b", _VALID)})
+                copy.options = replace(op.options, fields={**op.options.fields, 0: ("b", VALID)})
             operators.append(copy)
             macs += node.macs // sg.tensors[node.output].shape[1] * (rows[1] - rows[0])
             produced[node.output] = (output, rows)
@@ -452,7 +449,7 @@ def _fold_pads(model: tw.Model) -> tuple[tw.Model, list[int]]:
         x, padded = sg.tensors[op.inputs[0]], sg.tensors[op.outputs[0]]
         if (kind not in _CONVS or conv.inputs[0] != op.outputs[0] or conv.inputs.count(op.outputs[0]) != 1
                 or not _band_tensor(x) or not _same_quantization(x, padded)
-                or _option(conv, 0, "b", _SAME) != _VALID):
+                or _option(conv, 0, "b", SAME) != VALID):
             continue
         pads = _values(model, sg.tensors[op.inputs[1]])
         g = _conv_geometry(model, sg, conv, kind)
@@ -462,7 +459,7 @@ def _fold_pads(model: tw.Model) -> tuple[tw.Model, list[int]]:
         h, w = x.shape[1:3]
         oh, ow = y.shape[1:3]
         same = window(kind, functools.partial(_option, conv),
-                      sg.tensors[conv.inputs[1]].shape)._replace(padding=_SAME)
+                      sg.tensors[conv.inputs[1]].shape)._replace(padding=SAME)
         if [oh, ow] != same.outputs((h, w)):
             continue
         if [tuple(int(v) for v in pads[1]), tuple(int(v) for v in pads[2])] != same.pads((h, w), (oh, ow)):
@@ -470,7 +467,7 @@ def _fold_pads(model: tw.Model) -> tuple[tw.Model, list[int]]:
         folded.add(k)
         changed[users[0]] = replace(conv, inputs=[op.inputs[0], *conv.inputs[1:]],
                                     options=replace(conv.options, fields={
-                                        **conv.options.fields, 0: ("b", _SAME)}))
+                                        **conv.options.fields, 0: ("b", SAME)}))
     kept = [k for k in range(len(sg.operators)) if k not in folded]
     operators = [changed.get(k, sg.operators[k]) for k in kept]
     return replace(model, subgraphs=[replace(sg, operators=operators)]), kept
@@ -523,7 +520,7 @@ def _tensors(model: tw.Model, referenced: bool = False) -> list:
     `referenced`, a tensor _prune drops is not placed."""
     sg = model.subgraphs[0]
     used = set(_kept(model)) if referenced else None
-    return [(_TENSOR_TYPES[t.type] if 0 <= t.type < len(_TENSOR_TYPES) else None, t.shape or [],
+    return [(TENSOR_TYPES[t.type] if 0 <= t.type < len(TENSOR_TYPES) else None, t.shape or [],
              not (_is_constant(model, t) or t.is_variable) and (used is None or i in used))
             for i, t in enumerate(sg.tensors)]
 
@@ -567,7 +564,7 @@ def persistent(model: tw.Model, target: TflmTarget, compression: bool = False,
     for i in keep:
         t = sg.tensors[i]
         q = t.quantization
-        tensors.append((_TENSOR_TYPES[t.type] if 0 <= t.type < len(_TENSOR_TYPES) else None,
+        tensors.append((TENSOR_TYPES[t.type] if 0 <= t.type < len(TENSOR_TYPES) else None,
                         t.shape or [], t.is_variable,
                         len(q.scale or ()) if q else 0, len(q.zero_point or ()) if q else 0))
     operators = []
@@ -587,21 +584,12 @@ def _live(model: tw.Model) -> list[int]:
     sizes = tflm_tensor_bytes(_tensors(model), [(_kind(model, op), op.inputs, op.outputs)
                                                 for op in sg.operators])
     scopes = len(sg.operators) + 1
-    first, last = {}, {}
-    for index in sg.inputs:
-        first.setdefault(index, 0)
-        last[index] = 0
-    for scope, op in enumerate(sg.operators, start=1):
-        for index in op.outputs:
-            first.setdefault(index, scope)
-        for index in (*op.inputs, *op.outputs):
-            if index >= 0:
-                last[index] = scope
-    for index in sg.outputs:
-        first.setdefault(index, scopes - 1)
-        last[index] = scopes - 1
+    first, last = tflm_lifetimes(len(sg.tensors), [(op.inputs, op.outputs) for op in sg.operators],
+                                 sg.inputs, sg.outputs)
     change = [0] * (scopes + 1)
-    for index, start in first.items():
+    for index, start in enumerate(first):
+        if start == -1:
+            continue
         size = (sizes[index] + 15) // 16 * 16
         change[start] += size
         change[last[index] + 1] -= size
@@ -689,7 +677,7 @@ def export(data: bytes, target: str = DEFAULT_TARGET) -> Export:
             if kind in _UNMODELED_SCRATCH:
                 raise ValueError(f"TFLite Micro's scratch buffers for {kind} are not modeled")
         for kind in kinds:
-            if kind not in _TFLM_KERNELS:
+            if kind not in TFLM_KERNELS:
                 raise ValueError(f"TFLite Micro's persistent allocations for {kind} are not "
                                  "modeled")
         _check_references(model)

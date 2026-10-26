@@ -18,6 +18,7 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.frontends import tflite
 from tigris.frontends.flatbuffer import Table
 from tigris.frontends.tflite_export import tflm_tensor_arena
+from tigris.frontends.tflite_schema import BUILTIN_OPERATORS
 from tigris.inspection import inspect_file
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tflite"
@@ -306,7 +307,7 @@ def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
     buffer = bytearray(data)
     for entry in Table.root(data).tables(1):
         builtin = max(entry.scalar(3, "i"), entry.scalar(0, "b"))
-        if tflite._BUILTIN_OPERATORS[builtin] == kind:
+        if BUILTIN_OPERATORS[builtin] == kind:
             for slot, fmt in ((3, "<i"), (0, "<b")):
                 offset = entry._field(slot)
                 if offset:
@@ -315,7 +316,7 @@ def _with_operator_replaced(data: bytes, kind: str, code: int) -> bytes:
 
 
 def test_an_unsupported_operator_is_refused_by_name(tmp_path):
-    sparse = tflite._BUILTIN_OPERATORS.index("EMBEDDING_LOOKUP_SPARSE")
+    sparse = BUILTIN_OPERATORS.index("EMBEDDING_LOOKUP_SPARSE")
     path = tmp_path / "kws_sparse.tflite"
     path.write_bytes(_with_operator_replaced(KWS.read_bytes(), "FULLY_CONNECTED", sparse))
 
@@ -335,7 +336,7 @@ def test_a_truncated_file_is_an_error_not_a_misread():
 
 
 def test_an_int8_operator_tflite_micro_runs_in_float_only_is_refused():
-    negate = tflite._BUILTIN_OPERATORS.index("NEG")
+    negate = BUILTIN_OPERATORS.index("NEG")
     data = _with_operator_replaced((FIXTURES / "ops" / "abs.tflite").read_bytes(), "ABS", negate)
     assert any("NEG: TFLite Micro runs it in float32 only" in reason
                for reason in tflite.unsupported(data))
@@ -439,7 +440,7 @@ def test_a_constant_strided_slice_reads_one_entry_per_axis_and_adds_the_offset()
 
 
 def test_an_int8_l2_pool_is_refused():
-    l2_pool = tflite._BUILTIN_OPERATORS.index("L2_POOL_2D")
+    l2_pool = BUILTIN_OPERATORS.index("L2_POOL_2D")
     data = _with_operator_replaced((FIXTURES / "ops" / "avg_pool_same.tflite").read_bytes(),
                                    "AVERAGE_POOL_2D", l2_pool)
     assert any("L2_POOL_2D: TFLite Micro runs it in float32 only" in reason

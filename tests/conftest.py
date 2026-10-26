@@ -129,13 +129,13 @@ def loop_past_512_tensors_path(tmp_path):
     """float_while_if_through with a tree of 519 Adds over its loop output,
     which takes the main graph past 512 tensors; the plan also holds the loop
     and branch bodies. Returns the path and the model's main-graph tensors."""
-    from tigris.frontends import tflite
     from tigris.frontends import tflite_writer as tw
+    from tigris.frontends.tflite_schema import BUILTIN_OPERATORS
 
     fixture = Path(__file__).parent / "fixtures" / "tflite" / "ops" / "float_while_if_through.tflite"
     model = tw.read(fixture.read_bytes())
     graph = model.subgraphs[0]
-    add = tflite._BUILTIN_OPERATORS.index("ADD")
+    add = BUILTIN_OPERATORS.index("ADD")
     model.operator_codes.append(tw.OperatorCode(add, 1, None, add))
     level = [graph.outputs[0]] * 520
     while len(level) > 1:

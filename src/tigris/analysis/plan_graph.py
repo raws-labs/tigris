@@ -14,7 +14,6 @@ import numpy as np
 from tigris import TILE_AXIS_HW
 from tigris.emitters.binary.defs import (
     OP_ATTR_SUBGRAPHS,
-    OP_TYPE_MAP,
     TENSOR_FLAG_CONSTANT,
     TENSOR_FLAG_LINEAR,
 )
@@ -31,8 +30,8 @@ from tigris.graph.ir import (
     serialized_axis_map,
 )
 from tigris.graph.subgraphs import CONTROL_FLOW
+from tigris.operator_contract import OP_TYPE_BY_CODE
 
-_OP_NAMES = {code: name for name, code in OP_TYPE_MAP.items()}
 _NO_TILE_PLAN = 0xFFFF
 _NO_QUANT_PARAM = 0xFFFF
 
@@ -78,7 +77,7 @@ def graph_from_plan(plan: dict, fast_reserve: int = 0) -> AnalyzedGraph:
         ops = []
         for step, index in enumerate(op_order):
             record = plan["ops"][index]
-            op = OpNode(name=f"op{index}", op_type=_OP_NAMES[record["op_type"]],
+            op = OpNode(name=f"op{index}", op_type=OP_TYPE_BY_CODE[record["op_type"]],
                         inputs=[names[i] for i in record["inputs"]],
                         outputs=[names[i] for i in record["outputs"]], step=step)
             if op.op_type in CONTROL_FLOW and index in attrs:
