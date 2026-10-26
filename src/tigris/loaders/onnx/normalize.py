@@ -683,10 +683,7 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
     converted: dict[tuple[str, Layout], str] = {}
     rewritten: list[OpNode] = []
     counter = 0
-    readers: dict[str, list[OpNode]] = {}
-    for op in ag.ops:
-        for name in op.inputs:
-            readers.setdefault(name, []).append(op)
+    uses = _Uses(ag)
 
     for op in ag.ops:
         required = _required_layout(ag, op)
@@ -737,8 +734,8 @@ def _assign_tensor_layouts(ag: AnalyzedGraph) -> AnalyzedGraph:
                     break
         if (produced is Layout.SPATIAL and _transposes_to_storage_order(ag, op)
                 and op.outputs[0] not in ag.model_outputs
-                and all(_required_layout(ag, reader) is not Layout.SPATIAL
-                        for reader in readers.get(op.outputs[0], []))):
+                and all(_required_layout(ag, ag.ops[reader]) is not Layout.SPATIAL
+                        for reader, _ in uses.readers(op.outputs[0]))):
             # A Transpose to channels-last order writes the input's own stored
             # order, so held as stated it is a copy, and what reads it, such
             # as a flatten into a matrix product, sees the elements in the
@@ -846,16 +843,7 @@ def _fold_split_into_its_weight(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 
 def _fold_one_split(ag: AnalyzedGraph) -> bool:
-    producer_of: dict[str, int] = {}
-    for index, op in enumerate(ag.ops):
-        for name in op.outputs:
-            producer_of[name] = index
-    readers: dict[str, int] = {}
-    for op in ag.ops:
-        for name in op.inputs:
-            if name:
-                readers[name] = readers.get(name, 0) + 1
-
+    uses = _Uses(ag)
     for split_index, split in enumerate(ag.ops):
         if split.op_type != "Split" or len(split.inputs) < 1:
             continue
@@ -868,8 +856,8 @@ def _fold_one_split(ag: AnalyzedGraph) -> bool:
         # Each entry: the op, and the axis its output stacks the parts on, with that axis' extent.
         chain: list[tuple[int, int, int]] = []
         while True:
-            index = producer_of.get(name)
-            if index is None or readers.get(name, 0) != 1 or name in ag.model_outputs:
+            index = uses.producers.get(name)
+            if index is None or uses.sole_reader(name) is None:
                 break
             op = ag.ops[index]
             current = ag.tensors.get(name)
@@ -1132,8 +1120,8 @@ def _drop_unreferenced_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
     Folded subgraphs and absorbed activations leave their operands behind, and
     the emitter writes every entry of ``weight_data`` into the plan blob.
     """
-    referenced = {name for op in ag.ops for name in op.inputs if name}
-    for name in [n for n in ag.weight_data if n not in referenced]:
+    uses = _Uses(ag)
+    for name in [n for n in ag.weight_data if not uses.reader_count(n)]:
         del ag.weight_data[name]
     return ag
 
@@ -1153,7 +1141,7 @@ def _drop_inference_identities(ag: AnalyzedGraph) -> AnalyzedGraph:
     optional second output is a mask that only training consumes; an op whose
     mask is actually read is left alone rather than silently dropped.
     """
-    consumed = {name for op in ag.ops for name in op.inputs if name}
+    uses = _Uses(ag)
     outputs_kept = set(ag.model_outputs)
 
     surviving: list[OpNode] = []
@@ -1163,7 +1151,7 @@ def _drop_inference_identities(ag: AnalyzedGraph) -> AnalyzedGraph:
             surviving.append(op)
             continue
         if len(op.outputs) > 1 and any(
-            out in consumed or out in outputs_kept for out in op.outputs[1:]
+            uses.reader_count(out) or out in outputs_kept for out in op.outputs[1:]
         ):
             surviving.append(op)
             continue
@@ -1312,15 +1300,15 @@ def _fold_static_subgraphs(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 def _fold_elementwise_patterns(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Recognize elementwise compositions without crossing quantization edges."""
-    producers = {name: op for op in ag.ops for name in op.outputs}
+    uses = _Uses(ag)
     removed: set[str] = set()
 
     def match(name: str, kind: str, arity: int) -> OpNode | None:
-        op = producers.get(name)
+        op = uses.producer(name)
         return op if op is not None and op.op_type == kind and len(op.inputs) == arity else None
 
     def constant(name: str) -> bool:
-        source = producers.get(name)
+        source = uses.producer(name)
         if source is not None and source.op_type == "DequantizeLinear" and source.inputs:
             name = source.inputs[0]
         info = ag.tensors.get(name)
@@ -1443,15 +1431,14 @@ def _transpose_quantized_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
     result and the quantization axis moves with it, so the Gemm reads an
     int8 weight like any other.
     """
-    producer = {out: op for op in ag.ops for out in op.outputs}
-    reads = _read_counts(ag)
+    uses = _Uses(ag)
     removed: set[int] = set()
     for index, op in enumerate(ag.ops):
         if op.op_type != "Transpose" or len(op.inputs) != 1:
             continue
-        dql = producer.get(op.inputs[0])
-        if (dql is None or dql.op_type != "DequantizeLinear" or reads[op.inputs[0]] != 1
-                or dql.inputs[0] not in ag.weight_data or reads[dql.inputs[0]] != 1
+        dql = uses.producer(op.inputs[0])
+        if (dql is None or dql.op_type != "DequantizeLinear" or uses.reads[op.inputs[0]] != 1
+                or dql.inputs[0] not in ag.weight_data or uses.reads[dql.inputs[0]] != 1
                 or any(n and n not in ag.weight_data for n in dql.inputs[1:])):
             continue
         data = ag.weight_data[dql.inputs[0]]
@@ -1485,10 +1472,7 @@ def _quantize_float_biases(ag: AnalyzedGraph) -> AnalyzedGraph:
     converter does. A bias this cannot express is left as it is and refused by
     validation.
     """
-    consumers: dict[str, int] = {}
-    for op in ag.ops:
-        for name in op.inputs:
-            consumers[name] = consumers.get(name, 0) + 1
+    uses = _Uses(ag)
     for op in ag.ops:
         if op.op_type not in {"Conv", "ConvTranspose", "Gemm"} or len(op.inputs) < 3:
             continue
@@ -1519,7 +1503,7 @@ def _quantize_float_biases(ag: AnalyzedGraph) -> AnalyzedGraph:
         if np.any(np.abs(quantized) > np.iinfo(np.int32).max):
             continue
         target = bias_name
-        if consumers.get(bias_name, 0) > 1:
+        if uses.reader_count(bias_name) > 1:
             target = _fresh_name(ag, f"{bias_name}__int32_{op.name or len(ag.weight_data)}")
             op.inputs[2] = target
         ag.weight_data[target] = quantized.astype(np.int32).reshape(bias.shape)
@@ -1554,12 +1538,7 @@ def _quantize_inputs_first(ag: AnalyzedGraph) -> AnalyzedGraph:
     intermediate step give the same values, and the fold turns the input into
     an int8 boundary and every step into an int8 one.
     """
-    consumers: dict[str, list[OpNode]] = {}
-    for op in ag.ops:
-        for name in op.inputs:
-            if name:
-                consumers.setdefault(name, []).append(op)
-
+    uses = _Uses(ag)
     inserted: dict[int, list[OpNode]] = {}
     for name in ag.model_inputs:
         info = ag.tensors.get(name)
@@ -1567,8 +1546,8 @@ def _quantize_inputs_first(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
         held = [name]
         op = None
-        while len(consumers.get(held[-1], [])) == 1:
-            op = consumers[held[-1]][0]
+        while uses.reader_count(held[-1]) == 1:
+            op = ag.ops[uses.readers(held[-1])[0][0]]
             if op.op_type not in _LAYOUT_OPS or op.inputs[0] != held[-1]:
                 break
             if op.outputs[0] in ag.model_outputs:
@@ -1583,7 +1562,7 @@ def _quantize_inputs_first(ag: AnalyzedGraph) -> AnalyzedGraph:
         quantized = ag.tensors.get(op.outputs[0])
         dtype = quantized.dtype if quantized is not None else 3
         for tensor in held[:-1]:
-            first = consumers[tensor][0]
+            first = ag.ops[uses.readers(tensor)[0][0]]
             shape = ag.tensors[tensor].shape
             q = _fresh_name(ag, f"{tensor}_input_q")
             ag.tensors[q] = TensorInfo(name=q, shape=shape, dtype=dtype)
@@ -1632,17 +1611,7 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     if not has_qdq:
         return ag
 
-    # Build output->op index map
-    output_to_op: dict[str, int] = {}
-    for i, op in enumerate(ag.ops):
-        for out in op.outputs:
-            output_to_op[out] = i
-
-    # Build consumer map: tensor_name -> list of (op_idx, input_position)
-    input_to_consumers: dict[str, list[tuple[int, int]]] = {}
-    for i, op in enumerate(ag.ops):
-        for pos, inp in enumerate(op.inputs):
-            input_to_consumers.setdefault(inp, []).append((i, pos))
+    uses = _Uses(ag)
 
     # Operators with unencoded operands or results retain their float arithmetic.
     encoded = {op.inputs[0] for op in ag.ops if op.op_type == "QuantizeLinear"}
@@ -1650,23 +1619,23 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
               "SquaredDifference", "FloorDiv", "FloorMod"}
     float_only = effective_operators("reference") - effective_operators("s8_ref")
     float_required = {i for i, op in enumerate(ag.ops) if op.op_type in float_only}
-    float_required.update(output_to_op[n] for n in ag.model_outputs
-                          if n in output_to_op and ag.tensors[n].dtype == 1)
+    float_required.update(uses.producers[n] for n in ag.model_outputs
+                          if n in uses.producers and ag.tensors[n].dtype == 1)
     pending = list(float_required)
     while pending:
         index = pending.pop()
         if ag.ops[index].op_type in qdq_types:
             continue
         for name in ag.ops[index].inputs:
-            parent = output_to_op.get(name)
+            parent = uses.producers.get(name)
             if parent is not None and parent not in float_required:
                 float_required.add(parent)
                 pending.append(parent)
 
     def from_activation_dequantize(op):
-        return any(n in output_to_op and
-                   ag.ops[output_to_op[n]].op_type == "DequantizeLinear"
-                   and ag.ops[output_to_op[n]].inputs[0] not in ag.weight_data
+        return any(n in uses.producers and
+                   ag.ops[uses.producers[n]].op_type == "DequantizeLinear"
+                   and ag.ops[uses.producers[n]].inputs[0] not in ag.weight_data
                    for n in op.inputs)
 
     def float_constant_boundary(op):
@@ -1674,7 +1643,7 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
                      and ag.weight_data[n].dtype == np.float32]
         if op.op_type not in binary or not constants or not from_activation_dequantize(op):
             return False
-        if any(output_to_op.get(n) in float_required for n in op.outputs):
+        if any(uses.producers.get(n) in float_required for n in op.outputs):
             return True
         # Sub and Div with a right-hand constant lower to Add and Mul.
         lowerable = op.op_type in {"Add", "Mul"} or (
@@ -1695,7 +1664,7 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     pending = list(integer_ops)
     while pending:
         for name in ag.ops[pending.pop()].inputs:
-            parent = output_to_op.get(name)
+            parent = uses.producers.get(name)
             if (parent is not None and parent not in integer_ops
                     and ag.ops[parent].op_type not in qdq_types | float_only
                     and not float_constant_boundary(ag.ops[parent])):
@@ -1707,7 +1676,7 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
             continue
         unencoded_constant = float_constant_boundary(op)
         from_dequantize = from_activation_dequantize(op)
-        from_section = any(output_to_op.get(n) in float_ops and n in ag.tensors
+        from_section = any(uses.producers.get(n) in float_ops and n in ag.tensors
                            and ag.tensors[n].dtype == 1 for n in op.inputs)
         float_output = any(n in ag.tensors and ag.tensors[n].dtype == 1 for n in op.outputs)
         typed = {"ArgMax", "ArgMin", "Cast", "DetectionPostProcess", "If", "While",
@@ -1727,9 +1696,9 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
         dql = ag.ops[index]
         target = dql.outputs[0]
         deferred_cleanup.update(n for n in dql.inputs[1:] if n)
-        keep = any(c in float_ops | crossing for c, _ in input_to_consumers.get(target, [])) or (
+        keep = any(c in float_ops | crossing for c, _ in uses.readers(target)) or (
             subgraph and target in ag.model_outputs)
-        for consumer, position in input_to_consumers.get(target, []):
+        for consumer, position in uses.readers(target):
             if consumer not in float_ops | crossing:
                 ag.ops[consumer].inputs[position] = source
         if keep and constant:
@@ -1833,8 +1802,8 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
             bypass_dql(i, dql_input, constant=True)
 
         # Case 2: QuantizeLinear -> DequantizeLinear on a weight
-        elif dql_input in output_to_op:
-            ql_idx = output_to_op[dql_input]
+        elif dql_input in uses.producers:
+            ql_idx = uses.producers[dql_input]
             ql_op = ag.ops[ql_idx]
             if ql_op.op_type == "QuantizeLinear" and ql_op.inputs[0] in ag.weight_data:
                 is_weight_dql = True
@@ -1882,12 +1851,12 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
         if (
             not is_weight_dql
             and dql_input in ag.model_inputs
-            and dql_input not in output_to_op
+            and dql_input not in uses.producers
             and dql_input in ag.tensors
             and ag.tensors[dql_input].dtype in (2, 3)  # uint8, int8
             and all(
                 ag.ops[cons_idx].op_type == "DequantizeLinear"
-                for cons_idx, _ in input_to_consumers.get(dql_input, [])
+                for cons_idx, _ in uses.readers(dql_input)
             )
         ):
             qp, _ = _get_quant_param(op)
@@ -1924,12 +1893,12 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
         source = ag.tensors.get(ql_input)
         if (source is not None and (ql_input in float_results or (
                 source.quant is not None and source.dtype == 3
-                and not _same_quant(source.quant, qp)))):
+                and not source.quant.same_scale_and_zero_point(qp)))):
             ag.tensors[ql_output] = TensorInfo(name=ql_output, shape=source.shape, dtype=3, quant=qp)
             requantize = OpNode(name=op.name, op_type="Quantize", inputs=[ql_input],
                                 outputs=[ql_output], step=op.step)
             requantized.append((i, requantize))
-            for dql_idx in [c for c, _ in input_to_consumers.get(ql_output, [])
+            for dql_idx in [c for c, _ in uses.readers(ql_output)
                             if ag.ops[c].op_type == "DequantizeLinear"]:
                 bypass_dql(dql_idx, ql_output)
             removed.add(i)
@@ -1943,7 +1912,7 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
 
         # Find the DQL consumer(s) of this QL's output
         dql_indices = []
-        for cons_idx, pos in input_to_consumers.get(ql_output, []):
+        for cons_idx, pos in uses.readers(ql_output):
             if ag.ops[cons_idx].op_type == "DequantizeLinear":
                 dql_indices.append(cons_idx)
 
@@ -1983,11 +1952,6 @@ def _fold_qdq(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
         ag.is_quantized = True
 
     return ag
-
-
-def _same_quant(a: QuantParam, b: QuantParam) -> bool:
-    return (np.array_equal(np.asarray(a.scale), np.asarray(b.scale))
-            and np.array_equal(np.asarray(a.zero_point), np.asarray(b.zero_point)))
 
 
 # Broadcast operand order
@@ -2134,19 +2098,8 @@ def _standalone_bn_as_affine(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Fold Conv -> BatchNormalization into a single Conv with updated weights."""
-    # Build output->op index map
-    output_to_op: dict[str, int] = {}
-    for i, op in enumerate(ag.ops):
-        for out in op.outputs:
-            output_to_op[out] = i
-
-    # Build input consumer map: tensor_name -> list of op indices
-    input_to_consumers: dict[str, list[int]] = {}
-    for i, op in enumerate(ag.ops):
-        for inp in op.inputs:
-            input_to_consumers.setdefault(inp, []).append(i)
-
-    reads = _read_counts(ag)
+    uses = _Uses(ag)
+    reads = uses.reads
     removed: set[int] = set()
     folded_parameters: list[str] = []
 
@@ -2159,18 +2112,17 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
             continue
 
         bn_input = op.inputs[0]
-        if bn_input not in output_to_op:
+        if bn_input not in uses.producers:
             continue
 
-        conv_idx = output_to_op[bn_input]
+        conv_idx = uses.producers[bn_input]
         conv_op = ag.ops[conv_idx]
 
         if conv_op.op_type not in ("Conv",):
             continue
 
         # Exactly one consumer (the BN), and not a model output.
-        consumers = input_to_consumers.get(bn_input, [])
-        if len(consumers) != 1 or bn_input in ag.model_outputs:
+        if uses.sole_reader(bn_input) is None:
             continue
 
         # Get BN parameters from weight_data
@@ -2206,66 +2158,54 @@ def _fold_bn(ag: AnalyzedGraph) -> AnalyzedGraph:
                     ag, conv_op, gamma, beta, mean, var, eps, reads):
                 reads.update(op.inputs)
                 continue
-            # Rewire: conv's output becomes the BN's output
-            bn_output = op.outputs[0]
-            conv_op.outputs = [bn_output]
-
-            # Remove the intermediate tensor
-            if bn_input in ag.tensors and not ag.tensors[bn_input].is_constant:
-                del ag.tensors[bn_input]
-
-            folded_parameters += [gamma_name, beta_name, mean_name, var_name]
-            removed.add(i)
-            continue
-
-        W = W.copy()
-
-        # Conv bias: inputs[2] (optional)
-        has_bias = len(conv_op.inputs) >= 3 and conv_op.inputs[2] in ag.weight_data
-        if has_bias:
-            conv_b_name = conv_op.inputs[2]
-            B = ag.weight_data[conv_b_name].copy()
         else:
-            B = np.zeros(W.shape[0], dtype=np.float32)
+            W = W.copy()
 
-        # Fold: scale = gamma / sqrt(var + eps)
-        inv_std = 1.0 / np.sqrt(var + eps)
-        scale = gamma * inv_std
+            # Conv bias: inputs[2] (optional)
+            has_bias = len(conv_op.inputs) >= 3 and conv_op.inputs[2] in ag.weight_data
+            if has_bias:
+                conv_b_name = conv_op.inputs[2]
+                B = ag.weight_data[conv_b_name].copy()
+            else:
+                B = np.zeros(W.shape[0], dtype=np.float32)
 
-        # W_new[oc] = W[oc] * scale[oc]  (broadcast over spatial dims)
-        # For NCHW layout, W shape is [OC, IC/G, KH, KW]
-        scale_shape = [len(scale)] + [1] * (W.ndim - 1)
-        W_new = W * scale.reshape(scale_shape)
-        B_new = (B - mean) * inv_std * gamma + beta
+            # Fold: scale = gamma / sqrt(var + eps)
+            inv_std = 1.0 / np.sqrt(var + eps)
+            scale = gamma * inv_std
 
-        # Update weight_data
-        conv_w_name = _own_constant(ag, conv_op, 1, reads)
-        ag.weight_data[conv_w_name] = W_new.astype(np.float32)
+            # W_new[oc] = W[oc] * scale[oc]  (broadcast over spatial dims)
+            # For NCHW layout, W shape is [OC, IC/G, KH, KW]
+            scale_shape = [len(scale)] + [1] * (W.ndim - 1)
+            W_new = W * scale.reshape(scale_shape)
+            B_new = (B - mean) * inv_std * gamma + beta
 
-        if has_bias:
-            conv_b_name = _own_constant(ag, conv_op, 2, reads)
-            ag.weight_data[conv_b_name] = B_new.astype(np.float32)
-        else:
-            # Create a new bias tensor
-            bias_name = conv_w_name.replace("weight", "bias")
-            if bias_name == conv_w_name:
-                bias_name = conv_w_name + "_bias"
-            bias_name = _fresh_name(ag, bias_name)
-            reads[bias_name] += 1
-            ag.weight_data[bias_name] = B_new.astype(np.float32)
-            ag.tensors[bias_name] = TensorInfo(
-                name=bias_name,
-                shape=B_new.shape,
-                dtype=1,  # FLOAT
-                is_constant=True,
-            )
-            conv_op.inputs = (
-                list(conv_op.inputs[:2]) + [bias_name] + list(conv_op.inputs[3:])
-            )
+            # Update weight_data
+            conv_w_name = _own_constant(ag, conv_op, 1, reads)
+            ag.weight_data[conv_w_name] = W_new.astype(np.float32)
+
+            if has_bias:
+                conv_b_name = _own_constant(ag, conv_op, 2, reads)
+                ag.weight_data[conv_b_name] = B_new.astype(np.float32)
+            else:
+                # Create a new bias tensor
+                bias_name = conv_w_name.replace("weight", "bias")
+                if bias_name == conv_w_name:
+                    bias_name = conv_w_name + "_bias"
+                bias_name = _fresh_name(ag, bias_name)
+                reads[bias_name] += 1
+                ag.weight_data[bias_name] = B_new.astype(np.float32)
+                ag.tensors[bias_name] = TensorInfo(
+                    name=bias_name,
+                    shape=B_new.shape,
+                    dtype=1,  # FLOAT
+                    is_constant=True,
+                )
+                conv_op.inputs = (
+                    list(conv_op.inputs[:2]) + [bias_name] + list(conv_op.inputs[3:])
+                )
 
         # Rewire: conv's output becomes the BN's output
-        bn_output = op.outputs[0]
-        conv_op.outputs = [bn_output]
+        conv_op.outputs = [op.outputs[0]]
 
         # Remove the intermediate tensor
         if bn_input in ag.tensors and not ag.tensors[bn_input].is_constant:
@@ -2315,7 +2255,7 @@ def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
     transposes an activation, which no constant can absorb; validation refuses
     it.
     """
-    reads = _read_counts(ag)
+    reads = _Uses(ag).reads
     for op in ag.ops:
         if op.op_type != "Gemm" or len(op.inputs) < 2:
             continue
@@ -2399,7 +2339,7 @@ def _transpose_product_weights(
     products relabelled before layouts and products lowered after them read
     one copy, as long as it still holds the transpose.
     """
-    reads = _read_counts(ag)
+    reads = _Uses(ag).reads
     for name, readers in products.items():
         copy = transposed.get(name)
         if copy is not None and _holds_transpose(ag, copy, name):
@@ -2441,7 +2381,7 @@ def _holds_transpose(ag: AnalyzedGraph, copy: str, name: str) -> bool:
     if copy_info.dtype != info.dtype or (expected is None) != (copy_info.quant is None):
         return False
     return expected is None or (expected.axis == copy_info.quant.axis
-                                and _same_quant(expected, copy_info.quant))
+                                and expected.same_scale_and_zero_point(copy_info.quant))
 
 
 def _fold_sub_constant_to_add(ag: AnalyzedGraph) -> AnalyzedGraph:
@@ -2559,11 +2499,53 @@ def _fresh_name(ag: AnalyzedGraph, base: str, taken: Collection[str] = ()) -> st
     return name
 
 
-def _read_counts(ag: AnalyzedGraph) -> Counter:
-    """How often each name is read: once per operand position and once per model output."""
-    counts = Counter(name for op in ag.ops for name in op.inputs)
-    counts.update(ag.model_outputs)
-    return counts
+class _Uses:
+    """Which operator writes each name and which operand positions read it.
+
+    It holds the operators as they stood when it was built, so a pass that
+    rewires as it goes keeps reading the graph it started from; only
+    ``sole_reader`` checks the model outputs as they are when asked. An
+    omitted operand ("") is no read. ``reads`` counts each name once per
+    operand position and once per model output, and the folds that copy a
+    shared constant keep it current.
+    """
+
+    def __init__(self, ag: AnalyzedGraph):
+        self._ag = ag
+        self._ops = ag.ops
+        self.producers: dict[str, int] = {}
+        self._readers: dict[str, list[tuple[int, int]]] = {}
+        for index, op in enumerate(ag.ops):
+            for position, name in enumerate(op.inputs):
+                if name:
+                    self._readers.setdefault(name, []).append((index, position))
+            for name in op.outputs:
+                self.producers[name] = index
+        self.reads = Counter({name: len(readers) for name, readers in self._readers.items()})
+        self.reads.update(ag.model_outputs)
+
+    def producer(self, name: str) -> OpNode | None:
+        """The operator ``producers`` points at for ``name``, or None."""
+        index = self.producers.get(name)
+        return None if index is None else self._ops[index]
+
+    def readers(self, name: str) -> list[tuple[int, int]]:
+        """(operator index, operand position) for every position that reads ``name``."""
+        return self._readers.get(name, [])
+
+    def reader_count(self, name: str) -> int:
+        return len(self._readers.get(name, ()))
+
+    def reading_ops(self, name: str) -> set[int]:
+        """The operators that read ``name``, each once however many operands it gives it."""
+        return {index for index, _ in self._readers.get(name, ())}
+
+    def sole_reader(self, name: str) -> int | None:
+        """The operator reading ``name`` if exactly one operand position does and it is no model output."""
+        readers = self._readers.get(name, ())
+        if len(readers) != 1 or name in self._ag.model_outputs:
+            return None
+        return readers[0][0]
 
 
 def _own_constant(ag: AnalyzedGraph, op: OpNode, position: int, reads: Counter) -> str:
@@ -2588,7 +2570,7 @@ def _own_constant(ag: AnalyzedGraph, op: OpNode, position: int, reads: Counter) 
 
 def _forget_unread(ag: AnalyzedGraph, names) -> None:
     """Drop each constant in ``names`` that no operator reads and the model does not return."""
-    reads = _read_counts(ag)
+    reads = _Uses(ag).reads
     for name in names:
         if name in ag.weight_data and not reads[name]:
             del ag.weight_data[name]
@@ -2702,16 +2684,7 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
 
     A Dequantize between the product and Add prevents folding across rounding.
     """
-    output_to_op: dict[str, int] = {}
-    for i, op in enumerate(ag.ops):
-        for out in op.outputs:
-            output_to_op[out] = i
-
-    consumers: dict[str, list[int]] = {}
-    for i, op in enumerate(ag.ops):
-        for inp in op.inputs:
-            consumers.setdefault(inp, []).append(i)
-
+    uses = _Uses(ag)
     removed: set[int] = set()
 
     for i, op in enumerate(ag.ops):
@@ -2723,7 +2696,7 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
         const_name = constants[0]
         product = next(n for n in op.inputs if n != const_name)
 
-        producer_idx = output_to_op.get(product)
+        producer_idx = uses.producers.get(product)
         if producer_idx is None or producer_idx in removed:
             continue
         producer = ag.ops[producer_idx]
@@ -2732,7 +2705,7 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
         if len(producer.inputs) not in (2, 3):
             continue
         # Another consumer or a model output still reads the product.
-        if consumers.get(product, []) != [i] or product in ag.model_outputs:
+        if uses.sole_reader(product) != i:
             continue
 
         product_info = ag.tensors.get(product)
@@ -2781,11 +2754,7 @@ def _fold_channel_bias_add(ag: AnalyzedGraph) -> AnalyzedGraph:
 
 def _fold_gelu(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Recognize the erf and tanh GELU expressions without crossing a shared edge."""
-    producers = {name: i for i, op in enumerate(ag.ops) for name in op.outputs}
-    consumers: dict[str, set[int]] = {}
-    for i, op in enumerate(ag.ops):
-        for name in op.inputs:
-            consumers.setdefault(name, set()).add(i)
+    uses = _Uses(ag)
 
     def scalar(name, expected):
         value = ag.weight_data.get(name)
@@ -2793,7 +2762,7 @@ def _fold_gelu(ag: AnalyzedGraph) -> AnalyzedGraph:
                 and np.float32(value.reshape(-1)[0]) == np.float32(expected))
 
     def node(name, kind):
-        index = producers.get(name)
+        index = uses.producers.get(name)
         if index is None or ag.ops[index].op_type != kind:
             return None
         return index, ag.ops[index]
@@ -2874,7 +2843,7 @@ def _fold_gelu(ag: AnalyzedGraph) -> AnalyzedGraph:
                         break
         if x is None:
             continue
-        for add_index in consumers.get(activation.outputs[0], set()):
+        for add_index in uses.reading_ops(activation.outputs[0]):
             gate = ag.ops[add_index]
             if gate.op_type != "Add" or len(gate.inputs) != 2 or not any(
                     scalar(value, 1.0) for value in gate.inputs):
@@ -2882,8 +2851,8 @@ def _fold_gelu(ag: AnalyzedGraph) -> AnalyzedGraph:
             gate_name = gate.outputs[0]
             # 0.5 * x * gate takes at most two Muls, so the last one sits
             # within two consumer hops of the gate.
-            first = {i for i in consumers.get(gate_name, set()) if ag.ops[i].op_type == "Mul"}
-            second = {j for i in first for j in consumers.get(ag.ops[i].outputs[0], set())
+            first = {i for i in uses.reading_ops(gate_name) if ag.ops[i].op_type == "Mul"}
+            second = {j for i in first for j in uses.reading_ops(ag.ops[i].outputs[0])
                       if ag.ops[j].op_type == "Mul"}
             for index in sorted(first | second):
                 final = ag.ops[index]
@@ -2896,7 +2865,7 @@ def _fold_gelu(ag: AnalyzedGraph) -> AnalyzedGraph:
                 if group & removed:
                     continue
                 intermediate = [name for i in group if i != index for name in ag.ops[i].outputs]
-                if any(name in ag.model_outputs or not consumers.get(name, set()) <= group
+                if any(name in ag.model_outputs or not uses.reading_ops(name) <= group
                        for name in intermediate):
                     continue
                 if any(ag.tensors[name].dtype != 1 or ag.tensors[name].quant is not None
@@ -2976,22 +2945,17 @@ def _fold_pad_into_conv(ag: AnalyzedGraph) -> AnalyzedGraph:
     Only the spatial axes may be padded, the fill has to be zero, and the
     padded tensor may have no other reader: anything else and the Pad stays.
     """
-    readers: dict[str, list[int]] = {}
-    for index, op in enumerate(ag.ops):
-        for name in op.inputs:
-            if name:
-                readers.setdefault(name, []).append(index)
-
+    uses = _Uses(ag)
     folded: set[int] = set()
     for index, op in enumerate(ag.ops):
         if op.op_type != "Pad" or not op.outputs or len(op.inputs) < 2:
             continue
         if op.attrs.get("mode", "constant") != "constant":
             continue
-        consumers = readers.get(op.outputs[0], [])
-        if len(consumers) != 1 or op.outputs[0] in ag.model_outputs:
+        reader = uses.sole_reader(op.outputs[0])
+        if reader is None:
             continue
-        target = ag.ops[consumers[0]]
+        target = ag.ops[reader]
         if target.op_type not in ("Conv", "DepthwiseConv"):
             continue
         if target.inputs[0] != op.outputs[0]:
@@ -3283,8 +3247,7 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
             raise ValueError(f"{op.op_type} requires matching float32 or int8 data")
         if source.dtype == 3 and (source.quant is None or output.quant is None
                 or source.quant.scale.size != 1 or source.quant.zero_point.size != 1
-                or not np.array_equal(source.quant.scale, output.quant.scale)
-                or not np.array_equal(source.quant.zero_point, output.quant.zero_point)):
+                or not source.quant.same_scale_and_zero_point(output.quant)):
             raise ValueError(f"{op.op_type} requires identical per-tensor quantization")
         kind = op.op_type
         if source.is_constant:
@@ -3415,8 +3378,7 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
             if update.dtype != source.dtype or any(u > d or u <= 0 for u, d in zip(update.shape, shape)):
                 raise ValueError("DynamicUpdateSlice update must fit the input shape and dtype")
             if source.dtype == 3 and (update.quant is None
-                    or not np.array_equal(source.quant.scale, update.quant.scale)
-                    or not np.array_equal(source.quant.zero_point, update.quant.zero_point)):
+                    or not source.quant.same_scale_and_zero_point(update.quant)):
                 raise ValueError("DynamicUpdateSlice requires identical update quantization")
             metadata = list(update.shape)
             if starts is not None:
@@ -3434,10 +3396,7 @@ def _normalize_movement(ag: AnalyzedGraph) -> AnalyzedGraph:
 def _narrow_index_casts(ag: AnalyzedGraph) -> AnalyzedGraph:
     """An int64 model input cast to int32 that only feeds gather indices,
     through movement, enters as int32 and the Cast becomes an Identity."""
-    readers: dict[str, list[OpNode]] = {}
-    for op in ag.ops:
-        for name in op.inputs:
-            readers.setdefault(name, []).append(op)
+    uses = _Uses(ag)
     gathers = {"Gather", "GatherND", "EmbeddingLookup", "tigris::Gather", "tigris::GatherND"}
     for op in ag.ops:
         if (op.op_type != "Cast" or int(op.attrs.get("to", 0)) != 6
@@ -3450,11 +3409,12 @@ def _narrow_index_casts(ag: AnalyzedGraph) -> AnalyzedGraph:
             if name in seen:
                 continue
             seen.add(name)
-            uses = readers.get(name, [])
-            if name in ag.model_outputs or not uses:
+            readers = uses.readers(name)
+            if name in ag.model_outputs or not readers:
                 valid = False
                 break
-            for reader in uses:
+            for index, _ in readers:
+                reader = ag.ops[index]
                 if reader.op_type in gathers and reader.inputs[1] == name:
                     continue
                 if reader.op_type not in {"Identity", "Reshape", "Transpose"} or reader.inputs[0] != name:
@@ -3722,8 +3682,7 @@ def _normalize_reduction_axes(ag: AnalyzedGraph) -> AnalyzedGraph:
             output = ag.tensors.get(op.outputs[0])
             if (source.quant is None or output is None or output.quant is None
                     or source.quant.scale.size != 1 or source.quant.zero_point.size != 1
-                    or not np.array_equal(source.quant.scale, output.quant.scale)
-                    or not np.array_equal(source.quant.zero_point, output.quant.zero_point)):
+                    or not source.quant.same_scale_and_zero_point(output.quant)):
                 raise ValueError("ReduceMax requires identical input and output quantization")
     return ag
 
@@ -3843,12 +3802,7 @@ def _fold_shape_ops(ag: AnalyzedGraph) -> AnalyzedGraph:
     are static at compile time, these ops can be removed.  The intermediate
     tensors are marked ``is_constant=True`` so the binary emitter skips them.
     """
-    # Build output->op index map
-    output_to_op: dict[str, int] = {}
-    for i, op in enumerate(ag.ops):
-        for out in op.outputs:
-            output_to_op[out] = i
-
+    uses = _Uses(ag)
     removed: set[int] = set()
 
     for i, op in enumerate(ag.ops):
@@ -3872,10 +3826,10 @@ def _fold_shape_ops(ag: AnalyzedGraph) -> AnalyzedGraph:
                 continue
             seen_tensors.add(tname)
 
-            if tname not in output_to_op:
+            if tname not in uses.producers:
                 continue  # model input or initializer - not an op output
 
-            prod_idx = output_to_op[tname]
+            prod_idx = uses.producers[tname]
             if prod_idx in visited_ops:
                 continue
             visited_ops.add(prod_idx)
@@ -4160,18 +4114,7 @@ def _absorb_activations(ag: AnalyzedGraph) -> AnalyzedGraph:
     Sets ``attrs["fused_activation"]`` on the producer op, rewires outputs,
     removes the activation op and its intermediate tensor.
     """
-    # Build output->op index map
-    output_to_op: dict[str, int] = {}
-    for i, op in enumerate(ag.ops):
-        for out in op.outputs:
-            output_to_op[out] = i
-
-    # Build input consumer map: tensor_name -> list of op indices
-    input_to_consumers: dict[str, list[int]] = {}
-    for i, op in enumerate(ag.ops):
-        for inp in op.inputs:
-            input_to_consumers.setdefault(inp, []).append(i)
-
+    uses = _Uses(ag)
     removed: set[int] = set()
 
     for i, op in enumerate(ag.ops):
@@ -4182,17 +4125,16 @@ def _absorb_activations(ag: AnalyzedGraph) -> AnalyzedGraph:
         act_output = op.outputs[0]
 
         # Check that the input comes from a fusable producer
-        if act_input not in output_to_op:
+        if act_input not in uses.producers:
             continue
-        prod_idx = output_to_op[act_input]
+        prod_idx = uses.producers[act_input]
         producer = ag.ops[prod_idx]
 
         if producer.op_type not in _FUSABLE_PRODUCERS:
             continue
 
         # Exactly one consumer (the activation), and not a model output.
-        consumers = input_to_consumers.get(act_input, [])
-        if len(consumers) != 1 or act_input in ag.model_outputs:
+        if uses.sole_reader(act_input) is None:
             continue
 
         # An intermediate carrying its own scale is a quantization step of its
