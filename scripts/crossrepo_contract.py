@@ -16,11 +16,12 @@ import math
 import os
 import re
 import subprocess
-import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import NamedTuple
 
 import numpy as np
 import onnx
@@ -34,6 +35,7 @@ from tigris.analysis.plan_graph import graph_from_plan, slow_arena_required
 from tigris.analysis.validation import io_in_fast, slow_pool_usage, validate_memory_plan
 from tigris.capabilities import KERNEL_CAPABILITIES
 from tigris.cli import _run_pipeline
+from tigris.cli.compile import plan_model
 from tigris.emitters.codegen import _executor_workspace_limits
 from tigris.emitters.binary.defs import (
     COMPRESS_LZ4,
@@ -51,11 +53,6 @@ from tigris.runtime import Session
 from tigris.cli.trace import check as check_trace
 from tigris.cli.trace import units as trace_units
 from tigris.graph.ir import Stage
-
-# The byte-level line-buffer flag decoder already exists in the compiler's
-# plan test-suite; reuse it rather than duplicating the stage-record parser.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
-from test_linebuffer_plan import _stage_reserved1  # noqa: E402
 
 
 Array = NDArray[np.generic]
@@ -7065,7 +7062,10 @@ def _compile_plan(
     force_one_op_stages: bool = False,
 ) -> dict:
     budgets = (mem_budget,) if slow_budget is None else (mem_budget, slow_budget)
-    graph, _ = _run_pipeline(str(model_path), budgets)
+    # Forced stages replace the planned ones, so the writer sizes the weight
+    # reserve from the stages it emits rather than from the discarded layout.
+    graph, _, _ = plan_model(str(model_path), budgets,
+                             compress=None if force_one_op_stages else compression)
     if force_one_op_stages:
         stages: list[Stage] = []
         for index, op in enumerate(graph.ops):
@@ -7110,20 +7110,8 @@ def _compile_plan(
         raise AssertionError(
             f"slow arena derived from the plan ({derived}) differs from the "
             f"compiler's slow requirement ({plan['_compiler_slow_peak']})")
-    plan["_plan_bytes"] = plan_bytes
+    plan["_graph"] = graph
     return plan
-
-
-def _quantize_input(value: Array, plan: dict, tensor: dict) -> Array:
-    quant_index = tensor["quant_param_idx"]
-    if quant_index == 0xFFFF:
-        raise AssertionError(f"int8 input {tensor['name']!r} has no quant params")
-    quant = plan["quant_params"][quant_index]
-    scale = float(quant["scale"])
-    if scale <= 0:
-        raise AssertionError(f"int8 input {tensor['name']!r} has invalid scale")
-    quantized = np.rint(value / scale) + int(quant["zero_point"])
-    return np.clip(quantized, -128, 127).astype(np.int8)
 
 
 def _declared_dtype(tensor: dict) -> int:
@@ -7142,7 +7130,10 @@ def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
         if declared == TensorProto.FLOAT:
             encoded = source.astype(np.float32, copy=False)
         elif declared == TensorProto.INT8:
-            encoded = source if source.dtype == np.int8 else _quantize_input(source, plan, tensor)
+            if source.dtype != np.int8:
+                raise AssertionError(
+                    f"int8 input {tensor['name']!r} is given as {source.dtype}")
+            encoded = source
         elif declared == TensorProto.BOOL:
             encoded = source.astype(np.bool_, copy=False)
         elif declared in (TensorProto.INT32, TensorProto.INT64):
@@ -7169,10 +7160,6 @@ def _pack_inputs(plan: dict, inputs: dict[str, Array]) -> bytes:
             )
         chunks.append(encoded.tobytes())
     return b"".join(chunks)
-
-
-_TENSOR_FLAG_LINEAR = 0x08
-"""Axes are stored in the order the model states them, not channels-last."""
 
 
 def _decode_outputs(
@@ -7204,7 +7191,7 @@ def _decode_outputs(
         # guess could not tell a model's own terminal Transpose from a layout
         # conversion the compiler inserted, since both are a Transpose writing a
         # model output.
-        if not tensor["flags"] & _TENSOR_FLAG_LINEAR:
+        if not tensor["flags"] & TENSOR_FLAG_LINEAR:
             value = _from_runtime_layout(value, reference.ndim)
         decoded.append(value)
         offset = end
@@ -7231,13 +7218,26 @@ _MEMORY_REPORT = re.compile(
 )
 
 
-def _assert_memory_contract(
-    case_name: str, plan: dict, runtime_stdout: str, *, full_budget: bool = False
-) -> None:
+class _MemoryReport(NamedTuple):
+    budget: int
+    activation_limit: int
+    reserve: int
+    required: int
+    allocated: int
+    peak: int
+    slow_peak: int
+
+
+def _memory_report(case_name: str, runtime_stdout: str) -> _MemoryReport:
     match = _MEMORY_REPORT.search(runtime_stdout)
     if match is None:
         raise AssertionError(f"{case_name}: runtime emitted no memory report")
+    return _MemoryReport(*map(int, match.groups()))
 
+
+def _assert_memory_contract(
+    case_name: str, plan: dict, runtime_stdout: str, *, full_budget: bool = False
+) -> None:
     (
         budget,
         activation_limit,
@@ -7246,7 +7246,7 @@ def _assert_memory_contract(
         allocated,
         measured_peak,
         slow_peak,
-    ) = map(int, match.groups())
+    ) = _memory_report(case_name, runtime_stdout)
     scheduled_peak = int(plan["_compiler_scheduled_peak"])
     if budget != plan["budget"]:
         raise AssertionError(
@@ -7311,7 +7311,7 @@ def _assert_runs_in_slow_figure(
     """The runtime's slow peak is the compiler's slow figure, and the plan runs
     in a slow arena of exactly that size, to the same bytes."""
     figure = int(plan["_compiler_slow_peak"])
-    slow_peak = int(_MEMORY_REPORT.search(runtime_stdout).group(7))
+    slow_peak = _memory_report(case_name, runtime_stdout).slow_peak
     if slow_peak != figure:
         raise AssertionError(
             f"{case_name}: runtime slow peak {slow_peak} != the compiler's slow "
@@ -7351,13 +7351,11 @@ def _assert_runs_without_slow(
     copied = outputs_path.with_name("inputs-in-slow.bin")
     completed = _run([str(runner), str(plan_path), str(inputs_path), str(copied), str(limit),
                       "--inputs-in-slow"], f"{case_name} run with inputs in slow")
-    match = _MEMORY_REPORT.search(completed.stdout)
-    if match is None:
-        raise AssertionError(f"{case_name}: runtime emitted no memory report")
-    reserve, peak, slow_peak = (int(match.group(i)) for i in (3, 6, 7))
-    if peak > plan["_compiler_scheduled_peak"] + reserve or slow_peak == 0:
+    report = _memory_report(case_name, completed.stdout)
+    if report.peak > plan["_compiler_scheduled_peak"] + report.reserve or report.slow_peak == 0:
         raise AssertionError(
-            f"{case_name}: inputs in slow peaked at {peak} fast and {slow_peak} slow bytes")
+            f"{case_name}: inputs in slow peaked at {report.peak} fast and "
+            f"{report.slow_peak} slow bytes")
     if copied.read_bytes() != expected:
         raise AssertionError(f"{case_name}: the run with inputs in slow changed the outputs")
     return True
@@ -7485,6 +7483,31 @@ def _parse_rows(case: ContractCase, runtime_stdout: str) -> dict[str, int]:
     return {key: int(value) for key, value in zip(keys, match.groups())}
 
 
+def _prepare_case(case: ContractCase, work_dir: Path) -> tuple[Path, dict, list[Array]]:
+    """Save the case's models, compile and check its plan, and pack its inputs.
+
+    Returns the case directory, the plan and the ONNX Runtime outputs.
+    """
+    case_dir = work_dir / case.name
+    case_dir.mkdir()
+    onnx.save(case.compile_model, case_dir / "compile.onnx")
+    onnx.save(case.reference_model, case_dir / "reference.onnx")
+    plan = _compile_plan(
+        case_dir / "compile.onnx",
+        case_dir / "model.tgrs",
+        mem_budget=case.mem_budget,
+        slow_budget=case.slow_budget,
+        compression=case.compression,
+        xip=case.xip,
+        force_one_op_stages=case.force_one_op_stages,
+    )
+    _assert_plan_mode(case, plan)
+    reference_outputs = _reference_session(case, case_dir / "reference.onnx").run(
+        None, case.inputs)
+    (case_dir / "inputs.bin").write_bytes(_pack_inputs(plan, case.inputs))
+    return case_dir, plan, reference_outputs
+
+
 def _run_metric_case(
     case: ContractCase, rows_runner: Path, work_dir: Path
 ) -> None:
@@ -7494,29 +7517,11 @@ def _run_metric_case(
     the rows-instrumented runner twice: normally (roll on) and with
     ``--no-linebuffer`` (the recompute path). Both runs must match ONNX Runtime,
     and the roll must reduce total kernel output-rows, approaching the unique
-    output-row count. The reduction ratio is the headline metric.
+    output-row count. It prints the ratio of recompute to line-buffered kernel
+    rows.
     """
-    case_dir = work_dir / case.name
-    case_dir.mkdir()
-    compile_path = case_dir / "compile.onnx"
-    reference_path = case_dir / "reference.onnx"
-    plan_path = case_dir / "model.tgrs"
-    inputs_path = case_dir / "inputs.bin"
-    onnx.save(case.compile_model, compile_path)
-    onnx.save(case.reference_model, reference_path)
-
-    plan = _compile_plan(
-        compile_path,
-        plan_path,
-        mem_budget=case.mem_budget,
-        slow_budget=case.slow_budget,
-        compression=case.compression,
-        xip=case.xip,
-    )
-    _assert_plan_mode(case, plan)
-    session = _reference_session(case, reference_path)
-    reference_outputs = session.run(None, case.inputs)
-    inputs_path.write_bytes(_pack_inputs(plan, case.inputs))
+    case_dir, plan, reference_outputs = _prepare_case(case, work_dir)
+    plan_path, inputs_path = case_dir / "model.tgrs", case_dir / "inputs.bin"
     limit = str(plan["_compiler_scheduled_peak"])
 
     def _execute(extra_args: list[str], label: str) -> dict[str, int]:
@@ -7532,8 +7537,8 @@ def _run_metric_case(
             plan, outputs_path.read_bytes(), reference_outputs
         )
         _assert_output_parity(
-        actual_outputs, reference_outputs, _output_scales(plan), case.exact
-    )
+            actual_outputs, reference_outputs, _output_scales(plan), case.exact
+        )
         return _parse_rows(case, completed.stdout)
 
     rows_on = _execute([], "linebuffered")
@@ -7590,11 +7595,7 @@ def _section_reference_outputs(
     primary: bytes, reference_outputs: list[Array],
 ) -> list[Array]:
     """Check section entry codes and evaluate float outputs on those same codes."""
-    graph, _ = _run_pipeline(
-        str(case_dir / "compile.onnx"),
-        (case.mem_budget,) + ((case.slow_budget,) if case.slow_budget else ()),
-        report_bindings=False,
-    )
+    graph = plan["_graph"]
     section_inputs = {op.outputs[0] for op in graph.ops if op.op_type == "Dequantize"
                       and graph.tensors[op.inputs[0]].dtype == TensorProto.INT8}
     entries = list(dict.fromkeys(
@@ -7667,32 +7668,10 @@ def _section_reference_outputs(
     return outputs
 
 
-def _run_case(
-    case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Path | None = None
-) -> Path:
-    case_dir = work_dir / case.name
-    case_dir.mkdir()
-    compile_path = case_dir / "compile.onnx"
-    reference_path = case_dir / "reference.onnx"
-    plan_path = case_dir / "model.tgrs"
-    inputs_path = case_dir / "inputs.bin"
-    outputs_path = case_dir / "outputs.bin"
-    onnx.save(case.compile_model, compile_path)
-    onnx.save(case.reference_model, reference_path)
-
-    plan = _compile_plan(
-        compile_path,
-        plan_path,
-        mem_budget=case.mem_budget,
-        slow_budget=case.slow_budget,
-        compression=case.compression,
-        xip=case.xip,
-        force_one_op_stages=case.force_one_op_stages,
-    )
-    _assert_plan_mode(case, plan)
-    session = _reference_session(case, reference_path)
-    reference_outputs = session.run(None, case.inputs)
-    inputs_path.write_bytes(_pack_inputs(plan, case.inputs))
+def _run_case(case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Path) -> Path:
+    case_dir, plan, reference_outputs = _prepare_case(case, work_dir)
+    compile_path, plan_path = case_dir / "compile.onnx", case_dir / "model.tgrs"
+    inputs_path, outputs_path = case_dir / "inputs.bin", case_dir / "outputs.bin"
     completed = _run(
         [
             str(runner),
@@ -7725,8 +7704,6 @@ def _run_case(
     )
     # Extra caller capacity must not change the scheduled memory bound.
     for full_runner in (runner, roomy_runner):
-        if full_runner is None:
-            continue
         completed = _run(
             [str(full_runner), str(plan_path), str(inputs_path), str(outputs_path)],
             f"{case.name} full-budget execution",
@@ -7837,7 +7814,7 @@ def _output_scales(plan: dict) -> list[float]:
     scales: list[float] = []
     for tensor_index in plan["model_outputs"]:
         tensor = plan["tensors"][tensor_index]
-        if _declared_dtype(tensor) == tensor["dtype"] or tensor["dtype"] == 6:
+        if _declared_dtype(tensor) == tensor["dtype"] or tensor["dtype"] == TensorProto.INT32:
             scales.append(0.0)
             continue
         quant = plan["quant_params"][tensor["quant_param_idx"]]
@@ -7913,13 +7890,12 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
     if chained != case.expect_chain:
         raise AssertionError(f"{case.name}: chained={chained}, expected {case.expect_chain}")
 
-    # Decode the head-stage line-buffer flag straight from the emitted plan
-    # bytes (a recomputing chain marks only its head, where chain_id equals the
-    # stage's own index). This makes "is actually line-buffered" a checked
-    # precondition of the differential rather than an assumption.
-    plan_bytes = plan["_plan_bytes"]
+    # Read the head-stage line-buffer flag from the emitted plan (a recomputing
+    # chain marks only its head, where chain_id equals the stage's own index).
+    # This makes "is actually line-buffered" a checked precondition of the
+    # differential rather than an assumption.
     line_buffered = any(
-        _stage_reserved1(plan_bytes, index) & STAGE_FLAG_LINE_BUFFERED
+        stage["flags"] & STAGE_FLAG_LINE_BUFFERED
         for index, stage in enumerate(plan["stages"])
         if stage["chain_len"] >= 2 and stage["chain_id"] == index
     )
@@ -7931,7 +7907,6 @@ def _assert_plan_mode(case: ContractCase, plan: dict) -> None:
 
     # Both axes of a 2D case split, by the stated counts: num_tiles // ceil(H / tile_h) columns.
     if case.expect_2d:
-        from types import SimpleNamespace
         tile_plan = SimpleNamespace(**next(tile for tile in plan["tile_plans"]
                                           if tile["tileable"]))
         if tile_plan.axis != TILE_AXIS_HW:
