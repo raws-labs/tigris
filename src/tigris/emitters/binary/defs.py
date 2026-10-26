@@ -155,7 +155,7 @@ TENSOR_FLAG_LINEAR = 0x08
 # A variable's value entering or leaving an invocation through the state buffer.
 TENSOR_FLAG_STATE = 0x10
 
-# Stage flags - packed into the head stage's _reserved1 field.
+# Stage flags, stored in the head stage's _reserved1 field.
 STAGE_FLAG_LINE_BUFFERED = 0x0001
 
 # Canonical little-endian wire layouts.  Writer, reader, and size estimates all
