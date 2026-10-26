@@ -240,6 +240,98 @@ def test_incompatible_schema(linear_plan):
         Session(linear_plan)
 
 
+def test_compile_refuses_a_plan_the_runtime_loader_refuses(tmp_path, monkeypatch):
+    """With the writer's contract check turned off, a Softmax that reads only
+    a constant reaches the plan; compile refuses it with the loader's reason
+    and writes nothing."""
+    import importlib
+
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    from tigris.emitters.binary import writer
+
+    compile_command = importlib.import_module("tigris.cli.compile")
+
+    model = helper.make_model(helper.make_graph(
+        [helper.make_node("MatMul", ["input", "w"], ["h"], name="product"),
+         helper.make_node("Softmax", ["h"], ["output"], axis=-1, name="scores")],
+        "contract", [helper.make_tensor_value_info("input", TensorProto.FLOAT, [4, 8])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 8])],
+        [numpy_helper.from_array(np.eye(8, dtype=np.float32), "w")]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    source = tmp_path / "contract.onnx"
+    onnx.save(model, source)
+
+    def pipeline(*args, **kwargs):
+        graph, budget = _run_pipeline(*args, **kwargs)
+        next(op for op in graph.ops if op.op_type == "Softmax").inputs = ["w"]
+        return graph, budget
+
+    monkeypatch.setattr(compile_command, "_run_pipeline", pipeline)
+    monkeypatch.setattr(writer, "_contract_violations", lambda *args: [])
+    plan = tmp_path / "contract.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 1, result.output
+    assert result.output.endswith("Error: no plan written: the runtime loader refuses the plan: "
+                                  "operator contract is not executable\n")
+    assert not plan.exists()
+
+
+def test_a_plan_beyond_the_default_build_limits_loads_and_states_its_needs(tmp_path, loop_past_512_tensors_path):
+    """The host runtime allows every build limit at its maximum, so a plan
+    with more than 512 tensors loads, and the loader states the same needs as
+    the compiler's build-limit report."""
+    from tigris.inspection import _plan, _plan_requirements
+
+    source, _ = loop_past_512_tensors_path
+    plan = tmp_path / "loop.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "256K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    data = plan.read_bytes()
+    needs = runtime.check_plan(data)
+    assert needs["TIGRIS_MAX_TENSORS"] > 512
+    assert needs == {limit["name"]: limit["needed"] for limit in _plan_requirements(_plan(data))["build_limits"]}
+    with Session(plan) as session:
+        assert session.inputs
+
+
+def test_the_loader_states_a_chain_s_needs_as_the_compiler_does(tmp_path):
+    from tigris.inspection import _plan, _plan_requirements
+
+    source = Path(__file__).parent / "fixtures" / "tflite" / "vww_96_int8.tflite"
+    plan = tmp_path / "vww.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(source), "-m", "16K", "-m", "8M", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    data = plan.read_bytes()
+    needs = runtime.check_plan(data)
+    assert needs == {limit["name"]: limit["needed"] for limit in _plan_requirements(_plan(data))["build_limits"]}
+    assert needs["TIGRIS_MAX_CHAIN_STAGES"] == 5 and needs["TIGRIS_MAX_SPATIAL_OPS_PER_STAGE"] == 1
+
+
+def test_compile_without_a_host_runtime_writes_the_plan_unchecked(linear_3op_path, tmp_path, monkeypatch):
+    """A pure wheel has no host runtime to load the plan with; the writer's
+    contract check is all compile has."""
+    def unavailable():
+        raise AssertionError("no host runtime is loaded without one installed")
+
+    monkeypatch.setattr(runtime, "_NATIVE", tmp_path / "native")
+    monkeypatch.setattr(runtime, "_library", unavailable)
+    assert runtime.check_plan(b"TGRS") is None
+    plan = tmp_path / "linear.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(linear_3op_path), "-m", "64K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    assert plan.exists()
+
+
+def test_check_plan_names_the_loader_s_refusal(linear_plan):
+    data = bytearray(linear_plan.read_bytes())
+    data[0] ^= 0xFF
+    with pytest.raises(ValueError, match="^the runtime loader refuses the plan: bad magic"):
+        runtime.check_plan(bytes(data))
+
+
 @pytest.fixture
 def zoo_plan(linear_plan):
     """The linear plan as a fetched zoo artifact would hold it, with its manifest and receipt."""
@@ -486,6 +578,26 @@ def test_analyze_measures_a_loop_with_a_fixed_iteration_count():
     assert "per inference:" in row
     report = json.loads(CliRunner().invoke(cli, ["analyze", model, "-m", "64K", "--json"]).output)
     assert report["slow"]["traffic"]["written"] > 0 and report["slow"]["traffic"]["read"] > 0
+
+
+def test_analyze_names_why_the_host_runtime_cannot_run_the_plan(tmp_path):
+    """The host runtime sizes its slow arena at twice the bytes of every
+    tensor; three 1 GiB tensors exceed its 32-bit capacity, so the session
+    is refused and analyze reports the refusal instead of the traffic."""
+    from onnx import TensorProto, helper
+
+    shape = [1, 4, 8192, 8192]
+    model = str(save_onnx(tmp_path, "large", [helper.make_node("Relu", ["x"], ["h"]),
+                                              helper.make_node("Relu", ["h"], ["y"])],
+                          [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+                          [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)]))
+    result = CliRunner().invoke(cli, ["analyze", model, "-m", "1M"], env={"NO_COLOR": "1"})
+    assert result.exit_code == 0, result.output
+    row = next(line for line in result.output.splitlines() if "slow traffic" in line)
+    assert row.split() == ["slow", "traffic", "not", "measured:", "Host", "slow", "capacity", "exceeds",
+                           "the", "runtime", "limit"]
+    report = json.loads(CliRunner().invoke(cli, ["analyze", model, "-m", "1M", "--json"]).output)
+    assert report["slow"]["traffic"] is None
 
 
 def test_trace_runs_an_input_dependent_loop_on_the_given_input(tmp_path):

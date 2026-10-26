@@ -125,6 +125,34 @@ def large_activations_path(tmp_path):
 
 
 @pytest.fixture
+def loop_past_512_tensors_path(tmp_path):
+    """float_while_if_through with a tree of 519 Adds over its loop output,
+    which takes the main graph past 512 tensors; the plan also holds the loop
+    and branch bodies. Returns the path and the model's main-graph tensors."""
+    from tigris.frontends import tflite
+    from tigris.frontends import tflite_writer as tw
+
+    fixture = Path(__file__).parent / "fixtures" / "tflite" / "ops" / "float_while_if_through.tflite"
+    model = tw.read(fixture.read_bytes())
+    graph = model.subgraphs[0]
+    add = tflite._BUILTIN_OPERATORS.index("ADD")
+    model.operator_codes.append(tw.OperatorCode(add, 1, None, add))
+    level = [graph.outputs[0]] * 520
+    while len(level) > 1:
+        sums = []
+        for a, b in zip(level[::2], level[1::2]):
+            graph.tensors.append(tw.Tensor([1, 4], 0, 0, b"sum%d" % len(graph.tensors)))
+            graph.operators.append(tw.Operator(len(model.operator_codes) - 1, [a, b],
+                                               [len(graph.tensors) - 1]))
+            sums.append(len(graph.tensors) - 1)
+        level = sums + level[len(sums) * 2:]
+    graph.outputs = level
+    source = tmp_path / "loop.tflite"
+    source.write_bytes(tw.write(model))
+    return source, len(graph.tensors)
+
+
+@pytest.fixture
 def conv_relu_chain_path(tmp_path):
     """Conv3x3 -> Relu -> Conv3x3 on [1,3,32,32] - tileable, RF=5.
 

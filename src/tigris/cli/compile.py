@@ -131,6 +131,12 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
         raise click.ClickException(
             f"no plan written: the plan is {fmt_bytes(len(plan_data))}, "
             f"the flash budget is {fmt_bytes(ag.budget.flash)}")
+    from tigris.runtime import RuntimeError as HostRuntimeError, check_plan
+
+    try:
+        check_plan(plan_data)
+    except HostRuntimeError as exc:
+        raise click.ClickException(f"no plan written: {exc}") from exc
     out.write_bytes(plan_data)
 
     text.echo()

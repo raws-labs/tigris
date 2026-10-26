@@ -294,40 +294,20 @@ def test_a_plan_beyond_the_default_build_is_written_and_names_the_build(tmp_path
     assert report["runtime_build"] == [{"name": "TIGRIS_MAX_STAGE_OUTPUTS", "needed": 19, "default": 16}]
 
 
-def test_a_control_flow_plan_names_the_tensor_count_of_the_whole_plan(tmp_path):
+def test_a_control_flow_plan_names_the_tensor_count_of_the_whole_plan(tmp_path, loop_past_512_tensors_path):
     """The plan's tensor table also holds the loop and branch bodies, so
     compile names the tensor build limit with that count and no other."""
     import re
-    from pathlib import Path
 
-    from tigris.frontends import tflite
-    from tigris.frontends import tflite_writer as tw
     from tigris.inspection import inspect_file
 
-    fixture = Path(__file__).parent / "fixtures" / "tflite" / "ops" / "float_while_if_through.tflite"
-    model = tw.read(fixture.read_bytes())
-    graph = model.subgraphs[0]
-    add = tflite._BUILTIN_OPERATORS.index("ADD")
-    model.operator_codes.append(tw.OperatorCode(add, 1, None, add))
-    # A tree of ADDs over the loop output takes the main graph past 512 tensors.
-    level = [graph.outputs[0]] * 520
-    while len(level) > 1:
-        sums = []
-        for a, b in zip(level[::2], level[1::2]):
-            graph.tensors.append(tw.Tensor([1, 4], 0, 0, b"sum%d" % len(graph.tensors)))
-            graph.operators.append(tw.Operator(len(model.operator_codes) - 1, [a, b],
-                                               [len(graph.tensors) - 1]))
-            sums.append(len(graph.tensors) - 1)
-        level = sums + level[len(sums) * 2:]
-    graph.outputs = level
-    source = tmp_path / "loop.tflite"
-    source.write_bytes(tw.write(model))
+    source, model_tensors = loop_past_512_tensors_path
     plan = tmp_path / "loop.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(source), "-m", "256K", "-o", str(plan)],
                                 env={"NO_COLOR": "1"})
     assert result.exit_code == 0, result.output
     tensors = len(inspect_file(plan)["plan"]["tensors"])
-    assert 512 < len(graph.tensors) < tensors
+    assert 512 < model_tensors < tensors
     assert re.findall(r"TIGRIS_MAX_TENSORS=(\d+)", result.output) == [str(tensors)]
     assert f"runtime build   -DTIGRIS_MAX_TENSORS={tensors}" in result.output
 

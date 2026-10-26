@@ -88,7 +88,7 @@ The `.tgrs` plan is target-agnostic: the same file runs on an ESP32, a Cortex-M,
 
 ## What you get
 
-`tigris compile` writes a single `.tgrs` file holding the operator schedule, tile parameters, quantization tables, and the weights.
+`tigris compile` writes a single `.tgrs` file holding the operator schedule, tile parameters, quantization tables, and the weights. With a host runtime, bundled or named by `TIGRIS_HOST_LIBRARY`, it first loads the plan with the runtime's loader and writes no plan the loader refuses. The pure wheel without `TIGRIS_HOST_LIBRARY` writes the plan without that check.
 
 `tigris codegen` produces a C harness that loads the plan and hands it to the runtime: buffer and arena declarations, a target entry point, and the glue for reaching the plan bytes. `--format app` emits a standalone program. `--format core` emits a source and header for firmware that already owns its entry point, arenas, and input source, so several generated cores can coexist in one binary. The [`codegen` reference](https://tigris-ml.dev/toolchain/codegen/) documents the flags.
 

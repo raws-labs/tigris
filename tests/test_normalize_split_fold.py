@@ -24,7 +24,8 @@ def _head_split(seq, widths, product="MatMul"):
     The stacked axis has extent sum(widths) after the Reshape and the Transpose;
     seq equal to that extent puts the same extent on the sequence axis too.
     ``product`` is MatMul against a constant, Gemm against a transposed
-    constant, or MatMul against a second model input.
+    constant, or MatMul against a second model input of the same rank, since
+    the runtime's MatMul of two activations does not broadcast.
     """
     total = sum(widths)
     weight = np.random.default_rng(7).standard_normal((8, 8 * total)).astype(np.float32)
@@ -40,7 +41,7 @@ def _head_split(seq, widths, product="MatMul"):
         if product == "MatMul":
             constants.append(numpy_helper.from_array(weight, "w"))
         else:
-            inputs.append(helper.make_tensor_value_info("w", TensorProto.FLOAT, list(weight.shape)))
+            inputs.append(helper.make_tensor_value_info("w", TensorProto.FLOAT, [1, *weight.shape]))
     perm = [len(lead), *range(len(lead)), len(lead) + 1]
     constants.append(numpy_helper.from_array(np.array([*lead, total, 8], np.int64), "shape"))
     names = [f"y{i}" for i in range(len(widths))]
