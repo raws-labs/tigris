@@ -13,6 +13,7 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.cli import cli
 from tigris.graph.ir import QuantParam
 from tigris.loaders.onnx.loader import load_model
+from tigris.loaders.onnx.normalize import fusion
 
 # The package exports a function under the module's name, so the module is looked up directly.
 normalize_module = importlib.import_module("tigris.loaders.onnx.normalize")
@@ -136,8 +137,8 @@ def test_each_part_is_computed_by_its_own_product(tmp_path, seq, widths):
 def test_a_refused_fold_leaves_the_plan_as_without_the_pass(tmp_path, monkeypatch, product):
     """A product the fold cannot cut stays whole, and no part it began is left in the plan."""
     model = _head_split(3, [2, 1], product)
-    fold, attempts = normalize_module._fold_split_onto, []
-    monkeypatch.setattr(normalize_module, "_fold_split_onto",
+    fold, attempts = fusion._fold_split_onto, []
+    monkeypatch.setattr(fusion, "_fold_split_onto",
                         lambda *args: attempts.append(fold(*args)) or attempts[-1])
     _, folded = _compile(tmp_path, model, "attempted")
     assert attempts == [False]
@@ -198,15 +199,15 @@ def test_a_block_quantization_is_cut_only_along_its_own_axis():
     """Per-tensor holds for every block; per-channel is sliced along its axis or refused."""
     blocks = [(0, 4), (4, 2)]
     per_tensor = QuantParam(scale=np.array([0.1], np.float32), zero_point=np.array([0], np.int8))
-    assert [q is per_tensor for q in normalize_module._quant_of_blocks(per_tensor, 2, 1, 6, blocks)] == [True, True]
-    assert normalize_module._quant_of_blocks(None, 2, 1, 6, blocks) == [None, None]
+    assert [q is per_tensor for q in fusion._quant_of_blocks(per_tensor, 2, 1, 6, blocks)] == [True, True]
+    assert fusion._quant_of_blocks(None, 2, 1, 6, blocks) == [None, None]
 
     scale = np.arange(1, 7, dtype=np.float32)
     columns = QuantParam(scale=scale, zero_point=np.arange(6, dtype=np.int8), axis=-1)
-    first, second = normalize_module._quant_of_blocks(columns, 2, 1, 6, blocks)
+    first, second = fusion._quant_of_blocks(columns, 2, 1, 6, blocks)
     np.testing.assert_array_equal(first.scale, scale[:4])
     np.testing.assert_array_equal(second.zero_point, np.arange(4, 6))
     assert (first.axis, second.axis) == (1, 1)
 
     rows = QuantParam(scale=scale, zero_point=np.zeros(6, np.int8), axis=0)
-    assert normalize_module._quant_of_blocks(rows, 2, 1, 6, blocks) is None
+    assert fusion._quant_of_blocks(rows, 2, 1, 6, blocks) is None

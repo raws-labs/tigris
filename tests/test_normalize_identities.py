@@ -5,7 +5,8 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.loaders.onnx.loader import load_model
-from tigris.loaders.onnx.normalize import normalize, _stored_extent
+from tigris.loaders.onnx.normalize import normalize
+from tigris.loaders.onnx.normalize.layout import _stored_extent
 
 from conftest import save_onnx, vi
 

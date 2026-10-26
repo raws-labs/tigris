@@ -1260,7 +1260,7 @@ def test_reducemax_does_not_rewrite_nonspatial_axes_to_global_pool(tmp_path):
 
 @pytest.mark.parametrize("kind", ["ArgMax", "ArgMin"])
 def test_arg_normalization_preserves_indices_and_refuses_last_index(tmp_path, kind):
-    from tigris.loaders.onnx.normalize import _normalize_arg_outputs
+    from tigris.loaders.onnx.normalize.attributes import _normalize_arg_outputs
 
     graph = _reduction_graph(kind)
     graph.tensors["y"].dtype = 7
