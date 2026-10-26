@@ -16,7 +16,8 @@ from tigris.analysis.validation import (
 )
 from tigris.inspection import inspect_file
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
-from tigris.cli import _run_pipeline, cli
+from tigris.cli import _run_pipeline, cli, text
+from tigris.cli.analyze import verdict_lines
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, Stage, TensorInfo, TilePlan
@@ -226,7 +227,10 @@ def test_an_output_no_operator_computes_leaves_dtype_errors_reported(mixed_dtype
     assert findings.dtype_errors == [
         "float32 activations in an int8 plan must follow a Dequantize, If or While: "
         "float_input, float_output"]
-    assert findings.verdict_text == findings.output_errors[0]
+    assert findings.verdict == "needs_work"
+    # The output error is the cause analyze and compile state.
+    assert verdict_lines(findings, graph.mem_budget, graph) == [
+        text.bad("cannot compile") + ": " + findings.output_errors[0]]
 
 
 def test_ceil_mode_whose_last_window_lies_in_the_padding_is_rejected(tmp_path):

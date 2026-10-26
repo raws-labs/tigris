@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris.analysis.findings import compute_findings
+from tigris.analysis.findings import _weight_sizes, compute_findings
 from tigris.emitters.binary.defs import (
     HEADER_SIZE,
     HEADER_STRUCT,
@@ -117,7 +117,7 @@ def _assert_weights_sized_as_stored(graph, weight_bytes):
     assert findings.total_weight_bytes == weight_bytes
     assert findings.plan_overhead_bytes == len(plan) - weight_bytes
     # Without a float weight the int8 profile is the plan as written.
-    assert findings.int8_weight_bytes == weight_bytes
+    assert sum(_weight_sizes(graph)[1]) == weight_bytes
     assert findings.int8_plan_size_bytes == len(plan)
 
 

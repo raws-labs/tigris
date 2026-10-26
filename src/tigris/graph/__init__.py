@@ -2,7 +2,6 @@
 
 from tigris.graph.ir import (
     AnalyzedGraph,
-    MemorySnapshot,
     OpNode,
     QuantParam,
     Stage,
@@ -13,7 +12,6 @@ from tigris.graph.ir import (
 
 __all__ = [
     "AnalyzedGraph",
-    "MemorySnapshot",
     "OpNode",
     "QuantParam",
     "Stage",

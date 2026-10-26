@@ -127,7 +127,7 @@ def _run_pipeline(
     try:
         ag = load_model(model_path, input_shapes)
         ag = compute_lifetimes(ag)
-        ag = compute_memory_timeline(ag, capture_live_tensors=False)
+        ag = compute_memory_timeline(ag)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -170,8 +170,8 @@ def _run_pipeline(
     # Each subgraph a control-flow operator runs is planned as a graph of its
     # own under the same budget, those it runs in turn first.
     def planned_below(graph):
-        graph.subgraphs = [planned(planned_below(compute_memory_timeline(
-            compute_lifetimes(sub), capture_live_tensors=False))) for sub in graph.subgraphs]
+        graph.subgraphs = [planned(planned_below(compute_memory_timeline(compute_lifetimes(sub))))
+                           for sub in graph.subgraphs]
         return graph
 
     ag = planned(planned_below(ag))

@@ -120,7 +120,7 @@ def test_findings_never_pass_when_scheduled_peak_exceeds_budget(conv_relu_chain_
 
     findings = compute_findings(graph)
 
-    assert findings.scheduled_peak_bytes > findings.budget
+    assert findings.scheduled_peak_bytes > graph.mem_budget
     assert findings.verdict == "needs_work"
     assert findings.feasibility_errors
 
