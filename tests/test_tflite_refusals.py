@@ -182,7 +182,7 @@ REASONS = [
     pytest.param("float_resize_bilinear", [_option(0, 2, "?", True), _option(0, 3, "?", True)],
                  ["operator 0 RESIZE_BILINEAR: align_corners and half_pixel_centers together"],
                  id="resize-corners"),
-    # _int32_reason
+    # _int32_arithmetic, _int32_comparison
     pytest.param("gather_index_arithmetic", [_option(0, 0, "b", 1)],
                  ["operator 0 MUL: a fused activation on int32"], id="int32-fused"),
     pytest.param("gather_index_arithmetic", [_int32_overflow],
@@ -723,7 +723,7 @@ def test_an_index_outside_its_table_or_an_operand_left_out_is_an_error(name, edi
 
 
 def test_every_kind_the_importer_converts_or_folds_has_its_operand_counts():
-    assert set(tflite._SUPPORTED) - set(tflite._OPERANDS) == {tflite._DETECTION}
+    assert set(tflite._KINDS) - set(tflite._OPERANDS) == {tflite._DETECTION}
 
 
 def _first_of_each_kind():
