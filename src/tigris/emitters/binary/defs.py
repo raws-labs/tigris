@@ -165,6 +165,7 @@ TILE_PLAN_V10_STRUCT = struct.Struct("<BBH7I")
 TILE_PLAN_V11_STRUCT = struct.Struct("<BBH7I3IHBB")
 WEIGHT_ENTRY_STRUCT = struct.Struct("<III")
 QUANT_PARAM_STRUCT = struct.Struct("<fiHHHH")
+# first_weight_idx is the block's lowest weight index and num_weights its weight count, not a range.
 WEIGHT_BLOCK_STRUCT = struct.Struct("<HHHHIII")
 OP_ATTRIBUTE_STRUCT = struct.Struct("<HBBI")
 # scheduled_peak(u32): fast bytes the largest stage or chain holds, as validated; no decompressed weights.
