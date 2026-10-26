@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -386,8 +387,9 @@ def sanitized_runtime(tmp_path_factory):
     """The runtime sources compiled once with address and undefined-behavior sanitizers."""
     _check_toolchain()
     build = tmp_path_factory.mktemp("sanitized-runtime")
-    objects = []
-    for source in sorted((_RUNTIME_INCLUDE.parent / "src").glob("*.c")):
+    sources = sorted((_RUNTIME_INCLUDE.parent / "src").glob("*.c"))
+
+    def compile_source(source):
         target = build / f"{source.stem}.o"
         result = subprocess.run(
             [_CC, "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
@@ -395,8 +397,10 @@ def sanitized_runtime(tmp_path_factory):
              "-c", str(source), "-o", str(target)],
             text=True, capture_output=True, check=False)
         assert result.returncode == 0, result.stdout + result.stderr
-        objects.append(str(target))
-    return objects
+        return str(target)
+
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+        return list(pool.map(compile_source, sources))
 
 
 def _sanitized_binary(objects, sources, include: Path, output: Path) -> Path:
