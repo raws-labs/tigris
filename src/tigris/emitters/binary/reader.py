@@ -20,6 +20,7 @@ from .defs import (
     MEMORY_SIZE,
     MEMORY_STRUCT,
     MAGIC,
+    NO_STATE_OUTPUT,
     OP_ACTIVATION_OFFSET,
     OP_ACTIVATION_STRUCT,
     OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
@@ -52,6 +53,14 @@ from .defs import (
     SPATIAL_ATTRS_STRUCT,
     STAGE_SIZE,
     STAGE_STRUCT,
+    STATE_ENTRY_SIZE,
+    STATE_ENTRY_STRUCT,
+    STATE_HEADER_SIZE,
+    STATE_HEADER_STRUCT,
+    SUBGRAPH_ENTRY_SIZE,
+    SUBGRAPH_ENTRY_STRUCT,
+    SUBGRAPH_HEADER_SIZE,
+    SUBGRAPH_HEADER_STRUCT,
     TENSOR_SIZE,
     TENSOR_STRUCT,
     TILE_PLAN_SIZE,
@@ -371,11 +380,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         entries_start = qp_base + QUANT_SECTION_HEADER_STRUCT.size
         _check_range(SEC_QUANT_PARAMS, entries_start, nqp * QUANT_PARAM_SIZE)
         data_start = entries_start + nqp * QUANT_PARAM_SIZE
-        quant_end = min(
-            (offset for offset in sections.values() if offset > qp_base),
-            default=len(data),
-        )
-        qd_bytes = quant_end - data_start
+        qd_bytes = section_ends[SEC_QUANT_PARAMS] - data_start
         if qd_bytes < 0 or qd_bytes % 4:
             raise ValueError("Malformed quant-data section")
         for i in range(nqp):
@@ -454,10 +459,7 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         )
         entries_start = attrs_base + OP_ATTRIBUTE_SECTION_HEADER_STRUCT.size
         data_start = entries_start + num_attrs * OP_ATTRIBUTE_SIZE
-        section_end = min(
-            (offset for offset in sections.values() if offset > attrs_base),
-            default=len(data),
-        )
+        section_end = section_ends[SEC_OP_ATTRIBUTES]
         if data_start > section_end:
             raise ValueError("operator-attribute entries exceed section")
         for i in range(num_attrs):
@@ -477,27 +479,29 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
     subgraphs = []
     if SEC_SUBGRAPHS in sections:
         base = sections[SEC_SUBGRAPHS]
-        _check_range(SEC_SUBGRAPHS, base, 4)
-        (count, _reserved) = struct.unpack_from("<HH", data, base)
-        _check_range(SEC_SUBGRAPHS, base + 4, 12 * count)
+        _check_range(SEC_SUBGRAPHS, base, SUBGRAPH_HEADER_SIZE)
+        (count, _reserved) = SUBGRAPH_HEADER_STRUCT.unpack_from(data, base)
+        entries_start = base + SUBGRAPH_HEADER_SIZE
+        _check_range(SEC_SUBGRAPHS, entries_start, SUBGRAPH_ENTRY_SIZE * count)
         for k in range(count):
-            first, length, in_off, in_count, out_off, out_count = struct.unpack_from(
-                "<6H", data, base + 4 + 12 * k)
+            first, length, in_off, in_count, out_off, out_count = SUBGRAPH_ENTRY_STRUCT.unpack_from(
+                data, entries_start + SUBGRAPH_ENTRY_SIZE * k)
             subgraphs.append({"first_stage": first, "num_stages": length,
                               "inputs": _read_index_pool(in_off, in_count),
                               "outputs": _read_index_pool(out_off, out_count)})
     state = {"bytes": 0, "entries": []}
     state_base = sections.get(SEC_STATE, 0)
     if state_base:
-        _check_range(SEC_STATE, state_base, 8)
-        count, _reserved, state["bytes"] = struct.unpack_from("<HHI", data, state_base)
-        _check_range(SEC_STATE, state_base + 8, 16 * count)
+        _check_range(SEC_STATE, state_base, STATE_HEADER_SIZE)
+        count, _reserved, state["bytes"] = STATE_HEADER_STRUCT.unpack_from(data, state_base)
+        entries_start = state_base + STATE_HEADER_SIZE
+        _check_range(SEC_STATE, entries_start, STATE_ENTRY_SIZE * count)
         for i in range(count):
-            entry_in, entry_out, offset, size, initial = struct.unpack_from(
-                "<HHIII", data, state_base + 8 + 16 * i)
+            entry_in, entry_out, offset, size, initial = STATE_ENTRY_STRUCT.unpack_from(
+                data, entries_start + STATE_ENTRY_SIZE * i)
             _check_range(SEC_STATE, state_base + initial, size)
             state["entries"].append({
-                "input": entry_in, "output": None if entry_out == 0xFFFF else entry_out,
+                "input": entry_in, "output": None if entry_out == NO_STATE_OUTPUT else entry_out,
                 "offset": offset, "bytes": size,
                 "initial": data[state_base + initial:state_base + initial + size]})
 

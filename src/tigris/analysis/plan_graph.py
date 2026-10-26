@@ -13,6 +13,9 @@ import numpy as np
 
 from tigris import TILE_AXIS_HW
 from tigris.emitters.binary.defs import (
+    NO_CHAIN,
+    NO_QUANT_PARAM,
+    NO_TILE_PLAN,
     OP_ATTR_SUBGRAPHS,
     TENSOR_FLAG_CONSTANT,
     TENSOR_FLAG_LINEAR,
@@ -32,16 +35,13 @@ from tigris.graph.ir import (
 from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.operator_contract import OP_TYPE_BY_CODE
 
-_NO_TILE_PLAN = 0xFFFF
-_NO_QUANT_PARAM = 0xFFFF
-
 
 def _tensor(index: int, record: dict, quant_params: list[dict]) -> TensorInfo:
     layout = Layout.LINEAR if record["flags"] & TENSOR_FLAG_LINEAR else Layout.SPATIAL
     stored = record["shape"]
     axes = serialized_axis_map(len(stored), layout)
     quant = None
-    if record["quant_param_idx"] != _NO_QUANT_PARAM:
+    if record["quant_param_idx"] != NO_QUANT_PARAM:
         entry = quant_params[record["quant_param_idx"]]
         quant = QuantParam(scale=np.array([entry["scale"]], np.float32),
                            zero_point=np.array([entry["zero_point"]], np.int32))
@@ -89,7 +89,7 @@ def graph_from_plan(plan: dict, fast_reserve: int = 0) -> AnalyzedGraph:
         first = graph_range["first_stage"]
         for position, record in enumerate(records):
             tile = None
-            if record["tile_plan_idx"] != _NO_TILE_PLAN:
+            if record["tile_plan_idx"] != NO_TILE_PLAN:
                 entry = plan["tile_plans"][record["tile_plan_idx"]]
                 tile = TilePlan(
                     tileable=entry["tileable"], axis=entry["axis"],
@@ -100,8 +100,8 @@ def graph_from_plan(plan: dict, fast_reserve: int = 0) -> AnalyzedGraph:
                 input_tensors=[names[i] for i in record["inputs"]],
                 output_tensors=[names[i] for i in record["outputs"]],
                 peak_bytes=record["peak_bytes"], tile_plan=tile,
-                chain_id=(record["chain_id"] - first if record["chain_id"] != 0xFFFF
-                          else 0xFFFF),
+                chain_id=(record["chain_id"] - first if record["chain_id"] != NO_CHAIN
+                          else NO_CHAIN),
                 chain_len=record["chain_len"], chain_tile_h=record["chain_tile_h"])
             for i in stage.op_indices:
                 ops[i].stage = position

@@ -30,24 +30,6 @@ SEC_SUBGRAPHS = 13  # u16 count, u16 0, then per graph (main first): u16 first s
                     # u16 outputs (offsets into the index pool)
 # The plan's fast-arena figure (schema 11+): MEMORY_STRUCT.
 SEC_MEMORY = 14
-SUBGRAPH_HEADER_SIZE = 4
-SUBGRAPH_ENTRY_SIZE = 12
-STATE_HEADER_SIZE = 8
-STATE_ENTRY_SIZE = 16
-
-SECTION_TYPES = (
-    SEC_TENSORS,
-    SEC_OPS,
-    SEC_STAGES,
-    SEC_TILE_PLANS,
-    SEC_INDEX_POOL,
-    SEC_SHAPE_POOL,
-    SEC_STRINGS,
-    SEC_WEIGHTS,
-    SEC_QUANT_PARAMS,
-    SEC_WEIGHT_BLOCKS,
-    SEC_OP_ATTRIBUTES,
-)
 
 # Per-operator attribute kinds stored in SEC_OP_ATTRIBUTES. The loader refuses
 # a kind it does not know, so an older runtime rejects a plan that carries a
@@ -108,40 +90,12 @@ OP_ATTR_DETECTION = 18  # uint16 max detections, detections per class, classes; 
 OP_ATTR_GELU_APPROXIMATE = 19  # uint8[1], exact (0) or tanh approximation (1)
 OP_ATTR_TABLE_SHAPE = 20  # int32 extents of a constant Gather data operand
 
-OP_ATTR_KINDS = (
-    OP_ATTR_TABLE_SHAPE,
-    OP_ATTR_GELU_APPROXIMATE,
-    OP_ATTR_COMPARISON_REQUANT,
-    OP_ATTR_CONSTANTS,
-    OP_ATTR_SVDF,
-    OP_ATTR_LSTM,
-    OP_ATTR_SUBGRAPHS,
-    OP_ATTR_DETECTION,
-    OP_ATTR_TRANSPOSE_PERM,
-    OP_ATTR_EPSILON,
-    OP_ATTR_ALPHA,
-    OP_ATTR_CLIP_BOUNDS,
-    OP_ATTR_PADS,
-    OP_ATTR_AXES,
-    OP_ATTR_BINARY_REQUANT,
-    OP_ATTR_POOL_ROUNDING,
-    OP_ATTR_CONSTANT_OPERAND,
-    OP_ATTR_RESIZE_SCALES,
-    OP_ATTR_CUMSUM_OPTIONS,
-    OP_ATTR_MOVEMENT,
-)
-
 # Compression types
 COMPRESS_NONE = 0
 COMPRESS_LZ4 = 1
 
 # Header flags
 FLAG_XIP = 0x01  # weights are execute-in-place from flash
-
-# Op type enum (ONNX op_type string -> uint8)
-
-OP_TYPE_UNKNOWN = 255
-
 
 # Tensor flags
 TENSOR_FLAG_CONSTANT = 0x01
@@ -190,8 +144,10 @@ MEMORY_STRUCT = struct.Struct("<I")
 QUANT_SECTION_HEADER_STRUCT = struct.Struct("<HH")
 WEIGHT_BLOCK_SECTION_HEADER_STRUCT = struct.Struct("<HH")
 OP_ATTRIBUTE_SECTION_HEADER_STRUCT = struct.Struct("<HH")
-INDEX_STRUCT = struct.Struct("<H")
-SHAPE_DIM_STRUCT = struct.Struct("<i")
+SUBGRAPH_HEADER_STRUCT = struct.Struct("<HH")
+SUBGRAPH_ENTRY_STRUCT = struct.Struct("<6H")
+STATE_HEADER_STRUCT = struct.Struct("<HHI")
+STATE_ENTRY_STRUCT = struct.Struct("<HHIII")
 QUANT_DATA_STRUCT = struct.Struct("<i")
 
 # Every section begins on this boundary.  The weights section receives an
@@ -217,21 +173,24 @@ QUANT_PARAM_SIZE = QUANT_PARAM_STRUCT.size
 WEIGHT_BLOCK_SIZE = WEIGHT_BLOCK_STRUCT.size
 OP_ATTRIBUTE_SIZE = OP_ATTRIBUTE_STRUCT.size
 MEMORY_SIZE = MEMORY_STRUCT.size
+SUBGRAPH_HEADER_SIZE = SUBGRAPH_HEADER_STRUCT.size
+SUBGRAPH_ENTRY_SIZE = SUBGRAPH_ENTRY_STRUCT.size
+STATE_HEADER_SIZE = STATE_HEADER_STRUCT.size
+STATE_ENTRY_SIZE = STATE_ENTRY_STRUCT.size
 
-# Derived field offsets used for staged decoding/patching.
+# Derived field offsets used for staged decoding.
 OP_SPATIAL_OFFSET = OP_PREFIX_STRUCT.size
 OP_WEIGHT_BIAS_OFFSET = OP_SPATIAL_OFFSET + SPATIAL_ATTRS_STRUCT.size
 OP_ACTIVATION_OFFSET = OP_WEIGHT_BIAS_OFFSET + OP_WEIGHT_BIAS_STRUCT.size
-STAGE_TILE_PLAN_INDEX_OFFSET = struct.calcsize("<I6H")
 
-# Sentinel for no weight/bias
+# Sentinels for an absent u16 index
 NO_WEIGHT = 0xFFFF
 NO_QUANT_PARAM = 0xFFFF
+NO_TILE_PLAN = 0xFFFF
+NO_CHAIN = 0xFFFF  # a stage's chain_id when it belongs to no chain
+NO_STATE_OUTPUT = 0xFFFF  # a state entry's output when the value leaves unchanged
 
 # Fused activation enum
 ACT_NONE = 0
 ACT_RELU = 1
 ACT_RELU6 = 2
-
-# Spatial attr keys we extract from ONNX op attrs
-_SPATIAL_KEYS = ("kernel_shape", "strides", "pads", "dilations", "group")
