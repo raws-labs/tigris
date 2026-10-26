@@ -13,7 +13,7 @@ from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.findings import compute_findings
-from tigris.cli import cli
+from tigris.cli import _run_pipeline, cli
 from tigris.cli.compile import _run_compressed_pipeline
 from tigris.emitters.binary.defs import NO_WEIGHT, OP_ATTR_CONSTANTS, OP_TYPE_MAP
 from tigris.emitters.binary.reader import read_binary_plan
@@ -233,6 +233,22 @@ def test_compressed_plan_fails_when_total_budget_omits_reservation(
 
     with pytest.raises(ValueError, match="Cannot emit an infeasible memory plan"):
         emit_binary_bytes(ag, compress="lz4")
+
+
+def test_decompressed_weights_that_take_the_whole_budget_leave_no_plan(tmp_path):
+    """No fast memory is left for activations, so no plan is written."""
+    model = Path(__file__).parent / "fixtures" / "tflite" / "ops" / "conv_bias.tflite"
+    unreserved, _ = _run_pipeline(str(model), ("256",), report_bindings=False)
+    assert compressed_weight_reserve_bytes(unreserved) == 256
+
+    output = tmp_path / "conv_bias.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(model), "-m", "256", "-c", "lz4", "-o", str(output)])
+    assert result.exit_code == 1
+    assert result.output.splitlines()[-1] == (
+        "Error: no plan written: decompressed weights need all 256 B of fast memory, "
+        "none is left for activations")
+    assert not output.exists()
 
 
 def test_compile_compressed_uses_total_arena_budget(

@@ -144,9 +144,15 @@ def _run_pipeline(
         raise click.ClickException(
             "Fast-memory budget exceeds the uint32 plan-format limit"
         )
-    if total_budget >= 0 and fast_reserve_bytes > total_budget:
+    if fast_reserve_bytes > 0 and fast_reserve_bytes >= total_budget:
         # Only compressed plans reserve fast memory, for decompressed weights.
         from tigris.utils import fmt_bytes
+        if fast_reserve_bytes == total_budget:
+            # An activation budget of 0 would read as no budget, and nothing would be planned.
+            raise click.ClickException(
+                f"no plan written: decompressed weights need all {fmt_bytes(total_budget)} "
+                "of fast memory, none is left for activations"
+            )
         raise click.ClickException(
             f"no plan written: decompressed weights need {fmt_bytes(fast_reserve_bytes)} "
             f"of fast memory, the budget is {fmt_bytes(total_budget)}"
