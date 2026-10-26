@@ -120,8 +120,7 @@ def _conv(inp, out, kernel=3, stride=1):
 
 def single_stage(ops, shapes, inputs, c, h, w, mem_budget, constants=()):
     """One stage over all ops on int8 tensors, with the whole-tensor working
-    set c*h*w as peak_bytes: a single-row height tile costs exactly c*w bytes,
-    matching the 1D solver's proportional row-byte model."""
+    set c*h*w as peak_bytes."""
     stage = Stage(stage_id=0, op_indices=list(range(len(ops))),
                   input_tensors=inputs, output_tensors=["output"],
                   peak_bytes=c * h * w)

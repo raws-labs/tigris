@@ -635,9 +635,25 @@ def test_a_strided_stripe_states_the_output_band_it_runs(strided_conv_path):
     (stage,) = ag.stages
     tp = stage.tile_plan
     assert (tp.tile_height, tp.num_tiles, tp.original_height, tp.halo) == (2, 8, 16, 2)
-    # The band priced is still three input rows plus the halo; seven boundaries read the halo again.
-    assert (tp.tiled_peak_bytes, tp.overhead_bytes) == (1280, 7 * 256)
+    # Five input rows of 128 bytes and two output rows of 256; seven boundaries read the halo again.
+    assert (tp.tiled_peak_bytes, tp.overhead_bytes) == (1152, 7 * 256)
     (record,) = read_binary_plan(emit_binary_bytes(ag))["tile_plans"]
     assert (record["input_band_extent"], record["output_band_extent"]) == (0, 2)
     assert (record["tile_extent"], record["num_tiles"], record["original_extent"],
             record["halo"], record["band_axis"]) == (2, 8, 16, 2, 1)
+
+
+@pytest.mark.parametrize("budget,band", [(640, 1), (1280, 2), (1663, 2), (1664, 3)])
+def test_a_stripe_states_the_working_set_of_its_band(strided_conv_path, budget, band):
+    """A band of B output rows reads 2B+1 input rows of 128 bytes and writes B rows of 256, and
+    the plan states exactly that working set for the largest band the budget holds. At 640 bytes
+    one output row fits as a height stripe, so the stage needs no 2D tile."""
+    from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
+    from tigris.cli import _run_pipeline
+
+    ag, _ = _run_pipeline(str(strided_conv_path), (str(budget),), report_bindings=False)
+    tp = ag.stages[0].tile_plan
+    assert tp.axis == TILE_AXIS_HEIGHT_OR_LENGTH and tp.tile_width == 0
+    assert (tp.tile_height, tp.num_tiles) == (band, -(-16 // band))
+    assert tp.tiled_peak_bytes == (2 * band + 1) * 128 + band * 256 <= budget
+    assert not tp.warnings
