@@ -24,6 +24,7 @@ from tigris.emitters.binary.defs import (
     FLAG_XIP, OP_ATTR_SUBGRAPHS, OP_C_NAMES, OP_TYPE_MAP, TENSOR_FLAG_CONSTANT,
     TENSOR_FLAG_STATE,
 )
+from tigris.analysis.memory import TENSOR_ALIGN, align_up
 from tigris.analysis.plan_graph import fast_activation_bytes, slow_arena_required
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.operator_contract import operators_with
@@ -31,11 +32,6 @@ from tigris.operator_contract import operators_with
 
 BACKENDS = CODEGEN_BACKENDS
 _CMSIS_TENSOR_ALIGN = 16
-_PLAN_TENSOR_ALIGN = 32
-
-
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
 
 
 # Headers with TIGRIS_RUNTIME_VERSION_MAJOR declare tigris_input_alloc(), which generated code calls.
@@ -58,7 +54,7 @@ def _weight_decompression_overhead(plan: dict, alignment: int) -> int:
         return 0
 
     def block_size(block: dict) -> int:
-        return _align_up(block["uncompressed_size"], alignment)
+        return align_up(block["uncompressed_size"], alignment)
 
     max_required = max(block_size(block) for block in blocks)
     stages = plan.get("stages", [])
@@ -398,7 +394,7 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
     plan = read_binary_plan(plan_data)
     macro_prefix = core_name.upper()
     guard = f"{macro_prefix}_CORE_H"
-    weight_reserve = _weight_decompression_overhead(plan, _PLAN_TENSOR_ALIGN)
+    weight_reserve = _weight_decompression_overhead(plan, TENSOR_ALIGN)
     fast_arena_required = fast_activation_bytes(plan) + weight_reserve
     slow_arena_bytes = slow_arena_required(plan)
     workspace_limits = _executor_workspace_limits(plan)
@@ -425,7 +421,7 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
  * runtimes whose TIGRIS_TENSOR_ALIGN is at most this value. Backend-specific
  * scratch/workspace is prepared separately and is not included here. */
 #define {macro_prefix}_TENSOR_CAPACITY {plan['num_tensors']}u
-#define {macro_prefix}_PLAN_TENSOR_ALIGNMENT_BYTES {_PLAN_TENSOR_ALIGN}u
+#define {macro_prefix}_PLAN_TENSOR_ALIGNMENT_BYTES {TENSOR_ALIGN}u
 #define {macro_prefix}_PLAN_BUDGET_BYTES {plan['budget']}u
 #define {macro_prefix}_WEIGHT_DECOMPRESSION_RESERVE_BYTES {weight_reserve}u
 #define {macro_prefix}_CORE_FAST_ARENA_BYTES {fast_arena_required}u
@@ -1058,7 +1054,7 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
     dispatch = "tigris_dispatch_kernel_cmsis_nn" if is_quantized else "tigris_dispatch_kernel"
     kernel_include = '#include "tigris_kernels_cmsis_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
     weight_overhead = _cmsis_weight_decompression_overhead(plan)
-    core_fast_arena_size = _align_up(
+    core_fast_arena_size = align_up(
         (fast_activation_bytes(plan) or 65536) + weight_overhead, 16)
     if core_fast_arena_size > 0xFFFFFFFF:
         raise ValueError(

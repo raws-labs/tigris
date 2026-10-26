@@ -14,6 +14,7 @@ from tigris import (
     TILE_AXIS_NONE,
 )
 from tigris.analysis.broadcast import BINARY_OPS, padded
+from tigris.analysis.memory import align_up
 from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.graph.ir import (
     AnalyzedGraph,
@@ -644,9 +645,8 @@ def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
         return 0
 
     weight_idx, weights = _serialized_weights(ag, _StringTable())
-    align = ag.tensor_alignment
     block_bytes = {
-        stage_idx: (len(data) + align - 1) & ~(align - 1)
+        stage_idx: align_up(len(data))
         for stage_idx, _, _, data in _stage_blocks(ag, weight_idx, weights)
     }
 

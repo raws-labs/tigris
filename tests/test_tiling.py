@@ -471,14 +471,14 @@ def test_reshape_band_solver_preserves_integral_endpoints():
     from tigris.analysis.partition_spatial import _reshape_tile_for_bytes
 
     mapping = (2, 33, 4, 11, 12, 1)
-    plan = _reshape_tile_for_bytes(mapping, 256, 32, 4)
+    plan = _reshape_tile_for_bytes(mapping, 256, 4)
     assert plan.tileable and plan.tile_height == 6 and plan.num_tiles == 6
     assert plan.original_height == 33 and plan.band_axis == 1
     assert plan.tiled_peak_bytes == 192
     for start in range(0, 33, plan.tile_height):
         end = min(33, start + plan.tile_height)
         assert start * 4 % 12 == 0 and end * 4 % 12 == 0
-    refused = _reshape_tile_for_bytes(mapping, 95, 32, 4)
+    refused = _reshape_tile_for_bytes(mapping, 95, 4)
     assert not refused.tileable and refused.min_tile_bytes == 96
 
 
@@ -497,19 +497,19 @@ def test_reshape_refuses_strided_intervals_as_contiguous(source, target, expecte
     # Axis 1 has multiple leading blocks on each side. Only whole axis-0
     # intervals are contiguous, and their first integral band is the tensor.
     assert mapping == expected
-    assert not _reshape_tile_for_bytes(mapping, 64, 32, 4).tileable
+    assert not _reshape_tile_for_bytes(mapping, 64, 4).tileable
 
 
 def test_contiguous_reshape_rounds_bands_to_integral_endpoints():
     from tigris.analysis.partition_spatial import _reshape_tile_for_bytes
 
     mapping = (1, 36, 4, 6, 24, 0)
-    plan = _reshape_tile_for_bytes(mapping, 255, 32, 4)
+    plan = _reshape_tile_for_bytes(mapping, 255, 4)
     assert plan.tileable and plan.tile_height == 12 and plan.num_tiles == 3
     for start in range(0, 36, plan.tile_height):
         assert start * 4 % 24 == 0
         assert min(36, start + plan.tile_height) * 4 % 24 == 0
-    assert not _reshape_tile_for_bytes(mapping, 95, 32, 4).tileable
+    assert not _reshape_tile_for_bytes(mapping, 95, 4).tileable
 
 
 @pytest.mark.parametrize("kind", ["ReduceMean", "ReduceMax", "ReduceMin", "ReduceSum", "ReduceAll",

@@ -232,18 +232,16 @@ def _plan_requirements(plan: dict) -> dict:
     """What a runtime needs to run the plan: the fast arena, the state it
     keeps between runs, and the build limits the plan asks for. The fast arena
     adds the decompression buffer, sized as the runtime sizes it at the
-    largest tensor alignment, so it is an upper bound across targets."""
+    memory model's 32-byte alignment."""
     from tigris.emitters.binary.writer import (
         RUNTIME_MAX_CHAIN_STAGES, RUNTIME_MAX_STAGE_INPUTS, RUNTIME_MAX_STAGE_OUTPUTS,
         RUNTIME_MAX_TENSORS)
+    from tigris.analysis.memory import align_up
     from tigris.analysis.plan_graph import fast_activation_bytes
     from tigris.emitters.codegen import _build_limits_needed
 
-    def aligned(size):
-        return -(-size // _MAX_TENSOR_ALIGN) * _MAX_TENSOR_ALIGN
-
     blocks = [block for block in plan["weight_blocks"] if block["compressed_size"]]
-    decompression = max((aligned(block["uncompressed_size"]) for block in blocks), default=0)
+    decompression = max((align_up(block["uncompressed_size"]) for block in blocks), default=0)
     for index, stage in enumerate(plan["stages"]):
         if stage["chain_len"] < 2 or stage["chain_id"] != index:
             continue
@@ -252,7 +250,7 @@ def _plan_requirements(plan: dict) -> dict:
         for block in blocks:
             if index <= block["stage_idx"] < index + stage["chain_len"]:
                 firsts.setdefault(block["stage_idx"], block)
-        decompression = max(decompression, sum(aligned(b["uncompressed_size"]) for b in firsts.values()))
+        decompression = max(decompression, sum(align_up(b["uncompressed_size"]) for b in firsts.values()))
     tensors, inputs, outputs, chain, spatial = _build_limits_needed(
         {**plan, "num_tensors": len(plan["tensors"])})
     defaults = {"TIGRIS_MAX_TENSORS": RUNTIME_MAX_TENSORS,
@@ -270,9 +268,7 @@ def _plan_requirements(plan: dict) -> dict:
     }
 
 
-# The runtime's largest TIGRIS_TENSOR_ALIGN and its default spatial-operator
-# limit; tigris_config.h holds both.
-_MAX_TENSOR_ALIGN = 32
+# The runtime's default spatial-operator limit; tigris_config.h holds it.
 _RUNTIME_MAX_SPATIAL_OPS = 8
 
 

@@ -164,7 +164,8 @@ def slow_arena_required(plan: dict) -> int:
     derived again from the plan at 32-byte allocations, which covers every
     runtime whose TIGRIS_TENSOR_ALIGN is at most that."""
     from tigris.analysis.validation import slow_pool_usage
-    from tigris.emitters.codegen import _PLAN_TENSOR_ALIGN, _weight_decompression_overhead
+    from tigris.analysis.memory import TENSOR_ALIGN
+    from tigris.emitters.codegen import _weight_decompression_overhead
 
-    reserve = _weight_decompression_overhead(plan, _PLAN_TENSOR_ALIGN)
+    reserve = _weight_decompression_overhead(plan, TENSOR_ALIGN)
     return slow_pool_usage(graph_from_plan(plan, reserve)).slow_peak_bytes
