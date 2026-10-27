@@ -233,43 +233,19 @@ def _plan_requirements(plan: dict) -> dict:
     keeps between runs, and the build limits the plan asks for. The fast arena
     adds the decompression buffer, sized as the runtime sizes it at the
     memory model's 32-byte alignment."""
-    from tigris.emitters.binary.writer import (
-        RUNTIME_MAX_CHAIN_STAGES, RUNTIME_MAX_STAGE_INPUTS, RUNTIME_MAX_STAGE_OUTPUTS,
-        RUNTIME_MAX_TENSORS)
-    from tigris.analysis.memory import align_up
-    from tigris.analysis.plan_graph import fast_activation_bytes
-    from tigris.emitters.codegen import _build_limits_needed
+    from tigris.analysis.plan_graph import (
+        BUILD_LIMIT_DEFAULTS, build_limits_needed, fast_activation_bytes,
+        plan_decompression_reserve)
 
-    blocks = [block for block in plan["weight_blocks"] if block["compressed_size"]]
-    decompression = max((align_up(block["uncompressed_size"]) for block in blocks), default=0)
-    for index, stage in enumerate(plan["stages"]):
-        if stage["chain_len"] < 2 or stage["chain_id"] != index:
-            continue
-        # A chain head decompresses each member's first block before any tile.
-        firsts = {}
-        for block in blocks:
-            if index <= block["stage_idx"] < index + stage["chain_len"]:
-                firsts.setdefault(block["stage_idx"], block)
-        decompression = max(decompression, sum(align_up(b["uncompressed_size"]) for b in firsts.values()))
-    tensors, inputs, outputs, chain, spatial = _build_limits_needed(
-        {**plan, "num_tensors": len(plan["tensors"])})
-    defaults = {"TIGRIS_MAX_TENSORS": RUNTIME_MAX_TENSORS,
-                "TIGRIS_MAX_STAGE_INPUTS": RUNTIME_MAX_STAGE_INPUTS,
-                "TIGRIS_MAX_STAGE_OUTPUTS": RUNTIME_MAX_STAGE_OUTPUTS,
-                "TIGRIS_MAX_CHAIN_STAGES": RUNTIME_MAX_CHAIN_STAGES,
-                "TIGRIS_MAX_SPATIAL_OPS_PER_STAGE": _RUNTIME_MAX_SPATIAL_OPS}
-    needed = dict(zip(defaults, (tensors, inputs, outputs, chain, spatial)))
+    decompression = plan_decompression_reserve(plan)
+    needed = build_limits_needed({**plan, "num_tensors": len(plan["tensors"])})
     return {
         "fast_arena_bytes": fast_activation_bytes(plan) + decompression,
         "decompression_bytes": decompression,
         "state_bytes": plan["state"]["bytes"],
-        "build_limits": [{"name": name, "needed": needed[name], "default": default}
-                         for name, default in defaults.items()],
+        "build_limits": [{"name": name, "needed": value, "default": default}
+                         for (name, default), value in zip(BUILD_LIMIT_DEFAULTS.items(), needed)],
     }
-
-
-# The runtime's default spatial-operator limit; tigris_config.h holds it.
-_RUNTIME_MAX_SPATIAL_OPS = 8
 
 
 def inspect_file(path: str | Path) -> dict:
