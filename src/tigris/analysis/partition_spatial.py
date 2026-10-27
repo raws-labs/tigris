@@ -107,6 +107,9 @@ _BAND_COST_ALIGN = 32
 # 65536 rows. Such a solver declines the stage and says why.
 _MAX_PLAN_EXTENT = 0xFFFF
 
+# A stripe stage with an op that reads a tensor from before the band moved.
+_OFF_BAND_WARNING = "Stage {} reads rows a tile does not hold"
+
 
 def _plan_extents_fit(tile_height: int, num_tiles: int, original: int) -> bool:
     """Whether a banding stays within the solver's tile extent cap."""
@@ -345,6 +348,10 @@ def _stage_2d_eligible(
     or different-resolution operand is not guaranteed to be co-tiled with
     that rectangle. Admitting such a stage as 2D would load the operand with
     the wrong region and size and silently produce a wrong result.
+
+    An op after the spatial op is handed the output tile, so it may read a
+    tensor from before the spatial op only when that op maps rows and columns
+    one to one (_ops_read_the_running_band with ``columns``).
     """
     if _stage_io_ranks(ag, stage) != {4}:
         return False
@@ -370,7 +377,8 @@ def _stage_2d_eligible(
     # Not asked for a resample: _assign_tile_plans bands a stage holding one by height first.
     return all(_op_supports_axis(op, TILE_AXIS_HW)
                and not _has_unequal_binary_operands(ag, op)
-               for op in stage_ops)
+               for op in stage_ops) and _ops_read_the_running_band(
+                   ag, stage, carries_operands=False, columns=True)
 
 
 def _stage_is_convtranspose_2d(stage_ops: list[OpNode]) -> bool:
@@ -1523,6 +1531,8 @@ def _solve_resize_height(ag: AnalyzedGraph, stage: Stage, ops: list[OpNode], bud
                (seen_resize or not _cotileable_skip_operands(ag, stage, op)))):
             return TilePlan(tileable=False, warnings=["Resize requires one spatial operator per band"])
         seen_output |= any(name in stage.output_tensors for name in op.outputs)
+    if not _ops_read_the_running_band(ag, stage, carries_operands=False):
+        return TilePlan(tileable=False, warnings=[_OFF_BAND_WARNING.format(stage.stage_id)])
     source, result = ag.tensors[resize.inputs[0]], ag.tensors[resize.outputs[0]]
     ih, oh = int(source.shape[2]), int(result.shape[2])
     if max(ih, oh) > _MAX_PLAN_EXTENT:
@@ -1683,6 +1693,12 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
                     if tile_axis == TILE_AXIS_NONE
                     else f"Stage {stage.stage_id} contains untileable ops"
                 ],
+            )
+            continue
+
+        if not _ops_read_the_running_band(ag, stage, carries_operands=False):
+            stage.tile_plan = TilePlan(
+                tileable=False, warnings=[_OFF_BAND_WARNING.format(stage.stage_id)]
             )
             continue
 
@@ -1922,24 +1938,47 @@ def _external_outputs_keep_their_rows(
     return True
 
 
-def _maps_rows_one_to_one(op: OpNode, weight_shapes) -> bool:
-    """A convolution or pool whose output row r reads input row r only."""
+def _maps_one_to_one(op: OpNode, axis: int, weight_shapes) -> bool:
+    """A convolution or pool whose output index i along ``axis`` (0 the height
+    or length, 1 the width) reads input index i only."""
     pads = op.attrs.get("pads") or []
-    return (_window(op, 0, weight_shapes) == (1, 1)
-            and (int(pads[0]) if len(pads) >= 1 else 0) == 0
-            and (int(pads[2]) if len(pads) >= 3 else 0) == 0)
+    # ONNX lists every axis's leading pad, then every axis's trailing pad.
+    half = len(pads) // 2
+    begin, end = (int(pads[axis]), int(pads[half + axis])) if len(pads) > half + axis else (0, 0)
+    return _window(op, axis, weight_shapes) == (1, 1) and begin == 0 and end == 0
 
 
-def _ops_read_the_running_band(ag: AnalyzedGraph, stage: Stage) -> bool:
-    """Whether every op of a chained stage reads the band the chain executor holds.
+def _keeps_the_band(ag: AnalyzedGraph, op: OpNode, weight_shapes, columns: bool) -> bool:
+    """Whether a convolution or pool leaves the band where it is.
 
-    The chain executor runs a stage as one height band. The band starts at the
-    stage input rows, and each convolution or pool that does not map rows one
-    to one moves it to that op's output rows. Every op reads the current band.
-    An op that reads a tensor from an earlier point of the band, such as a
-    branch off the input of a strided convolution, would be handed rows of the
-    wrong height and position. A two-operand binary op is the exception: the
-    executor offsets a carried operand to the band's rows.
+    Its output rows are its input rows, and its output is as wide as its
+    input. With ``columns``, as for an HW tile, which holds a column halo,
+    every output column also reads only its own input column.
+    """
+    if not _maps_one_to_one(op, 0, weight_shapes):
+        return False
+    if columns:
+        return _maps_one_to_one(op, 1, weight_shapes)
+    source, result = ag.tensors[op.inputs[0]].shape, ag.tensors[op.outputs[0]].shape
+    return len(source) != 4 or len(result) != 4 or int(source[3]) == int(result[3])
+
+
+def _ops_read_the_running_band(
+    ag: AnalyzedGraph, stage: Stage, carries_operands: bool = True, columns: bool = False
+) -> bool:
+    """Whether every op of a stage reads the band its executor holds.
+
+    The chain executor, the height stripe and the HW tile run a stage as one
+    band. The band starts at the stage input, and each resample, and each
+    convolution or pool that does not keep the band (see _keeps_the_band),
+    moves it to that op's output. Every op is handed the current band's
+    height and width. An op that reads a tensor from an earlier point of the
+    band, such as a branch off the input of a strided convolution, would be
+    handed rows or columns of the wrong extent and position. With
+    ``carries_operands``, as in the chain executor, a two-operand binary op is
+    the exception: the executor offsets a carried operand to the band's rows.
+    The height stripe and the HW tile offset none. ``columns`` states that the
+    band is an HW tile.
     """
     weight_shapes = _ag_weight_shapes(ag)
     level = dict.fromkeys(stage.input_tensors, 0)
@@ -1949,13 +1988,15 @@ def _ops_read_the_running_band(ag: AnalyzedGraph, stage: Stage) -> bool:
         dynamic = [name for name in op.inputs
                    if name in ag.tensors and not ag.tensors[name].is_constant]
         on_band = [name for name in dynamic if level.get(name) == current]
-        if op.op_type in _BINARY_OPS and len(dynamic) == 2:
+        if carries_operands and op.op_type in _BINARY_OPS and len(dynamic) == 2:
             if not on_band:
                 return False
         elif len(on_band) != len(dynamic):
             return False
-        if (op_category(op) in (TileCategory.CONV, TileCategory.POOL)
-                and not _maps_rows_one_to_one(op, weight_shapes)):
+        category = op_category(op)
+        if category is TileCategory.UPSAMPLE or (
+                category in (TileCategory.CONV, TileCategory.POOL)
+                and not _keeps_the_band(ag, op, weight_shapes, columns)):
             current += 1
         for name in op.outputs:
             level[name] = current
