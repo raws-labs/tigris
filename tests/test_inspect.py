@@ -11,6 +11,7 @@ import pytest
 from click.testing import CliRunner
 from onnx import TensorProto, helper
 
+from tigris import TILE_AXIS_HW
 from tigris.cli import cli
 from tigris.emitters.binary import defs
 from tigris.emitters.binary.reader import read_binary_plan
@@ -20,6 +21,7 @@ from conftest import save_onnx, section_entries
 
 
 FIXTURES = Path(__file__).parent / "schema_compat"
+TFLITE_OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
 
 
 def test_onnx_original_graph(linear_3op_path, monkeypatch):
@@ -130,9 +132,33 @@ def test_a_layout_conversion_counts_the_compilers_band(tmp_path):
     for index in (0, 2):
         tile = compiled.stages[index].tile_plan
         assert tile.tileable and tile.num_tiles > 1
-        assert f"{tile.num_tiles} tiles of the compiler's band, axis {tile.axis}" in result.output
+        assert f"{tile.num_tiles} tiles planned, axis {tile.axis}, band sized at run time" in result.output
     softmax = compiled.stages[1].tile_plan
     assert f"{softmax.num_tiles} tiles, axis {softmax.axis}, halo {softmax.halo}" in result.output
+
+
+def test_a_2d_tile_is_listed_by_its_output_tile(conv_relu_chain_path, tmp_path):
+    from tigris.pipeline import plan_model
+    from tigris.emitters.binary.writer import emit_binary_bytes
+
+    path = tmp_path / "hw.tgrs"
+    path.write_bytes(emit_binary_bytes(plan_model(str(conv_relu_chain_path), ("4K",))))
+    result = CliRunner().invoke(cli, ["inspect", str(path), "-v"])
+    assert result.exit_code == 0, result.output
+    assert "16 tiles of 9 x 9, halo 2" in result.output and "20 tiles of 6 x 8, halo 2" in result.output
+
+    # Below schema 10 the record states the output tile as tile height and tile width.
+    older = bytearray((FIXTURES / "schema-v5-conv1d-axis.tgrs").read_bytes())
+    record = section_entries(older)[defs.SEC_TILE_PLANS][1]
+    struct.pack_into("<B", older, record + 1, TILE_AXIS_HW)
+    struct.pack_into("<H", older, record + 20, 7)
+    legacy = tmp_path / "schema-5-hw.tgrs"
+    legacy.write_bytes(bytes(older))
+    (tile,) = inspect_file(legacy)["plan"]["tile_plans"]
+    assert (tile["tile_height"], tile["tile_width"], tile["num_tiles"]) == (49, 7, 6)
+    result = CliRunner().invoke(cli, ["inspect", str(legacy), "-v"])
+    assert result.exit_code == 0, result.output
+    assert f"6 tiles of 49 x 7, halo {tile['halo']}" in result.output
 
 
 def test_plan_detected_by_content(tmp_path):
@@ -149,6 +175,32 @@ def test_interface_dtype_and_attributes():
     assert any(tensor["dtype"] != tensor["interface_dtype"] for tensor in inputs)
     report = inspect_file(FIXTURES / "schema-v8-layer-norm.tgrs")
     assert any(attr["type"] == "epsilon" for op in report["plan"]["ops"] for attr in op["attributes"])
+
+
+def test_every_attribute_kind_is_named_and_decoded(tmp_path):
+    from tigris.pipeline import plan_model
+    from tigris.emitters.binary.writer import emit_binary_bytes
+
+    attributes = {}
+    for name in ("cumsum_exclusive_reverse", "less", "svdf", "float_lstm_time_major_clip", "float_if",
+                 "detection_regular", "gelu_approximate", "embedding_table"):
+        path = tmp_path / f"{name}.tgrs"
+        path.write_bytes(emit_binary_bytes(plan_model(str(TFLITE_OPS / f"{name}.tflite"), ("256K",))))
+        for op in inspect_file(path)["plan"]["ops"]:
+            attributes.update((attr["type"], attr["values"]) for attr in op["attributes"])
+    assert not [kind for kind in attributes if kind.startswith("unknown")]
+    assert {name for name, _, _ in defs.OP_ATTR_KINDS.values()} == attributes.keys() | {
+        "epsilon", "alpha", "clip_bounds", "pads", "binary_requant", "pool_rounding", "resize_scales"}
+    assert attributes["cumsum_options"] == [1, 1]
+    assert attributes["comparison_requant"][0] == 8 and len(attributes["comparison_requant"]) == 5
+    assert attributes["svdf"][0] == 2
+    # Lstm: int32 time_major, then a float32 cell clip; detection: three uint16, two uint8, six float32.
+    assert attributes["lstm"] == [1, pytest.approx(0.8)]
+    assert attributes["detection"][:5] == [8, 3, 3, 1, 0]
+    assert attributes["detection"][5:] == pytest.approx([0.7, 0.45, 10.0, 10.0, 5.0, 5.0])
+    assert attributes["subgraphs"] == [1, 2]
+    assert attributes["gelu_approximate"] == [1]
+    assert attributes["table_shape"] == [32, 16]
 
 
 def test_compressed_metadata_without_decompression(linear_3op_path, tmp_path, monkeypatch):
