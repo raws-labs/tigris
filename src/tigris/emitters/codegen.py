@@ -34,6 +34,14 @@ from tigris.operator_contract import OP_TYPE_BY_CODE
 BACKENDS = CODEGEN_BACKENDS
 _CMSIS_TENSOR_ALIGN = 16
 
+# Dispatcher symbol and kernel header of each resolved kernel backend.
+_KERNEL_DISPATCH = {
+    "reference": ("tigris_dispatch_kernel", "tigris_kernels.h"),
+    "s8_ref": ("tigris_dispatch_kernel_s8", "tigris_kernels_s8.h"),
+    "esp-nn": ("tigris_dispatch_kernel_esp_nn", "tigris_kernels_esp_nn.h"),
+    "cmsis-nn": ("tigris_dispatch_kernel_cmsis_nn", "tigris_kernels_cmsis_nn.h"),
+}
+
 
 # Headers with TIGRIS_RUNTIME_VERSION_MAJOR declare tigris_input_alloc(), which generated code calls.
 _RUNTIME_CHECK = (
@@ -41,6 +49,14 @@ _RUNTIME_CHECK = (
     '#error "these runtime headers predate tigris_input_alloc(), which this generated code '
     'calls; build with the runtime of the same TiGrIS release as the compiler"\n'
     "#endif\n"
+)
+_APP_RUNTIME_INCLUDES = (
+    '#include "tigris.h"\n'
+    '#include "tigris_iface.h"\n'
+    '#include "tigris_loader.h"\n'
+    '#include "tigris_mem.h"\n'
+    '#include "tigris_executor.h"\n'
+    + _RUNTIME_CHECK
 )
 
 
@@ -142,7 +158,6 @@ def generate_c(
         raise ValueError("Plan has no executable stages; compile it with a memory budget")
     xip = bool(plan["flags"] & FLAG_XIP)
     dtype = _plan_dtype(plan)
-    is_quantized = dtype == "int8"
     kernel_backend = resolve_kernel_backend(backend, dtype)
     supported = effective_operators(kernel_backend)
 
@@ -151,9 +166,8 @@ def generate_c(
         opcode = op["op_type"]
         op_type = OP_TYPE_BY_CODE.get(opcode)
         float_op = any(plan["tensors"][i]["dtype"] == 1 for i in op["outputs"])
-        op_supported = effective_operators("reference") if float_op and opcode not in {
-            OP_TYPE_MAP["Dequantize"], OP_TYPE_MAP["If"], OP_TYPE_MAP["While"],
-            OP_TYPE_MAP["DetectionPostProcess"]} else supported
+        op_supported = (effective_operators("reference")
+                        if float_op and opcode not in _TYPED_OPERATORS else supported)
         if op_type is None or op_type not in op_supported:
             label = op_type if op_type is not None else f"opcode {opcode}"
             unsupported.append(f"{op['name']} ({label})" if op["name"] else label)
@@ -170,45 +184,55 @@ def generate_c(
 
     if output_format == "core":
         return header_comment + _generate_core(
-            plan, backend, is_quantized, core_header, core_name
+            plan, kernel_backend, core_header, core_name
         )
     if backend == "esp-nn":
-        app = _generate_esp(plan, is_quantized)
+        app = _generate_esp(plan, kernel_backend)
     elif backend == "cmsis-nn":
-        app = _generate_cmsis(plan, is_quantized)
+        app = _generate_cmsis(plan, kernel_backend)
     else:
-        app = _generate_posix(plan, is_quantized)
-    return header_comment + _with_state(app, plan)
+        app = _generate_posix(plan, kernel_backend)
+    return header_comment + app
 
 
-# The one inference each example application runs.
-_APP_RUN = re.compile(
-    r"tigris_exec_error_t eerr = tigris_run_with_workspace_buffer\(\n"
-    r"(?P<indent>[ ]+)&plan, &mem, (?P<dispatch>\w+), NULL, &stats,\n"
-    r"[ ]+executor_workspace, sizeof\(executor_workspace\)\);")
-
-
-def _with_state(app: str, plan: dict) -> str:
-    """An example application for a plan that keeps variables: a static state
-    buffer, prepared with the initial values before the run that uses it."""
+def _app_run(plan: dict, dispatch: str) -> str:
+    """The one inference of an example application, written at the indent of
+    main's body. A plan that keeps variables gets a static state buffer,
+    prepared with the initial values before the run that uses it."""
     size = plan["state"]["bytes"]
     if not size:
-        return app
-    runs = list(_APP_RUN.finditer(app))
-    if len(runs) != 1:
-        raise ValueError("generated application has no single inference to give state")
-    indent, dispatch = runs[0]["indent"], runs[0]["dispatch"]
-    outer = indent[:-4]
-    block = (
+        return (
+            "tigris_exec_error_t eerr = tigris_run_with_workspace_buffer(\n"
+            f"        &plan, &mem, {dispatch}, NULL, &stats,\n"
+            "        executor_workspace, sizeof(executor_workspace));")
+    return (
         f"static uint8_t generated_state[{size}];\n"
-        f"{outer}tigris_exec_error_t eerr = tigris_state_init(\n"
-        f"{indent}&plan, generated_state, sizeof(generated_state));\n"
-        f"{outer}if (eerr == TIGRIS_EXEC_OK)\n"
-        f"{indent}eerr = tigris_run_with_state(\n"
-        f"{indent}    &plan, &mem, {dispatch}, NULL, &stats,\n"
-        f"{indent}    executor_workspace, sizeof(executor_workspace),\n"
-        f"{indent}    generated_state, sizeof(generated_state));")
-    return app[:runs[0].start()] + block + app[runs[0].end():]
+        "    tigris_exec_error_t eerr = tigris_state_init(\n"
+        "        &plan, generated_state, sizeof(generated_state));\n"
+        "    if (eerr == TIGRIS_EXEC_OK)\n"
+        "        eerr = tigris_run_with_state(\n"
+        f"            &plan, &mem, {dispatch}, NULL, &stats,\n"
+        "            executor_workspace, sizeof(executor_workspace),\n"
+        "            generated_state, sizeof(generated_state));")
+
+
+def _hosted_arena_sizing(plan: dict, on_invalid: str) -> tuple[int, str]:
+    """Slow-arena size and the arena sizing statements of the POSIX and ESP
+    applications; ``on_invalid`` is the platform's block for an invalid fast
+    size, at the indent of an if body in main."""
+    budget = plan["budget"] or 65536
+    slow_size = slow_arena_required(plan)
+    if slow_size > 0xFFFFFFFF:
+        raise ValueError("Slow arena exceeds the uint32 runtime size limit")
+    return slow_size, f"""\
+    uint32_t fast_size = tigris_fast_arena_required(&plan);
+    if (fast_size == 0) fast_size = {budget};
+    if (fast_size == UINT32_MAX) {{
+{on_invalid}
+    }}
+
+    uint32_t slow_size = {slow_size}u;
+"""
 
 
 def _validate_core_name(core_name: str) -> None:
@@ -368,20 +392,19 @@ tigris_exec_error_t {core_name}_run_with_state(
 
 
 def _generate_core(
-    plan: dict, backend: str, is_quantized: bool, core_header: str,
-    core_name: str,
+    plan: dict, kernel_backend: str, core_header: str, core_name: str,
 ) -> str:
     """Generate embeddable backend glue with no platform or entry-point policy."""
-    if backend == "cmsis-nn":
-        dispatch = "tigris_dispatch_kernel_cmsis_nn" if is_quantized else "tigris_dispatch_kernel"
-        kernel_include = '#include "tigris_kernels_cmsis_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
+    dispatch, kernel_header = _KERNEL_DISPATCH[kernel_backend]
+    teardown = prepare = ""
+    if kernel_backend == "cmsis-nn":
         teardown = """\
     /* CMSIS-NN reserves scratch from the previous fast arena.  Release that
      * reservation before reinitializing the arena so repeated reset() calls
      * cannot make scratch alias live activations.  The first reset has no
      * reservation; deinit intentionally returns -1 and is harmless. */
     (void)tigris_cmsis_nn_deinit(mem);
-""" if is_quantized else ""
+"""
         prepare = """\
     uint32_t cmsis_fast_required =
         tigris_cmsis_nn_fast_arena_required(plan);
@@ -390,26 +413,18 @@ def _generate_core(
         return TIGRIS_ERR_MEM;
     if (tigris_cmsis_nn_prepare(plan, mem) != 0)
         return TIGRIS_ERR_MEM;
-""" if is_quantized else ""
-    elif backend == "esp-nn":
-        dispatch = "tigris_dispatch_kernel_esp_nn" if is_quantized else "tigris_dispatch_kernel"
-        kernel_include = '#include "tigris_kernels_esp_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
-        teardown = ""
+"""
+    elif kernel_backend == "esp-nn":
         prepare = """\
     if (tigris_esp_nn_prepare(plan, mem) != 0)
         return TIGRIS_ERR_MEM;
-""" if is_quantized else ""
-    else:
-        dispatch = "tigris_dispatch_kernel_s8" if is_quantized else "tigris_dispatch_kernel"
-        kernel_include = '#include "tigris_kernels_s8.h"' if is_quantized else '#include "tigris_kernels.h"'
-        teardown = ""
-        prepare = ""
+"""
 
     return f'''\
 #include <string.h>
 
 #include "{core_header}"
-{_RUNTIME_CHECK}{kernel_include}
+{_RUNTIME_CHECK}#include "{kernel_header}"
 
 static tigris_error_t {core_name}_allocate_inputs(
     const tigris_plan_t *plan, tigris_mem_t *mem,
@@ -531,13 +546,12 @@ def _header_comment(
 """
 
 
-def _generate_posix(plan: dict, is_quantized: bool) -> str:
-    dispatch = "tigris_dispatch_kernel_s8" if is_quantized else "tigris_dispatch_kernel"
-    kernel_include = '#include "tigris_kernels_s8.h"' if is_quantized else '#include "tigris_kernels.h"'
-    budget = plan["budget"] or 65536
-    slow_size = slow_arena_required(plan)
-    if slow_size > 0xFFFFFFFF:
-        raise ValueError("Slow arena exceeds the uint32 runtime size limit")
+def _generate_posix(plan: dict, kernel_backend: str) -> str:
+    dispatch, kernel_header = _KERNEL_DISPATCH[kernel_backend]
+    slow_size, arena_sizing = _hosted_arena_sizing(plan, """\
+        fprintf(stderr, "Invalid core fast-arena requirement\\n");
+        free(plan_buf);
+        return 1;""")
     workspace_declaration = (
         _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
     )
@@ -552,12 +566,7 @@ def _generate_posix(plan: dict, is_quantized: bool) -> str:
 #include <stdlib.h>
 #include <string.h>
 
-#include "tigris.h"
-#include "tigris_iface.h"
-#include "tigris_loader.h"
-#include "tigris_mem.h"
-#include "tigris_executor.h"
-{_RUNTIME_CHECK}{kernel_include}
+{_APP_RUNTIME_INCLUDES}#include "{kernel_header}"
 
 {workspace_declaration}
 
@@ -618,16 +627,7 @@ int main(int argc, char **argv)
            plan.header->num_ops, plan.header->num_stages, plan.header->budget);
 
     /* 2. Allocate buffers */
-    uint32_t fast_size = tigris_fast_arena_required(&plan);
-    if (fast_size == 0) fast_size = {budget};
-    if (fast_size == UINT32_MAX) {{
-        fprintf(stderr, "Invalid core fast-arena requirement\\n");
-        free(plan_buf);
-        return 1;
-    }}
-
-    uint32_t slow_size = {slow_size}u;
-
+{arena_sizing}
     void *fast_buf = allocate_aligned(fast_size);
     void *slow_buf = {slow_buffer};
     uint16_t num_t = plan.header->num_tensors;
@@ -663,9 +663,7 @@ int main(int argc, char **argv)
 
     /* 5. Run inference */
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run_with_workspace_buffer(
-        &plan, &mem, {dispatch}, NULL, &stats,
-        executor_workspace, sizeof(executor_workspace));
+    {_app_run(plan, dispatch)}
     if (eerr != TIGRIS_EXEC_OK) {{
         fprintf(stderr, "Inference failed: %s\\n", tigris_exec_error_str(eerr));
         free(tensor_ptrs); free(slow_buf); free(fast_buf); free(plan_buf);
@@ -726,11 +724,12 @@ int main(int argc, char **argv)
 """
 
 
-def _generate_esp(plan: dict, is_quantized: bool) -> str:
-    budget = plan["budget"] or 65536
-    slow_size = slow_arena_required(plan)
-    if slow_size > 0xFFFFFFFF:
-        raise ValueError("Slow arena exceeds the uint32 runtime size limit")
+def _generate_esp(plan: dict, kernel_backend: str) -> str:
+    dispatch, kernel_header = _KERNEL_DISPATCH[kernel_backend]
+    slow_size, arena_sizing = _hosted_arena_sizing(plan, """\
+        ESP_LOGE(TAG, "invalid core fast-arena requirement");
+        esp_partition_munmap(mmap_handle);
+        return;""")
     workspace_declaration = (
         _build_limit_assertions(plan) + _executor_workspace_declaration(plan)
     )
@@ -739,12 +738,10 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
                    if slow_size else "NULL")
     slow_missing = " || !slow_buf" if slow_size else ""
 
-    if is_quantized:
-        dispatch = "tigris_dispatch_kernel_esp_nn"
-        kernel_includes = """\
-#include "tigris_kernels_esp_nn.h"
-#include "tigris_kernels_s8.h"
-"""
+    kernel_includes = f'#include "{kernel_header}"'
+    prepare_block = ""
+    if kernel_backend == "esp-nn":
+        kernel_includes += '\n#include "tigris_kernels_s8.h"\n'
         prepare_block = """\
 
     /* ESP-NN scratch buffer setup */
@@ -753,10 +750,6 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
         goto cleanup;
     }
 """
-    else:
-        dispatch = "tigris_dispatch_kernel"
-        kernel_includes = '#include "tigris_kernels.h"'
-        prepare_block = ""
 
     return f"""\
 #include <stdio.h>
@@ -768,12 +761,7 @@ def _generate_esp(plan: dict, is_quantized: bool) -> str:
 #include "esp_timer.h"
 #include "esp_log.h"
 
-#include "tigris.h"
-#include "tigris_iface.h"
-#include "tigris_loader.h"
-#include "tigris_mem.h"
-#include "tigris_executor.h"
-{_RUNTIME_CHECK}{kernel_includes}
+{_APP_RUNTIME_INCLUDES}{kernel_includes}
 
 static const char *TAG = "tigris";
 {workspace_declaration}
@@ -824,16 +812,7 @@ void app_main(void)
            tigris_model_name(&plan), plan.header->num_ops, plan.header->num_stages);
 
     /* 3. Allocate buffers */
-    uint32_t fast_size = tigris_fast_arena_required(&plan);
-    if (fast_size == 0) fast_size = {budget};
-    if (fast_size == UINT32_MAX) {{
-        ESP_LOGE(TAG, "invalid core fast-arena requirement");
-        esp_partition_munmap(mmap_handle);
-        return;
-    }}
-
-    uint32_t slow_size = {slow_size}u;
-
+{arena_sizing}
     void *fast_buf = heap_caps_malloc(fast_size,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #if CONFIG_SPIRAM
@@ -878,9 +857,7 @@ void app_main(void)
     /* 6. Run inference */
     int64_t t0 = esp_timer_get_time();
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run_with_workspace_buffer(
-        &plan, &mem, {dispatch}, NULL, &stats,
-        executor_workspace, sizeof(executor_workspace));
+    {_app_run(plan, dispatch)}
     int64_t t1 = esp_timer_get_time();
 
     if (eerr != TIGRIS_EXEC_OK) {{
@@ -933,9 +910,8 @@ cleanup:
 """
 
 
-def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
-    dispatch = "tigris_dispatch_kernel_cmsis_nn" if is_quantized else "tigris_dispatch_kernel"
-    kernel_include = '#include "tigris_kernels_cmsis_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
+def _generate_cmsis(plan: dict, kernel_backend: str) -> str:
+    dispatch, kernel_header = _KERNEL_DISPATCH[kernel_backend]
     weight_overhead = plan_decompression_reserve(plan, _CMSIS_TENSOR_ALIGN)
     core_fast_arena_size = align_up(
         (fast_activation_bytes(plan) or 65536) + weight_overhead, 16)
@@ -956,7 +932,7 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
         if slow_arena_size else "")
     slow_arguments = "slow_arena, sizeof(slow_arena)" if slow_arena_size else "NULL, 0u"
 
-    if is_quantized:
+    if kernel_backend == "cmsis-nn":
         scratch_declaration = f"""\
 /* Override at build time for larger plans. The runtime query below validates
  * this allowance against the linked CMSIS-NN library before initialization. */
@@ -1009,12 +985,7 @@ def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
 #include <stdio.h>
 #include <string.h>
 
-#include "tigris.h"
-#include "tigris_iface.h"
-#include "tigris_loader.h"
-#include "tigris_mem.h"
-#include "tigris_executor.h"
-{_RUNTIME_CHECK}{kernel_include}
+{_APP_RUNTIME_INCLUDES}#include "{kernel_header}"
 
 {scratch_declaration}
 
@@ -1074,9 +1045,7 @@ int main(void)
 
     /* 4. Run inference */
     tigris_exec_stats_t stats;
-    tigris_exec_error_t eerr = tigris_run_with_workspace_buffer(
-        &plan, &mem, {dispatch}, NULL, &stats,
-        executor_workspace, sizeof(executor_workspace));
+    {_app_run(plan, dispatch)}
     if (eerr != TIGRIS_EXEC_OK) {{
         printf("Inference failed: %s\\n", tigris_exec_error_str(eerr));
         return 1;
