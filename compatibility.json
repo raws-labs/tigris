@@ -9,7 +9,7 @@
     "capability_growth": "same-schema with fail-closed runtime validation",
     "runtime_dependency": "vendored-wire-contract",
     "integration_branch": "develop",
-    "release_cadence": "independent-per-component"
+    "release_cadence": "paired-same-version"
   },
   "integration": {
     "compiler_branch": "develop",

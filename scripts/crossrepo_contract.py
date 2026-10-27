@@ -239,8 +239,10 @@ def _decode_outputs(
     return decoded
 
 
-def _run(command: list[str], description: str) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+def _run(
+    command: list[str], description: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(command, text=True, capture_output=True, check=False, env=env)
     if completed.returncode != 0:
         raise RuntimeError(
             f"{description} failed (exit {completed.returncode}):\n"
@@ -467,6 +469,12 @@ def _assert_refused_below_peak(
             f"up front (exit {completed.returncode}):\n{completed.stdout}{completed.stderr}")
 
 
+def _build_environment() -> dict[str, str]:
+    """Environment for `cmake --build`: CMAKE_BUILD_PARALLEL_LEVEL jobs, 4 unless already set."""
+    return {**os.environ,
+            "CMAKE_BUILD_PARALLEL_LEVEL": os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "4")}
+
+
 def _build_runner(
     runtime: Path, build_dir: Path, *, alignment: int | None = None
 ) -> tuple[Path, Path]:
@@ -497,9 +505,9 @@ def _build_runner(
             "--target",
             "tigris_contract_runner",
             "tigris_contract_runner_rows",
-            "--parallel", "4",
         ],
         "runtime contract-runner build",
+        _build_environment(),
     )
     return (
         build_dir / "tigris_contract_runner",
@@ -787,8 +795,8 @@ def _build_host_library(runtime: Path, build_dir: Path) -> Path:
     """Build the host library, which compiles the runtime with execution tracing."""
     _run(["cmake", "-S", str(runtime), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release",
           "-DTIGRIS_BUILD_HOST=ON"], "host library configure")
-    _run(["cmake", "--build", str(build_dir), "--target", "tigris_host", "--parallel", "4"],
-         "host library build")
+    _run(["cmake", "--build", str(build_dir), "--target", "tigris_host"],
+         "host library build", _build_environment())
     for name in ("libtigris_host.so", "libtigris_host.dylib", "tigris_host.dll"):
         matches = sorted(build_dir.rglob(name))
         if matches:

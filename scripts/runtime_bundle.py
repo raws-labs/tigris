@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import re
 import platform as host_platform
 import shutil
@@ -24,9 +25,13 @@ HOST_ABI = int(re.search(r"^HOST_ABI = (\d+)$", (ROOT / "src" / "tigris" / "runt
                          re.M)[1])
 
 
+def build_environment():
+    """Environment for `cmake --build`: CMAKE_BUILD_PARALLEL_LEVEL jobs, 4 unless already set."""
+    return {**os.environ, "CMAKE_BUILD_PARALLEL_LEVEL": os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "4")}
+
+
 def build_source(source: Path):
     source = source.resolve()
-    build = source / "build-host-ci"
     machine = host_platform.machine().lower()
     if sys.platform == "win32":
         platform = "win_amd64"
@@ -34,22 +39,24 @@ def build_source(source: Path):
         platform = f"macosx_11_0_{machine}"
     else:
         platform = f"linux_{machine}"
-    arguments = ["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
-                 "-DCMAKE_BUILD_TYPE=Release", "-DTIGRIS_BUILD_HOST=ON",
-                 f"-DTIGRIS_HOST_PLATFORM={platform}"]
-    if sys.platform == "win32":
-        arguments.append("-DCMAKE_C_COMPILER=clang")
-    elif sys.platform == "darwin":
-        arguments.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0")
-    subprocess.run(arguments, check=True)
-    subprocess.run(["cmake", "--build", str(build), "--target", "test_host", "--parallel", "4"], check=True)
-    subprocess.run(["ctest", "--test-dir", str(build), "-R", "^host_library$", "--output-on-failure"], check=True)
-    subprocess.run(["cmake", "--build", str(build), "--target", "host_archive"], check=True)
-    directory = build / "host-artifacts"
-    manifest = json.loads((directory / "stage" / "manifest.json").read_text())
-    archive = directory / f"tigris-host-{manifest['version']}-{platform}.tar.gz"
-    data = archive.read_bytes()
-    checksum = archive.with_suffix(archive.suffix + ".sha256").read_text().split()[0]
+    with tempfile.TemporaryDirectory(prefix="tigris-host-build-") as temporary:
+        build = Path(temporary)
+        arguments = ["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
+                     "-DCMAKE_BUILD_TYPE=Release", "-DTIGRIS_BUILD_HOST=ON",
+                     f"-DTIGRIS_HOST_PLATFORM={platform}"]
+        if sys.platform == "win32":
+            arguments.append("-DCMAKE_C_COMPILER=clang")
+        elif sys.platform == "darwin":
+            arguments.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0")
+        subprocess.run(arguments, check=True)
+        subprocess.run(["cmake", "--build", str(build), "--target", "test_host"], check=True, env=build_environment())
+        subprocess.run(["ctest", "--test-dir", str(build), "-R", "^host_library$", "--output-on-failure"], check=True)
+        subprocess.run(["cmake", "--build", str(build), "--target", "host_archive"], check=True, env=build_environment())
+        directory = build / "host-artifacts"
+        manifest = json.loads((directory / "stage" / "manifest.json").read_text())
+        archive = directory / f"tigris-host-{manifest['version']}-{platform}.tar.gz"
+        data = archive.read_bytes()
+        checksum = archive.with_suffix(archive.suffix + ".sha256").read_text().split()[0]
     return stage(data, checksum, DESTINATION, platform=platform)
 
 

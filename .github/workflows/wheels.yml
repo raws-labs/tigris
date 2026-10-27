@@ -124,7 +124,7 @@ jobs:
       - name: Install and test the pure wheel outside the checkout
         env:
           TIGRIS_REQUIRE_PURE: "1"
-          TIGRIS_TEST_HOST_LIBRARY: ${{ github.workspace }}/runtime-source/build-host-ci/host/libtigris_host.so
+          TIGRIS_TEST_HOST_LIBRARY: ${{ github.workspace }}/src/tigris/native/libtigris_host.so
         run: |
           python -m pip install dist/*-py3-none-any.whl pytest
           mkdir -p "$RUNNER_TEMP/pure-tests/fixtures/tflite" "$RUNNER_TEMP/pure-tests/scripts/contract_cases"

@@ -52,7 +52,7 @@ def validate(root: Path, runtime: Path | None = None) -> list[str]:
         "capability_growth": "same-schema with fail-closed runtime validation",
         "runtime_dependency": "vendored-wire-contract",
         "integration_branch": "develop",
-        "release_cadence": "independent-per-component",
+        "release_cadence": "paired-same-version",
     }
     for key, expected in expected_policy.items():
         if policy.get(key) != expected:
@@ -103,8 +103,8 @@ def validate(root: Path, runtime: Path | None = None) -> list[str]:
     if not isinstance(releases, list) or not releases:
         errors.append("releases must be a non-empty list")
         return errors
-    # Compiler and runtime release on independent cadences, so an entry names
-    # whichever component was cut. Schema compatibility is the contract.
+    # Releases pair since v0.11.0, but an entry may name one component (earlier
+    # releases, the runtime-only v0.11.1); schemas, not versions, are checked.
     seen_tags: dict[str, set[str]] = {"compiler": set(), "runtime": set()}
     emitted_schemas: set[int] = set()
     accepted_schema_sets: list[list[int]] = []

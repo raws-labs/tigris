@@ -1,10 +1,13 @@
-"""Native archive integrity and extraction rules."""
+"""Native archive integrity and extraction rules, and the runtime build commands."""
 
 import hashlib
 import io
 import json
+import re
+import subprocess
 import sys
 import tarfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -118,3 +121,83 @@ def test_pin_records_release_and_archive_checksums(tmp_path, monkeypatch):
 def test_pin_refuses_a_malformed_release():
     with pytest.raises(SystemExit):
         runtime_bundle.pin_release("0.11.0")
+
+
+def _parallel_level(monkeypatch, level):
+    if level is None:
+        monkeypatch.delenv("CMAKE_BUILD_PARALLEL_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", level)
+
+
+def _build_jobs(command, env):
+    """The job count a `cmake --build` command runs with, or None for another command."""
+    if command[:2] != ["cmake", "--build"]:
+        return None
+    if "--parallel" in command:
+        return command[command.index("--parallel") + 1]
+    return (env or {}).get("CMAKE_BUILD_PARALLEL_LEVEL", "unset")
+
+
+@pytest.mark.parametrize("level, jobs", [(None, "4"), ("2", "2")])
+def test_source_build_stays_out_of_the_checkout(tmp_path, monkeypatch, level, jobs):
+    _parallel_level(monkeypatch, level)
+    source = tmp_path / "runtime"
+    source.mkdir()
+    configured, built, staged = [], [], []
+
+    def run(command, check, env=None):
+        if command[:2] == ["cmake", "-S"]:
+            configured.append(command)
+        if _build_jobs(command, env) is not None:
+            built.append(_build_jobs(command, env))
+        if "host_archive" in command:
+            platform = next(arg for arg in configured[0] if arg.startswith("-DTIGRIS_HOST_PLATFORM="))
+            artifacts = Path(command[2]) / "host-artifacts"
+            (artifacts / "stage").mkdir(parents=True)
+            (artifacts / "stage" / "manifest.json").write_text('{"version": "1.2.3"}')
+            name = f"tigris-host-1.2.3-{platform.split('=', 1)[1]}.tar.gz"
+            (artifacts / name).write_bytes(b"archive")
+            (artifacts / f"{name}.sha256").write_text(f"{'a' * 64}  {name}\n")
+
+    def stage(data, checksum, destination, platform):
+        staged.append((data, checksum))
+        return {"version": "1.2.3", "platform": platform}
+
+    monkeypatch.setattr(runtime_bundle.subprocess, "run", run)
+    monkeypatch.setattr(runtime_bundle, "stage", stage)
+    runtime_bundle.build_source(source)
+
+    build = Path(configured[0][configured[0].index("-B") + 1])
+    assert staged == [(b"archive", "a" * 64)]
+    assert built == [jobs, jobs]
+    assert not build.is_relative_to(source) and not build.exists()
+    assert list(source.iterdir()) == []
+
+
+@pytest.mark.parametrize("level, jobs", [(None, "4"), ("2", "2")])
+def test_contract_gate_builds_take_the_parallel_level(tmp_path, monkeypatch, level, jobs):
+    from scripts import crossrepo_contract
+
+    _parallel_level(monkeypatch, level)
+    built = []
+
+    def run(command, text, capture_output, check, env=None):
+        if _build_jobs(command, env) is not None:
+            built.append(_build_jobs(command, env))
+            (Path(command[2]) / "libtigris_host.so").write_bytes(b"")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(crossrepo_contract.subprocess, "run", run)
+    (tmp_path / "runner").mkdir()
+    (tmp_path / "host").mkdir()
+    crossrepo_contract._build_runner(tmp_path / "runtime", tmp_path / "runner")
+    crossrepo_contract._build_host_library(tmp_path / "runtime", tmp_path / "host")
+    assert built == [jobs, jobs]
+
+
+def test_pure_wheel_job_reads_the_staged_host_library():
+    workflow = (runtime_bundle.ROOT / ".github" / "workflows" / "wheels.yml").read_text()
+    staged = runtime_bundle.DESTINATION.relative_to(runtime_bundle.ROOT).as_posix()
+    assert re.findall(r"TIGRIS_TEST_HOST_LIBRARY: (.*)", workflow) == [
+        "${{ github.workspace }}/" + staged + "/libtigris_host.so"]
