@@ -24,8 +24,6 @@ def _filters(function):
 
 
 def _matches(config, *, mem, flash, **filters):
-    if len(mem) > 2:
-        raise click.UsageError("At most two memory pools are supported")
     if filters.get("runtime") is not None:
         version(filters["runtime"])
     pools = [_parse_size(value) for value in mem]

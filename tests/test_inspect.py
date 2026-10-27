@@ -3,6 +3,7 @@
 import json
 import re
 import struct
+import sys
 from pathlib import Path
 
 import onnx
@@ -354,3 +355,15 @@ def test_qdq_weights_belong_to_the_operator_that_uses_them(qdq_conv_path, tmp_pa
     produced_from_constants = {node.output[0] for node in model.graph.node
                                if node.input[0] in {init.name for init in model.graph.initializer}}
     assert not names & produced_from_constants
+
+
+def test_inspect_lists_five_conversion_reasons_then_counts_the_rest(monkeypatch):
+    model = TFLITE / "vww_96_int8.tflite"
+    report = inspect_file(model)
+    report["unsupported"] = [f"reason {k}" for k in range(7)]
+    monkeypatch.setattr(sys.modules["tigris.cli.inspect"], "inspect_file", lambda path: report)
+    result = CliRunner().invoke(cli, ["inspect", str(model)])
+    assert result.exit_code == 0
+    assert "no, 7 reasons" in result.output
+    assert "reason 4" in result.output and "reason 5" not in result.output
+    assert "and 2 more; --json lists all" in result.output

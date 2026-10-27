@@ -8,7 +8,7 @@ from tigris.cli import cli, text
 from tigris.analysis.plan_graph import fast_activation_bytes
 from tigris.emitters.binary.defs import FLAG_XIP, STAGE_FLAG_LINE_BUFFERED
 from tigris.inspection import inspect_file
-from tigris.utils import fmt_bytes
+from tigris.utils import fmt_bytes, plural
 
 
 def _panel(title, rows):
@@ -38,20 +38,15 @@ def _names(indices, tensors):
     return ", ".join(tensors[index]["name"] or f"tensor {index}" for index in indices) or "none"
 
 
-def _operators(ops, tensors=None, title="steps"):
-    header = ["step", "operator", "type", "inputs", "outputs"]
-    if tensors is not None:
-        header.append("fused activation")
+def _operators(ops, tensors):
+    header = ["step", "operator", "type", "inputs", "outputs", "fused activation"]
     rows = [[text.dim(cell) for cell in header]]
     for index, op in ops:
         op_type = f"{op['domain']}::{op['type']}" if op.get("domain") else op["type"]
-        values = [str(index), op["name"] or "(unnamed)", op_type,
-                  _names(op["inputs"], tensors) if tensors is not None else ", ".join(op["inputs"]),
-                  _names(op["outputs"], tensors) if tensors is not None else ", ".join(op["outputs"])]
-        if tensors is not None:
-            values.append(op["fused_activation"])
-        rows.append(values)
-    text.section(title, rows, ">")
+        rows.append([str(index), op["name"] or "(unnamed)", op_type,
+                     _names(op["inputs"], tensors), _names(op["outputs"], tensors),
+                     op["fused_activation"]])
+    text.section("steps", rows, ">")
 
 
 def _value(value):
@@ -91,10 +86,6 @@ def _tensors(title, tensors, *, plan=False):
 _FORMATS = {"tgrs": "plan", "onnx": "ONNX", "tflite": "TFLite"}
 
 
-def _count(n: int, noun: str) -> str:
-    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
-
-
 def _render(report, verbose, path: Path):
     is_plan = report["format"] == "tgrs"
     is_tflite = report["format"] == "tflite"
@@ -116,16 +107,16 @@ def _render(report, verbose, path: Path):
         else:
             summary.append(f"IR {report['ir_version']}, opsets " + ", ".join(
                 f"{item['domain'] or 'ai.onnx'} {item['version']}" for item in report["opsets"]))
-    summary.append(_count(sum(counts.values()), "operator"))
+    summary.append(plural(sum(counts.values()), "operator"))
     if is_tflite and report["subgraphs"] > 1:
-        summary.append(_count(report["subgraphs"], "subgraph"))
+        summary.append(plural(report["subgraphs"], "subgraph"))
     if is_plan:
         stages = plan["stages"]
         # A stage runs tiled when it has a tile plan or belongs to a chain.
         tiled = sum((stage["tile_plan_idx"] is not None and
                      plan["tile_plans"][stage["tile_plan_idx"]]["tileable"]) or
                     (stage["chain_id"] is not None and stage["chain_len"] >= 2) for stage in stages)
-        summary.append(_count(len(stages), "stage") + (f", {tiled} tiled" if tiled else ""))
+        summary.append(plural(len(stages), "stage") + (f", {tiled} tiled" if tiled else ""))
     summary.append(fmt_bytes(report["file_size_bytes"]))
     # The name stored inside the file, where it is not the file's own.
     if report.get("name") and report["name"] != path.stem:
@@ -214,10 +205,10 @@ def _model_summary(report, is_tflite):
         rows.append(["quantization", _quantization(report["quantization"])])
         reasons = report["unsupported"]
         rows.append(["converts", "yes" if not reasons else
-                     text.bad("no") + f", {_count(len(reasons), 'reason')}"])
-        rows += [["", reason] for reason in reasons[:5]]
-        if len(reasons) > 5:
-            rows.append(["", text.dim(f"and {len(reasons) - 5} more; --json lists all")])
+                     text.bad("no") + f", {plural(len(reasons), 'reason')}"])
+        rows += [["", reason] for reason in reasons[:text.CAUSES_SHOWN]]
+        if len(reasons) > text.CAUSES_SHOWN:
+            rows.append(["", text.dim(f"and {len(reasons) - text.CAUSES_SHOWN} more; --json lists all")])
     else:
         graph = report["graph"]
         external = sum(item["storage"] == "external" for item in graph["initializers"])
@@ -245,7 +236,7 @@ def _quantization(quant):
                     else f"{quant['asymmetric']} asymmetric")
         parts.append(f"int8 weights {layout}, {symmetry}")
     if quant["float_islands"]:
-        parts.append(_count(quant["float_islands"], "float32 region"))
+        parts.append(plural(quant["float_islands"], "float32 region"))
     return "; ".join(parts)
 
 

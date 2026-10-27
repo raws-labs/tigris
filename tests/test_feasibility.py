@@ -1,6 +1,7 @@
 """Fail-closed validation for deployment memory budgets."""
 
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import onnx
@@ -383,3 +384,10 @@ def test_int8_global_pool_refuses_an_overflowing_sum(tmp_path, budget):
     assert read_binary_plan(path.read_bytes())["version"] == SCHEMA_VERSION
     with pytest.raises(HostError):
         Session(path)
+
+
+def test_analyze_lists_five_blocking_stages_then_counts_the_rest():
+    model = Path(__file__).parent / "fixtures" / "tflite" / "vww_96_int8.tflite"
+    result = CliRunner().invoke(cli, ["analyze", str(model), "-m", "1K"])
+    assert result.exit_code == 0
+    assert "  and 2 more; --json lists all" in result.output

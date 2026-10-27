@@ -9,6 +9,10 @@ import os
 import click
 
 
+# Causes listed under a verdict; --json lists all.
+CAUSES_SHOWN = 5
+
+
 def _style(text: str, **how) -> str:
     return text if os.environ.get("NO_COLOR") else click.style(text, **how)
 
@@ -55,7 +59,7 @@ def gap() -> None:
         echo()
 
 
-def columns(rows: list[list[str]], align: str = "", indent: int = 2, gap: int = 3) -> list[str]:
+def columns(rows: list[list[str]], align: str = "", indent: int = 2) -> list[str]:
     """Rows of cells aligned in columns. `align` holds one '<' or '>' per
     column; columns beyond it align left. Widths ignore color codes."""
     if not rows:
@@ -72,7 +76,7 @@ def columns(rows: list[list[str]], align: str = "", indent: int = 2, gap: int = 
             pad = " " * (widths[k] - len(click.unstyle(cell)))
             right = k < len(align) and align[k] == ">"
             cells.append(pad + cell if right else cell + (pad if k < count - 1 else ""))
-        lines.append(" " * indent + (" " * gap).join(cells).rstrip())
+        lines.append(" " * indent + "   ".join(cells).rstrip())
     return lines
 
 
