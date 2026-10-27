@@ -127,7 +127,7 @@ def _tried(model: str, budget: int, fits: bool, input_shape) -> list[tuple[int, 
 def _lz4_compiles(model: str, mem: tuple[str, ...], input_shape) -> bool:
     """Whether compile -c lz4 writes a plan at these budgets: the fast arena
     also holds each stage's decompressed weights, which can leave too little."""
-    from tigris.analysis.validation import validate_budget
+    from tigris.analysis.validation import plan_gate
     from tigris.cli.compile import plan_model
 
     try:
@@ -135,8 +135,7 @@ def _lz4_compiles(model: str, mem: tuple[str, ...], input_shape) -> bool:
                                  report_bindings=False)
     except click.ClickException:
         return False
-    result = validate_budget(graph)
-    return result.fast.feasible and result.slow.fits
+    return plan_gate(graph).passes
 
 
 def interface_rows(ag) -> list[list[str]]:
@@ -227,8 +226,7 @@ def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
     if f.largest_tensor_bytes:
         memory.append(["largest tensor", fmt_bytes(f.largest_tensor_bytes),
                        text.dim(f.largest_tensor_shape)])
-    supported = not (f.unsupported_operators or f.output_errors or f.dtype_errors)
-    if budget > 0 and supported and f.scheduled_peak_bytes > 0 and not f.blocking_stages:
+    if budget > 0 and f.gate.usable and f.scheduled_peak_bytes > 0 and not f.blocking_stages:
         memory.append(["this plan", fmt_bytes(f.scheduled_peak_bytes),
                        text.dim(f"{fmt_bytes(budget - f.scheduled_peak_bytes)} headroom")])
     if f.slow_peak_bytes > 0:
@@ -330,7 +328,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     data = Path(model).read_bytes()
     tflm_arena = tflm_tensor_arena(data)
     findings = compute_findings(ag)
-    supported = not (findings.unsupported_operators or findings.output_errors or findings.dtype_errors)
+    supported = findings.gate.usable
     tried = (_tried(model, budget, not findings.blocking_stages, input_shape)
              if budget > 0 and supported else [])
     if findings.lz4_plan_size_bytes and not (
