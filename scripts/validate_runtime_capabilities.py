@@ -22,6 +22,7 @@ _ADAPTER_CASE_RE = re.compile(
     r"\bcase\s+(TIGRIS_OP_[A-Z0-9_]+)\s*:\s*"
     r"(?:(?:rc\s*=\s*)|return\s+)adapt_[a-z0-9_]+\s*\(",
 )
+_DEFAULT_DELEGATE_RE = re.compile(r"\bdefault\s*:\s*return\s+(tigris_dispatch_[a-z0-9_]+)\s*\(")
 
 
 def _function_body(source: str, function: str) -> str:
@@ -38,6 +39,18 @@ def _function_body(source: str, function: str) -> str:
             if depth == 0:
                 return source[start:index + 1]
     raise ValueError(f"unterminated runtime function {function}")
+
+
+def _dispatched_cases(source: str, function: str, shared: str) -> set[str]:
+    """Case labels of a dispatcher and of the switches in `shared` its default case returns into."""
+    body = _function_body(source, function)
+    names = set(_CASE_RE.findall(body))
+    seen = {function}
+    while (delegate := _DEFAULT_DELEGATE_RE.search(body)) and delegate.group(1) not in seen:
+        seen.add(delegate.group(1))
+        body = _function_body(shared, delegate.group(1))
+        names |= set(_CASE_RE.findall(body))
+    return names
 
 
 def _opcodes(names: set[str], enum_values: dict[str, int]) -> set[int]:
@@ -85,13 +98,15 @@ def validate(runtime: Path) -> list[str]:
         "esp-nn": "tigris_dispatch_kernel_esp_nn",
         "cmsis-nn": "tigris_dispatch_kernel_cmsis_nn",
     }
+    # The float and int8 dispatchers share a switch for dtype-generic operators.
+    reference_sources = sources["reference"] + "\n" + sources["s8_ref"]
     for backend, function in functions.items():
         try:
-            body = _function_body(sources[backend], function)
-            case_names = set(
-                (_ADAPTER_CASE_RE if backend in {"esp-nn", "cmsis-nn"} else _CASE_RE)
-                .findall(body)
-            )
+            if backend in {"esp-nn", "cmsis-nn"}:
+                body = _function_body(sources[backend], function)
+                case_names = set(_ADAPTER_CASE_RE.findall(body))
+            else:
+                case_names = _dispatched_cases(sources[backend], function, reference_sources)
             actual = _opcodes(case_names, enum_values)
         except ValueError as exc:
             errors.append(str(exc))
