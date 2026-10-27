@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +66,90 @@ def test_capability_contract_matches_current_runtime_when_available():
             pytest.fail(f"TIGRIS_RUNTIME_SOURCE has no runtime headers: {RUNTIME}")
         pytest.skip("tigris-runtime checkout not found; set TIGRIS_RUNTIME_SOURCE")
     assert validate_capabilities(RUNTIME) == []
+
+
+def _runtime_copy(tmp_path):
+    if not (RUNTIME / "include/tigris.h").is_file():
+        if _RUNTIME_SOURCE:
+            pytest.fail(f"TIGRIS_RUNTIME_SOURCE has no runtime headers: {RUNTIME}")
+        pytest.skip("tigris-runtime checkout not found; set TIGRIS_RUNTIME_SOURCE")
+    copy = tmp_path / "runtime"
+    for part in ("include", "src"):
+        shutil.copytree(RUNTIME / part, copy / part)
+    return copy
+
+
+def _edit(path, pattern, replacement=""):
+    text, count = re.subn(pattern, replacement, path.read_text())
+    assert count, f"{pattern} not found in {path.name}"
+    path.write_text(text)
+
+
+def _dispatch_error(backend, operator):
+    return (
+        f"{backend} dispatch differs from compiler capabilities: "
+        f"runtime-only=[], compiler-only=['{operator}']"
+    )
+
+
+@pytest.mark.parametrize(
+    ("operator", "label"),
+    [("Pad", "PAD"), ("Gather", "GATHER"), ("Split", "SPLIT")],
+)
+def test_capability_contract_rejects_reference_dispatch_without_an_operator(
+    tmp_path, operator, label,
+):
+    runtime = _runtime_copy(tmp_path)
+    removed = 0
+    for name in ("tigris_kernels.c", "tigris_kernels_s8.c"):
+        source = runtime / "src" / name
+        text, count = re.subn(rf"\bcase\s+TIGRIS_OP_{label}\s*:", "", source.read_text())
+        source.write_text(text)
+        removed += count
+    assert removed
+
+    assert validate_capabilities(runtime) == [
+        _dispatch_error("reference", operator),
+        _dispatch_error("s8_ref", operator),
+    ]
+
+
+def test_capability_contract_rejects_int8_dispatch_without_its_own_case(tmp_path):
+    runtime = _runtime_copy(tmp_path)
+    _edit(runtime / "src/tigris_kernels_s8.c", r"\bcase\s+TIGRIS_OP_PAD\s*:")
+
+    assert validate_capabilities(runtime) == [_dispatch_error("s8_ref", "Pad")]
+
+
+@pytest.mark.parametrize(
+    ("backend", "name", "function"),
+    [
+        ("reference", "tigris_kernels.c", "tigris_dispatch_kernel"),
+        ("s8_ref", "tigris_kernels_s8.c", "tigris_dispatch_kernel_s8"),
+    ],
+)
+def test_capability_contract_counts_a_shared_switch_only_when_the_dispatcher_reaches_it(
+    tmp_path, backend, name, function,
+):
+    runtime = _runtime_copy(tmp_path)
+    source = runtime / "src" / name
+    dispatcher = re.search(
+        rf"\b{function}\s*\([^;]*?\)\s*\{{.*?\n\}}", source.read_text(), re.S,
+    ).group(0)
+    if not re.search(r"\bdefault\s*:\s*return\s+tigris_dispatch_", dispatcher):
+        pytest.skip(f"{function} has no default case returning into a shared switch")
+    _edit(
+        source,
+        r"\bdefault\s*:\s*return\s+tigris_dispatch_[a-z0-9_]+\s*\([^;]*\);",
+        "default: return -1;",
+    )
+
+    errors = validate_capabilities(runtime)
+
+    assert len(errors) == 1
+    assert errors[0].startswith(f"{backend} dispatch differs from compiler capabilities: ")
+    assert "runtime-only=[]" in errors[0]
+    assert "'Gather'" in errors[0]
 
 
 def _document():
