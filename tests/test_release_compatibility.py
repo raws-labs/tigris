@@ -210,6 +210,16 @@ def test_release_manifest_rejects_incompatible_pair(tmp_path):
     assert any("incompatible compiler and runtime" in error for error in errors)
 
 
+def test_release_manifest_states_paired_releases(tmp_path):
+    document = _document()
+    assert document["policy"]["release_cadence"] == "paired-same-version"
+    document["policy"]["release_cadence"] = "independent-per-component"
+
+    errors = _validated_copy(tmp_path, document)
+
+    assert "policy.release_cadence must be 'paired-same-version'" in errors
+
+
 def test_release_manifest_accepts_an_independent_component_release():
     document = _document()
     assert any(

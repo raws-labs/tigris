@@ -3,6 +3,8 @@ name: Promote to main
 # Fast-forwards main to a tested develop commit for a release. main never gets
 # its own commits, so it stays an ancestor of develop and a release tag on main
 # is reachable from develop. The tag itself is created with the GitHub release.
+# The compiler and runtime repositories keep this file identical, so the
+# version check has one branch for each.
 
 on:
   workflow_dispatch:
@@ -49,8 +51,10 @@ jobs:
         run: |
           git checkout --quiet --detach "$SHA"
           if [ -f scripts/check_version_sources.py ]; then
+            # Runtime: its CMake, ESP component, example and consumer versions.
             python3 scripts/check_version_sources.py --expect "$VERSION"
           elif [ -f runtime-host.json ]; then
+            # Compiler: the pinned host runtime release.
             pinned="$(python3 -c 'import json; print(json.load(open("runtime-host.json"))["release"])')"
             [ "$pinned" = "v$VERSION" ] || { echo "runtime-host.json pins $pinned, not v$VERSION" >&2; exit 1; }
           fi
