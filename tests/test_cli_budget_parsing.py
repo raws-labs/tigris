@@ -2,10 +2,11 @@ import pytest
 from click import BadParameter
 from click.testing import CliRunner
 
-from tigris.cli import _memory_sizes, _parse_size, cli
+from tigris.cli import _memory_sizes, cli
+from tigris.pipeline import parse_size
 
 
-_MALFORMED = "expected bytes or a number with a K, KB, M or MB suffix (e.g. 256K)"
+_MALFORMED = "expected bytes or a number with a K, KB, M or MB suffix, for example 256K"
 _NONPOSITIVE = "must be greater than zero"
 
 
@@ -14,7 +15,7 @@ _NONPOSITIVE = "must be greater than zero"
     (" 4M ", 4 * 1024 * 1024), ("1.5MB", 1536 * 1024),
 ])
 def test_parse_size_suffixes(text, size):
-    assert _parse_size(text) == size
+    assert parse_size(text) == size
 
 
 @pytest.mark.parametrize("text, reason", [
@@ -24,7 +25,7 @@ def test_parse_size_suffixes(text, size):
 ])
 def test_a_malformed_memory_size_raises_value_error(text, reason):
     with pytest.raises(ValueError, match="invalid memory size") as error:
-        _parse_size(text)
+        parse_size(text)
     assert reason in str(error.value)
 
 

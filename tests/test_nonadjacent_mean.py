@@ -7,10 +7,10 @@ import onnxruntime as ort
 import pytest
 
 from tigris.analysis.validation import validate_budget
-from tigris.cli import _run_pipeline
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.frontends import tflite
+from tigris.pipeline import plan_model
 from tigris.runtime import Session
 
 pytestmark = pytest.mark.usefixtures("require_host_library")
@@ -33,7 +33,7 @@ def test_nonadjacent_mean_matches_micro_and_onnx(name, tmp_path):
     previous = None
     tight = ('2K' if name.endswith('keep') else '1536') if name.startswith('float_') and not name.endswith('tokens') else '512'
     for budget in (tight, '1M'):
-        ag, _ = _run_pipeline(str(source), (budget, '8M'), report_bindings=False)
+        ag = plan_model(str(source), (budget, '8M'))
         assert validate_budget(ag).feasible
         assert any(op.op_type == 'ReduceMean' for op in ag.ops)
         # A batch of one leaves the reduced token and feature axes adjacent,

@@ -42,7 +42,6 @@ from .defs import (
     ACT_RELU,
     ACT_RELU6,
     COMPRESS_LZ4,
-    COMPRESS_NONE,
     FLAG_XIP,
     HEADER_SIZE,
     HEADER_STRUCT,
@@ -575,9 +574,8 @@ def _stage_blocks(
 def _build_weights_compressed(
     ag: AnalyzedGraph,
     strings: _StringTable,
-    compress: str,
 ) -> tuple[bytes, bytes, dict[str, int]]:
-    """Build compressed per-stage weight blocks.
+    """Build LZ4-compressed per-stage weight blocks.
 
     Returns (entries_only_bytes, weight_blocks_section_bytes, weight_idx map).
     entries_only_bytes = weight_entry_t[] with block-relative offsets.
@@ -587,7 +585,6 @@ def _build_weights_compressed(
 
     weight_idx, weights = _serialized_weights(ag, strings)
     blocks = _stage_blocks(ag, weight_idx, weights)
-    compress_type = COMPRESS_LZ4 if compress == "lz4" else COMPRESS_NONE
 
     # Section layout: header num_blocks(u16) + compression_type(u16),
     # tigris_weight_block_t[num_blocks], then the block blobs.
@@ -600,10 +597,7 @@ def _build_weights_compressed(
             raw, name_off = weights[widx]
             WEIGHT_ENTRY_STRUCT.pack_into(
                 entries_buf, widx * WEIGHT_ENTRY_SIZE, name_off, offset, len(raw))
-        if compress_type == COMPRESS_LZ4:
-            compressed = lz4.block.compress(data, store_size=False)
-        else:
-            compressed = data
+        compressed = lz4.block.compress(data, store_size=False)
         block_entries.extend(WEIGHT_BLOCK_STRUCT.pack(
             stage_idx, members[0], len(members), 0,  # pad
             blob_offset, len(compressed), len(data),
@@ -612,7 +606,7 @@ def _build_weights_compressed(
         blob_parts.append(compressed)
 
     weight_blocks_section = (
-        WEIGHT_BLOCK_SECTION_HEADER_STRUCT.pack(len(blocks), compress_type)
+        WEIGHT_BLOCK_SECTION_HEADER_STRUCT.pack(len(blocks), COMPRESS_LZ4)
         + bytes(block_entries) + b"".join(blob_parts)
     )
     return bytes(entries_buf), weight_blocks_section, weight_idx
@@ -625,8 +619,12 @@ def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
     a normal stage needs one aligned decompressed block, while a tiled chain
     holds its member-stage blocks simultaneously.  It deliberately builds the
     same block grouping as serialization so plan validation cannot approve an
-    arena that the executor later overcommits.
+    arena that the executor later overcommits. The stages of the subgraphs
+    control flow runs are stages of the plan, so their blocks count too.
     """
+    if ag.subgraphs:
+        from tigris.graph.subgraphs import flatten_subgraphs
+        ag = flatten_subgraphs(ag)[0]
     if not ag.weight_data:
         return 0
 
@@ -1628,7 +1626,10 @@ def emit_binary_bytes(
     control-flow operator runs is validated as a graph of its own, then
     serialized after the main graph's stages. Without `names` the plan keeps
     only the model's name and its interface tensors' names, which is all a
-    runtime reads."""
+    runtime reads. With `compress="lz4"` the graph's fast-memory reservation
+    holds the decompressed weights, as `tigris.pipeline.plan_model` plans it."""
+    if compress not in (None, "lz4"):
+        raise ValueError(f"unknown weight compression {compress!r}: expected None or 'lz4'")
     if not ag.subgraphs:
         return _emit(ag, compress, xip, names=names)
     from tigris.analysis.validation import scheduled_fast_peak
@@ -1691,44 +1692,24 @@ def _emit(
     if ag.fast_memory_reserve_bytes < 0:
         raise ValueError("Fast-memory reservation must not be negative")
 
+    # The fast budget is the activation arena; the reservation beside it holds
+    # the decompressed weights.
     compressed_reserve = compressed_weight_reserve_bytes(ag) if compress else 0
-    reserved_activation_budget = ag.fast_memory_reserve_bytes > 0
-    if reserved_activation_budget and compressed_reserve > ag.fast_memory_reserve_bytes:
+    if compressed_reserve > ag.fast_memory_reserve_bytes:
         raise ValueError(
             "Cannot emit a compressed plan: compressed-weight reservation "
             f"({compressed_reserve:,} bytes) exceeds the declared reservation "
             f"({ag.fast_memory_reserve_bytes:,} bytes)"
         )
-    if (
-        not reserved_activation_budget
-        and ag.mem_budget > 0
-        and compressed_reserve > ag.mem_budget
-    ):
-        raise ValueError(
-            "Cannot emit a compressed plan: compressed-weight reservation "
-            f"({compressed_reserve:,} bytes) exceeds the fast-memory budget "
-            f"({ag.mem_budget:,} bytes)"
-        )
 
     if validate and ag.mem_budget > 0:
-        validation = validate_memory_plan(
-            ag,
-            fast_reserve_bytes=0 if reserved_activation_budget else compressed_reserve,
-        )
+        validation = validate_memory_plan(ag)
         if not validation.feasible:
             details = "; ".join(issue.describe() for issue in validation.issues)
             raise ValueError(f"Cannot emit an infeasible memory plan: {details}")
 
     if not serialize:
         return b""
-
-    # The serialized plan budget is the activation arena.  The compile command
-    # already partitions with the compressed-weight reservation removed.  Keep
-    # the defensive direct-emitter behaviour for callers that still provide a
-    # total arena budget instead.
-    serialized_budget = (
-        ag.mem_budget if reserved_activation_budget else ag.mem_budget - compressed_reserve
-    )
 
     # Reject counts before any fixed-width table field is packed. The runtime
     # has a deliberately bounded tensor working set; the other limits are
@@ -1755,7 +1736,7 @@ def _emit(
     weight_blocks_data = b""
     if compress and ag.weight_data:
         weight_entries_only, weight_blocks_data, weight_idx = \
-            _build_weights_compressed(ag, strings, compress)
+            _build_weights_compressed(ag, strings)
         weight_data = weight_entries_only  # entries only, no blob
     else:
         weight_data, weight_idx = _build_weights(ag, strings)
@@ -1876,7 +1857,7 @@ def _emit(
         num_ops,
         num_stages,
         num_tile_plans,
-        serialized_budget,
+        ag.mem_budget,
         ag.peak_memory_bytes,
         model_name_off,
         model_io_off,

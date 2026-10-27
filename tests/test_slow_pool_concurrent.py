@@ -16,7 +16,6 @@ from pathlib import Path
 
 from tigris.analysis.plan_graph import graph_from_plan, slow_arena_required
 from tigris.analysis.validation import io_in_fast, row_band_aliases, slow_pool_usage
-from tigris.cli import _run_pipeline
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris import SCHEMA_VERSION_TILE_AXIS, TILE_AXIS_HEIGHT_OR_LENGTH
@@ -29,6 +28,7 @@ from tigris.graph.ir import (
     TensorInfo,
     TilePlan,
 )
+from tigris.pipeline import plan_model
 
 from conftest import save_onnx
 
@@ -226,7 +226,7 @@ def _attention_model(path):
 def test_a_banded_stage_shares_one_buffer_with_its_input(tmp_path):
     path = tmp_path / "attention.onnx"
     _attention_model(path)
-    ag, _ = _run_pipeline(str(path), ("32K", "2M"))
+    ag = plan_model(str(path), ("32K", "2M"))
 
     aliases = row_band_aliases(ag, ag.budget.fast + ag.budget.fast_reserve)
     assert aliases == {"probs": "scores"}
@@ -309,7 +309,7 @@ def test_a_banded_stage_never_writes_over_an_output(tmp_path, require_host_libra
 
     path = tmp_path / "model.onnx"
     _banded_softmax_model(path, kept)
-    ag, _ = _run_pipeline(str(path), ("32K", "8M"))
+    ag = plan_model(str(path), ("32K", "8M"))
     fast_total = ag.budget.fast + ag.budget.fast_reserve
     assert [row_band_aliases(graph, fast_total) for graph in (ag, *ag.subgraphs)] == aliases
     required = slow_pool_usage(ag).slow_peak_bytes
@@ -342,7 +342,7 @@ def test_slow_requirement_counts_allocation_alignment(tmp_path):
 
     path = tmp_path / "softmax.onnx"
     _softmax_with_unread_input(path, state=False)
-    ag, _ = _run_pipeline(str(path), ("16K", "96"))
+    ag = plan_model(str(path), ("16K", "96"))
     assert slow_pool_usage(ag).slow_peak_bytes == 96
 
     short = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-m", "80",
@@ -358,7 +358,7 @@ def test_slow_requirement_is_reported_without_a_slow_budget(tmp_path):
     """An unconstrained slow pool still has a requirement; it is not zero."""
     path = tmp_path / "softmax.onnx"
     _softmax_with_unread_input(path, state=False)
-    ag, _ = _run_pipeline(str(path), ("16K",))
+    ag = plan_model(str(path), ("16K",))
     usage = slow_pool_usage(ag)
     assert usage.slow_peak_bytes == 96
     assert usage.fits
@@ -369,7 +369,7 @@ def test_a_one_stage_plan_that_fits_needs_no_slow_memory(tmp_path):
     input and output in the fast pool, and the plan says so on its own."""
     path = tmp_path / "softmax.onnx"
     _softmax_model(path, [1, 2, 3])
-    ag, _ = _run_pipeline(str(path), ("16K", "64"))
+    ag = plan_model(str(path), ("16K", "64"))
     assert io_in_fast(ag)
     assert slow_pool_usage(ag).slow_peak_bytes == 0
     plan = read_binary_plan(emit_binary_bytes(ag))
@@ -492,7 +492,7 @@ def test_an_input_no_operator_reads_still_takes_slow_memory(tmp_path, state):
     32-byte boundary tensors."""
     path = tmp_path / "softmax.onnx"
     _softmax_with_unread_input(path, state)
-    ag, _ = _run_pipeline(str(path), ("16K", "8M"))
+    ag = plan_model(str(path), ("16K", "8M"))
     assert slow_pool_usage(ag).slow_peak_bytes == 96
 
 
@@ -522,5 +522,5 @@ def test_a_branch_input_its_graph_does_not_read_is_counted_once(tmp_path):
     model.ir_version = 9
     path = tmp_path / "if.onnx"
     onnx.save(model, path)
-    ag, _ = _run_pipeline(str(path), ("4K", "8M"))
+    ag = plan_model(str(path), ("4K", "8M"))
     assert slow_pool_usage(ag).slow_peak_bytes == 192

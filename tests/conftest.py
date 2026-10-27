@@ -8,10 +8,6 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris.analysis.lifetime import compute_lifetimes
-from tigris.analysis.memory import compute_memory_timeline
-from tigris.analysis.partition_spatial import detect_and_solve_chains, partition_spatial
-from tigris.analysis.partition_temporal import partition_temporal
 from tigris.emitters.binary import defs
 from tigris.loaders import load_model
 from scripts.contract_cases.fixtures import build_conv_relu_chain, build_linear_3op
@@ -63,20 +59,6 @@ def require_host_library(monkeypatch):
 def normalized(tmp_path, name, nodes, inputs, outputs, init=(), **kwargs):
     """Save a one-graph model and load it through the normalizer."""
     return load_model(save_onnx(tmp_path, name, nodes, inputs, outputs, init, **kwargs))
-
-
-def full_pipeline(path, budget=0, spatial=True, chains=False):
-    """Load, compute lifetimes and memory; with a budget, partition the graph."""
-    ag = load_model(path)
-    ag = compute_lifetimes(ag)
-    ag = compute_memory_timeline(ag)
-    if budget > 0:
-        ag = partition_temporal(ag, budget)
-        if spatial:
-            ag = partition_spatial(ag)
-            if chains:
-                ag = detect_and_solve_chains(ag)
-    return ag
 
 
 @pytest.fixture

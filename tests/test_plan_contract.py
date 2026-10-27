@@ -12,9 +12,9 @@ import onnx
 import pytest
 
 from tigris import SCHEMA_VERSION
-from tigris.cli import _run_pipeline
 from tigris.emitters.binary.defs import HEADER_SIZE, MAGIC
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.pipeline import plan_model
 from scripts.contract_cases.fixtures import build_linear_3op, build_conv_relu_chain, build_ds_cnn
 
 
@@ -27,7 +27,7 @@ def _compile_fixture(builder, budget_str):
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "model.onnx"
         onnx.save(model, str(path))
-        ag, _ = _run_pipeline(str(path), (budget_str,))
+        ag = plan_model(str(path), (budget_str,))
         return emit_binary_bytes(ag)
 
 

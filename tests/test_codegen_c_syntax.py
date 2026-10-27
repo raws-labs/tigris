@@ -12,8 +12,9 @@ import pytest
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.emitters.codegen import generate_c, generate_core_header
+from tigris.pipeline import plan_model
 
-from conftest import full_pipeline, save_onnx
+from conftest import save_onnx
 
 _ROOT = Path(__file__).resolve().parents[1]
 # With TIGRIS_RUNTIME_SOURCE set or under CI, a missing compiler or header fails.
@@ -117,11 +118,11 @@ def test_generated_harness_is_valid_c99(
     linear_3op_path, qdq_conv_path, tmp_path, backend, quantized
 ):
     if backend == "cmsis-nn":
-        data = emit_binary_bytes(full_pipeline(qdq_conv_path, 4096), compress="lz4")
+        data = emit_binary_bytes(plan_model(qdq_conv_path, (4096,), compress="lz4"), compress="lz4")
     elif quantized:
-        data = emit_binary_bytes(full_pipeline(qdq_conv_path, 4096))
+        data = emit_binary_bytes(plan_model(qdq_conv_path, (4096,)))
     else:
-        data = emit_binary_bytes(full_pipeline(linear_3op_path, 4096))
+        data = emit_binary_bytes(plan_model(linear_3op_path, (4096,)))
 
     mode = "int8" if quantized else "float32"
     source_path = tmp_path / f"generated-{backend}-{mode}.c"
@@ -153,7 +154,7 @@ def test_generated_harness_is_valid_c99(
 def test_generated_core_is_valid_c99(qdq_conv_path, tmp_path, backend):
     source_path = tmp_path / "generated-core.c"
     header_path = tmp_path / "generated_core.h"
-    plan = read_binary_plan(emit_binary_bytes(full_pipeline(qdq_conv_path, 4096)))
+    plan = read_binary_plan(emit_binary_bytes(plan_model(qdq_conv_path, (4096,))))
     source_path.write_text(
         generate_c(plan, backend, output_format="core", core_header=header_path.name)
     )
@@ -173,7 +174,7 @@ def test_generated_core_is_valid_c99(qdq_conv_path, tmp_path, backend):
 
 
 def test_named_generated_cores_link_together(qdq_conv_path, tmp_path):
-    plan_data = emit_binary_bytes(full_pipeline(qdq_conv_path, 4096))
+    plan_data = emit_binary_bytes(plan_model(qdq_conv_path, (4096,)))
     cores = [("tigris_codegen", "default"), ("audio_codegen", "audio")]
     objects = []
     for core_name, stem in cores:
@@ -209,12 +210,11 @@ def test_named_generated_cores_link_together(qdq_conv_path, tmp_path):
 def test_bool_harness_and_core_are_valid_c99(tmp_path, kind, quantized):
     import onnx
     from scripts.contract_cases.elementwise import _bool_case
-    from tigris.cli import _run_pipeline
 
     case = _bool_case(kind, quantized)
     path = tmp_path / "bool.onnx"
     onnx.save(case.compile_model, path)
-    graph, _ = _run_pipeline(str(path), ("4K",))
+    graph = plan_model(str(path), ("4K",))
     data = emit_binary_bytes(graph)
     header = tmp_path / "generated_core.h"
     header.write_text(generate_core_header(read_binary_plan(data)))
@@ -283,7 +283,7 @@ def test_generated_code_stops_on_older_runtime_headers(
     header.write_text(stripped)
 
     for path in (qdq_conv_path, conv_relu_chain_path):
-        data = emit_binary_bytes(full_pipeline(path, 4096))
+        data = emit_binary_bytes(plan_model(path, (4096,)))
         core_header = tmp_path / "generated_core.h"
         core_header.write_text(generate_core_header(read_binary_plan(data)))
         source = tmp_path / f"generated-{fmt}.c"
@@ -430,7 +430,7 @@ def test_generated_code_runs_on_the_host(
         assert result.exit_code == 0, result.output
         data = (tmp_path / "compiled.tgrs").read_bytes()
     else:
-        data = emit_binary_bytes(full_pipeline(conv_relu_chain_path, 4096))
+        data = emit_binary_bytes(plan_model(conv_relu_chain_path, (4096,)))
     plan_path = tmp_path / "model.tgrs"
     plan_path.write_bytes(data)
     (tmp_path / "generated_core.h").write_text(generate_core_header(read_binary_plan(data)))
@@ -545,7 +545,6 @@ def test_runtime_derives_every_stated_tile_fact(sanitized_runtime, tmp_path):
     order finds for the stage when it reads the plan's records as schema 10."""
     from tigris.analysis.plan_graph import graph_from_plan
     from tigris.analysis.validation import validate_memory_plan
-    from tigris.cli import _run_pipeline
 
     facts = ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis", "band_kind", "band_mode")
     fields = ("tileable", "axis", "band_on_columns", "band_in_output_rows", "tile_height",
@@ -559,8 +558,7 @@ def test_runtime_derives_every_stated_tile_fact(sanitized_runtime, tmp_path):
         budgets[_rank2_dense_constant_model(tmp_path, op_type)] = (("16K", "4M"),)
     for model, model_budgets in budgets.items():
         for budget in model_budgets:
-            graph, _ = _run_pipeline(str(model), budget if isinstance(budget, tuple) else (budget,),
-                                     report_bindings=False)
+            graph = plan_model(str(model), budget if isinstance(budget, tuple) else (budget,))
             if not validate_memory_plan(graph).feasible or not any(
                     stage.tile_plan for stage in graph.stages):
                 continue

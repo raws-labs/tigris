@@ -11,8 +11,7 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import _permute_fc_weight_for_nhwc, emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
-
-from conftest import full_pipeline
+from tigris.pipeline import plan_model
 
 
 # Weight extraction
@@ -34,7 +33,7 @@ def test_no_weights_for_activation_only(diamond_path):
     """A graph with no initializers has no weight_data and no weight entries."""
     assert len(load_model(diamond_path).weight_data) == 0
 
-    plan = read_binary_plan(emit_binary_bytes(full_pipeline(diamond_path)))
+    plan = read_binary_plan(emit_binary_bytes(plan_model(diamond_path)))
     assert plan["num_weights"] == 0
     assert len(plan["weights"]) == 0
 
@@ -44,7 +43,7 @@ def test_no_weights_for_activation_only(diamond_path):
 
 def test_weights_in_binary(conv_relu_chain_path):
     """Weight entries carry the names, sizes and bytes of the original arrays."""
-    ag = full_pipeline(conv_relu_chain_path)
+    ag = plan_model(conv_relu_chain_path)
     data = emit_binary_bytes(ag, names=True)
     plan = read_binary_plan(data)
 
@@ -154,7 +153,7 @@ def test_fc_weight_on_the_channels_last_flatten_gives_the_model_result(shape):
 
 def test_conv_ops_have_weights(conv_relu_chain_path):
     """Conv ops reference weight entries, with weight and bias distinct."""
-    ag = full_pipeline(conv_relu_chain_path)
+    ag = plan_model(conv_relu_chain_path)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -167,7 +166,7 @@ def test_conv_ops_have_weights(conv_relu_chain_path):
 
 def test_relu_has_no_weights(linear_3op_path):
     """Relu ops should have NO_WEIGHT for both weight and bias."""
-    ag = full_pipeline(linear_3op_path)
+    ag = plan_model(linear_3op_path)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 

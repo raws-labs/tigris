@@ -1,65 +1,15 @@
 """The execution trace: what the runtime did when it ran a plan, event by event."""
 
 from tigris.cli import text
+from tigris.runtime import check_trace, trace_units
 from tigris.utils import fmt_bytes
 
-_PATHS = {"normal": "untiled", "tiled": "1D tile", "tiled_2d": "2D tile", "by_input": "reduce by rows",
-          "transpose": "transpose", "rows": "row bands", "reshape": "reshape bands", "control": "control"}
 # Paths whose event ranges are rows and columns of the tensor; the others
 # report ranges in their own iteration order.
 _SPATIAL = {"tiled", "tiled_2d", "chain"}
 _NAME_WIDTH = 32
 # Zero inputs can keep such a loop running forever.
 _ZERO_INPUT_LOOP = "the number of While iterations depends on the input values"
-
-
-def units(plan: dict, events: list[dict]) -> list[dict]:
-    """Group events into execution units, one per stage or chain, in the order
-    they ran, with what each read, wrote and held."""
-    result, current = [], None
-    for event in events:
-        if event["kind"] == "stage_begin":
-            stage = plan["stages"][event["stage"]] if event["stage"] is not None else None
-            kind = (f"chain {stage['chain_len']}" if event["path"] == "chain" and stage
-                    else _PATHS.get(event["path"], event["path"]))
-            current = {"stage": event["stage"], "path": event["path"], "kind": kind, "tiles": 0, "read": 0, "written": 0,
-                       "weights": 0, "copied": 0, "fast_peak": event["fast_used"],
-                       "slow_used": event["slow_used"], "events": []}
-            result.append(current)
-            continue
-        if current is None:
-            continue
-        current["events"].append(event)
-        current["fast_peak"] = max(current["fast_peak"], event["fast_used"])
-        current["slow_used"] = max(current["slow_used"], event["slow_used"])
-        kind = event["kind"]
-        if kind == "tile_begin":
-            current["tiles"] += 1
-        elif kind == "load":
-            current["read"] += event["bytes"]
-        elif kind == "spill":
-            current["written"] += event["bytes"]
-        elif kind == "weights":
-            current["weights"] += event["bytes"]
-        elif kind == "copy":
-            current["copied"] += event["bytes"]
-        elif kind == "stage_end":
-            current = None
-    return result
-
-
-def check(events: list[dict], counters: dict[str, int]) -> list[str]:
-    """Differences between the event stream and the runtime's own counters."""
-    sums = {"load_bytes": "load", "spill_bytes": "spill", "weight_bytes": "weights", "copy_bytes": "copy"}
-    problems = []
-    for counter, kind in sums.items():
-        total = sum(event["bytes"] for event in events if event["kind"] == kind)
-        if total != counters[counter]:
-            problems.append(f"{kind} events add up to {total} bytes, the runtime counted {counters[counter]}")
-    tiles = sum(event["kind"] == "tile_begin" for event in events)
-    if tiles != counters["tiles"]:
-        problems.append(f"{tiles} tile events, the runtime counted {counters['tiles']} tiles")
-    return problems
 
 
 def _shorten(name: str) -> str:
@@ -108,7 +58,7 @@ def render(model: str, plan: dict, events: list[dict], counters: dict[str, int],
            info: dict[str, str], verbose: bool) -> None:
     """Print the trace: totals, one row per execution unit, and with
     `verbose` every event of every tile."""
-    done = units(plan, events)
+    done = trace_units(plan, events)
     read = sum(unit["read"] for unit in done)
     written = sum(unit["written"] for unit in done)
     fast_peak = max((event["fast_used"] for event in events), default=0)
@@ -150,7 +100,7 @@ def render(model: str, plan: dict, events: list[dict], counters: dict[str, int],
             for line in text.columns(rows, "<<<<>"):
                 text.echo(line)
 
-    problems = check(events, counters)
+    problems = check_trace(events, counters)
     text.gap()
     if problems:
         for problem in problems:

@@ -12,9 +12,10 @@ from tigris.analysis.partition_spatial import (
     _stage_tile_axis,
 )
 from tigris.analysis.validation import validate_memory_plan
+from tigris.pipeline import plan_model
 from scripts.contract_cases.fixtures import build_tcn
 
-from conftest import full_pipeline, save_onnx
+from conftest import save_onnx
 
 
 def _write_conv1d(path, length=32):
@@ -143,7 +144,7 @@ class TestTilingIntegration:
             (conv_relu_chain_path, 1024, [(2, 60, 2, 3), (2, 98, 2, 3)]),
             (conv_pool_chain_path, 512, [(1, 150, 2, 3), (1, 75, 1, 2), (1, 91, 2, 3)]),
         ]:
-            ag = full_pipeline(path, budget=budget)
+            ag = plan_model(path, (budget,))
             plans = [s.tile_plan for s in ag.stages]
             assert all(tp is not None and tp.tileable for tp in plans)
             assert [(tp.tile_height, tp.num_tiles, tp.halo, tp.receptive_field)
@@ -151,7 +152,7 @@ class TestTilingIntegration:
 
     def test_untileable_stage_flagged(self, conv_with_flatten_path):
         """Conv-Relu-Flatten should flag the stage containing Flatten as untileable."""
-        ag = full_pipeline(conv_with_flatten_path, budget=256)
+        ag = plan_model(conv_with_flatten_path, (256,))
 
         # Find stages with tile plans
         tiled = [s for s in ag.stages if s.tile_plan is not None]
@@ -165,14 +166,14 @@ class TestTilingIntegration:
 
     def test_no_tiling_when_fits(self, conv_relu_chain_path):
         """With a large budget, no stages should need tiling."""
-        ag = full_pipeline(conv_relu_chain_path, budget=10 * 1024 * 1024)
+        ag = plan_model(conv_relu_chain_path, (10 * 1024 * 1024,))
 
         # No stage should have a tile plan
         for s in ag.stages:
             assert s.tile_plan is None
 
     def test_conv1d_uses_serialized_length_axis(self, tmp_path):
-        ag = full_pipeline(_write_conv1d(tmp_path / "conv1d.onnx"), budget=128)
+        ag = plan_model(_write_conv1d(tmp_path / "conv1d.onnx"), (128,))
 
         assert len(ag.stages) == 1
         tile_plan = ag.stages[0].tile_plan
@@ -189,7 +190,7 @@ class TestTilingIntegration:
         model = _write_rank3_pointwise(
             tmp_path / f"rank3_{op_type.lower()}.onnx", op_type
         )
-        ag = full_pipeline(model, budget=256)
+        ag = plan_model(model, (256,))
 
         assert len(ag.stages) == 1
         tile_plan = ag.stages[0].tile_plan
@@ -270,7 +271,7 @@ class TestTilingIntegration:
         model_path = tmp_path / "tcn.onnx"
         model_path.write_bytes(build_tcn().SerializeToString())
 
-        ag = full_pipeline(model_path, budget=16 * 1024)
+        ag = plan_model(model_path, (16 * 1024,))
         pointwise = {"Tanh", "Sigmoid", "Mul"}
         placed = set()
         for stage in ag.stages:
@@ -295,7 +296,7 @@ class TestTilingIntegration:
 
 class TestOversizedStagesCarryTilePlan:
     def test_oversized_stages_carry_tile_plan(self, conv_relu_chain_path):
-        ag = full_pipeline(conv_relu_chain_path, budget=1024)
+        ag = plan_model(conv_relu_chain_path, (1024,))
 
         tiled = [s for s in ag.stages if s.tile_plan is not None]
         assert len(tiled) == 2
@@ -320,10 +321,9 @@ def _gated_map_path(tmp_path, channels=16, side=12):
 
 def test_per_channel_operand_stage_is_banded_over_the_full_operand(tmp_path):
     """The gate is one row high and listed first; the band runs over the map."""
-    from tigris.cli import _run_pipeline
     from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
 
-    ag, _ = _run_pipeline(str(_gated_map_path(tmp_path)), ("2K",), report_bindings=False)
+    ag = plan_model(str(_gated_map_path(tmp_path)), ("2K",))
     stage = next(s for s in ag.stages
                  if any(ag.ops[i].op_type == "Mul" for i in s.op_indices))
     plan = stage.tile_plan
@@ -359,7 +359,6 @@ def test_independent_operator_band_fits_256_bytes(tmp_path, kind, quantized):
     import onnx
     from scripts.contract_cases.movement import _movement_case
     from scripts.contract_cases.reduction import _arg_case, _reduce_all_case, _reduction_case
-    from tigris.cli import _run_pipeline
 
     if kind in {"ArgMax", "ArgMin"}:
         case = _arg_case(kind, 2, quantized, True, tiled=True)
@@ -371,7 +370,7 @@ def test_independent_operator_band_fits_256_bytes(tmp_path, kind, quantized):
         case = _movement_case(kind, quantized, 2 if kind == "Gather" else 0, tiled=True)
     path = tmp_path / "band.onnx"
     onnx.save(case.compile_model, path)
-    graph, _ = _run_pipeline(str(path), ("256", "16K"))
+    graph = plan_model(str(path), ("256", "16K"))
     stage = next(s for s in graph.stages if any(graph.ops[i].op_type == kind for i in s.op_indices))
     assert stage.tile_plan and stage.tile_plan.tileable and stage.tile_plan.num_tiles > 1
     assert stage.tile_plan.tiled_peak_bytes <= 256
@@ -592,11 +591,10 @@ def test_row_band_operators_are_the_contract_row_mode():
 def test_a_strided_stripe_states_the_output_band_it_runs(strided_conv_path):
     """Three input rows and the halo give a stride-2 conv two output rows, so the plan states
     eight bands of two of the sixteen output rows, not eleven bands of the 32 input rows."""
-    from tigris.cli import _run_pipeline
     from tigris.emitters.binary.reader import read_binary_plan
     from tigris.emitters.binary.writer import emit_binary_bytes
 
-    ag, _ = _run_pipeline(str(strided_conv_path), ("1280",), report_bindings=False)
+    ag = plan_model(str(strided_conv_path), ("1280",))
     (stage,) = ag.stages
     tp = stage.tile_plan
     assert (tp.tile_height, tp.num_tiles, tp.original_height, tp.halo) == (2, 8, 16, 2)
@@ -617,12 +615,11 @@ def test_a_stripe_states_the_working_set_of_its_band(strided_conv_path, budget, 
     at 2688 bytes a band of 5 fits, and 4 rows cover the 16 in the same 4 tiles. At 640 bytes
     one output row fits as a height stripe, so the stage needs no 2D tile."""
     from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
-    from tigris.cli import _run_pipeline
 
     # The largest band the budget holds needs as many tiles; one row less than `band` needs more.
     largest = (budget - 128) // 512
     assert -(-16 // largest) == tiles and (band == 1 or -(-16 // (band - 1)) > tiles)
-    ag, _ = _run_pipeline(str(strided_conv_path), (str(budget),), report_bindings=False)
+    ag = plan_model(str(strided_conv_path), (str(budget),))
     tp = ag.stages[0].tile_plan
     assert tp.axis == TILE_AXIS_HEIGHT_OR_LENGTH and tp.tile_width == 0
     assert (tp.tile_height, tp.num_tiles) == (band, tiles)
@@ -637,9 +634,7 @@ def test_a_stripe_band_reads_no_more_rows_than_the_largest_that_fits(edge_conv_p
     of 256. Up to 5119 bytes the largest band that fits is 12 or less, and two bands of 7 read
     9 + 9 rows, as many as two bands of 12. At 5120 bytes a band of 13 fits, and its two bands
     read 14 + 3 rows, one fewer, so the plan keeps it."""
-    from tigris.cli import _run_pipeline
-
-    ag, _ = _run_pipeline(str(edge_conv_path), (str(budget),), report_bindings=False)
+    ag = plan_model(str(edge_conv_path), (str(budget),))
     tp = ag.stages[0].tile_plan
     assert (tp.tile_height, tp.num_tiles, tp.tile_width) == (band, 2, 0)
     assert tp.tiled_peak_bytes == min(band + 4, 14) * 128 + band * 256 <= budget
@@ -658,7 +653,6 @@ def test_a_stage_takes_the_tile_that_loads_fewer_input_bytes(wide_conv_path, bud
     stripe. At 17408 bytes bands of 8 rows load 38 rows (19,456 bytes) and 14x24 tiles 36 x 34
     pixels (19,584 bytes)."""
     from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW
-    from tigris.cli import _run_pipeline
 
     def span(n):
         return sum(min(start + n + 1, 32) - max(start - 1, 0) for start in range(0, 32, n))
@@ -668,7 +662,7 @@ def test_a_stage_takes_the_tile_that_loads_fewer_input_bytes(wide_conv_path, bud
     assert (band + 2) * 512 + band * 1024 <= budget
     assert min(th + 2, 32) * min(tw + 2, 32) * 16 + th * tw * 32 <= budget
     assert (span(th) * span(tw) * 16 < span(band) * 512) == two_d
-    ag, _ = _run_pipeline(str(wide_conv_path), (str(budget),), report_bindings=False)
+    ag = plan_model(str(wide_conv_path), (str(budget),))
     tp = ag.stages[0].tile_plan
     if two_d:
         assert (tp.axis, tp.tile_height, tp.tile_width) == (TILE_AXIS_HW, th, tw)

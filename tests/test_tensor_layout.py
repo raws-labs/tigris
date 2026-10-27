@@ -7,14 +7,14 @@ from onnx import helper, numpy_helper
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import Layout, TensorInfo, serialized_axis_map
-from tigris.cli import _run_pipeline
+from tigris.pipeline import plan_model
 
 from conftest import save_onnx, vi
 
 
 def _plan(tmp_path, name, nodes, inputs, outputs, init=(), budget="64K"):
     path = save_onnx(tmp_path, name, nodes, inputs, outputs, init)
-    ag, _ = _run_pipeline(str(path), (budget,))
+    ag = plan_model(str(path), (budget,))
     return ag, read_binary_plan(emit_binary_bytes(ag))
 
 

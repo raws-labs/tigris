@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from tigris.cli import _run_pipeline, cli
-from tigris.cli.trace import _plan_bytes, check, render, units
+from tigris.cli import cli
+from tigris.cli.trace import _plan_bytes, render
 from tigris.graph.ir import AnalyzedGraph, OpNode
 from tigris.graph.subgraphs import input_dependent_loop
+from tigris.pipeline import plan_model
+from tigris.runtime import check_trace, trace_units
 
 OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
 # Loops whose condition reads a value that starts from, or is updated from, a model input.
@@ -61,7 +63,7 @@ COUNTERS = {"load_bytes": 192, "spill_bytes": 128, "weight_bytes": 0, "copy_byte
 
 
 def test_units_group_events_per_stage_with_their_traffic():
-    chain, untiled = units(PLAN, EVENTS)
+    chain, untiled = trace_units(PLAN, EVENTS)
     assert (chain["stage"], chain["kind"], chain["tiles"], chain["read"], chain["written"]) == \
         (0, "chain 2", 2, 128, 64)
     assert (chain["fast_peak"], chain["slow_used"]) == (112, 364)
@@ -70,8 +72,8 @@ def test_units_group_events_per_stage_with_their_traffic():
 
 
 def test_check_compares_event_sums_with_the_runtime_counters():
-    assert check(EVENTS, COUNTERS) == []
-    problems = check(EVENTS, {**COUNTERS, "spill_bytes": 100, "tiles": 3})
+    assert check_trace(EVENTS, COUNTERS) == []
+    problems = check_trace(EVENTS, {**COUNTERS, "spill_bytes": 100, "tiles": 3})
     assert problems == ["spill events add up to 128 bytes, the runtime counted 100",
                         "2 tile events, the runtime counted 3 tiles"]
 
@@ -124,7 +126,7 @@ def test_trace_refuses_a_plan_compile_refuses_for_slow_overflow(conv_relu_chain_
         raise AssertionError("the plan ran")
 
     model = str(conv_relu_chain_path)
-    ag, _ = _run_pipeline(model, ("16K",), report_bindings=False)
+    ag = plan_model(model, ("16K",))
     assert _plan_bytes(ag) is not None
     assert _plan_bytes(replace(ag, budget=replace(ag.budget, slow=64 * 1024))) is not None
     ag.budget = replace(ag.budget, slow=1024)
@@ -146,7 +148,7 @@ def test_trace_refuses_a_plan_compile_refuses_for_slow_overflow(conv_relu_chain_
 @pytest.mark.parametrize("name", sorted(path.stem for path in OPS.glob("*.tflite")
                                         if {"if", "while"} & set(path.stem.split("_"))))
 def test_input_dependent_loops_are_told_from_fixed_ones(name):
-    ag, _ = _run_pipeline(str(OPS / f"{name}.tflite"), ("64K",), report_bindings=False)
+    ag = plan_model(str(OPS / f"{name}.tflite"), ("64K",))
     assert input_dependent_loop(ag) is (name in INPUT_DEPENDENT)
 
 

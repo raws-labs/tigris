@@ -8,10 +8,10 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.validation import validate_budget
-from tigris.cli import _run_pipeline
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.frontends import tflite
+from tigris.pipeline import plan_model
 from tigris.runtime import RuntimeError, Session
 
 from conftest import save_onnx
@@ -40,7 +40,7 @@ def test_constant_gather_matches_onnx_with_bounded_bands(kind, index_type, tmp_p
     expected = ort.InferenceSession(model.SerializeToString(), options, providers=['CPUExecutionProvider']).run(None, {'indices': indices})[0]
     previous = None
     for budget in ('256', '1M'):
-        ag, _ = _run_pipeline(str(source), (budget, '8M'), report_bindings=False)
+        ag = plan_model(str(source), (budget, '8M'))
         assert validate_budget(ag).feasible
         binary = emit_binary_bytes(ag)
         plan = tmp_path / f'{budget}.tgrs'
@@ -71,7 +71,7 @@ def test_constant_table_matches_micro(name, tmp_path):
     assert not tflite.unsupported(source.read_bytes())
     golden = np.load(source.with_suffix('.npz'))
     for budget in ('256', '1M'):
-        ag, _ = _run_pipeline(str(source), (budget, '8M'), report_bindings=False)
+        ag = plan_model(str(source), (budget, '8M'))
         assert validate_budget(ag).feasible
         binary = emit_binary_bytes(ag)
         plan = tmp_path / f'{budget}.tgrs'
@@ -119,7 +119,7 @@ def test_constant_indices_and_data_feed_a_runtime_consumer(kind, tmp_path):
     values = np.arange(32, dtype=np.float32).reshape(2, 16) * 0.25
     expected = table[indices] if kind == 'Gather' else table[tuple(indices.T)]
     expected = expected + values
-    ag, _ = _run_pipeline(str(source), ('256', '8M'), report_bindings=False)
+    ag = plan_model(str(source), ('256', '8M'))
     assert validate_budget(ag).feasible
     plan = tmp_path / 'constants.tgrs'
     plan.write_bytes(emit_binary_bytes(ag))

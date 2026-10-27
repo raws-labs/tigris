@@ -32,8 +32,9 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.pipeline import plan_model
 
-from conftest import full_pipeline, save_onnx
+from conftest import save_onnx
 
 OPS = Path(__file__).parent / "fixtures" / "tflite" / "ops"
 
@@ -75,7 +76,7 @@ def test_exported_record_sizes_are_derived_from_canonical_layouts():
     ],
 )
 def test_float_plan_estimate_matches_serialized_size(request, fixture_name, budget):
-    graph = full_pipeline(request.getfixturevalue(fixture_name), budget=budget)
+    graph = plan_model(request.getfixturevalue(fixture_name), (budget,), chains=False)
     findings = compute_findings(graph)
 
     if fixture_name == "conv_relu_chain_path":
@@ -87,7 +88,7 @@ def test_float_plan_estimate_matches_serialized_size(request, fixture_name, budg
 
 
 def test_plan_estimate_scales_past_the_old_fixed_string_allowance(linear_3op_path):
-    graph = full_pipeline(linear_3op_path, 65536)
+    graph = plan_model(linear_3op_path, (65536,))
     graph.model_name = "large-model-" + "x" * 5000
     findings = compute_findings(graph)
 
@@ -95,7 +96,7 @@ def test_plan_estimate_scales_past_the_old_fixed_string_allowance(linear_3op_pat
 
 
 def test_quantized_plan_estimate_includes_quant_section(qdq_conv_path):
-    graph = full_pipeline(qdq_conv_path, budget=4096)
+    graph = plan_model(qdq_conv_path, (4096,))
     findings = compute_findings(graph)
 
     assert graph.is_quantized
@@ -103,7 +104,7 @@ def test_quantized_plan_estimate_includes_quant_section(qdq_conv_path):
 
 
 def test_plan_estimate_includes_typed_attributes(transpose_path):
-    graph = full_pipeline(transpose_path, budget=4096)
+    graph = plan_model(transpose_path, (4096,))
     findings = compute_findings(graph)
 
     assert findings.plan_size_bytes == len(emit_binary_bytes(graph))
@@ -123,7 +124,7 @@ def _assert_weights_sized_as_stored(graph, weight_bytes):
 
 @pytest.mark.parametrize(("name", "weight_bytes"), [("svdf", 160), ("svdf_batch", 54)])
 def test_int16_weights_are_sized_as_the_plan_stores_them(name, weight_bytes):
-    _assert_weights_sized_as_stored(full_pipeline(OPS / f"{name}.tflite", budget=262144), weight_bytes)
+    _assert_weights_sized_as_stored(plan_model(OPS / f"{name}.tflite", (262144,)), weight_bytes)
 
 
 def test_bool_weights_are_sized_as_the_plan_stores_them(tmp_path):
@@ -134,7 +135,7 @@ def test_bool_weights_are_sized_as_the_plan_stores_them(tmp_path):
          helper.make_node("Where", ["mask", "x", "negated"], ["y"])],
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8])],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8])], [mask])
-    graph = full_pipeline(path, budget=4096)
+    graph = plan_model(path, (4096,))
 
     assert graph.weight_data["mask"].dtype == np.bool_
     _assert_weights_sized_as_stored(graph, 8)
@@ -150,7 +151,7 @@ def test_no_lz4_estimate_when_the_writer_cannot_group_weights_by_stage(tmp_path)
          helper.make_node("Conv", ["b", "w"], ["y"], pads=[1, 1, 1, 1])],
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 16, 16])],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 16, 16])], [weight])
-    graph = full_pipeline(path, budget=12288)
+    graph = plan_model(path, (12288,), chains=False)
 
     assert len(graph.stages) == 2
     with pytest.raises(ValueError, match="shared across stages"):

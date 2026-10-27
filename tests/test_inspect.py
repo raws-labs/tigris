@@ -112,14 +112,14 @@ def test_tile_records_list_the_fields_their_schema_states(tmp_path):
 
 
 def test_a_layout_conversion_counts_the_compilers_band(tmp_path):
-    from tigris.cli import _run_pipeline
+    from tigris.pipeline import plan_model
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     shape = [1, 4096, 8]
     source = save_onnx(tmp_path, "softmax", [helper.make_node("Softmax", ["x"], ["y"], axis=-1)],
                        [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
                        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
-    compiled, _ = _run_pipeline(str(source), ("32000",))
+    compiled = plan_model(str(source), ("32000",))
     path = tmp_path / "softmax.tgrs"
     path.write_bytes(emit_binary_bytes(compiled))
     stages = [[compiled.ops[i].op_type for i in stage.op_indices] for stage in compiled.stages]
@@ -153,10 +153,10 @@ def test_interface_dtype_and_attributes():
 
 def test_compressed_metadata_without_decompression(linear_3op_path, tmp_path, monkeypatch):
     import lz4.block
-    from tigris.cli import _run_pipeline
+    from tigris.pipeline import plan_model
     from tigris.emitters.binary.writer import emit_binary_bytes
 
-    graph, _ = _run_pipeline(str(linear_3op_path), ("256K",))
+    graph = plan_model(str(linear_3op_path), ("256K",), compress="lz4")
     data = emit_binary_bytes(graph, compress="lz4")
     assert read_binary_plan(data)["weight_blocks"][0]["decompressed"]
 
@@ -238,10 +238,10 @@ def test_tensor_attributes_do_not_include_weight_values(tmp_path):
 
 
 def test_chain_mode_and_fused_activation(conv_relu_chain_path, tmp_path):
-    from tigris.cli import _run_pipeline
+    from tigris.pipeline import plan_model
     from tigris.emitters.binary.writer import emit_binary_bytes
 
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("16K",))
+    graph = plan_model(str(conv_relu_chain_path), ("16K",))
     path = tmp_path / "chain.tgrs"
     path.write_bytes(emit_binary_bytes(graph, xip=True))
     report = inspect_file(path)

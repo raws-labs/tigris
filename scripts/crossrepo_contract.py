@@ -24,7 +24,6 @@ from typing import NamedTuple
 import numpy as np
 import onnx
 import onnxruntime as ort
-from click import ClickException
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris import SCHEMA_VERSION, TILE_AXIS_HW
@@ -35,8 +34,6 @@ from tigris.analysis.plan_graph import (
 )
 from tigris.analysis.validation import io_in_fast, slow_pool_usage, validate_memory_plan
 from tigris.capabilities import KERNEL_CAPABILITIES
-from tigris.cli import _run_pipeline
-from tigris.cli.compile import plan_model
 from tigris.emitters.binary.defs import (
     COMPRESS_LZ4,
     FLAG_XIP,
@@ -47,9 +44,8 @@ from tigris.emitters.binary.defs import (
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary
 from tigris.operator_contract import OP_TYPE_BY_CODE
-from tigris.runtime import Session
-from tigris.cli.trace import check as check_trace
-from tigris.cli.trace import units as trace_units
+from tigris.pipeline import plan_model, reserve_weights
+from tigris.runtime import Session, check_trace, trace_units
 from tigris.graph.ir import Stage
 
 if __package__:
@@ -104,10 +100,9 @@ def _compile_plan(
     force_one_op_stages: bool = False,
 ) -> dict:
     budgets = (mem_budget,) if slow_budget is None else (mem_budget, slow_budget)
-    # Forced stages replace the planned ones, so the writer sizes the weight
-    # reserve from the stages it emits rather than from the discarded layout.
-    graph, _, _ = plan_model(str(model_path), budgets,
-                             compress=None if force_one_op_stages else compression)
+    # Forced stages replace the planned ones, so their weights are reserved
+    # for the stages emitted rather than for the discarded layout.
+    graph = plan_model(model_path, budgets, compress=None if force_one_op_stages else compression)
     if force_one_op_stages:
         stages: list[Stage] = []
         for index, op in enumerate(graph.ops):
@@ -136,6 +131,8 @@ def _compile_plan(
                 )
             )
         graph.stages = stages
+        if compression:
+            reserve_weights(graph)
     validation = validate_memory_plan(graph)
     if not validation.feasible:
         details = "; ".join(issue.describe() for issue in validation.issues)
@@ -412,7 +409,7 @@ def _run_peak_fixtures(runners: tuple[Path, ...], work_dir: Path) -> None:
                           ("select_v2_rank", 128), ("float_space_to_depth", 192),
                           ("concat_rank2", 96), ("lstm_unrolled", 160)):
         model_path = fixtures / f"{name}.tflite"
-        graph, _ = _run_pipeline(str(model_path), (str(minimum - 1),))
+        graph = plan_model(model_path, (minimum - 1,))
         assert not validate_memory_plan(graph).feasible, name
         with np.load(fixtures / f"{name}.npz") as samples:
             for budget in (minimum, 256):
@@ -1061,7 +1058,7 @@ def _assert_compile_rejected(work_dir: Path) -> None:
                 compression=None,
                 xip=False,
             )
-        except (ClickException, ValueError) as exc:
+        except ValueError as exc:
             if reason not in str(exc):
                 raise AssertionError(
                     f"{model.graph.name} was refused for another reason: {exc}"

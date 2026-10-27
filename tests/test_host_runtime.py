@@ -11,10 +11,10 @@ import numpy as np
 import pytest
 from click.testing import CliRunner
 
-from tigris.cli import cli, _run_pipeline
-from tigris.cli.compile import _run_compressed_pipeline
+from tigris.cli import cli
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris import SCHEMA_VERSION, runtime
+from tigris.pipeline import plan_model
 from tigris.runtime import Session, runtime_info, runtime_version
 
 from conftest import save_onnx
@@ -25,7 +25,7 @@ pytestmark = pytest.mark.usefixtures("require_host_library")
 
 @pytest.fixture
 def linear_plan(linear_3op_path, tmp_path):
-    graph, _ = _run_pipeline(str(linear_3op_path), ("64K",))
+    graph = plan_model(str(linear_3op_path), ("64K",))
     path = tmp_path / "linear.tgrs"
     path.write_bytes(emit_binary_bytes(graph))
     return path
@@ -77,7 +77,7 @@ def test_a_strided_stripe_runs_the_bands_its_plan_states(strided_conv_path, tmp_
 
     results = []
     for size in (budget, "64K"):
-        graph, _ = _run_pipeline(str(strided_conv_path), (size,), report_bindings=False)
+        graph = plan_model(str(strided_conv_path), (size,))
         path = tmp_path / f"strided-{size}.tgrs"
         path.write_bytes(emit_binary_bytes(graph))
         with Session(path) as session:
@@ -101,7 +101,7 @@ def test_a_2d_tile_that_loads_fewer_bytes_runs_as_stated(wide_conv_path, tmp_pat
 
     results = []
     for size in ("4096", "64K"):
-        graph, _ = _run_pipeline(str(wide_conv_path), (size,), report_bindings=False)
+        graph = plan_model(str(wide_conv_path), (size,))
         path = tmp_path / f"wide-{size}.tgrs"
         path.write_bytes(emit_binary_bytes(graph))
         with Session(path) as session:
@@ -222,9 +222,9 @@ def test_conv_matches_onnx_runtime(conv_relu_chain_path, qdq_conv_path, tmp_path
     x = rng.uniform(-0.5, 0.5, reference.get_inputs()[0].shape).astype(np.float32)
     expected = reference.run(None, {reference.get_inputs()[0].name: x})[0]
     if compressed:
-        graph, _, _, _ = _run_compressed_pipeline(str(model), ("64K",))
+        graph = plan_model(str(model), ("64K",), compress="lz4")
     else:
-        graph, _ = _run_pipeline(str(model), ("16K",))
+        graph = plan_model(str(model), ("16K",))
     path = tmp_path / "conv.tgrs"
     path.write_bytes(emit_binary_bytes(graph, compress="lz4" if compressed else None))
     with Session(path) as session:
@@ -271,14 +271,11 @@ def test_compile_refuses_a_plan_the_runtime_loader_refuses(tmp_path, monkeypatch
     """With the writer's contract check turned off, a Softmax that reads only
     a constant reaches the plan; compile refuses it with the loader's reason
     and writes nothing."""
-    import importlib
-
     import onnx
     from onnx import TensorProto, helper, numpy_helper
 
+    from tigris import pipeline
     from tigris.emitters.binary import writer
-
-    compile_command = importlib.import_module("tigris.cli.compile")
 
     model = helper.make_model(helper.make_graph(
         [helper.make_node("MatMul", ["input", "w"], ["h"], name="product"),
@@ -291,12 +288,14 @@ def test_compile_refuses_a_plan_the_runtime_loader_refuses(tmp_path, monkeypatch
     source = tmp_path / "contract.onnx"
     onnx.save(model, source)
 
-    def pipeline(*args, **kwargs):
-        graph, budget = _run_pipeline(*args, **kwargs)
-        next(op for op in graph.ops if op.op_type == "Softmax").inputs = ["w"]
-        return graph, budget
+    plan_graph = pipeline.plan
 
-    monkeypatch.setattr(compile_command, "_run_pipeline", pipeline)
+    def planned(*args, **kwargs):
+        graph = plan_graph(*args, **kwargs)
+        next(op for op in graph.ops if op.op_type == "Softmax").inputs = ["w"]
+        return graph
+
+    monkeypatch.setattr(pipeline, "plan", planned)
     monkeypatch.setattr(writer, "_contract_violations", lambda *args: [])
     plan = tmp_path / "contract.tgrs"
     result = CliRunner().invoke(cli, ["compile", str(source), "-m", "64K", "-o", str(plan)])
@@ -495,7 +494,7 @@ def test_multiple_inputs_and_named_outputs(tmp_path):
              helper.make_node("Sub", ["a", "b"], ["allow_pickle"])]
     source = save_onnx(tmp_path, "two_inputs", nodes, inputs, outputs, opset=17, ir_version=8,
                        filename="model.onnx")
-    graph, _ = _run_pipeline(str(source), ("4K",))
+    graph = plan_model(str(source), ("4K",))
     path = tmp_path / "model.tgrs"
     path.write_bytes(emit_binary_bytes(graph))
     a = np.array([[1, 2, 3, 4]], dtype=np.float32)
@@ -521,7 +520,7 @@ def test_bool_passthrough_boundary_selects_data_dispatcher(tmp_path):
     output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [4])
     model_path = save_onnx(tmp_path, "boundary", [helper.make_node("Relu", ["data"], ["output"])],
                            [flag, data], [flag, output], ir_version=8)
-    graph, _ = _run_pipeline(str(model_path), ("4K",))
+    graph = plan_model(str(model_path), ("4K",))
     plan = emit_binary_bytes(graph)
     assert "t->dtype == 9u" in generate_c(read_binary_plan(plan), "reference")
     path = tmp_path / "boundary.tgrs"
@@ -541,9 +540,9 @@ def test_inspect_fast_arena_matches_the_runtime(conv_relu_chain_path, tmp_path, 
     from tigris.inspection import inspect_file
 
     if compressed:
-        graph, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("64K",))
+        graph = plan_model(str(conv_relu_chain_path), ("64K",), compress="lz4")
     else:
-        graph, _ = _run_pipeline(str(conv_relu_chain_path), ("16K",))
+        graph = plan_model(str(conv_relu_chain_path), ("16K",))
     path = tmp_path / "conv.tgrs"
     path.write_bytes(emit_binary_bytes(graph, compress="lz4" if compressed else None))
     needs = inspect_file(path)["requirements"]

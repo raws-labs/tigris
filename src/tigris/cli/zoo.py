@@ -5,7 +5,8 @@ from pathlib import Path
 
 import click
 
-from tigris.cli import _memory_sizes, _parse_size, cli, text
+from tigris.cli import _memory_sizes, cli, text
+from tigris.pipeline import parse_size
 from tigris.utils import fmt_bytes
 from tigris.zoo import REPOSITORY, Zoo, select, version
 
@@ -26,11 +27,11 @@ def _filters(function):
 def _matches(config, *, mem, flash, **filters):
     if filters.get("runtime") is not None:
         version(filters["runtime"])
-    pools = [_parse_size(value) for value in mem]
+    pools = [parse_size(value) for value in mem]
     zoo = Zoo(**config)
     return zoo, select(zoo.artifacts, fast=pools[0] if pools else None,
                        slow=pools[1] if len(pools) > 1 else None,
-                       flash=_parse_size(flash) if flash is not None else None, **filters)
+                       flash=parse_size(flash) if flash is not None else None, **filters)
 
 
 @cli.group()
