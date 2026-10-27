@@ -90,6 +90,31 @@ OP_ATTR_DETECTION = 18  # uint16 max detections, detections per class, classes; 
 OP_ATTR_GELU_APPROXIMATE = 19  # uint8[1], exact (0) or tanh approximation (1)
 OP_ATTR_TABLE_SHAPE = 20  # int32 extents of a constant Gather data operand
 
+# Each kind's name and payload layout: struct codes for a fixed head, then one
+# code repeated to the end of the payload.
+OP_ATTR_KINDS = {
+    OP_ATTR_TRANSPOSE_PERM: ("transpose_perm", "", "B"),
+    OP_ATTR_EPSILON: ("epsilon", "", "f"),
+    OP_ATTR_ALPHA: ("alpha", "", "f"),
+    OP_ATTR_CLIP_BOUNDS: ("clip_bounds", "", "f"),
+    OP_ATTR_PADS: ("pads", "", "i"),
+    OP_ATTR_AXES: ("axes", "", "B"),
+    OP_ATTR_BINARY_REQUANT: ("binary_requant", "", "i"),
+    OP_ATTR_POOL_ROUNDING: ("pool_rounding", "", "B"),
+    OP_ATTR_CONSTANT_OPERAND: ("constant_operand", "", "B"),
+    OP_ATTR_RESIZE_SCALES: ("resize_scales", "", "f"),
+    OP_ATTR_CUMSUM_OPTIONS: ("cumsum_options", "", "B"),
+    OP_ATTR_MOVEMENT: ("movement", "", "i"),
+    OP_ATTR_COMPARISON_REQUANT: ("comparison_requant", "", "i"),
+    OP_ATTR_CONSTANTS: ("constants", "", "H"),
+    OP_ATTR_SVDF: ("svdf", "", "i"),
+    OP_ATTR_LSTM: ("lstm", "if", "i"),
+    OP_ATTR_SUBGRAPHS: ("subgraphs", "", "H"),
+    OP_ATTR_DETECTION: ("detection", "3H2B", "f"),
+    OP_ATTR_GELU_APPROXIMATE: ("gelu_approximate", "", "B"),
+    OP_ATTR_TABLE_SHAPE: ("table_shape", "", "i"),
+}
+
 # Compression types
 COMPRESS_NONE = 0
 COMPRESS_LZ4 = 1

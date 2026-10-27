@@ -99,23 +99,12 @@ def _graph(proto) -> dict:
 
 
 def _plan_attribute(attr: dict) -> dict:
-    kinds = {
-        defs.OP_ATTR_TRANSPOSE_PERM: ("transpose_perm", "B"),
-        defs.OP_ATTR_EPSILON: ("epsilon", "f"),
-        defs.OP_ATTR_ALPHA: ("alpha", "f"),
-        defs.OP_ATTR_CLIP_BOUNDS: ("clip_bounds", "f"),
-        defs.OP_ATTR_PADS: ("pads", "i"),
-        defs.OP_ATTR_AXES: ("axes", "B"),
-        defs.OP_ATTR_BINARY_REQUANT: ("binary_requant", "i"),
-        defs.OP_ATTR_POOL_ROUNDING: ("pool_rounding", "B"),
-        defs.OP_ATTR_CONSTANT_OPERAND: ("constant_operand", "B"),
-        defs.OP_ATTR_RESIZE_SCALES: ("resize_scales", "f"),
-    }
-    name, code = kinds.get(attr["type"], (f"unknown({attr['type']})", "B"))
-    size = struct.calcsize(code)
-    if len(attr["data"]) % size:
+    kind, data = attr["type"], attr["data"]
+    name, head, element = defs.OP_ATTR_KINDS.get(kind, (f"unknown({kind})", "", "B"))
+    fixed, size = struct.calcsize(f"<{head}"), struct.calcsize(f"<{element}")
+    if len(data) < fixed or (len(data) - fixed) % size:
         raise ValueError(f"Invalid {name} attribute size")
-    values = list(struct.unpack(f"<{len(attr['data']) // size}{code}", attr["data"]))
+    values = list(struct.unpack(f"<{head}{(len(data) - fixed) // size}{element}", data))
     return {"type": name, "values": values}
 
 

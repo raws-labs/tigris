@@ -276,6 +276,20 @@ def test_analyze_prints_the_trace(conv_relu_chain_path):
                                     "--trace"]).exit_code != 0
 
 
+@pytest.mark.parametrize("budget, rows", [
+    ("64K", ["0 0-1 52.62 KiB 1 1 untiled"]),
+    ("16K", ["0 0 40.12 KiB 1 1 chain of 2, tile height 5", "1 1 52.62 KiB 1 1 in chain 0"]),
+    ("4K", ["0 0 40.12 KiB 1 1 16 tiles of 9 x 9, halo 2", "1 1 52.62 KiB 1 1 20 tiles of 6 x 8, halo 2"]),
+])
+def test_analyze_verbose_lists_the_stages(conv_relu_chain_path, budget, rows):
+    plain = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", budget])
+    result = CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", budget, "-v"])
+    assert plain.exit_code == 0 and result.exit_code == 0, result.output
+    assert result.output.startswith(plain.output)
+    table = [" ".join(line.split()) for line in result.output[len(plain.output):].splitlines() if line.strip()]
+    assert table == ["stages", "stage ops untiled peak in out tiling", *rows]
+
+
 @pytest.mark.parametrize("command", ["plan", "simulate"])
 def test_plan_and_simulate_are_removed(conv_relu_chain_path, command):
     result = CliRunner().invoke(cli, [command, str(conv_relu_chain_path), "-m", "64K"])

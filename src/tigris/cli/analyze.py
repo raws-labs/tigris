@@ -6,6 +6,7 @@ from pathlib import Path
 
 import click
 
+from tigris import TILE_AXIS_HW
 from tigris.cli import _memory_sizes, _parse_input_shape, _planned, cli, text
 from tigris.pipeline import parse_size
 from tigris.utils import describe_interface, fmt_bytes, plural, source_shape
@@ -264,12 +265,15 @@ def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
 
 
 def _stages(ag) -> None:
-    """One row per stage, as inspect prints a plan's stages."""
+    """One row per stage of the planned graph: its operators, untiled peak, input and
+    output tensor counts, and how it is tiled or chained."""
     rows = [[text.dim(cell) for cell in ("stage", "ops", "untiled peak", "in", "out", "tiling")]]
     for s in ag.stages:
         tp = s.tile_plan
-        tiling = (f"{tp.num_tiles} tiles, axis {tp.axis}, halo {tp.halo}"
-                  if runs_tiled(s) and tp is not None and tp.tileable else "untiled")
+        tiling = "untiled"
+        if runs_tiled(s) and tp is not None and tp.tileable:
+            tiling = (f"{tp.num_tiles} tiles of {tp.tile_height} x {tp.tile_width}, halo {tp.halo}"
+                      if tp.axis == TILE_AXIS_HW else f"{tp.num_tiles} tiles, axis {tp.axis}, halo {tp.halo}")
         if s.chain_id != 0xFFFF:
             tiling = (f"chain of {s.chain_len}, tile height {s.chain_tile_h}"
                       if s.chain_id == s.stage_id else f"in chain {s.chain_id}")
