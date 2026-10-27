@@ -26,13 +26,13 @@ from tigris.loaders.onnx.normalize.quantization import (
     _transpose_quantized_weights
 )
 from tigris.loaders.onnx.normalize.relabels import (
-    _clip_to_relu6, _decompose_silu, _fold_div_constant_to_mul, _fold_float_square,
+    _clip_to_relu6, _fold_div_constant_to_mul, _fold_float_square,
     _fold_gemm_scalars, _fold_sub_constant_to_add, _lower_legacy_softmax, _reduce_mean_to_gap,
     _relabel_conv1d, _relabel_depthwise, _relabel_matmul_to_gemm, _split_grouped_convs,
     _standalone_bn_as_affine, _whole_map_average_pool_to_gap
 )
 from tigris.loaders.onnx.normalize.static import (
-    _drop_inference_identities, _drop_unreferenced_weights, _fold_shape_ops, _fold_static_subgraphs
+    _drop_inference_identities, _drop_unreferenced_weights, _fold_static_subgraphs
 )
 
 __all__ = ["detection_scratch_bytes", "normalize"]
@@ -72,7 +72,6 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _fold_div_constant_to_mul(ag)
     ag = _quantize_uniform_constants(ag)
     ag = _fold_channel_bias_add(ag)
-    ag = _decompose_silu(ag)
     ag = _explicit_auto_pad(ag)
     ag = _ceil_mode_as_padding(ag)
     ag = _fold_pad_into_conv(ag)
@@ -83,7 +82,6 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _normalize_reduction_axes(ag)
     ag = _reduce_mean_to_gap(ag)
     ag = _whole_map_average_pool_to_gap(ag)
-    ag = _fold_shape_ops(ag)
     ag = _resolve_resize_conventions(ag)
     ag = _extract_resize_scales(ag)
     ag = _normalize_movement(ag)

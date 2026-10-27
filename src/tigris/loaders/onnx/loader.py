@@ -53,11 +53,7 @@ def _extract_dtype(type_proto: onnx.TypeProto) -> int:
 
 
 def _infer(model: onnx.ModelProto) -> onnx.ModelProto:
-    try:
-        return shape_inference.infer_shapes(model, data_prop=True)
-    except Exception:
-        # Some models fail full data propagation; try without
-        return shape_inference.infer_shapes(model)
+    return shape_inference.infer_shapes(model, data_prop=True)
 
 
 def resolve_shapes(
