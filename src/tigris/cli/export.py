@@ -7,7 +7,7 @@ import click
 from tigris.cli import cli, text
 from tigris.frontends.tflite_export import DEFAULT_TARGET
 from tigris.frontends.tflm import TFLM_TARGETS
-from tigris.utils import fmt_bytes
+from tigris.utils import fmt_bytes, plural
 
 
 def _signed(value: int) -> str:
@@ -88,7 +88,7 @@ def export(model: str, output: str | None, target: str):
         span = f"operator {first}" if first == last else f"operators {first}-{last}"
         done.append(f"{span} computed in {result.bands} row bands" + _macs(result))
     if result.folded:
-        done.append(f"{result.folded} PAD operator{'s' if result.folded != 1 else ''} folded "
+        done.append(f"{plural(result.folded, 'PAD operator')} folded "
                     "into convolutions")
     text.echo("; ".join(done) + f"; {result.operators_after} operators after export")
     rows = [["head", fmt_bytes(result.arena_after),

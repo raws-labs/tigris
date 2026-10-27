@@ -1,3 +1,8 @@
+def plural(n: int, noun: str) -> str:
+    """`n` and the noun, pluralized with an s unless n is 1."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
 def fmt_bytes(b: int, *, unit_ref: int | None = None) -> str:
     """Format a byte count as a human-readable string.
 
@@ -60,6 +65,6 @@ def describe_interface(ag) -> list[tuple[str, str]]:
             rows.append((label, text))
     if ports:
         size = sum(ag.tensors[ag.model_inputs[port.input]].size_bytes for port in ports)
-        rows.append(("State", f"{len(ports)} variable{'s' if len(ports) != 1 else ''}, "
+        rows.append(("State", f"{plural(len(ports), 'variable')}, "
                               f"{size} bytes kept across runs"))
     return rows

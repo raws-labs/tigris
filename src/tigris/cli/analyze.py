@@ -7,10 +7,8 @@ from pathlib import Path
 import click
 
 from tigris.cli import _memory_sizes, _parse_input_shape, _parse_size, _run_pipeline, cli, text
-from tigris.utils import describe_interface, fmt_bytes, source_shape
+from tigris.utils import describe_interface, fmt_bytes, plural, source_shape
 
-# Causes listed under a verdict; --json lists all.
-_CAUSES_SHOWN = 5
 # Budgets tried beyond the one given, halving below a fit or doubling above a failure.
 _BUDGETS_TRIED = 3
 
@@ -154,12 +152,8 @@ def runs_tiled(stage) -> bool:
             or stage.chain_id != 0xFFFF)
 
 
-def _count(n: int, noun: str) -> str:
-    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
-
-
 def _stage_count(n: int) -> str:
-    return _count(n, "stage")
+    return plural(n, "stage")
 
 
 def verdict_lines(findings, budget: int, ag) -> list[str]:
@@ -168,8 +162,8 @@ def verdict_lines(findings, budget: int, ag) -> list[str]:
     if f.unsupported_operators:
         count = len(f.unsupported_operators)
         lines = [text.bad("cannot compile") +
-                 f": {count} unsupported operator{'s' if count != 1 else ''}"]
-        return lines + text.columns([[issue] for issue in f.unsupported_operators[:_CAUSES_SHOWN]])
+                 f": {plural(count, 'unsupported operator')}"]
+        return lines + text.columns([[issue] for issue in f.unsupported_operators[:text.CAUSES_SHOWN]])
     if f.output_errors or f.dtype_errors:
         return [text.bad("cannot compile") + f": {(f.output_errors + f.dtype_errors)[0]}"]
     if budget <= 0:
@@ -181,10 +175,10 @@ def verdict_lines(findings, budget: int, ag) -> list[str]:
                  f"{_stage_count(count)} exceed{'s' if count == 1 else ''} it"]
         causes = sorted(f.blocking_stages, key=lambda b: (-b.required_bytes, b.stage_id))
         rows = [[f"stage {b.stage_id}", text.bad(fmt_bytes(b.required_bytes)), b.reason]
-                for b in causes[:_CAUSES_SHOWN]]
+                for b in causes[:text.CAUSES_SHOWN]]
         lines += text.columns(rows, "<>")
-        if count > _CAUSES_SHOWN:
-            lines.append(text.dim(f"  and {count - _CAUSES_SHOWN} more; --json lists all"))
+        if count > text.CAUSES_SHOWN:
+            lines.append(text.dim(f"  and {count - text.CAUSES_SHOWN} more; --json lists all"))
         return lines
     fit = f" {fmt_bytes(budget)} fast memory, {_stage_count(f.total_stages)}"
     if tiled:
@@ -205,8 +199,8 @@ def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
     f = findings
     dtype = "int8" if f.is_quantized else "float32" if f.is_float32 else "mixed"
     graphs = len(getattr(ag, "subgraphs", []) or [])
-    title = f"{dtype}, {_count(len(ag.ops), 'operator')}" + (
-        f", {_count(graphs, 'subgraph')}" if graphs else "")
+    title = f"{dtype}, {plural(len(ag.ops), 'operator')}" + (
+        f", {plural(graphs, 'subgraph')}" if graphs else "")
     text.gap()
     text.echo(text.bold(Path(model).name) + "   " + title)
     for line in text.columns(interface_rows(ag)):

@@ -115,11 +115,6 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
 
     ag.budget = replace(ag.budget, flash=_parse_size(flash) if flash else 0)
 
-    if budget > 0xFFFFFFFF:
-        raise click.ClickException(
-            "Fast-memory budget exceeds the uint32 plan-format limit"
-        )
-
     from tigris.analysis.findings import compute_findings
     from tigris.cli.analyze import summary
     from tigris.frontends.tflite_export import tflm_tensor_arena

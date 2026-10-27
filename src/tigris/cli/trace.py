@@ -62,11 +62,12 @@ def check(events: list[dict], counters: dict[str, int]) -> list[str]:
     return problems
 
 
-def _name(plan: dict, index) -> str:
-    if index is None:
-        return ""
-    name = plan["tensors"][index]["name"]
+def _shorten(name: str) -> str:
     return name if len(name) <= _NAME_WIDTH else name[:_NAME_WIDTH - 3] + "..."
+
+
+def _name(plan: dict, index) -> str:
+    return "" if index is None else _shorten(plan["tensors"][index]["name"])
 
 
 def _rows(event) -> str:
@@ -97,8 +98,7 @@ def _event_row(plan: dict, event: dict, spatial: bool) -> list[str] | None:
         return [kind, _name(plan, event["tensor"]), "", where, fmt_bytes(event["bytes"]), ""]
     if kind == "op":
         op = plan["ops"][event["op"]]
-        return [kind, op["name"] if len(op["name"]) <= _NAME_WIDTH else op["name"][:_NAME_WIDTH - 3] + "...",
-                "", "", "", ""]
+        return [kind, _shorten(op["name"]), "", "", "", ""]
     if kind == "reset":
         return [kind, "", "", f"fast+{event['fast_used']}", "", ""]
     return None
