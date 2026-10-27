@@ -95,8 +95,8 @@ _RANK3_AXIS1_UNARY_OPS = operators_with("axis_unary")
 _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 
 # The band-axis cost search rounds each tensor's per-band bytes to 32, the
-# literal in the runtime loader's band-axis search (tigris_loader.c). It picks
-# the band axis, so it must equal that literal whatever TIGRIS_TENSOR_ALIGN is.
+# literal in the runtime's band-axis search. It picks the band axis, so it
+# must equal that literal whatever TIGRIS_TENSOR_ALIGN is.
 _BAND_COST_ALIGN = 32
 
 # tigris_tile_plan_t carries tile_height, num_tiles and original_height in
@@ -814,8 +814,8 @@ def _row_band_axis(ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]) -> 
 def _leading_band_axis(ag: AnalyzedGraph, op: OpNode, mode: int) -> int:
     """The serialized axis of the operator's first input that a mode bands.
 
-    Mirrors tigris_band_axis in the runtime's loader, whose operand list
-    holds no constants.
+    Mirrors tigris_band_axis in the runtime, whose operand list holds no
+    constants.
     """
     source = next(ag.tensors[n] for n in op.inputs if n and not ag.tensors[n].is_constant)
     shape = serialized_shape(source.shape, source.layout)
@@ -835,7 +835,7 @@ def _constant_repeats_every_row(ag: AnalyzedGraph, op: OpNode) -> bool:
     varies along the rows meets the wrong rows. At rank 2 the runtime prefers
     the row band to the leading band, which offsets the constant, so such an
     operator has to leave the row band. Mirrors constant_repeats_every_row in
-    the runtime's loader.
+    the runtime.
     """
     output = ag.tensors.get(op.outputs[0]) if op.outputs else None
     if (op.op_type not in BINARY_OPS or output is None or len(output.shape) != 2
