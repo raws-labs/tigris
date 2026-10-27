@@ -1,5 +1,7 @@
 """Tests for streamable chain detection and tile-through execution."""
 
+from dataclasses import replace
+
 import numpy as np
 import onnx
 import pytest
@@ -14,12 +16,14 @@ from tigris.analysis.partition_spatial import (
     _external_outputs_keep_their_rows,
     _get_stage_spatial_params,
     _ops_read_the_running_band,
+    _stage_2d_eligible,
     detect_and_solve_chains,
     detect_chains,
     partition_spatial,
     solve_chain_tile_height,
 )
 from tigris.analysis.partition_temporal import partition_temporal
+from tigris.emitters.binary.defs import TILE_BAND_KIND_HW
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import OpNode, Stage
@@ -413,11 +417,110 @@ def _fire_model(path):
     return path
 
 
+# A Conv with a 1 x k kernel: (k, width stride, width pad).
+_ROW_CONVS = {"conv1x1s2": (1, 2, 0), "conv1x3": (3, 1, 0), "conv1x3p1": (3, 1, 1)}
+
+
+def _stripe_model(path, middle):
+    """A Conv stem to x, then `middle` to b with a Relu of x to c, then b + c.
+
+    Ops: 0 the stem, 1 the middle op, 2 the Relu, 3 the join (a Resize of c
+    first when the middle op is a Resize, and a MaxPool of c with the same
+    window when it is a 1 x k Conv, so the operands agree).
+    """
+    rng = np.random.default_rng(0)
+    inits = []
+
+    def conv(source, name, cin, cout, kernel, output):
+        values = rng.standard_normal((cout, cin, kernel, kernel)).astype(np.float32) * 0.3
+        inits.append(helper.make_tensor(name, TensorProto.FLOAT, values.shape, values.ravel().tolist()))
+        return helper.make_node("Conv", [source, name], [output], kernel_shape=[kernel, kernel],
+                                pads=[kernel // 2] * 4)
+
+    def resize(source, output):
+        return helper.make_node("Resize", [source, "", "scales"], [output], mode="nearest",
+                                coordinate_transformation_mode="asymmetric", nearest_mode="floor")
+
+    side = width = 32
+    nodes = [conv("input", "w0", 3, 8, 3, "x")]
+    if middle in _ROW_CONVS:
+        kernel, stride, pad = _ROW_CONVS[middle]
+        window = {"kernel_shape": [1, kernel], "strides": [1, stride], "pads": [0, pad, 0, pad]}
+        width = (32 + 2 * pad - kernel) // stride + 1
+        values = rng.standard_normal((8, 8, 1, kernel)).astype(np.float32) * 0.3
+        inits.append(helper.make_tensor("w1", TensorProto.FLOAT, values.shape, values.ravel().tolist()))
+        nodes += [helper.make_node("Conv", ["x", "w1"], ["b"], **window),
+                  helper.make_node("Relu", ["x"], ["c"]),
+                  helper.make_node("MaxPool", ["c"], ["narrow"], **window),
+                  helper.make_node("Add", ["b", "narrow"], ["output"])]
+    elif middle == "resize":
+        side = width = 64
+        inits.append(helper.make_tensor("scales", TensorProto.FLOAT, [4], [1.0, 1.0, 2.0, 2.0]))
+        nodes += [resize("x", "b"), helper.make_node("Relu", ["x"], ["c"]), resize("c", "wide"),
+                  helper.make_node("Add", ["b", "wide"], ["output"])]
+    else:
+        kernel = {"conv3": 3, "conv1": 1}[middle]
+        nodes += [conv("x", "w1", 8, 8, kernel, "b"), helper.make_node("Relu", ["x"], ["c"]),
+                  helper.make_node("Add", ["b", "c"], ["output"])]
+    return save_onnx(path.parent, "stripe", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 32, 32])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, side, width])],
+                     inits, ir_version=8, filename=path.name)
+
+
+def _wide_model(path, kernel):
+    """A Conv stem to x of 4 x 256, then a 1 x `kernel` Conv that keeps the
+    width to b with a Relu of x to c, then b + c. Ops as in _stripe_model."""
+    rng = np.random.default_rng(0)
+    inits = []
+    for name, shape in (("w0", (16, 3, 3, 3)), ("w1", (16, 16, 1, kernel))):
+        values = rng.standard_normal(shape).astype(np.float32) * 0.3
+        inits.append(helper.make_tensor(name, TensorProto.FLOAT, values.shape, values.ravel().tolist()))
+    nodes = [helper.make_node("Conv", ["input", "w0"], ["x"], kernel_shape=[3, 3], pads=[1] * 4),
+             helper.make_node("Conv", ["x", "w1"], ["b"], kernel_shape=[1, kernel],
+                              pads=[0, kernel // 2, 0, kernel // 2]),
+             helper.make_node("Relu", ["x"], ["c"]),
+             helper.make_node("Add", ["b", "c"], ["output"])]
+    return save_onnx(path.parent, "wide", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 4, 256])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 16, 4, 256])],
+                     inits, ir_version=8, filename=path.name)
+
+
+def _stripe_stages(path, budget):
+    """Stages {0}, {1, 2} and the rest, partitioned where they fit, then
+    tiled at `budget`; the temporal partition never keeps more than one op in
+    a stage it cannot fit, so this is the only way such a stage is tiled."""
+    ag = compute_memory_timeline(compute_lifetimes(load_model(path)))
+    ag = partition_temporal(ag, 1 << 22, frozenset(range(len(ag.ops))) - {2})
+    ag.budget = replace(ag.budget, fast=budget)
+    return partition_spatial(ag)
+
+
+def _run_against_onnxruntime(path, plan):
+    import onnxruntime as ort
+    from tigris.runtime import Session
+
+    reference = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    x = np.random.default_rng(1).standard_normal(reference.get_inputs()[0].shape).astype(np.float32)
+    expected = reference.run(None, {"input": x})[0].transpose(0, 2, 3, 1)
+    with Session(plan) as session:
+        actual = session.run({"input": np.ascontiguousarray(x.transpose(0, 2, 3, 1))})["output"]
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-5 * np.abs(expected).max())
+
+
 _RUNNING_BAND_MODELS = {
     "strided": lambda path: _branch_model(path, strided=True),
     "unit_stride": lambda path: _branch_model(path, strided=False),
     "fire": _fire_model,
 }
+
+# Partitions whose chains read off the band unless the compiler keeps them out.
+_OFF_BAND_CHAINS = [
+    ("strided", frozenset(), 120 * 1024),
+    ("unit_stride", frozenset({1, 2, 6}), 100 * 1024),
+    ("fire", frozenset({1, 5}), 160 * 1024),
+]
 
 
 class TestRunningBand:
@@ -452,6 +555,121 @@ class TestRunningBand:
         stage = next(i for i, s in enumerate(ag.stages) if 3 in s.op_indices)
         assert {3, 5} <= set(ag.stages[stage].op_indices)
         assert all(stage not in group for group in chains)
+
+    @pytest.mark.parametrize("model, cuts, budget", _OFF_BAND_CHAINS)
+    def test_the_runtime_refuses_a_chain_off_its_band(self, tmp_path, require_host_library,
+                                                       monkeypatch, model, cuts, budget):
+        """A compiler without the check chains these stages. The runtime loader
+        refuses that plan rather than run it with wrong output, and loads the
+        plan the compiler writes."""
+        from tigris.analysis import partition_spatial as spatial
+        from tigris.runtime import RuntimeError as HostError, check_plan
+
+        path = _RUNNING_BAND_MODELS[model](tmp_path / "model.onnx")
+
+        def plan():
+            ag = compute_memory_timeline(compute_lifetimes(load_model(path)))
+            ag = detect_and_solve_chains(partition_spatial(partition_temporal(ag, budget, cuts)))
+            return emit_binary_bytes(ag)
+
+        assert isinstance(check_plan(plan()), dict)
+        monkeypatch.setattr(spatial, "_ops_read_the_running_band", lambda *args, **kwargs: True)
+        with pytest.raises(HostError) as refused:
+            check_plan(plan())
+        assert str(refused.value) == ("the runtime loader refuses the plan: chained stage reads a "
+                                      "tensor outside its band; recompile the model with this "
+                                      "TiGrIS release")
+
+    def test_a_stripe_offsets_no_operand(self, chain_with_fanout_path):
+        """The height stripe carries no operand, so the residual Add that a
+        chain admits reads off the stripe's band."""
+        ag = load_model(chain_with_fanout_path)
+        stage = Stage(0, list(range(len(ag.ops))), ["input"], ["output"])
+        assert _ops_read_the_running_band(ag, stage)
+        assert not _ops_read_the_running_band(ag, stage, carries_operands=False)
+
+    @pytest.mark.parametrize("middle", ["conv3", "resize", "conv1x1s2", "conv1x3"])
+    def test_a_stripe_off_its_band_is_not_tiled(self, tmp_path, middle):
+        """The Relu after the spatial op reads x, which the stripe holds at
+        the spatial op's input rows and width. Tiled, the plan would run with
+        wrong output (Conv 3x3, and the 1 x k Convs that narrow the width) or
+        write past the Relu's output (Resize)."""
+        ag = _stripe_stages(_stripe_model(tmp_path / "stripe.onnx", middle), 48 * 1024)
+        stage = next(s for s in ag.stages if s.op_indices == [1, 2])
+        assert not stage.tile_plan.tileable
+        assert stage.tile_plan.warnings == [f"Stage {stage.stage_id} reads rows a tile does not hold"]
+
+    def test_a_one_to_one_stripe_runs_as_the_model(self, tmp_path, require_host_library):
+        """A 1x1 convolution leaves the rows where they are, so the stripe
+        still tiles the stage and the Relu reads the right rows."""
+        path = _stripe_model(tmp_path / "stripe.onnx", "conv1")
+        ag = _stripe_stages(path, 48 * 1024)
+        stage = next(s for s in ag.stages if s.op_indices == [1, 2])
+        assert stage.tile_plan.tileable and stage.tile_plan.num_tiles > 1 and stage.chain_len == 0
+        plan = tmp_path / "stripe.tgrs"
+        plan.write_bytes(emit_binary_bytes(ag))
+        _run_against_onnxruntime(path, plan)
+
+    @pytest.mark.parametrize("middle, keeps", [
+        ("conv1", True), ("conv1x3p1", True), ("conv1x1s2", False), ("conv1x3", False)])
+    def test_a_conv_that_narrows_the_width_moves_the_band(self, tmp_path, middle, keeps):
+        """A 1 x k Conv keeps the rows. The chain executor and the stripe
+        hand the ops after it its output width, so it keeps the band only
+        when its output is as wide as its input."""
+        ag = load_model(_stripe_model(tmp_path / "stripe.onnx", middle))
+        stage = Stage(0, [1, 2], ["x"], ["b", "c"])
+        assert _ops_read_the_running_band(ag, stage) is keeps
+        assert _ops_read_the_running_band(ag, stage, carries_operands=False) is keeps
+
+    @pytest.mark.parametrize("middle", ["conv1x1s2", "conv1x3"])
+    def test_the_runtime_refuses_a_chain_that_narrows_the_width(
+            self, tmp_path, require_host_library, monkeypatch, middle):
+        """Without the width rule the compiler chains the stage, and the
+        chained plan would run with wrong output. The runtime loader refuses
+        it."""
+        from tigris.analysis import partition_spatial as spatial
+        from tigris.runtime import RuntimeError as HostError, check_plan
+
+        path = _stripe_model(tmp_path / "stripe.onnx", middle)
+        ag = detect_and_solve_chains(_stripe_stages(path, 48 * 1024))
+        stage = next(s for s in ag.stages if s.op_indices == [1, 2])
+        assert stage.chain_len == 0 and not stage.tile_plan.tileable
+        monkeypatch.setattr(spatial, "_ops_read_the_running_band", lambda *args, **kwargs: True)
+        ag = detect_and_solve_chains(_stripe_stages(path, 48 * 1024))
+        stage = next(s for s in ag.stages if s.op_indices == [1, 2])
+        assert stage.chain_len >= 2
+        with pytest.raises(HostError) as refused:
+            check_plan(emit_binary_bytes(ag))
+        assert str(refused.value) == ("the runtime loader refuses the plan: chained stage reads a "
+                                      "tensor outside its band; recompile the model with this "
+                                      "TiGrIS release")
+
+    def test_a_chain_that_keeps_the_width_runs_as_the_model(self, tmp_path, require_host_library):
+        """A 1x3 Conv with width pads reads a column halo but keeps the width,
+        and the chain holds whole rows, so the Relu of its input stays in the
+        chain and reads the right elements."""
+        path = _stripe_model(tmp_path / "stripe.onnx", "conv1x3p1")
+        ag = detect_and_solve_chains(_stripe_stages(path, 48 * 1024))
+        assert next(s for s in ag.stages if s.op_indices == [1, 2]).chain_len >= 2
+        plan = tmp_path / "stripe.tgrs"
+        plan.write_bytes(emit_binary_bytes(ag))
+        _run_against_onnxruntime(path, plan)
+
+    @pytest.mark.parametrize("kernel, eligible", [(1, True), (3, False)])
+    def test_an_hw_tile_reads_its_band(self, tmp_path, require_host_library, kernel, eligible):
+        """An HW tile holds the spatial op's input with a column halo and
+        hands the ops after it the output tile. The Relu reads x, so the stage
+        is HW tiled only when the Conv maps columns one to one; tiled behind a
+        1x3 Conv, the plan would run with wrong output."""
+        path = _wide_model(tmp_path / "wide.onnx", kernel)
+        ag = _stripe_stages(path, 40 * 1024)
+        stage = next(s for s in ag.stages if s.op_indices == [1, 2])
+        assert _stage_2d_eligible(ag, stage, [ag.ops[i] for i in stage.op_indices]) is eligible
+        assert (stage.tile_plan.band_kind == TILE_BAND_KIND_HW) is eligible
+        if eligible:
+            plan = tmp_path / "wide.tgrs"
+            plan.write_bytes(emit_binary_bytes(ag))
+            _run_against_onnxruntime(path, plan)
 
     @pytest.mark.parametrize("model, cuts, budget, chained", [
         ("strided", frozenset(), 120 * 1024, [1]),
