@@ -12,8 +12,9 @@ from tigris.analysis.partition_spatial import (
     conversion_cut_points,
 )
 from tigris.graph.ir import Layout
+from tigris.pipeline import plan_model
 
-from conftest import full_pipeline, save_onnx
+from conftest import save_onnx
 
 
 def _planned(tmp_path, nodes, shapes, budget, name="split", initializers=()):
@@ -21,7 +22,7 @@ def _planned(tmp_path, nodes, shapes, budget, name="split", initializers=()):
                      [helper.make_tensor_value_info("x", TensorProto.FLOAT, shapes[0])],
                      [helper.make_tensor_value_info("y", TensorProto.FLOAT, shapes[1])],
                      list(initializers))
-    return full_pipeline(path, budget)
+    return plan_model(path, (budget,))
 
 
 def _stage_op_types(ag):

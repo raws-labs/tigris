@@ -2,6 +2,7 @@
 
 
 import json
+import re
 import struct
 from dataclasses import replace
 from pathlib import Path
@@ -13,18 +14,32 @@ from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.findings import compute_findings
-from tigris.cli import _run_pipeline, cli
-from tigris.cli.compile import _run_compressed_pipeline
-from tigris.emitters.binary.defs import NO_WEIGHT, OP_ATTR_CONSTANTS, OP_TYPE_MAP
+from tigris.analysis.plan_graph import plan_decompression_reserve, slow_arena_required
+from tigris.cli import cli
+from tigris.emitters.binary.defs import (
+    COMPRESS_LZ4,
+    COMPRESS_NONE,
+    HEADER_STRUCT,
+    NO_WEIGHT,
+    OP_ATTR_CONSTANTS,
+    OP_TYPE_MAP,
+    PLAN_SECTION_ALIGNMENT,
+    SEC_WEIGHT_BLOCKS,
+    SECTION_ENTRY_STRUCT,
+    WEIGHT_BLOCK_SECTION_HEADER_STRUCT,
+    WEIGHT_BLOCK_STRUCT,
+)
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import (
     compressed_weight_reserve_bytes,
     emit_binary_bytes,
 )
 from tigris.frontends.tflite import STATE_KEY
-from tigris.graph.ir import Stage
-
-from conftest import full_pipeline
+from tigris.graph.ir import AnalyzedGraph, Stage
+from tigris.pipeline import plan_model, reserve_weights
+from tigris.runtime import Session
+from tigris.utils import fmt_bytes
+from scripts.contract_cases.fixtures import build_conv_relu_chain
 
 
 # Compressed weight data matches uncompressed
@@ -32,7 +47,7 @@ from conftest import full_pipeline
 
 def test_compressed_weight_data_matches(conv_relu_chain_path):
     """Decompressed weight data from compressed plan matches uncompressed plan."""
-    ag, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("32K",))
+    ag = plan_model(str(conv_relu_chain_path), ("32K",), compress="lz4")
 
     data_plain = emit_binary_bytes(ag)
     data_lz4 = emit_binary_bytes(ag, compress="lz4")
@@ -65,19 +80,133 @@ def test_compressed_weight_data_matches(conv_relu_chain_path):
         assert block["uncompressed_size"] > 0
 
 
-def test_stored_weight_blocks_hold_the_lz4_blocks_decompressed(conv_relu_chain_path):
-    ag, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("32K",))
-    stored = read_binary_plan(emit_binary_bytes(ag, compress="none"))
-    lz4 = read_binary_plan(emit_binary_bytes(ag, compress="lz4"))
+@pytest.mark.parametrize("compress", ["none", "LZ4", ""])
+def test_only_lz4_compresses(conv_relu_chain_path, compress):
+    ag = plan_model(str(conv_relu_chain_path), ("32K",), compress="lz4")
+    message = f"unknown weight compression {compress!r}: expected None or 'lz4'"
+    with pytest.raises(ValueError, match=re.escape(message)):
+        emit_binary_bytes(ag, compress=compress)
+    with pytest.raises(ValueError, match=re.escape(message)):
+        plan_model(str(conv_relu_chain_path), ("32K",), compress=compress)
+
+
+def _seeded_conv_relu_chain(tmp_path: Path) -> Path:
+    """Conv -> ReLU -> Conv with seeded random weights and biases."""
+    model = build_conv_relu_chain()
+    rng = np.random.default_rng(0)
+    for tensor in model.graph.initializer:
+        values = rng.standard_normal(tuple(tensor.dims)).astype(np.float32)
+        tensor.CopyFrom(numpy_helper.from_array(values, tensor.name))
+    path = tmp_path / "seeded_conv_relu_chain.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def _blocks_from_plain_plan(packed: dict, plain_data: bytes, plain: dict) -> list[bytes]:
+    """Each weight block of an LZ4 plan, assembled from the uncompressed plan's
+    weight bytes at the block offsets of the LZ4 plan's weight table."""
+    blocks = []
+    for block in packed["weight_blocks"]:
+        data = bytearray(block["uncompressed_size"])
+        for k in range(block["first_weight_idx"], block["first_weight_idx"] + block["num_weights"]):
+            entry, stored = packed["weights"][k], plain["weights"][k]
+            assert entry["size_bytes"] == stored["size_bytes"]
+            assert entry["offset"] + entry["size_bytes"] <= len(data)
+            start = stored["blob_base"] + stored["offset"]
+            data[entry["offset"]:entry["offset"] + entry["size_bytes"]] = (
+                plain_data[start:start + stored["size_bytes"]])
+        blocks.append(bytes(data))
+    return blocks
+
+
+def _with_stored_weight_blocks(data: bytes, blobs: list[bytes]) -> bytes:
+    """Rewrite an LZ4 plan's weight-block section to hold the given decoded
+    blocks, compression type 0, which the runtime loads and copies without
+    decoding."""
+    blocks = read_binary_plan(data, decompress_weights=False)["weight_blocks"]
+    header = list(HEADER_STRUCT.unpack_from(data, 0))
+    directory = []
+    position = header[3]
+    while (entry := SECTION_ENTRY_STRUCT.unpack_from(data, position))[0]:
+        directory.append(entry)
+        position += SECTION_ENTRY_STRUCT.size
+    start = dict(directory)[SEC_WEIGHT_BLOCKS]
+    end = min((offset for _, offset in directory if offset > start), default=len(data))
+    section = bytearray(WEIGHT_BLOCK_SECTION_HEADER_STRUCT.pack(len(blocks), COMPRESS_NONE))
+    blob_offset = 0
+    for block, blob in zip(blocks, blobs, strict=True):
+        section += WEIGHT_BLOCK_STRUCT.pack(block["stage_idx"], block["first_weight_idx"],
+                                            block["num_weights"], 0, blob_offset, len(blob), len(blob))
+        blob_offset += len(blob)
+    section += b"".join(blobs)
+    section += bytes(-len(section) % PLAN_SECTION_ALIGNMENT)
+    shift = len(section) - (end - start)
+    out = bytearray(data[:start] + section + data[end:])
+    header[2] = len(out)
+    HEADER_STRUCT.pack_into(out, 0, *header)
+    for index, (kind, offset) in enumerate(directory):
+        if offset > start:
+            SECTION_ENTRY_STRUCT.pack_into(out, header[3] + index * SECTION_ENTRY_STRUCT.size,
+                                           kind, offset + shift)
+    return bytes(out)
+
+
+def _stored_lz4_and_plain_plans(tmp_path: Path) -> tuple[tuple[Path, Path, Path], list[bytes], AnalyzedGraph]:
+    """The seeded chain at 32K as plans with stored, LZ4 and no weight blocks,
+    the decoded blocks taken from the uncompressed plan, and the planned graph."""
+    ag = plan_model(str(_seeded_conv_relu_chain(tmp_path)), ("32K",), compress="lz4")
+    lz4_data, plain_data = emit_binary_bytes(ag, compress="lz4"), emit_binary_bytes(ag)
+    blobs = _blocks_from_plain_plan(read_binary_plan(lz4_data, decompress_weights=False),
+                                    plain_data, read_binary_plan(plain_data))
+    paths = (tmp_path / "stored.tgrs", tmp_path / "lz4.tgrs", tmp_path / "plain.tgrs")
+    for path, data in zip(paths, (_with_stored_weight_blocks(lz4_data, blobs), lz4_data, plain_data)):
+        path.write_bytes(data)
+    return paths, blobs, ag
+
+
+def test_the_reader_returns_stored_weight_blocks_as_written(tmp_path):
+    (stored_path, lz4_path, _), blobs, ag = _stored_lz4_and_plain_plans(tmp_path)
+    stored = read_binary_plan(stored_path.read_bytes())
+    lz4 = read_binary_plan(lz4_path.read_bytes())
 
     def layout(plan):
-        return [(b["stage_idx"], b["first_weight_idx"], b["num_weights"], b["uncompressed_size"],
-                 b["decompressed"]) for b in plan["weight_blocks"]]
+        return [(b["stage_idx"], b["first_weight_idx"], b["num_weights"], b["uncompressed_size"])
+                for b in plan["weight_blocks"]]
 
-    assert stored["weight_blocks_compression"] == 0
+    assert lz4["weight_blocks_compression"] == COMPRESS_LZ4
+    assert stored["weight_blocks_compression"] == COMPRESS_NONE
+    # Distinct blocks, so a read at the wrong blob offset returns other bytes.
+    assert len(blobs) >= 2 and len(set(blobs)) == len(blobs)
+    assert [b["blob_offset"] for b in stored["weight_blocks"]] == [
+        sum(map(len, blobs[:i])) for i in range(len(blobs))]
     assert all(b["compressed_size"] == b["uncompressed_size"] for b in stored["weight_blocks"])
     assert layout(stored) == layout(lz4)
     assert stored["weights"] == lz4["weights"]
+    assert [b["decompressed"] for b in stored["weight_blocks"]] == blobs
+    assert [b["decompressed"] for b in lz4["weight_blocks"]] == blobs
+    weights = list(ag.weight_data.values())
+    for block, blob in zip(stored["weight_blocks"], blobs):
+        for k in range(block["first_weight_idx"], block["first_weight_idx"] + block["num_weights"]):
+            entry = stored["weights"][k]
+            values = np.frombuffer(blob, np.float32, entry["size_bytes"] // 4, entry["offset"])
+            np.testing.assert_array_equal(np.sort(values), np.sort(weights[k].ravel()))
+
+
+@pytest.mark.usefixtures("require_host_library")
+def test_the_runtime_runs_a_plan_with_stored_weight_blocks(tmp_path):
+    paths, _, _ = _stored_lz4_and_plain_plans(tmp_path)
+    outputs = []
+    for path in paths:
+        with Session(path) as session:
+            (info,) = session.inputs
+            x = np.random.default_rng(0).standard_normal(info["shape"]).astype(info["dtype"])
+            outputs.append(session.run({info["name"]: x}))
+    stored, lz4, plain = outputs
+    assert stored.keys() == lz4.keys() == plain.keys()
+    for key in plain:
+        assert np.count_nonzero(plain[key]) > 0
+        np.testing.assert_array_equal(stored[key], plain[key])
+        np.testing.assert_array_equal(lz4[key], plain[key])
 
 
 def _compile(model: Path, compress: str, tmp_path: Path) -> tuple[bytes, dict]:
@@ -121,6 +250,35 @@ def test_every_weight_an_operator_reads_is_in_its_stage_block(name, tmp_path):
     _assert_reads_in_stage_blocks(plain_data, plain, packed)
 
 
+def _run(plan_path: Path, golden) -> list[dict]:
+    with Session(plan_path, slow_capacity=slow_arena_required(read_binary_plan(plan_path.read_bytes()))) as session:
+        return [session.run({info["name"]: golden[f"input_{position}"][sample]
+                             for position, info in enumerate(session.inputs)})
+                for sample in range(len(golden["input_0"]))]
+
+
+@pytest.mark.usefixtures("require_host_library")
+@pytest.mark.parametrize("name", ["if_conv", "float_if_feature_map", "float_while"])
+def test_the_reservation_holds_the_weights_of_the_stages_control_flow_runs(name, tmp_path):
+    """The stages of the subgraphs If and While run are stages of the plan, so
+    the fast memory reserved for decompressed weights covers their blocks."""
+    model = Path(__file__).parent / "fixtures" / "tflite" / "ops" / f"{name}.tflite"
+    _compile(model, "none", tmp_path)
+    output = tmp_path / "lz4.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(model), "-m", "256K", "-c", "lz4", "-o", str(output)])
+    assert result.exit_code == 0, result.output
+    reserve = plan_decompression_reserve(read_binary_plan(output.read_bytes()))
+    assert reserve > 0
+    assert (f"LZ4, {fmt_bytes(reserve)} of the 256.00 KiB fast memory holds decompressed weights"
+            in result.output)
+    golden = np.load(model.with_suffix(".npz"))
+    for plain, packed in zip(_run(tmp_path / "none.tgrs", golden), _run(output, golden)):
+        assert plain.keys() == packed.keys()
+        for key in plain:
+            np.testing.assert_array_equal(plain[key], packed[key])
+
+
 def _svdf_after(tmp_path: Path, head: str, constant: str):
     """x -> head(x, constant) -> Svdf, each operator in a stage of its own."""
     rng = np.random.default_rng(0)
@@ -148,7 +306,7 @@ def _svdf_after(tmp_path: Path, head: str, constant: str):
         [{"input": "state_in", "output": "state_out", "initial": "state_initial"}])})
     path = tmp_path / "svdf_after.onnx"
     onnx.save(model, str(path))
-    ag = full_pipeline(path, budget=4096)
+    ag = plan_model(path, (4096,))
     live = [[name for name in names if name in ag.tensors and not ag.tensors[name].is_constant]
             for op in ag.ops for names in (op.inputs, op.outputs)]
     for index, op in enumerate(ag.ops):
@@ -162,6 +320,7 @@ def _svdf_after(tmp_path: Path, head: str, constant: str):
 def test_constants_of_a_later_stage_are_in_that_stage_block(tmp_path):
     ag = _svdf_after(tmp_path, "MatMul", "projection")
     plain_data = emit_binary_bytes(ag)
+    reserve_weights(ag)
     packed = read_binary_plan(emit_binary_bytes(ag, compress="lz4"))
     assert [(op["op_type"], op["stage"]) for op in packed["ops"]] == [
         (OP_TYPE_MAP["Gemm"], 0), (OP_TYPE_MAP["Svdf"], 1)]
@@ -176,7 +335,7 @@ def test_a_listed_constant_shared_across_stages_is_refused(tmp_path):
 
 
 def test_a_weight_no_stage_reads_is_refused(conv_relu_chain_path):
-    ag, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("32K",))
+    ag = plan_model(str(conv_relu_chain_path), ("32K",), compress="lz4")
     ag.weight_data["unread"] = np.zeros(4, np.float32)
     with pytest.raises(ValueError, match=f"weight {len(ag.weight_data) - 1} belongs to no stage"):
         emit_binary_bytes(ag, compress="lz4")
@@ -188,7 +347,7 @@ def test_a_weight_no_stage_reads_is_refused(conv_relu_chain_path):
 
 def test_uncompressed_plan_unchanged(conv_relu_chain_path):
     """Without --compress, no SEC_WEIGHT_BLOCKS section should appear."""
-    ag = full_pipeline(conv_relu_chain_path, budget=8192)
+    ag = plan_model(conv_relu_chain_path, (8192,), chains=False)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -199,38 +358,44 @@ def test_uncompressed_plan_unchanged(conv_relu_chain_path):
 def test_compressed_plan_budget_excludes_exact_weight_reservation(
     conv_relu_chain_path,
 ):
-    ag, total, planned_reserve, required_reserve = _run_compressed_pipeline(
-        str(conv_relu_chain_path), ("32K",)
-    )
+    ag = plan_model(str(conv_relu_chain_path), ("32K",), compress="lz4")
     reserve = compressed_weight_reserve_bytes(ag)
     data = emit_binary_bytes(ag, compress="lz4")
     plan = read_binary_plan(data)
 
     assert reserve > 0
     assert plan["budget"] == ag.mem_budget
-    assert reserve == required_reserve
-    assert ag.mem_budget + planned_reserve == total
+    assert reserve == ag.fast_memory_reserve_bytes
+    assert ag.mem_budget + reserve == 32 * 1024
 
 
-def test_compressed_plan_fails_when_total_budget_omits_reservation(
-    conv_relu_chain_path,
-):
-    ag = full_pipeline(conv_relu_chain_path, budget=32768)
+def test_compressed_plan_fails_when_the_reservation_omits_weights(conv_relu_chain_path):
+    ag = plan_model(conv_relu_chain_path, ("32K",), compress="lz4")
     reserve = compressed_weight_reserve_bytes(ag)
-    # The activation schedule itself fits; one byte less than activation plus
-    # decompression reserve must still be rejected before emission.
-    from tigris.analysis.validation import validate_memory_plan
+    ag.budget = replace(ag.budget, fast_reserve=reserve - 1)
 
-    ag.budget = replace(ag.budget, fast=validate_memory_plan(ag).scheduled_peak_bytes + reserve - 1)
+    with pytest.raises(ValueError, match=re.escape(
+            f"compressed-weight reservation ({reserve:,} bytes) exceeds the declared "
+            f"reservation ({reserve - 1:,} bytes)")):
+        emit_binary_bytes(ag, compress="lz4")
 
-    with pytest.raises(ValueError, match="Cannot emit an infeasible memory plan"):
+
+def test_a_graph_planned_without_compression_does_not_compress(conv_relu_chain_path):
+    """The fast budget of a graph is its activation arena, so a graph planned
+    without a weight reservation has no room for decompressed weights."""
+    ag = plan_model(conv_relu_chain_path, ("32K",))
+    reserve = compressed_weight_reserve_bytes(ag)
+
+    with pytest.raises(ValueError, match=re.escape(
+            f"compressed-weight reservation ({reserve:,} bytes) exceeds the declared "
+            "reservation (0 bytes)")):
         emit_binary_bytes(ag, compress="lz4")
 
 
 def test_decompressed_weights_that_take_the_whole_budget_leave_no_plan(tmp_path):
     """No fast memory is left for activations, so no plan is written."""
     model = Path(__file__).parent / "fixtures" / "tflite" / "ops" / "conv_bias.tflite"
-    unreserved, _ = _run_pipeline(str(model), ("256",), report_bindings=False)
+    unreserved = plan_model(str(model), ("256",))
     assert compressed_weight_reserve_bytes(unreserved) == 256
 
     output = tmp_path / "conv_bias.tgrs"

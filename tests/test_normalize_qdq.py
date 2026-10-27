@@ -15,8 +15,9 @@ from tigris.analysis.memory import compute_memory_timeline
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.defs import NO_QUANT_PARAM
+from tigris.pipeline import plan_model
 
-from conftest import full_pipeline, save_onnx
+from conftest import save_onnx
 
 
 def test_qdq_fold_removes_ql_dql_ops(qdq_conv_path):
@@ -70,7 +71,7 @@ def test_qdq_fold_quantizes_the_conv(qdq_conv_path):
 
 def test_qdq_binary_roundtrip(qdq_conv_path):
     """The quantized plan carries valid quant params and keeps the ONNX output name."""
-    ag = full_pipeline(qdq_conv_path)
+    ag = plan_model(qdq_conv_path)
     assert ag.model_outputs == ["output"]
     assert ag.tensors["output"].quant is not None
 
@@ -195,7 +196,6 @@ def test_constant_section_boundary_respects_integer_lowering(tmp_path, kind, end
 
 
 def test_uniform_constant_shared_by_float_and_int8_adds(tmp_path):
-    from tigris.cli import _run_pipeline
     from tigris.runtime import Session
 
     path = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
@@ -214,7 +214,7 @@ def test_uniform_constant_shared_by_float_and_int8_adds(tmp_path):
     assert set(adds) == {1, 3}
     assert ag.weight_data[adds[1].inputs[1]].dtype == np.float32
     assert ag.weight_data[adds[3].inputs[1]].dtype == np.int8
-    ag, _ = _run_pipeline(str(path), ("1K",), report_bindings=False)
+    ag = plan_model(str(path), ("1K",))
     binary = tmp_path / "shared.tgrs"
     binary.write_bytes(emit_binary_bytes(ag))
     with Session(binary) as session:
@@ -226,18 +226,17 @@ def test_uniform_constant_shared_by_float_and_int8_adds(tmp_path):
 def test_bias_after_quantization_preserves_product_clipping(tmp_path):
     import onnxruntime as ort
 
-    from tigris.cli import _run_pipeline
     from tigris.runtime import Session
 
     path = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
-    ag, _ = _run_pipeline(str(path), ("16K",), report_bindings=False)
     binary = tmp_path / "bias.tgrs"
     values = np.full((1, 4), 31.75, dtype=np.float32)
     expected = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]).run(
         None, {"input": values}
     )[0]
-    for options in ({}, {"compress": "lz4"}, {"xip": True}):
-        binary.write_bytes(emit_binary_bytes(ag, **options))
+    for compress, xip in ((None, False), ("lz4", False), (None, True)):
+        ag = plan_model(str(path), ("16K",), compress=compress)
+        binary.write_bytes(emit_binary_bytes(ag, compress=compress, xip=xip))
         with Session(binary) as session:
             actual = session.run({"input": values})["output"]
         np.testing.assert_array_equal(actual, expected)
@@ -529,11 +528,9 @@ def test_int4_weights_compile_as_the_same_int8_values(tmp_path):
     """4-bit weights hold int8 values exactly; the plan is the int8 model's."""
     plans = []
     for weight_type in (TensorProto.INT4, TensorProto.INT8):
-        from tigris.cli import _run_pipeline
 
         (tmp_path / str(weight_type)).mkdir()
-        graph, _ = _run_pipeline(str(_int_weight_conv(tmp_path / str(weight_type) / "conv.onnx", weight_type)),
-                                 ("64K",), report_bindings=False)
+        graph = plan_model(str(_int_weight_conv(tmp_path / str(weight_type) / "conv.onnx", weight_type)), ("64K",))
         assert graph.weight_data["w"].dtype == np.int8
         plans.append(emit_binary_bytes(graph))
     assert plans[0] == plans[1]
@@ -571,7 +568,6 @@ def test_a_second_encoding_of_an_activation_is_a_requantization(tmp_path):
 
 
 def test_dequantize_float_section_keeps_int8_model_input(tmp_path):
-    from tigris.cli import _run_pipeline
     from tigris.runtime import Session
 
     source = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
@@ -585,7 +581,7 @@ def test_dequantize_float_section_keeps_int8_model_input(tmp_path):
         dim.dim_value = 1
     model.graph.input[0].type.tensor_type.shape.dim[1].dim_value = 2
     onnx.save(model, source)
-    ag, _ = _run_pipeline(str(source), ("1K",), report_bindings=False)
+    ag = plan_model(str(source), ("1K",))
     assert ag.is_quantized
     assert [op.op_type for op in ag.ops] == ["Dequantize", "Add"]
     binary = tmp_path / "section.tgrs"
@@ -597,7 +593,6 @@ def test_dequantize_float_section_keeps_int8_model_input(tmp_path):
 
 
 def test_float_only_kernel_between_quantized_tensors(tmp_path):
-    from tigris.cli import _run_pipeline
     from tigris.runtime import Session
 
     path = _qdq_gemm_bias_model(tmp_path, shared_scale=False)
@@ -610,7 +605,7 @@ def test_float_only_kernel_between_quantized_tensors(tmp_path):
         helper.make_node("DequantizeLinear", ["encoded", "io_scale", "io_zp"], ["output"]),
     ])
     onnx.save(model, path)
-    ag, _ = _run_pipeline(str(path), ("1K",), report_bindings=False)
+    ag = plan_model(str(path), ("1K",))
     assert [op.op_type for op in ag.ops] == ["Gemm", "Dequantize", "Exp", "Quantize"]
     binary = tmp_path / "exp.tgrs"
     binary.write_bytes(emit_binary_bytes(ag))
@@ -681,7 +676,6 @@ def test_float_bias_of_an_int8_product_becomes_int32(tmp_path, op_type):
 def test_float_bias_of_an_int8_product_matches_onnx_runtime(tmp_path, op_type):
     import onnxruntime as ort
 
-    from tigris.cli import _run_pipeline
     from tigris.runtime import Session
 
     path = _qdq_float_bias_model(tmp_path, op_type)
@@ -692,7 +686,7 @@ def test_float_bias_of_an_int8_product_matches_onnx_runtime(tmp_path, op_type):
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     expected = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]).run(
         None, {"input": values})[0]
-    ag, _ = _run_pipeline(str(path), ("16K",), report_bindings=False)
+    ag = plan_model(str(path), ("16K",))
     binary = tmp_path / "float_bias.tgrs"
     binary.write_bytes(emit_binary_bytes(ag))
     stored = np.transpose(values, (0, 2, 3, 1)) if op_type == "Conv" else values
@@ -766,7 +760,6 @@ def test_transposed_quantized_weight_folds_into_the_weight(tmp_path):
 def test_transposed_quantized_weight_matches_onnx_runtime(tmp_path):
     import onnxruntime as ort
 
-    from tigris.cli import _run_pipeline
     from tigris.runtime import Session
 
     path = _qdq_linear_transposed_weight(tmp_path)
@@ -775,7 +768,7 @@ def test_transposed_quantized_weight_matches_onnx_runtime(tmp_path):
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     expected = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]).run(
         None, {"input": values})[0]
-    ag, _ = _run_pipeline(str(path), ("16K",), report_bindings=False)
+    ag = plan_model(str(path), ("16K",))
     binary = tmp_path / "linear.tgrs"
     binary.write_bytes(emit_binary_bytes(ag))
     with Session(binary) as session:

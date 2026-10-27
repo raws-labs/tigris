@@ -3,8 +3,8 @@
 import pytest
 from onnx import TensorProto, helper
 
-from tigris.cli import _run_pipeline
 from tigris.analysis.validation import validate_memory_plan
+from tigris.pipeline import plan_model
 
 from conftest import save_onnx
 
@@ -20,7 +20,7 @@ def _mul(tmp_path):
 
 def test_a_one_row_band_counts_each_buffer_aligned(tmp_path):
     # Three 80-byte rows, each aligned to 96 bytes: 288, not 240.
-    ag, _ = _run_pipeline(_mul(tmp_path), ("288",), report_bindings=False)
+    ag = plan_model(_mul(tmp_path), ("288",))
     plan = ag.stages[0].tile_plan
     assert plan.tileable and plan.tile_height == 1
     assert plan.tiled_peak_bytes == 288
@@ -29,7 +29,7 @@ def test_a_one_row_band_counts_each_buffer_aligned(tmp_path):
 
 def test_a_band_that_does_not_fit_aligned_narrows_to_a_2d_tile(tmp_path):
     # One aligned row needs 288 bytes, so a 256-byte budget takes a 2D tile.
-    ag, _ = _run_pipeline(_mul(tmp_path), ("256",), report_bindings=False)
+    ag = plan_model(_mul(tmp_path), ("256",))
     plan = ag.stages[0].tile_plan
     assert plan.tileable and plan.tile_width > 0
     assert plan.tiled_peak_bytes <= 256
@@ -43,7 +43,7 @@ def test_transpose_band_counts_unchanged_trailing_block(tmp_path, budget, feasib
                      [helper.make_node("Transpose", ["x"], ["y"], perm=perm)],
                      [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
                      [helper.make_tensor_value_info("y", TensorProto.FLOAT, [shape[i] for i in perm])])
-    graph, _ = _run_pipeline(str(path), (str(budget),), report_bindings=False)
+    graph = plan_model(str(path), (str(budget),))
     assert validate_memory_plan(graph).feasible == feasible
     plan = graph.stages[0].tile_plan
     if feasible:

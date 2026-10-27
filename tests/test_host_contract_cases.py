@@ -3,9 +3,9 @@
 import numpy as np
 import pytest
 
-from tigris.cli import _run_pipeline
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.pipeline import plan_model
 from tigris.runtime import RuntimeError, Session
 
 
@@ -17,7 +17,7 @@ def _compile(tmp_path, case, budgets):
 
     model_path = tmp_path / "case.onnx"
     onnx.save(case.compile_model, model_path)
-    graph, _ = _run_pipeline(str(model_path), budgets)
+    graph = plan_model(str(model_path), budgets)
     return emit_binary_bytes(graph)
 
 
@@ -136,7 +136,7 @@ def test_rank2_row_band_equals_one_pass(tmp_path, kind, constant):
     onnx.save(case.compile_model, model_path)
     outputs = []
     for budgets in ((case.mem_budget, case.slow_budget), ("64K",)):
-        graph, _ = _run_pipeline(str(model_path), budgets)
+        graph = plan_model(str(model_path), budgets)
         [stage] = graph.stages
         ops = [graph.ops[i] for i in stage.op_indices]
         assert [op.op_type for op in ops] == [kind]

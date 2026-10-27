@@ -5,10 +5,10 @@ Compile-side only: this test verifies the compiler model (Stage.line_buffered)
 and the emitted binary bytes, not any runtime behavior.
 """
 
-from tigris.cli import _run_pipeline
 from tigris.emitters.binary.defs import STAGE_FLAG_LINE_BUFFERED
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.pipeline import plan_model
 from scripts.contract_cases.fixtures import build_ds_cnn
 
 
@@ -20,7 +20,7 @@ def test_recomputing_chain_head_is_line_buffered(tmp_path):
     import onnx
     m = tmp_path / "dscnn.onnx"
     onnx.save(build_ds_cnn(), str(m))
-    ag, _ = _run_pipeline(str(m), ("60K",))
+    ag = plan_model(str(m), ("60K",))
 
     heads = _chain_heads(ag)
     assert heads, "expected a chain to form for DS-CNN at 60K"

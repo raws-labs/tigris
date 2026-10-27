@@ -6,7 +6,8 @@ from pathlib import Path
 
 import click
 
-from tigris.cli import _memory_sizes, _parse_input_shape, _parse_size, _run_pipeline, cli, text
+from tigris.cli import _memory_sizes, _parse_input_shape, _planned, cli, text
+from tigris.pipeline import parse_size
 from tigris.utils import describe_interface, fmt_bytes, plural, source_shape
 
 # Budgets tried beyond the one given, halving below a fit or doubling above a failure.
@@ -110,8 +111,8 @@ def _tried(model: str, budget: int, fits: bool, input_shape) -> list[tuple[int, 
         if candidate <= 0 or candidate > 0xFFFFFFFF:
             break
         try:
-            graph, _ = _run_pipeline(model, (str(candidate),), input_shapes=input_shape,
-                                     report_bindings=False)
+            graph = _planned(model, (str(candidate),), input_shapes=input_shape,
+                             report_bindings=False)
         except click.ClickException:
             break
         ok = validate_memory_plan(graph).feasible
@@ -126,11 +127,10 @@ def _lz4_compiles(model: str, mem: tuple[str, ...], input_shape) -> bool:
     """Whether compile -c lz4 writes a plan at these budgets: the fast arena
     also holds each stage's decompressed weights, which can leave too little."""
     from tigris.analysis.validation import plan_gate
-    from tigris.cli.compile import plan_model
 
     try:
-        graph, _, _ = plan_model(model, mem, compress="lz4", input_shapes=input_shape,
-                                 report_bindings=False)
+        graph = _planned(model, mem, compress="lz4", input_shapes=input_shape,
+                         report_bindings=False)
     except click.ClickException:
         return False
     return plan_gate(graph).passes
@@ -307,12 +307,13 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
         raise click.UsageError("--json and --trace are two different outputs; choose one")
     if input_files and not trace:
         raise click.UsageError("--input is for --trace")
-    mem_pools = [_parse_size(m) for m in mem]
-    flash_budget = _parse_size(flash) if flash else 0
+    mem_pools = [parse_size(m) for m in mem]
+    flash_budget = parse_size(flash) if flash else 0
+    budget = mem_pools[0] if mem_pools else 0
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
-    # Only forward the fast tier to _run_pipeline: analyze interprets the slow
-    # tier itself and stays display-only.
-    ag, budget = _run_pipeline(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json)
+    # Only the fast tier is planned: analyze interprets the slow tier itself
+    # and stays display-only.
+    ag = _planned(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json)
     ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
     if trace:
         from tigris.cli.trace import trace_model

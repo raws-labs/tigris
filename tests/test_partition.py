@@ -3,8 +3,7 @@
 from tigris.graph.ir import AnalyzedGraph, Layout, OpNode, TensorInfo, TensorLifetime
 from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.partition_temporal import partition_temporal
-
-from conftest import full_pipeline
+from tigris.pipeline import plan_model
 
 
 class _CountingLifetimes(dict):
@@ -44,7 +43,7 @@ def _linear_graph(num_ops, *, tensor_size=32):
 
 
 def test_single_stage_large_budget(linear_3op_path):
-    ag = full_pipeline(linear_3op_path)
+    ag = plan_model(linear_3op_path)
     ag = partition_temporal(ag, budget=1024 * 1024)  # 1 MiB - everything fits
 
     assert len(ag.stages) == 1
@@ -55,7 +54,7 @@ def test_single_stage_large_budget(linear_3op_path):
 
 
 def test_multiple_stages_tight_budget(diamond_path):
-    ag = full_pipeline(diamond_path)
+    ag = plan_model(diamond_path)
     # Diamond: at the Add step, left (512B) + right (512B) are both live = 1024B.
     # With a budget of 512 bytes, should force multiple stages.
     ag = partition_temporal(ag, budget=512)
@@ -64,7 +63,7 @@ def test_multiple_stages_tight_budget(diamond_path):
 
 
 def test_stage_inputs_outputs(large_activations_path):
-    ag = full_pipeline(large_activations_path)
+    ag = plan_model(large_activations_path)
     # A budget of one 4096-byte tensor gives every Relu its own stage.
     ag = partition_temporal(ag, budget=4096)
 

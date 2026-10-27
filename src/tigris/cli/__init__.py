@@ -1,31 +1,10 @@
 """CLI entry point: ``tigris analyze model.onnx --mem 256K``."""
 
-from dataclasses import replace
 import os
-from pathlib import Path
 
 import click
 
-
-def _parse_size(s: str) -> int:
-    """Bytes in ``s``: a byte count, or a number with a K, KB, M or MB suffix."""
-    text = s.strip().upper()
-    multipliers = {"K": 1024, "KB": 1024, "M": 1024**2, "MB": 1024**2}
-    try:
-        for suffix, mult in sorted(multipliers.items(), key=lambda x: -len(x[0])):
-            if text.endswith(suffix):
-                size = int(float(text[: -len(suffix)]) * mult)
-                break
-        else:
-            size = int(text)
-    except (ValueError, OverflowError):
-        raise ValueError(
-            f"invalid memory size {s!r}: expected bytes or a number with a K, KB, M "
-            "or MB suffix (e.g. 256K)"
-        ) from None
-    if size <= 0:
-        raise ValueError(f"invalid memory size {s!r}: must be greater than zero")
-    return size
+from tigris.pipeline import parse_size
 
 
 def _memory_sizes(ctx, param, value):
@@ -53,7 +32,7 @@ def _memory_sizes(ctx, param, value):
             )
     for token in tokens:
         try:
-            _parse_size(token)
+            parse_size(token)
         except ValueError as exc:
             raise click.BadParameter(str(exc)) from None
     return value if isinstance(value, str) else tuple(tokens)
@@ -94,93 +73,25 @@ def _report_shape_bindings(ag) -> None:
         text.echo(text.warn("warning: ") + str(binding), err=True)
 
 
-def _run_pipeline(
-    model: str,
-    mem: tuple[str, ...],
-    *,
-    fast_reserve_bytes: int = 0,
-    input_shapes: dict[str, tuple[int, ...]] | None = None,
-    report_bindings: bool = True,
-):
-    """Run the shared planning pipeline.
-
-    ``--mem`` is the total fast arena supplied by the embedding application.
-    A caller that needs bytes outside the activation allocator (for example,
-    decompressed weights) supplies ``fast_reserve_bytes``; partitioning then
-    sees only the remaining activation capacity.  The returned budget remains
-    the caller's total, preserving the CLI's public accounting.
-    """
-    from tigris.analysis.lifetime import compute_lifetimes
-    from tigris.analysis.memory import compute_memory_timeline
-    from tigris.analysis.partition_spatial import (
-        detect_and_solve_chains,
-        partition_spatial,
-    )
-    from tigris.analysis.partition_temporal import partition_temporal
-    from tigris.loaders import load_model
-
-    model_path = Path(model)
-    mem_pools = [_parse_size(m) for m in mem]
-    if fast_reserve_bytes < 0:
-        raise click.ClickException("Fast-memory reservation must not be negative")
+def _planned(model: str, mem: tuple[str, ...], *, compress: str | None = None,
+             input_shapes: dict[str, tuple[int, ...]] | None = None,
+             report_bindings: bool = True):
+    """Plan a model as ``pipeline.plan_model`` does, for a command: dimensions
+    the compiler bound are reported once, an error is a ClickException."""
+    from tigris import pipeline
 
     try:
-        ag = load_model(model_path, input_shapes)
-        ag = compute_lifetimes(ag)
-        ag = compute_memory_timeline(ag)
+        if compress is None:
+            ag = pipeline.load(model, input_shapes)
+            if report_bindings:
+                _report_shape_bindings(ag)
+            return pipeline.plan(ag, mem)
+        ag = pipeline.plan_model(model, mem, compress=compress, input_shapes=input_shapes)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
-
     if report_bindings:
         _report_shape_bindings(ag)
-
-    if not 0 <= ag.peak_memory_bytes <= 0xFFFFFFFF:
-        raise click.ClickException(
-            "Peak activation memory exceeds the uint32 plan-format limit"
-        )
-
-    total_budget = mem_pools[0] if mem_pools else 0
-    if total_budget > 0xFFFFFFFF:
-        raise click.ClickException(
-            "Fast-memory budget exceeds the uint32 plan-format limit"
-        )
-    if fast_reserve_bytes > 0 and fast_reserve_bytes >= total_budget:
-        # Only compressed plans reserve fast memory, for decompressed weights.
-        from tigris.utils import fmt_bytes
-        if fast_reserve_bytes == total_budget:
-            # An activation budget of 0 would read as no budget, and nothing would be planned.
-            raise click.ClickException(
-                f"no plan written: decompressed weights need all {fmt_bytes(total_budget)} "
-                "of fast memory, none is left for activations"
-            )
-        raise click.ClickException(
-            f"no plan written: decompressed weights need {fmt_bytes(fast_reserve_bytes)} "
-            f"of fast memory, the budget is {fmt_bytes(total_budget)}"
-        )
-    budget = total_budget - fast_reserve_bytes
-
-    def planned(graph):
-        if budget > 0:
-            graph = partition_temporal(graph, budget)
-            graph = partition_spatial(graph)
-            graph = detect_and_solve_chains(graph)
-        graph.budget = replace(graph.budget, fast_reserve=fast_reserve_bytes)
-        return graph
-
-    # Each subgraph a control-flow operator runs is planned as a graph of its
-    # own under the same budget, those it runs in turn first.
-    def planned_below(graph):
-        graph.subgraphs = [planned(planned_below(compute_memory_timeline(compute_lifetimes(sub))))
-                           for sub in graph.subgraphs]
-        return graph
-
-    ag = planned(planned_below(ag))
-
-    slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
-    for graph in (*ag.subgraphs, ag):
-        graph.budget = replace(graph.budget, slow=slow_budget)
-
-    return ag, total_budget
+    return ag
 
 
 def _show_version(ctx, param, value):

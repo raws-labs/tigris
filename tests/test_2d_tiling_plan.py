@@ -13,10 +13,10 @@ from onnx import TensorProto, helper, numpy_helper
 
 from tigris import TILE_AXIS_HW
 from tigris.analysis.validation import validate_memory_plan
-from tigris.cli import _run_pipeline
 from tigris.emitters.binary.defs import TILE_BAND_KIND_HW
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.pipeline import plan_model
 
 
 def _build_high_res_conv(h: int, w: int, c: int) -> onnx.ModelProto:
@@ -48,7 +48,7 @@ def compile_high_res_conv_to_bytes(h: int, w: int, c: int, budget: str, tmp_path
     """
     model_path = tmp_path / "high_res_conv.onnx"
     onnx.save(_build_high_res_conv(h, w, c), str(model_path))
-    ag, _ = _run_pipeline(str(model_path), (budget,))
+    ag = plan_model(str(model_path), (budget,))
     validation = validate_memory_plan(ag)
     if not validation.feasible:
         details = "; ".join(issue.describe() for issue in validation.issues)

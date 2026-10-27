@@ -4,7 +4,6 @@ import json
 import numpy as np
 import onnx
 import pytest
-from click import ClickException
 from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
 
@@ -16,11 +15,12 @@ from tigris.analysis.validation import (
 )
 from tigris.inspection import inspect_file
 from tigris.capabilities import KERNEL_CAPABILITIES, effective_operators
-from tigris.cli import _run_pipeline, cli, text
+from tigris.cli import cli, text
 from tigris.cli.analyze import verdict_lines
 from tigris.emitters.binary.defs import OP_TYPE_MAP
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, Stage, TensorInfo, TilePlan
+from tigris.pipeline import plan_model
 
 from conftest import normalized, save_onnx
 
@@ -89,7 +89,7 @@ def mixed_dtype_model_path(tmp_path):
 
 
 def test_normalized_unknown_operator_is_reported(acos_model_path):
-    graph, _ = _run_pipeline(str(acos_model_path), ("4K",))
+    graph = plan_model(str(acos_model_path), ("4K",))
 
     validation = validate_operator_support(graph)
     findings = compute_findings(graph)
@@ -129,7 +129,7 @@ def test_compile_rejects_unsupported_operator_without_output(
 
 
 def test_writer_rejects_unsupported_operator(acos_model_path):
-    graph, _ = _run_pipeline(str(acos_model_path), ("4K",))
+    graph = plan_model(str(acos_model_path), ("4K",))
 
     with pytest.raises(
         ValueError,
@@ -141,7 +141,7 @@ def test_writer_rejects_unsupported_operator(acos_model_path):
 def test_mixed_activation_dtypes_are_never_reported_deployable(
     mixed_dtype_model_path,
 ):
-    graph, _ = _run_pipeline(str(mixed_dtype_model_path), ("4K",))
+    graph = plan_model(str(mixed_dtype_model_path), ("4K",))
 
     validation = validate_execution_dtype(graph)
     findings = compute_findings(graph)
@@ -200,7 +200,7 @@ def _constant_output_model(tmp_path, source):
 def test_compile_refuses_an_output_no_operator_computes(tmp_path, source):
     """The plan holds no constant as an output, so it would return one output fewer."""
     path = _constant_output_model(tmp_path, source)
-    graph, _ = _run_pipeline(str(path), ("4K",))
+    graph = plan_model(str(path), ("4K",))
     issue = "output 'k' is not computed by any operator"
     assert validate_model_outputs(graph).issues == (issue,)
     assert validate_execution_dtype(graph).supported
@@ -220,7 +220,7 @@ def test_compile_refuses_an_output_no_operator_computes(tmp_path, source):
 
 
 def test_an_output_no_operator_computes_leaves_dtype_errors_reported(mixed_dtype_model_path):
-    graph, _ = _run_pipeline(str(mixed_dtype_model_path), ("4K",))
+    graph = plan_model(str(mixed_dtype_model_path), ("4K",))
     graph.model_outputs.append("scale")
     findings = compute_findings(graph)
     assert findings.output_errors == ["output 'scale' is not computed by any operator"]
@@ -241,7 +241,7 @@ def test_ceil_mode_whose_last_window_lies_in_the_padding_is_rejected(tmp_path):
                      [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 1, 5, 5])],
                      [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1, 3, 3])],
                      opset=19, ir_version=9)
-    graph, _ = _run_pipeline(str(path), ("4K",))
+    graph = plan_model(str(path), ("4K",))
     assert "ceil_mode=1 is not encoded" in validate_operator_support(graph).describe()
 
 
@@ -273,7 +273,7 @@ def test_unrepresentable_pool_attributes_are_rejected(
     )
     path = save_onnx(tmp_path, "unsupported_pool_attrs", [node], [model_input], [model_output],
                      opset=19, ir_version=9)
-    graph, _ = _run_pipeline(str(path), ("4K",))
+    graph = plan_model(str(path), ("4K",))
 
     validation = validate_operator_support(graph)
 
@@ -310,7 +310,7 @@ def test_onnx_operator_variants_outside_the_encoding_are_not_emitted(
         [helper.make_tensor_value_info("output", TensorProto.FLOAT, output_shape)],
         initializers,
     )
-    graph, _ = _run_pipeline(str(path), ("4K",))
+    graph = plan_model(str(path), ("4K",))
 
     with pytest.raises(ValueError, match=message):
         emit_binary_bytes(graph)
@@ -643,7 +643,7 @@ def test_exact_constant_elementwise_operand_is_rejected_when_tiled():
 
 
 def test_existing_full_shape_float_constant_add_is_supported(linear_3op_path):
-    graph, _ = _run_pipeline(str(linear_3op_path), ("4K",))
+    graph = plan_model(str(linear_3op_path), ("4K",))
 
     validation = validate_operator_support(graph)
 
@@ -826,8 +826,7 @@ def _avg_pool_path(tmp_path, pads):
 
 def test_count_include_pad_without_padding_is_accepted(tmp_path):
     """Without padding every window lies inside the input: the flag is moot."""
-    ag, _ = _run_pipeline(str(_avg_pool_path(tmp_path, [0, 0, 0, 0])), ("64K",),
-                          report_bindings=False)
+    ag = plan_model(str(_avg_pool_path(tmp_path, [0, 0, 0, 0])), ("64K",))
     assert emit_binary_bytes(ag)
 
 
@@ -843,8 +842,7 @@ def _gate_path(tmp_path, gate_shape):
 
 def test_per_channel_dynamic_operand_is_accepted(tmp_path):
     """A squeeze-and-excitation gate: one value per channel, written first."""
-    ag, _ = _run_pipeline(str(_gate_path(tmp_path, [1, 4, 1, 1])), ("64K",),
-                          report_bindings=False)
+    ag = plan_model(str(_gate_path(tmp_path, [1, 4, 1, 1])), ("64K",))
     mul = next(op for op in ag.ops if op.op_type == "Mul")
     assert mul.inputs == ["input", "gate"], "full-shape operand goes first"
     assert emit_binary_bytes(ag)
@@ -853,8 +851,7 @@ def test_per_channel_dynamic_operand_is_accepted(tmp_path):
 def test_a_row_wise_dynamic_operand_is_emitted(tmp_path):
     """A row-wise operand is a broadcast inside the operand, read by output
     coordinate and never tiled."""
-    ag, _ = _run_pipeline(str(_gate_path(tmp_path, [1, 1, 5, 1])), ("64K",),
-                          report_bindings=False)
+    ag = plan_model(str(_gate_path(tmp_path, [1, 1, 5, 1])), ("64K",))
     assert emit_binary_bytes(ag)
 
 
@@ -1039,7 +1036,7 @@ def test_l2pool_fold_preserves_pool_semantics(tmp_path, count_include_pad, other
         helper.make_node("AveragePool", ["squared"], ["pooled"], **attrs),
         helper.make_node("Sqrt", ["pooled"], ["y"]),
     ], inputs, [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 2, 3, 3])])
-    graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
+    graph = plan_model(str(path), ("64K",))
     folded = [op for op in graph.ops if op.op_type == "L2Pool"]
     if other_operand:
         assert not folded
@@ -1062,7 +1059,7 @@ def test_lpnormalization_only_lowers_l2_without_epsilon_floor(tmp_path, order):
         helper.make_node("LpNormalization", ["x"], ["y"], p=order, axis=1),
     ], [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 4])],
        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 4])])
-    graph, _ = _run_pipeline(str(path), ("4K",), report_bindings=False)
+    graph = plan_model(str(path), ("4K",))
     if order == 2:
         op = next(op for op in graph.ops if op.op_type == "L2Normalization")
         assert op.attrs == {"axis": 1, "epsilon": 0.0}
@@ -1086,7 +1083,7 @@ def test_legacy_logsoftmax_normalizes_the_flattened_suffix(tmp_path, axis, flat_
         helper.make_node("LogSoftmax", ["x"], ["y"], name="normalize", **attrs),
     ], [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
        [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)], opset=12)
-    graph, _ = _run_pipeline(str(path), ("4K",), report_bindings=False)
+    graph = plan_model(str(path), ("4K",))
     op = next(op for op in graph.ops if op.op_type == "LogSoftmax")
     assert op.attrs["axis"] == -1
     assert graph.tensors[op.inputs[0]].shape == flat_shape
@@ -1198,7 +1195,7 @@ def test_reducemax_does_not_rewrite_nonspatial_axes_to_global_pool(tmp_path):
         helper.make_node("ReduceMax", ["x"], ["y"], axes=[1, 2], keepdims=1),
     ], [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3, 4, 5])],
        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 1, 1, 5])])
-    graph, _ = _run_pipeline(str(path), ("4K",), report_bindings=False)
+    graph = plan_model(str(path), ("4K",))
     assert any(op.op_type == "ReduceMax" for op in graph.ops)
     assert all(op.op_type != "GlobalMaxPool" for op in graph.ops)
     assert not validate_operator_support(graph).supported
@@ -1360,8 +1357,8 @@ def test_movement_refuses_runtime_bounds(tmp_path, kind):
     model.graph.initializer.remove(initializer)
     path = tmp_path / "dynamic_indices.onnx"
     onnx.save(model, path)
-    with pytest.raises(ClickException, match="constant indices or bounds"):
-        _run_pipeline(str(path), ("8K",))
+    with pytest.raises(ValueError, match="constant indices or bounds"):
+        plan_model(str(path), ("8K",))
 
 
 @pytest.mark.parametrize("kind,changes,message", [
@@ -1380,8 +1377,8 @@ def test_movement_refuses_invalid_constants(tmp_path, kind, changes, message):
         initializer.CopyFrom(numpy_helper.from_array(np.array(value, np.int64), name))
     path = tmp_path / "invalid_indices.onnx"
     onnx.save(case.compile_model, path)
-    with pytest.raises(ClickException, match=message):
-        _run_pipeline(str(path), ("8K",))
+    with pytest.raises(ValueError, match=message):
+        plan_model(str(path), ("8K",))
 
 
 def _bool_graph(kind, quantized=False, count=None):
@@ -1490,7 +1487,7 @@ def test_runtime_index_inputs_narrow_and_keep_their_slot(tmp_path, kind, dtype):
     info.type.tensor_type.elem_type = dtype
     path = tmp_path / "indices.onnx"
     onnx.save(case.compile_model, path)
-    graph, _ = _run_pipeline(str(path), ("8K",))
+    graph = plan_model(str(path), ("8K",))
     assert graph.tensors[name].dtype == 6
     assert validate_execution_dtype(graph).supported
     plan = read_binary_plan(emit_binary_bytes(graph))
@@ -1501,8 +1498,8 @@ def test_runtime_index_inputs_narrow_and_keep_their_slot(tmp_path, kind, dtype):
     graph.ops.pop()
     info.type.tensor_type.elem_type = 1
     onnx.save(case.compile_model, path)
-    with pytest.raises(ClickException, match="indices must be unquantized int32 or int64"):
-        _run_pipeline(str(path), ("8K",))
+    with pytest.raises(ValueError, match="indices must be unquantized int32 or int64"):
+        plan_model(str(path), ("8K",))
 
 
 def test_float_section_can_produce_a_typed_comparison():

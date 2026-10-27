@@ -28,8 +28,9 @@ from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import OpNode, Stage
 from tigris.loaders import load_model
+from tigris.pipeline import plan_model
 
-from conftest import full_pipeline, save_onnx
+from conftest import save_onnx
 
 
 # Fixtures
@@ -805,7 +806,7 @@ def test_padded_chain_fits_two_rows_without_unused_output_rows(tmp_path):
                      [helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)],
                      [helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)],
                      initializers, filename="chain.onnx")
-    ag = full_pipeline(path, budget=32768, chains=True)
+    ag = plan_model(path, (32768,))
     head = ag.stages[0]
     assert head.chain_len == 4
     assert head.chain_tile_h == 2
@@ -817,7 +818,7 @@ def test_padded_chain_fits_two_rows_without_unused_output_rows(tmp_path):
 class TestDetectChains:
     def test_linear_chain_detected(self, three_conv_chain_path):
         """Three consecutive Conv+Relu stages should form a single chain."""
-        ag = full_pipeline(three_conv_chain_path, budget=32000, chains=True)
+        ag = plan_model(three_conv_chain_path, (32000,))
 
         # Should have multiple stages (tight budget forces partitioning)
         assert len(ag.stages) >= 2
@@ -838,7 +839,7 @@ class TestDetectChains:
         the two changes the rows, so the Add cannot join and read the carried
         tensor; the chain has to stop before the Relu's output leaves it.
         """
-        ag = full_pipeline(chain_with_fanout_path, budget=32000, chains=True)
+        ag = plan_model(chain_with_fanout_path, (32000,))
 
         readers: dict[str, set[int]] = {}
         for index, stage in enumerate(ag.stages):
@@ -879,7 +880,7 @@ class TestChainPlanFormat:
     def test_chain_fields_roundtrip(self, three_conv_chain_path):
         """Chain fields survive binary write -> read, and chaining leaves the
         ops and tensors of the loose-budget pipeline unchanged."""
-        ag = full_pipeline(three_conv_chain_path, budget=32000, chains=True)
+        ag = plan_model(three_conv_chain_path, (32000,))
         assert any(s.chain_len >= 2 for s in ag.stages)
 
         plan = read_binary_plan(emit_binary_bytes(ag))
@@ -902,7 +903,7 @@ class TestChainPlanFormat:
                 assert s["chain_id"] == chain_id
                 assert s["chain_len"] == chain_len
 
-        ag_loose = full_pipeline(three_conv_chain_path, budget=10 * 1024 * 1024, chains=True)
+        ag_loose = plan_model(three_conv_chain_path, (10 * 1024 * 1024,))
         assert len(ag.ops) == len(ag_loose.ops)
         for a, b in zip(ag.ops, ag_loose.ops):
             assert a.op_type == b.op_type
@@ -912,7 +913,7 @@ class TestChainPlanFormat:
 
     def test_standalone_stages_have_no_chain(self, three_conv_chain_path):
         """Stages not in a chain should have chain_id=0xFFFF, chain_len=0."""
-        ag = full_pipeline(three_conv_chain_path, budget=10 * 1024 * 1024, chains=True)
+        ag = plan_model(three_conv_chain_path, (10 * 1024 * 1024,))
 
         data = emit_binary_bytes(ag)
         plan = read_binary_plan(data)
@@ -925,7 +926,7 @@ class TestChainPlanFormat:
 
     def test_chain_clears_individual_tile_plans(self, three_conv_chain_path):
         """Stages in a chain should not have individual tile plans."""
-        ag = full_pipeline(three_conv_chain_path, budget=32000, chains=True)
+        ag = plan_model(three_conv_chain_path, (32000,))
 
         chained = [s for s in ag.stages if s.chain_len >= 2]
         for s in chained:
@@ -938,7 +939,7 @@ class TestChainPlanFormat:
 class TestChainExecution:
     def test_chain_tile_h_fits_budget(self, three_conv_chain_path):
         """Solved chain_tile_h should produce tile buffers within budget."""
-        ag = full_pipeline(three_conv_chain_path, budget=32000, chains=True)
+        ag = plan_model(three_conv_chain_path, (32000,))
 
         for s in ag.stages:
             if s.chain_len >= 2 and s.chain_id == s.stage_id:

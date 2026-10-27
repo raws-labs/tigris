@@ -5,87 +5,9 @@ from pathlib import Path
 
 import click
 
-from tigris.cli import (
-    cli,
-    text,
-    _memory_sizes,
-    _parse_input_shape,
-    _parse_size,
-    _report_shape_bindings,
-    _run_pipeline,
-)
+from tigris.cli import _memory_sizes, _parse_input_shape, _planned, cli, text
+from tigris.pipeline import parse_size
 from tigris.utils import fmt_bytes
-
-
-def _run_compressed_pipeline(
-    model: str,
-    mem: tuple[str, ...],
-    input_shapes: dict[str, tuple[int, ...]] | None = None,
-):
-    """Plan a compressed model against its actual activation capacity.
-
-    Weight blocks depend on stage boundaries, while stage boundaries depend on
-    the memory left after reserving those blocks.  Re-plan until the computed
-    reservation fits the reservation used for partitioning.  Keeping the
-    larger value on a changing layout is conservative: the emitted plan can
-    never require more fast memory than the caller supplied.
-    """
-    from tigris.emitters.binary.writer import compressed_weight_reserve_bytes
-
-    reserve = 0
-    # Each additional reservation can only be introduced by a stage layout;
-    # this bound also turns an accidental planner oscillation into a clear
-    # compiler error instead of an unbounded command.
-    max_attempts = 64
-    for _ in range(max_attempts):
-        # The loop re-plans the same model, so only the final pass reports
-        # the bound input dimensions.
-        ag, total_budget = _run_pipeline(
-            model,
-            mem,
-            fast_reserve_bytes=reserve,
-            input_shapes=input_shapes,
-            report_bindings=False,
-        )
-        try:
-            required = compressed_weight_reserve_bytes(ag)
-        except ValueError as exc:
-            raise click.ClickException(f"Cannot compress the plan: {exc}") from exc
-        if required <= reserve:
-            # ``mem_budget`` is already the reduced activation capacity.  The
-            # writer uses this marker to avoid subtracting the same reserve a
-            # second time from the serialized plan budget.
-            ag.budget = replace(ag.budget, fast_reserve=required)
-            return ag, total_budget, reserve, required
-        reserve = required
-
-    raise click.ClickException(
-        "Compressed-weight reservation did not converge after "
-        f"{max_attempts} planning attempts"
-    )
-
-
-def plan_model(
-    model: str,
-    mem: tuple[str, ...],
-    *,
-    compress: str | None,
-    input_shapes: dict[str, tuple[int, ...]] | None = None,
-    report_bindings: bool = True,
-):
-    """Plan a model the way ``tigris compile`` does.
-
-    Returns the graph, the caller's total fast budget, and the fast bytes
-    reserved for decompressed weights (0 without ``compress="lz4"``).
-    """
-    if compress == "lz4":
-        ag, budget, _, weight_reserve = _run_compressed_pipeline(model, mem, input_shapes)
-        if report_bindings:
-            _report_shape_bindings(ag)
-        return ag, budget, weight_reserve
-    ag, budget = _run_pipeline(model, mem, input_shapes=input_shapes,
-                               report_bindings=report_bindings)
-    return ag, budget, 0
 
 
 @cli.command()
@@ -110,10 +32,10 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     compress_arg = compress if compress != "none" else None
-    ag, budget, weight_reserve = plan_model(model, mem, compress=compress_arg,
-                                            input_shapes=input_shape)
+    ag = _planned(model, mem, compress=compress_arg, input_shapes=input_shape)
+    budget = parse_size(mem[0])
 
-    ag.budget = replace(ag.budget, flash=_parse_size(flash) if flash else 0)
+    ag.budget = replace(ag.budget, flash=parse_size(flash) if flash else 0)
 
     from tigris.analysis.findings import compute_findings
     from tigris.cli.analyze import summary
@@ -151,6 +73,6 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     text.echo()
     note = ""
     if compress_arg:
-        note = (f", LZ4, {fmt_bytes(weight_reserve)} of the {fmt_bytes(budget)} fast memory "
-                f"holds decompressed weights")
+        note = (f", LZ4, {fmt_bytes(ag.fast_memory_reserve_bytes)} of the {fmt_bytes(budget)} "
+                "fast memory holds decompressed weights")
     text.echo(f"wrote {out}   {fmt_bytes(len(plan_data))}{note}")

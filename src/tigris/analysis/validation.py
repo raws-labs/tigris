@@ -703,18 +703,13 @@ class MemoryPlanValidation:
         return not self.issues
 
 
-def validate_memory_plan(
-    ag: AnalyzedGraph, *, fast_reserve_bytes: int = 0
-) -> MemoryPlanValidation:
+def validate_memory_plan(ag: AnalyzedGraph) -> MemoryPlanValidation:
     """Validate that every stage or chain fits the fast-memory budget.
 
     A zero budget means no deployment constraint was requested.  Structural
     analysis and binary-format tests may use that mode; the deployment CLI
     separately requires a positive budget before emitting a plan.
     """
-    if fast_reserve_bytes < 0:
-        raise ValueError("fast_reserve_bytes must not be negative")
-
     budget = ag.mem_budget
     if budget <= 0:
         return MemoryPlanValidation(scheduled_peak_bytes=0, issues=())
@@ -722,11 +717,8 @@ def validate_memory_plan(
     issues: list[MemoryPlanIssue] = []
     scheduled_peak = 0
 
-    for stage, activation_required, reason, invalid in _execution_units(ag):
-        required = activation_required + fast_reserve_bytes
+    for stage, required, reason, invalid in _execution_units(ag):
         scheduled_peak = max(scheduled_peak, required)
-        if fast_reserve_bytes:
-            reason = f"{reason}; {fmt_bytes(fast_reserve_bytes)} reserved for weights"
         if invalid or required > budget:
             issues.append(
                 MemoryPlanIssue(
@@ -749,7 +741,7 @@ def validate_memory_plan(
 
     # The subgraphs control flow runs use the same fast arena in turn.
     for position, sub in enumerate(ag.subgraphs, start=1):
-        nested = validate_memory_plan(sub, fast_reserve_bytes=fast_reserve_bytes)
+        nested = validate_memory_plan(sub)
         scheduled_peak = max(scheduled_peak, nested.scheduled_peak_bytes)
         issues.extend(replace(issue, reason=f"{issue.reason} (subgraph {position})",
                               subgraph=position)

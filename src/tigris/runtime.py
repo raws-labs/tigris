@@ -38,6 +38,9 @@ TRACE_KINDS = {1: "stage_begin", 2: "stage_end", 3: "tile_begin", 4: "load", 5: 
 TRACE_PATHS = {0: "normal", 1: "tiled", 2: "tiled_2d", 3: "by_input", 4: "transpose", 5: "rows",
                6: "reshape", 7: "chain", 8: "control"}
 _NONE_U16 = 0xFFFF
+# What an execution unit of each path is called in a trace.
+_UNIT_KINDS = {"normal": "untiled", "tiled": "1D tile", "tiled_2d": "2D tile", "by_input": "reduce by rows",
+               "transpose": "transpose", "rows": "row bands", "reshape": "reshape bands", "control": "control"}
 
 # A platform wheel stages the host library here; a pure wheel has no such directory.
 _NATIVE = Path(__file__).with_name("native")
@@ -333,3 +336,52 @@ class Session:
     def __del__(self):
         if getattr(self, "_handle", None):
             self.close()
+
+
+def trace_units(plan: dict, events: list[dict]) -> list[dict]:
+    """Group the events of ``Session.trace`` into execution units, one per
+    stage or chain, in the order they ran, with what each read, wrote and held."""
+    result, current = [], None
+    for event in events:
+        if event["kind"] == "stage_begin":
+            stage = plan["stages"][event["stage"]] if event["stage"] is not None else None
+            kind = (f"chain {stage['chain_len']}" if event["path"] == "chain" and stage
+                    else _UNIT_KINDS.get(event["path"], event["path"]))
+            current = {"stage": event["stage"], "path": event["path"], "kind": kind, "tiles": 0, "read": 0, "written": 0,
+                       "weights": 0, "copied": 0, "fast_peak": event["fast_used"],
+                       "slow_used": event["slow_used"], "events": []}
+            result.append(current)
+            continue
+        if current is None:
+            continue
+        current["events"].append(event)
+        current["fast_peak"] = max(current["fast_peak"], event["fast_used"])
+        current["slow_used"] = max(current["slow_used"], event["slow_used"])
+        kind = event["kind"]
+        if kind == "tile_begin":
+            current["tiles"] += 1
+        elif kind == "load":
+            current["read"] += event["bytes"]
+        elif kind == "spill":
+            current["written"] += event["bytes"]
+        elif kind == "weights":
+            current["weights"] += event["bytes"]
+        elif kind == "copy":
+            current["copied"] += event["bytes"]
+        elif kind == "stage_end":
+            current = None
+    return result
+
+
+def check_trace(events: list[dict], counters: dict[str, int]) -> list[str]:
+    """Differences between the events of ``Session.trace`` and the runtime's own counters."""
+    sums = {"load_bytes": "load", "spill_bytes": "spill", "weight_bytes": "weights", "copy_bytes": "copy"}
+    problems = []
+    for counter, kind in sums.items():
+        total = sum(event["bytes"] for event in events if event["kind"] == kind)
+        if total != counters[counter]:
+            problems.append(f"{kind} events add up to {total} bytes, the runtime counted {counters[counter]}")
+    tiles = sum(event["kind"] == "tile_begin" for event in events)
+    if tiles != counters["tiles"]:
+        problems.append(f"{tiles} tile events, the runtime counted {counters['tiles']} tiles")
+    return problems

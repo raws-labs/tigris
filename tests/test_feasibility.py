@@ -12,8 +12,9 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris import SCHEMA_VERSION
 from tigris.analysis.findings import compute_findings
 from tigris.analysis.validation import validate_memory_plan
-from tigris.cli import _run_pipeline, cli
+from tigris.cli import cli
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.pipeline import plan_model
 
 from conftest import save_onnx
 
@@ -54,7 +55,7 @@ def test_a_global_reduction_tiles_along_its_input(tmp_path):
     model_path = _write_oversized_height_op_model(
         tmp_path, "GlobalAveragePool")
 
-    graph, _ = _run_pipeline(str(model_path), ("4K",))
+    graph = plan_model(str(model_path), ("4K",))
     tile_plans = [
         stage.tile_plan for stage in graph.stages if stage.tile_plan is not None
     ]
@@ -71,7 +72,7 @@ def test_a_global_reduction_cuts_a_row_that_does_not_fit(tmp_path):
     model_path = _write_oversized_height_op_model(
         tmp_path, "GlobalAveragePool")
 
-    graph, _ = _run_pipeline(str(model_path), ("1K",))
+    graph = plan_model(str(model_path), ("1K",))
     tile_plans = [
         stage.tile_plan for stage in graph.stages if stage.tile_plan is not None
     ]
@@ -107,7 +108,7 @@ def test_minimum_tile_that_exceeds_budget_is_infeasible(conv_relu_chain_path):
     # 2D tile solve is attempted once the 1D single-row tile also overflows
     # and reports its own distinct "minimum 2D tile" reason, not the generic
     # 1D "minimum spatial tile" fallback.
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
+    graph = plan_model(str(conv_relu_chain_path), ("300",))
 
     validation = validate_memory_plan(graph)
 
@@ -117,7 +118,7 @@ def test_minimum_tile_that_exceeds_budget_is_infeasible(conv_relu_chain_path):
 
 
 def test_findings_never_pass_when_scheduled_peak_exceeds_budget(conv_relu_chain_path):
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
+    graph = plan_model(str(conv_relu_chain_path), ("300",))
 
     findings = compute_findings(graph)
 
@@ -168,7 +169,7 @@ def test_compile_rejects_budget_above_plan_format_limit(
 
 
 def test_writer_defensively_rejects_infeasible_graph(conv_relu_chain_path):
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("300",))
+    graph = plan_model(str(conv_relu_chain_path), ("300",))
 
     with pytest.raises(ValueError, match="Cannot emit an infeasible memory plan"):
         emit_binary_bytes(graph)
@@ -177,7 +178,7 @@ def test_writer_defensively_rejects_infeasible_graph(conv_relu_chain_path):
 def test_writer_defensively_rejects_budget_above_plan_format_limit(
     linear_3op_path,
 ):
-    graph, _ = _run_pipeline(str(linear_3op_path), ("4K",))
+    graph = plan_model(str(linear_3op_path), ("4K",))
     graph.budget = replace(graph.budget, fast=0x1_0000_0000)
 
     with pytest.raises(ValueError, match="uint32 plan-format limit"):
@@ -209,7 +210,7 @@ def test_compile_writes_the_writer_bytes_for_its_flags(conv_relu_chain_path, tmp
     result = CliRunner().invoke(
         cli, ["compile", str(conv_relu_chain_path), "-m", "16K", *flags, "-o", str(output)])
     assert result.exit_code == 0, result.output
-    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("16K",), report_bindings=False)
+    graph = plan_model(str(conv_relu_chain_path), ("16K",))
     assert output.read_bytes() == emit_binary_bytes(graph, xip=xip, names=names)
 
 
@@ -223,7 +224,7 @@ def test_a_graph_without_activations_is_gated_like_any_other(tmp_path):
     model.ir_version = 8
     path = tmp_path / "const_only.onnx"
     onnx.save(model, path)
-    graph, _ = _run_pipeline(str(path), ("16K",), report_bindings=False)
+    graph = plan_model(str(path), ("16K",))
     assert not graph.lifetimes
     findings = compute_findings(graph)
     assert findings.verdict == "needs_work"
@@ -282,14 +283,14 @@ def test_plan_and_simulate_are_removed(conv_relu_chain_path, command):
     assert f"No such command '{command}'" in result.output
 
 
-def test_run_pipeline_records_slow_tier(conv_relu_chain_path):
-    ag, total = _run_pipeline(str(conv_relu_chain_path), ("64K", "8M"))
+def test_plan_model_records_slow_tier(conv_relu_chain_path):
+    ag = plan_model(str(conv_relu_chain_path), ("64K", "8M"))
     assert ag.budget.slow == 8 * 1024 * 1024
-    assert ag.budget.fast + ag.budget.fast_reserve == total
+    assert ag.budget.fast + ag.budget.fast_reserve == 64 * 1024
 
 
-def test_run_pipeline_no_slow_tier_is_zero(conv_relu_chain_path):
-    ag, _ = _run_pipeline(str(conv_relu_chain_path), ("64K",))
+def test_plan_model_no_slow_tier_is_zero(conv_relu_chain_path):
+    ag = plan_model(str(conv_relu_chain_path), ("64K",))
     assert ag.budget.slow == 0
 
 
@@ -374,7 +375,7 @@ def test_int8_global_pool_refuses_an_overflowing_sum(tmp_path, budget):
                   _scalars(x=(0.125, -128), y=(0.25, 9)))
     source = tmp_path / "large.onnx"
     onnx.save(model, source)
-    graph, _ = _run_pipeline(str(source), (budget, "32M"))
+    graph = plan_model(str(source), (budget, "32M"))
     assert not validate_operator_support(graph).supported
     path = tmp_path / "large.tgrs"
     with pytest.raises(ValueError):
@@ -400,7 +401,7 @@ def test_a_stage_that_runs_untiled_names_its_operator_in_full(tmp_path):
                      [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 256])],
                      [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 10])],
                      [w], ir_version=8)
-    graph, _ = _run_pipeline(str(path), ("256",))
+    graph = plan_model(str(path), ("256",))
 
     assert [issue.reason for issue in validate_memory_plan(graph).issues] == ["runs untiled: fc (head)"]
     assert compute_findings(graph).untileable_op_types == ["Gemm"]

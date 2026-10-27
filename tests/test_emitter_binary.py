@@ -17,7 +17,6 @@ from tigris import (
     TILE_AXIS_HEIGHT_OR_LENGTH,
     TILE_AXIS_HW,
 )
-from tigris.cli.compile import _run_compressed_pipeline
 from tigris.emitters.binary import defs
 from tigris.emitters.binary.defs import (
     HEADER_SIZE,
@@ -50,8 +49,9 @@ from tigris.graph.ir import (
     TensorInfo,
     TilePlan,
 )
+from tigris.pipeline import plan_model
 
-from conftest import full_pipeline, save_onnx, section_entries
+from conftest import save_onnx, section_entries
 
 
 # Quant param pages
@@ -109,7 +109,7 @@ def test_v3_quant_param_rejects_arrays_that_cannot_fit_one_page():
 
 
 def test_roundtrip_linear(linear_3op_path, tmp_path):
-    ag = full_pipeline(linear_3op_path)
+    ag = plan_model(linear_3op_path)
     out = tmp_path / "test.tgrs"
     emit_binary(ag, out)
     data = out.read_bytes()
@@ -150,7 +150,7 @@ def test_roundtrip_linear(linear_3op_path, tmp_path):
 
 
 def test_roundtrip_conv_chain(conv_relu_chain_path):
-    ag = full_pipeline(conv_relu_chain_path, budget=6144)
+    ag = plan_model(conv_relu_chain_path, (6144,), chains=False)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -178,7 +178,7 @@ def test_roundtrip_conv_chain(conv_relu_chain_path):
 
 def test_roundtrip_conv_pool(conv_pool_chain_path):
     # This fixture has a feasible 4 KiB tile plan: both Conv stages take 2D tiles, the pool a stripe.
-    ag = full_pipeline(conv_pool_chain_path, budget=4096)
+    ag = plan_model(conv_pool_chain_path, (4096,), chains=False)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -214,7 +214,7 @@ def test_roundtrip_conv_pool(conv_pool_chain_path):
 
 
 def test_tensor_sizes(conv_relu_chain_path):
-    ag = full_pipeline(conv_relu_chain_path)
+    ag = plan_model(conv_relu_chain_path)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
 
@@ -271,7 +271,7 @@ def test_schema_v5_stage_table_supports_more_than_256_stages():
 
 
 def test_writer_rejects_reserved_width_axis(conv_pool_chain_path):
-    ag = full_pipeline(conv_pool_chain_path, budget=4096)
+    ag = plan_model(conv_pool_chain_path, (4096,), chains=False)
     stage = next(item for item in ag.stages if item.tile_plan is not None)
     stage.tile_plan.axis = 2
 
@@ -282,7 +282,7 @@ def test_writer_rejects_reserved_width_axis(conv_pool_chain_path):
 @pytest.mark.parametrize("kind,mode", [(0, 0), (8, 0), (TILE_BAND_KIND_STRIPE, TILE_BAND_MODE_LEADING),
                                        (TILE_BAND_KIND_LEADING, 0), (TILE_BAND_KIND_LEADING, 16)])
 def test_writer_rejects_a_tile_plan_without_a_band_kind(conv_pool_chain_path, kind, mode):
-    ag = full_pipeline(conv_pool_chain_path, budget=4096)
+    ag = plan_model(conv_pool_chain_path, (4096,), chains=False)
     stage = next(item for item in ag.stages if item.tile_plan is not None)
     stage.tile_plan.band_kind, stage.tile_plan.band_mode = kind, mode
 
@@ -308,10 +308,10 @@ def test_writer_rejects_a_tile_plan_without_a_band_kind(conv_pool_chain_path, ki
 def test_all_fixtures(request, fixture, model_name, num_ops, num_weights, plan_kind):
     path = request.getfixturevalue(fixture)
     if plan_kind == "lz4":
-        ag = _run_compressed_pipeline(str(path), ("32K",))[0]
+        ag = plan_model(str(path), ("32K",), compress="lz4")
         plan = read_binary_plan(emit_binary_bytes(ag, compress="lz4"))
     else:
-        ag = full_pipeline(path, budget=8192 if plan_kind == "budget" else 0)
+        ag = plan_model(path, (8192,) if plan_kind == "budget" else (), chains=False)
         plan = read_binary_plan(emit_binary_bytes(ag))
 
     assert plan["magic"] == MAGIC
@@ -465,7 +465,7 @@ def test_immutable_supported_schema_fixtures():
     [0, 1, max(SUPPORTED_SCHEMA_VERSIONS), max(SUPPORTED_SCHEMA_VERSIONS) + 1],
 )
 def test_schema_version_validation(linear_3op_path, version):
-    ag = full_pipeline(linear_3op_path)
+    ag = plan_model(linear_3op_path)
     data = bytearray(emit_binary_bytes(ag))
     struct.pack_into("<I", data, 4, version)
 
@@ -501,9 +501,9 @@ def test_plan_states_its_scheduled_fast_peak(conv_relu_chain_path, compress):
     from tigris.analysis.validation import scheduled_fast_peak, validate_memory_plan
 
     if compress:
-        ag, _, _, _ = _run_compressed_pipeline(str(conv_relu_chain_path), ("16K",))
+        ag = plan_model(str(conv_relu_chain_path), ("16K",), compress="lz4")
     else:
-        ag = full_pipeline(conv_relu_chain_path, budget=4096)
+        ag = plan_model(conv_relu_chain_path, (4096,))
     plan = read_binary_plan(emit_binary_bytes(ag, compress=compress))
     assert plan["scheduled_peak"] == scheduled_fast_peak(ag) > 0
     assert plan["scheduled_peak"] == validate_memory_plan(ag).scheduled_peak_bytes
@@ -512,7 +512,7 @@ def test_plan_states_its_scheduled_fast_peak(conv_relu_chain_path, compress):
 
 
 def test_memory_section_belongs_to_schema_11(linear_3op_path):
-    data = emit_binary_bytes(full_pipeline(linear_3op_path, budget=4096))
+    data = emit_binary_bytes(plan_model(linear_3op_path, (4096,)))
     entry = section_entries(data)[defs.SEC_MEMORY][0]
     older = bytearray(data)
     struct.pack_into("<I", older, 4, 10)
@@ -528,7 +528,7 @@ def test_memory_section_belongs_to_schema_11(linear_3op_path):
 
 
 def test_missing_required_section_is_rejected_cleanly(linear_3op_path):
-    ag = full_pipeline(linear_3op_path)
+    ag = plan_model(linear_3op_path)
     data = bytearray(emit_binary_bytes(ag))
     struct.pack_into("<II", data, HEADER_SIZE, 0, 0)
 
@@ -662,13 +662,13 @@ def _reduce_mean_model(path, shape, axes, keepdims, projected=False):
 
 
 def test_a_spatial_mean_over_both_image_axes_becomes_a_global_pool(tmp_path):
-    ag = full_pipeline(_reduce_mean_model(
+    ag = plan_model(_reduce_mean_model(
         tmp_path / "gap.onnx", [1, 4, 8, 8], (2, 3), keepdims=True))
     assert [op.op_type for op in ag.ops] == ["GlobalAveragePool"]
 
 
 def test_a_mean_over_one_axis_keeps_its_operator_and_states_the_axis(tmp_path):
-    ag = full_pipeline(_reduce_mean_model(
+    ag = plan_model(_reduce_mean_model(
         tmp_path / "tokens.onnx", [1, 12, 8], (1,), keepdims=True,
         projected=True))
     assert "ReduceMean" in [op.op_type for op in ag.ops]
@@ -689,7 +689,7 @@ def test_a_mean_over_a_stored_axis_is_emitted_where_the_runtime_holds_it(
     over the channel axis of an NCL tensor is a mean over the last stored axis,
     and emitting the model's own number would collapse the wrong one.
     """
-    ag = full_pipeline(_reduce_mean_model(
+    ag = plan_model(_reduce_mean_model(
         tmp_path / "channels.onnx", [1, 12, 8], (1,), keepdims=True))
     plan = read_binary_plan(emit_binary_bytes(ag))
     axes = [a for a in plan["op_attributes"] if a["type"] == OP_ATTR_AXES]
@@ -730,7 +730,7 @@ def _pool_model(path, pool, quantized):
 
 
 def _pool_rounding_records(tmp_path, pool, quantized):
-    ag = full_pipeline(_pool_model(tmp_path / "pool.onnx", pool, quantized))
+    ag = plan_model(_pool_model(tmp_path / "pool.onnx", pool, quantized))
     assert "GlobalAveragePool" in [op.op_type for op in ag.ops]
     plan = read_binary_plan(emit_binary_bytes(ag))
     return [a for a in plan["op_attributes"] if a["type"] == defs.OP_ATTR_POOL_ROUNDING]
@@ -757,11 +757,9 @@ def test_an_int8_global_average_pool_stays_a_mean(tmp_path):
 def test_quantization_entries_are_only_those_the_plan_reads(name, constants):
     """Convolution weights and biases need no entry: their scales are folded
     into the effective scale of the activation they produce."""
-    from tigris.cli import _run_pipeline
     from tigris.emitters.binary.writer import _build_quant_params
 
-    graph, _ = _run_pipeline(str(Path(__file__).parent / "fixtures" / "tflite" / name), ("256K",),
-                             report_bindings=False)
+    graph = plan_model(str(Path(__file__).parent / "fixtures" / "tflite" / name), ("256K",))
     _, index = _build_quant_params(graph)
     activations = {n for n, t in graph.tensors.items() if t.quant is not None and not t.is_constant}
     assert activations <= set(index)
@@ -780,10 +778,8 @@ def test_a_scale_below_the_shift_range_quantizes_to_zero(scale, expected):
 
 def test_vww_plan_shifts_stay_within_31_bits():
     """VWW has channels whose effective scale is below 2^-32."""
-    from tigris.cli import _run_pipeline
 
-    graph, _ = _run_pipeline(str(Path(__file__).parent / "fixtures" / "tflite" / "vww_96_int8.tflite"),
-                             ("256K",), report_bindings=False)
+    graph = plan_model(str(Path(__file__).parent / "fixtures" / "tflite" / "vww_96_int8.tflite"), ("256K",))
     shifts = [s for qp in read_binary_plan(emit_binary_bytes(graph))["quant_params"]
               for s in qp.get("shifts", [])]
     assert shifts and min(shifts) >= -31
@@ -792,7 +788,6 @@ def test_vww_plan_shifts_stay_within_31_bits():
 def test_attribute_payloads_start_four_byte_aligned(tmp_path):
     """A three-byte transpose permutation ahead of a Pad's int32 pads must not
     leave the pads at an offset the loader refuses."""
-    from tigris.cli import _run_pipeline
     from tigris.emitters.binary.defs import (OP_ATTR_PADS, OP_ATTRIBUTE_SECTION_HEADER_STRUCT,
                                              OP_ATTRIBUTE_STRUCT)
     from tigris.emitters.binary.writer import _build_op_attributes, _op_attribute_records
@@ -804,7 +799,7 @@ def test_attribute_payloads_start_four_byte_aligned(tmp_path):
                      [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 7, 3])],
                      [numpy_helper.from_array(np.array([0, 1, 0, 0, 1, 0], dtype=np.int64), "pads")],
                      opset=17, ir_version=8)
-    graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
+    graph = plan_model(str(path), ("64K",))
     tensor_idx = {name: i for i, name in enumerate(n for n, t in graph.tensors.items() if not t.is_constant)}
     section = _build_op_attributes(_op_attribute_records(graph, tensor_idx, {}, {}))
     count, _ = OP_ATTRIBUTE_SECTION_HEADER_STRUCT.unpack_from(section)
@@ -832,7 +827,6 @@ def _softmax_over_a_constant(graph):
 
 
 def _contract_graph(tmp_path):
-    from tigris.cli import _run_pipeline
 
     path = save_onnx(tmp_path, "contract",
                      [helper.make_node("MatMul", ["input", "w"], ["h"], name="product"),
@@ -841,7 +835,7 @@ def _contract_graph(tmp_path):
                      [helper.make_tensor_value_info("output", TensorProto.FLOAT, [4, 8])],
                      [numpy_helper.from_array(np.eye(8, dtype=np.float32), "w")], opset=17,
                      ir_version=8)
-    graph, _ = _run_pipeline(str(path), ("64K",), report_bindings=False)
+    graph = plan_model(str(path), ("64K",))
     return graph
 
 
@@ -887,14 +881,13 @@ def test_an_operator_writing_no_runtime_tensor_is_named(tmp_path):
 def test_tile_wire_layout(tmp_path, state):
     from scripts.contract_cases.common import _state_tile_case
     from scripts.contract_cases.reduction import _tiled_global_reduction_case
-    from tigris.cli import _run_pipeline
 
     case = _tiled_global_reduction_case()
     if state:
         case = _state_tile_case(case)
     path = tmp_path / "reduction.onnx"
     onnx.save(case.compile_model, path)
-    graph, _ = _run_pipeline(str(path), (case.mem_budget,))
+    graph = plan_model(str(path), (case.mem_budget,))
     data = emit_binary_bytes(graph)
     plan = read_binary_plan(data)
     tile = next(stage.tile_plan for stage in graph.stages if stage.tile_plan is not None)
@@ -918,7 +911,6 @@ def test_tile_wire_layout(tmp_path, state):
 def test_compact_preserved_axis_transpose(tmp_path):
     from scripts.contract_cases.common import _state_tile_case
     from scripts.contract_cases.movement import _fixed_axis_transpose_case
-    from tigris.cli import _run_pipeline
     from tigris.runtime import Session
 
     case = _state_tile_case(_fixed_axis_transpose_case())
@@ -926,7 +918,7 @@ def test_compact_preserved_axis_transpose(tmp_path):
     onnx.save(case.compile_model, source)
     outputs = []
     for budget in ("512", "8K"):
-        graph, _ = _run_pipeline(str(source), (budget, "16K"))
+        graph = plan_model(str(source), (budget, "16K"))
         path = tmp_path / (budget + ".tgrs")
         path.write_bytes(emit_binary_bytes(graph))
         plan = read_binary_plan(path.read_bytes())
@@ -945,13 +937,12 @@ def test_compact_preserved_axis_transpose(tmp_path):
 @pytest.mark.usefixtures("require_host_library")
 def test_loader_refuses_incomplete_group_geometry(tmp_path, field_offset):
     from scripts.contract_cases.reduction import _grouped_global_reduction_case
-    from tigris.cli import _run_pipeline
     from tigris.runtime import Session, RuntimeError as HostError
 
     case = _grouped_global_reduction_case(False, True)
     source = tmp_path / "gap.onnx"
     onnx.save(case.compile_model, source)
-    graph, _ = _run_pipeline(str(source), (case.mem_budget, "16K"))
+    graph = plan_model(str(source), (case.mem_budget, "16K"))
     data = bytearray(emit_binary_bytes(graph))
     struct.pack_into("<I", data, section_entries(data)[defs.SEC_TILE_PLANS][1] + field_offset, 0)
     plan = read_binary_plan(data)

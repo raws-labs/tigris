@@ -5,8 +5,9 @@ from onnx import TensorProto, helper, numpy_helper
 
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.pipeline import plan_model
 
-from conftest import full_pipeline, save_onnx
+from conftest import save_onnx
 
 
 def test_onnx_default_conv_stride_and_dilation_emit_as_one(tmp_path):
@@ -23,7 +24,7 @@ def test_onnx_default_conv_stride_and_dilation_emit_as_one(tmp_path):
                      [helper.make_node("Conv", ["input", "weights"], ["output"])], [model_input],
                      [model_output], [weights], ir_version=8)
 
-    plan = read_binary_plan(emit_binary_bytes(full_pipeline(path, 4096)))
+    plan = read_binary_plan(emit_binary_bytes(plan_model(path, (4096,))))
 
     assert plan["ops"][0]["spatial"]["stride_h"] == 1
     assert plan["ops"][0]["spatial"]["stride_w"] == 1

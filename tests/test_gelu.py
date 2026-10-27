@@ -9,10 +9,10 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris.analysis.validation import validate_budget
-from tigris.cli import _run_pipeline
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import Layout
+from tigris.pipeline import plan_model
 from tigris.runtime import Session
 
 pytestmark = pytest.mark.usefixtures("require_host_library")
@@ -68,7 +68,7 @@ def test_onnx_gelu_forms_match_tiled_and_untiled(shape, approximate, form, tmp_p
     expected = ort.InferenceSession(model.SerializeToString(), options, providers=["CPUExecutionProvider"]).run(None, {"input": values})[0]
     produced = []
     for budget in ("256", "1M"):
-        ag, _ = _run_pipeline(str(source), (budget, "8M"), report_bindings=False)
+        ag = plan_model(str(source), (budget, "8M"))
         assert [op.op_type for op in ag.ops] == ["Gelu"]
         assert validate_budget(ag).feasible
         plan = tmp_path / f"{budget}.tgrs"
@@ -94,7 +94,7 @@ def test_tflite_gelu_matches_builtin_reference(name, tmp_path):
         assert np.unique(golden['input_0']).size == 256
     tight = "2K" if "wide" in name or "offset" in name else "256"
     for budget in (tight, "1M"):
-        ag, _ = _run_pipeline(str(model), (budget, '8M'), report_bindings=False)
+        ag = plan_model(str(model), (budget, '8M'))
         assert any(op.op_type == 'Gelu' for op in ag.ops)
         plan = tmp_path / f'{budget}.tgrs'
         binary = emit_binary_bytes(ag)

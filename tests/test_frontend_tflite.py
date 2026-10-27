@@ -253,10 +253,10 @@ def test_single_operator_at_a_tight_budget(model, tmp_path, request):
 ])
 @pytest.mark.usefixtures("require_host_library")
 def test_independent_axis_and_reshape_fit_tight_budget(name, kind, tmp_path):
-    from tigris.cli import _run_pipeline
+    from tigris.pipeline import plan_model
 
     model = FIXTURES / "ops" / (name + ".tflite")
-    graph, _ = _run_pipeline(str(model), ("256",), report_bindings=False)
+    graph = plan_model(str(model), ("256",))
     stage = next(stage for stage in graph.stages
                  if any(graph.ops[i].op_type == kind for i in stage.op_indices))
     assert stage.tile_plan.tileable and stage.tile_plan.num_tiles > 1
@@ -281,11 +281,11 @@ def test_reshape_rank_boundary_fits_tight_budget(name, tmp_path):
 ])
 @pytest.mark.usefixtures("require_host_library")
 def test_contiguous_reshape_and_leading_operator_fit_tight_budget(name, kind, count, tmp_path):
-    from tigris.cli import _run_pipeline
+    from tigris.pipeline import plan_model
     from tigris.analysis.validation import validate_memory_plan
 
     model = FIXTURES / "ops" / (name + ".tflite")
-    graph, _ = _run_pipeline(str(model), ("256",), report_bindings=False)
+    graph = plan_model(str(model), ("256",))
     reshapes = [s for s in graph.stages if any(graph.ops[i].op_type == "Reshape" for i in s.op_indices)]
     assert len(reshapes) == count
     oversized = [s for s in reshapes if s.peak_bytes > 256]
@@ -848,11 +848,11 @@ def test_a_variable_is_kept_across_runs_and_reset(tmp_path):
 @pytest.mark.usefixtures("require_host_library")
 def test_grouped_pool_preserves_recorded_outputs(name, tmp_path):
     from dataclasses import replace
-    from tigris.cli import _run_pipeline
+    from tigris.pipeline import plan_model
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     source = FIXTURES / "ops" / (name + ".tflite")
-    graph, _ = _run_pipeline(str(source), ("96", "16K"))
+    graph = plan_model(str(source), ("96", "16K"))
     stage = next(stage for stage in graph.stages if
                  len(stage.op_indices) == 1 and graph.ops[stage.op_indices[0]].op_type == "GlobalAveragePool")
     batch, channels, height, width = graph.tensors[stage.input_tensors[0]].shape
