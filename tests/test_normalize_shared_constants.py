@@ -14,7 +14,7 @@ from tigris.cli import cli
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
 from tigris.loaders.onnx.normalize.adoption import _adopt_detection
-from tigris.loaders.onnx.normalize.relabels import _decompose_silu, _transpose_product_weights
+from tigris.loaders.onnx.normalize.relabels import _transpose_product_weights
 
 
 def _f32(name, value):
@@ -405,18 +405,6 @@ def test_a_quantized_bn_leaves_a_shared_weight_to_its_other_reader(tmp_path):
     assert ag.weight_data[conv_b.inputs[1]][:, :, 0, 0].tolist() == [[50, -25], [30, 10]]
     np.testing.assert_allclose(ag.tensors[conv_b.inputs[1]].quant.scale, [0.01])
     assert ag.weight_data[folded.inputs[1]][:, :, 0, 0].tolist() == [[50, -25], [-30, -10]]
-
-
-def test_each_silu_on_one_input_gets_its_own_sigmoid():
-    graph = AnalyzedGraph(
-        ops=[OpNode(name=f"silu{i}", op_type="Silu", inputs=["x"], outputs=[f"y{i}"]) for i in (1, 2)],
-        tensors={name: TensorInfo(name, (1, 4), TensorProto.FLOAT) for name in ("x", "y1", "y2")},
-        model_inputs=["x"], model_outputs=["y1", "y2"])
-
-    ag = _decompose_silu(graph)
-
-    sigmoids = [op.outputs[0] for op in ag.ops if op.op_type == "Sigmoid"]
-    assert len(set(sigmoids)) == 2 and max(_producers(ag).values()) == 1
 
 
 def test_a_detection_scratch_output_keeps_a_tensor_of_the_same_name():

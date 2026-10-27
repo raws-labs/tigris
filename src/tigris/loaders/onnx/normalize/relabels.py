@@ -322,58 +322,6 @@ def _fold_div_constant_to_mul(ag: AnalyzedGraph) -> AnalyzedGraph:
     return ag
 
 
-def _decompose_silu(ag: AnalyzedGraph) -> AnalyzedGraph:
-    """Replace Silu ops with Sigmoid + Mul sequence.
-
-    SiLU(x) = x * sigmoid(x). Some exporters (e.g. Ultralytics opset-11)
-    already emit Sigmoid + Mul - this pass handles the case where a single
-    ``Silu`` op is present.
-    """
-    new_ops: list[OpNode] = []
-
-    for op in ag.ops:
-        if op.op_type != "Silu":
-            new_ops.append(op)
-            continue
-
-        x_name = op.inputs[0]
-        y_name = op.outputs[0]
-
-        # Create intermediate tensor for sigmoid output
-        sig_name = _fresh_name(ag, f"{x_name}_sigmoid")
-        x_info = ag.tensors.get(x_name)
-        if x_info:
-            ag.tensors[sig_name] = TensorInfo(
-                name=sig_name,
-                shape=x_info.shape,
-                dtype=x_info.dtype,
-                is_constant=False,
-                quant=x_info.quant,
-            )
-
-        # Sigmoid op
-        sig_op = OpNode(
-            name=f"{op.name}/Sigmoid",
-            op_type="Sigmoid",
-            inputs=[x_name],
-            outputs=[sig_name],
-            attrs={},
-        )
-        # Mul op: x * sigmoid(x)
-        mul_op = OpNode(
-            name=f"{op.name}/Mul",
-            op_type="Mul",
-            inputs=[x_name, sig_name],
-            outputs=[y_name],
-            attrs={},
-        )
-        new_ops.append(sig_op)
-        new_ops.append(mul_op)
-
-    ag.ops = new_ops
-    return ag
-
-
 def _relabel_depthwise(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Relabel Conv ops with group == C_in as DepthwiseConv.
 
