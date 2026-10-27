@@ -1,10 +1,7 @@
 """ONNX-specific normalizations; the pass order is the body of ``normalize()``."""
 
 from tigris.graph.ir import AnalyzedGraph
-from tigris.loaders.onnx.normalize.adoption import (
-    _adopt_detection, _adopt_if, _adopt_lstm, _adopt_quantize, _adopt_svdf, _adopt_tflite_cumsum,
-    _adopt_tflite_gelu, _adopt_while, detection_scratch_bytes
-)
+from tigris.loaders.onnx.normalize.adoption import _adopt_compiler_ops, detection_scratch_bytes
 from tigris.loaders.onnx.normalize.attributes import (
     _ceil_mode_as_padding, _explicit_auto_pad, _extract_resize_scales, _lift_pad_operands,
     _mark_untileable_broadcasts, _normalize_arg_outputs, _normalize_reduction_axes,
@@ -43,14 +40,7 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     If or While runs."""
     declared_outputs = list(ag.model_outputs)
     transposed: dict[str, str] = {}
-    ag = _adopt_tflite_gelu(ag)
-    ag = _adopt_tflite_cumsum(ag)
-    ag = _adopt_svdf(ag)
-    ag = _adopt_lstm(ag)
-    ag = _adopt_if(ag)
-    ag = _adopt_while(ag)
-    ag = _adopt_detection(ag)
-    ag = _adopt_quantize(ag)
+    ag = _adopt_compiler_ops(ag)
     ag = _normalize_arg_outputs(ag)
     # Names tigris::Gather and tigris::GatherND: _normalize_movement strips the prefix.
     ag = _narrow_index_casts(ag)

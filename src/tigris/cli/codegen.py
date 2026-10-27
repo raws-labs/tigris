@@ -26,10 +26,10 @@ from tigris.utils import fmt_bytes
 def codegen(plan: str, backend: str, output: str | None,
             output_format: str, header: str | None, core_name: str):
     """Generate C deployment code for a plan."""
+    from tigris.emitters.binary.reader import read_binary_plan
     from tigris.emitters.codegen import generate_c
 
     plan_path = Path(plan)
-    plan_data = plan_path.read_bytes()
 
     if output_format != "core":
         if header is not None:
@@ -40,7 +40,8 @@ def codegen(plan: str, backend: str, output: str | None,
     out = Path(output) if output else plan_path.with_suffix(".c")
     header_path = Path(header) if header else out.with_suffix(".h")
     try:
-        c_source = generate_c(plan_data, backend, output_format, header_path.name, core_name)
+        parsed = read_binary_plan(plan_path.read_bytes(), decompress_weights=False)
+        c_source = generate_c(parsed, backend, output_format, header_path.name, core_name)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -50,10 +51,10 @@ def codegen(plan: str, backend: str, output: str | None,
     if guard[0].isdigit():
         guard = "_" + guard
     out.write_text(c_source)
-    kernels_path.write_text(generate_kernel_config(plan_data, guard))
+    kernels_path.write_text(generate_kernel_config(parsed, guard))
     if output_format == "core":
         from tigris.emitters.codegen import generate_core_header
-        header_path.write_text(generate_core_header(plan_data, core_name))
+        header_path.write_text(generate_core_header(parsed, core_name))
 
     details = f"{output_format}, {backend} backend, {fmt_bytes(len(c_source))}, kernels {kernels_path}"
     if output_format == "core":

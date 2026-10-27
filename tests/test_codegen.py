@@ -146,7 +146,7 @@ def test_codegen_reports_xip_and_loads_plan_at_runtime(linear_3op_path):
     ag = full_pipeline(linear_3op_path, budget=4096)
     data = emit_binary_bytes(ag, xip=True)
 
-    source = generate_c(data, "reference")
+    source = generate_c(read_binary_plan(data), "reference")
 
     assert "XIP:     yes" in source
     assert "static uint8_t *load_file" in source
@@ -170,7 +170,7 @@ def test_codegen_reports_xip_and_loads_plan_at_runtime(linear_3op_path):
 
 def test_posix_codegen_aligns_plan_and_arenas(linear_3op_path, conv_relu_chain_path):
     source = generate_c(
-        emit_binary_bytes(full_pipeline(linear_3op_path, budget=4096)),
+        read_binary_plan(emit_binary_bytes(full_pipeline(linear_3op_path, budget=4096))),
         "reference",
     )
 
@@ -181,7 +181,8 @@ def test_posix_codegen_aligns_plan_and_arenas(linear_3op_path, conv_relu_chain_p
     assert "void *slow_buf = NULL;" in source
     assert "if (!fast_buf || !tensor_ptrs)" in source
     staged = generate_c(
-        emit_binary_bytes(full_pipeline(conv_relu_chain_path, budget=4096)), "reference")
+        read_binary_plan(emit_binary_bytes(full_pipeline(conv_relu_chain_path, budget=4096))),
+        "reference")
     assert "void *slow_buf = allocate_aligned(slow_size)" in staged
     assert "if (!fast_buf || !slow_buf || !tensor_ptrs)" in staged
     assert "tigris_error_t ierr = tigris_input_alloc(&plan, &mem, tidx);" in staged
@@ -189,7 +190,7 @@ def test_posix_codegen_aligns_plan_and_arenas(linear_3op_path, conv_relu_chain_p
 
 def test_quantized_esp_codegen_has_valid_includes(qdq_conv_path):
     ag = full_pipeline(qdq_conv_path, budget=4096)
-    source = generate_c(emit_binary_bytes(ag), "esp-nn")
+    source = generate_c(read_binary_plan(emit_binary_bytes(ag)), "esp-nn")
 
     assert "Kernels: esp-nn -> s8_ref fallback" in source
     assert "if (tigris_esp_nn_prepare(&plan, &mem) != 0)" in source
@@ -211,7 +212,7 @@ def test_quantized_codegen_reads_the_declared_interface(qdq_conv_path):
     """The harness prints what the model declares, not what the plan stores."""
     ag = full_pipeline(qdq_conv_path, budget=4096)
 
-    source = generate_c(emit_binary_bytes(ag), "reference")
+    source = generate_c(read_binary_plan(emit_binary_bytes(ag)), "reference")
 
     assert "tigris_dispatch_kernel_s8" in source
     assert "tigris_output_read(&plan, &mem, tidx, staging, iface_bytes)" in source
@@ -233,7 +234,7 @@ def test_core_codegen_is_embeddable_and_backend_specific(
     ag = full_pipeline(qdq_conv_path, budget=4096)
 
     source = generate_c(
-        emit_binary_bytes(ag), backend, output_format="core",
+        read_binary_plan(emit_binary_bytes(ag)), backend, output_format="core",
         core_header="generated_core.h",
     )
 
@@ -256,7 +257,7 @@ def test_core_codegen_is_embeddable_and_backend_specific(
 
 def test_core_codegen_header_exposes_embedding_api(qdq_conv_path):
     header = generate_core_header(
-        emit_binary_bytes(full_pipeline(qdq_conv_path, budget=4096))
+        read_binary_plan(emit_binary_bytes(full_pipeline(qdq_conv_path, budget=4096)))
     )
 
     assert "tigris_codegen_input_init_fn" in header
@@ -340,7 +341,7 @@ def test_compressed_core_header_uses_plan_alignment_for_arena_requirement(
         for block in plan["weight_blocks"]
     )
 
-    header = generate_core_header(data)
+    header = generate_core_header(read_binary_plan(data))
 
     assert (
         f"TIGRIS_CODEGEN_WEIGHT_DECOMPRESSION_RESERVE_BYTES "
@@ -354,13 +355,41 @@ def test_compressed_core_header_uses_plan_alignment_for_arena_requirement(
     )
 
 
+def test_codegen_reads_the_plan_once_and_leaves_weight_blocks_encoded(
+    qdq_conv_path, tmp_path, monkeypatch,
+):
+    import lz4.block
+
+    import tigris.emitters.binary.reader as reader
+
+    plan_path = tmp_path / "model.tgrs"
+    plan_path.write_bytes(emit_binary_bytes(full_pipeline(qdq_conv_path, budget=4096), compress="lz4"))
+    reads = []
+    read = reader.read_binary_plan
+
+    def counted(data, **options):
+        reads.append(options)
+        return read(data, **options)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("codegen decoded a weight block")
+
+    monkeypatch.setattr(reader, "read_binary_plan", counted)
+    monkeypatch.setattr(lz4.block, "decompress", refuse)
+    result = CliRunner().invoke(
+        cli, ["codegen", str(plan_path), "--format", "core", "-o", str(tmp_path / "core.c")])
+
+    assert result.exit_code == 0, result.output
+    assert reads == [{"decompress_weights": False}]
+
+
 def test_core_codegen_custom_name_is_linkable_alongside_default(qdq_conv_path):
     data = emit_binary_bytes(full_pipeline(qdq_conv_path, budget=4096))
     source = generate_c(
-        data, "reference", output_format="core", core_header="audio_core.h",
+        read_binary_plan(data), "reference", output_format="core", core_header="audio_core.h",
         core_name="audio_codegen",
     )
-    header = generate_core_header(data, "audio_codegen")
+    header = generate_core_header(read_binary_plan(data), "audio_codegen")
 
     assert "audio_codegen_load_plan" in source
     assert "audio_codegen_load_plan" in header
@@ -416,14 +445,14 @@ def test_codegen_rejects_plan_with_mixed_serialized_dtypes(qdq_conv_path):
     with pytest.raises(
         ValueError, match="cannot select one graph-wide runtime dispatcher"
     ):
-        generate_c(bytes(data), "reference")
+        generate_c(read_binary_plan(bytes(data)), "reference")
 
 
 def test_codegen_rejects_plan_without_executable_stages(linear_3op_path):
     ag = full_pipeline(linear_3op_path)
 
     with pytest.raises(ValueError, match="Plan has no executable stages"):
-        generate_c(emit_binary_bytes(ag), "reference")
+        generate_c(read_binary_plan(emit_binary_bytes(ag)), "reference")
 
 
 def test_cmsis_codegen_rejects_unrepresentable_static_slow_arena(
@@ -434,7 +463,7 @@ def test_cmsis_codegen_rejects_unrepresentable_static_slow_arena(
     ag = full_pipeline(linear_3op_path, budget=4096)
     monkeypatch.setattr(codegen, "slow_arena_required", lambda plan: 0x100000000)
     with pytest.raises(ValueError, match="static slow arena exceeds"):
-        generate_c(emit_binary_bytes(ag), "cmsis-nn")
+        generate_c(read_binary_plan(emit_binary_bytes(ag)), "cmsis-nn")
 
 
 @pytest.mark.parametrize("backend", ["reference", "cmsis-nn", "esp-nn"])
@@ -442,7 +471,7 @@ def test_apps_size_the_slow_arena_from_the_plan(conv_relu_chain_path, backend):
     """The slow arena is what the plan needs, not a multiple of the fast budget."""
     data = emit_binary_bytes(full_pipeline(conv_relu_chain_path, budget=4096))
     required = slow_arena_required(read_binary_plan(data))
-    source = generate_c(data, backend)
+    source = generate_c(read_binary_plan(data), backend)
     assert 0 < required < 256 * 1024
     if backend == "cmsis-nn":
         assert f"static uint8_t slow_arena[{required}]" in source
@@ -453,7 +482,7 @@ def test_apps_size_the_slow_arena_from_the_plan(conv_relu_chain_path, backend):
 def test_quantized_cmsis_codegen_checks_prepare_and_memory(qdq_conv_path):
     ag = full_pipeline(qdq_conv_path, budget=4096)
 
-    source = generate_c(emit_binary_bytes(ag), "cmsis-nn")
+    source = generate_c(read_binary_plan(emit_binary_bytes(ag)), "cmsis-nn")
 
     assert "tigris_cmsis_nn_fast_arena_required(&plan)" in source
     assert "Increase TIGRIS_CMSIS_NN_SCRATCH_BYTES" in source
@@ -476,7 +505,7 @@ def test_compressed_cmsis_arena_includes_static_weight_reserve(qdq_conv_path):
         (block["uncompressed_size"] + 15) // 16 * 16 for block in blocks
     )
 
-    source = generate_c(data, "cmsis-nn")
+    source = generate_c(read_binary_plan(data), "cmsis-nn")
 
     expected_core = (plan["scheduled_peak"] + expected_overhead + 15) // 16 * 16
     assert "#define TIGRIS_CMSIS_NN_SCRATCH_BYTES 4096u" in source
@@ -495,7 +524,7 @@ def test_float_accelerated_backend_declares_reference_fallback(
 ):
     ag = full_pipeline(linear_3op_path, budget=4096)
 
-    source = generate_c(emit_binary_bytes(ag), backend)
+    source = generate_c(read_binary_plan(emit_binary_bytes(ag)), backend)
 
     assert (
         f"Kernels: reference (explicit float32 fallback; "
@@ -583,18 +612,18 @@ def test_codegen_writes_the_kernel_selection_header(linear_3op_path, tmp_path):
     from tigris.emitters.codegen import generate_kernel_config, kernel_macros
 
     data = emit_binary_bytes(full_pipeline(linear_3op_path, budget=4096))
-    header = generate_kernel_config(data, "MODEL_KERNELS_H")
+    header = generate_kernel_config(read_binary_plan(data), "MODEL_KERNELS_H")
     assert "#define TIGRIS_KERNEL_DEFAULT 0\n" in header
     macros = kernel_macros(read_binary_plan(data))
     assert macros and all(f"#define {m} 1\n" in header for m in macros)
     assert all(m.startswith("TIGRIS_KERNEL_F32_") for m in macros)
     with pytest.raises(ValueError):
-        generate_kernel_config(data, "not a guard")
+        generate_kernel_config(read_binary_plan(data), "not a guard")
 
     plan_path = tmp_path / "model.tgrs"
     plan_path.write_bytes(data)
     result = CliRunner().invoke(cli, ["codegen", str(plan_path), "-o", str(tmp_path / "app.c")])
     assert result.exit_code == 0, result.output
     written = (tmp_path / "app_kernels.h").read_text()
-    assert written == generate_kernel_config(data, "APP_KERNELS_H")
+    assert written == generate_kernel_config(read_binary_plan(data), "APP_KERNELS_H")
     assert f"kernels {tmp_path / 'app_kernels.h'}" in result.output

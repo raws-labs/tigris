@@ -5,7 +5,9 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
+from tigris.graph.ir import AnalyzedGraph, OpNode
 from tigris.loaders import load_model
+from tigris.loaders.onnx.normalize import normalize
 
 from conftest import save_onnx
 
@@ -367,3 +369,17 @@ def test_a_standard_if_whose_branches_give_different_shapes_is_refused(tmp_path)
         load_model(_save_outer_read(tmp_path, nodes))
 
     assert str(refused.value) == "If branches must take its operands and give its results"
+
+
+@pytest.mark.parametrize("first", ["Quantize", "Svdf"])
+def test_the_first_invalid_compiler_operator_in_graph_order_is_refused(first):
+    ops = {"Quantize": OpNode(name="q", op_type="tigris::Quantize", inputs=["a", "b"], outputs=["c"]),
+           "Svdf": OpNode(name="s", op_type="tigris::Svdf", inputs=["a"], outputs=["d"])}
+    rest = next(kind for kind in ops if kind != first)
+    graph = AnalyzedGraph(ops=[ops[first], ops[rest]])
+
+    with pytest.raises(ValueError) as refused:
+        normalize(graph)
+
+    assert str(refused.value) == {"Quantize": "Quantize requires one input and one output",
+                                  "Svdf": "Svdf requires five inputs and two outputs"}[first]

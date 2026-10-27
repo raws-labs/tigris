@@ -27,7 +27,6 @@ from tigris.analysis.plan_graph import (
     BUILD_LIMIT_DEFAULTS, build_limits_needed, executor_workspace_limits,
     fast_activation_bytes, plan_decompression_reserve, slow_arena_required,
 )
-from tigris.emitters.binary.reader import read_binary_plan
 from tigris.operator_contract import OP_TYPE_BY_CODE
 
 
@@ -131,13 +130,14 @@ def _plan_dtype(plan: dict) -> DTypeMode:
 
 
 def generate_c(
-    plan_data: bytes,
+    plan: dict,
     backend: str,
     output_format: str = "app",
     core_header: str = "tigris_codegen_core.h",
     core_name: str = "tigris_codegen",
 ) -> str:
-    """Generate C deployment code for the given plan and backend.
+    """Generate C deployment code for a plan, as ``read_binary_plan`` returns
+    it, and a backend.
 
     ``app`` is the self-contained example program.  ``core`` is deliberately
     platform-neutral: an application owns flash placement, arena placement,
@@ -153,7 +153,6 @@ def generate_c(
     if output_format == "core":
         _validate_core_name(core_name)
 
-    plan = read_binary_plan(plan_data)
     if not plan["stages"]:
         raise ValueError("Plan has no executable stages; compile it with a memory budget")
     xip = bool(plan["flags"] & FLAG_XIP)
@@ -276,11 +275,11 @@ def kernel_macros(plan: dict) -> list[str]:
     return sorted(macros)
 
 
-def generate_kernel_config(plan_data: bytes, guard: str = "TIGRIS_PLAN_KERNELS_H") -> str:
+def generate_kernel_config(plan: dict, guard: str = "TIGRIS_PLAN_KERNELS_H") -> str:
     """A header that makes the runtime link only the kernels this plan uses."""
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", guard):
         raise ValueError("Header guard must be an ASCII C identifier")
-    lines = "".join(f"#define {macro} 1\n" for macro in kernel_macros(read_binary_plan(plan_data)))
+    lines = "".join(f"#define {macro} 1\n" for macro in kernel_macros(plan))
     return f"""\
 /* Operator kernels this plan uses. Build the TiGrIS runtime with
  * TIGRIS_OP_CONFIG set to this file (the CMake cache variable of that name, or
@@ -295,10 +294,9 @@ def generate_kernel_config(plan_data: bytes, guard: str = "TIGRIS_PLAN_KERNELS_H
 """
 
 
-def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") -> str:
+def generate_core_header(plan: dict, core_name: str = "tigris_codegen") -> str:
     """Return the model-specific public header for ``codegen --format core``."""
     _validate_core_name(core_name)
-    plan = read_binary_plan(plan_data)
     macro_prefix = core_name.upper()
     guard = f"{macro_prefix}_CORE_H"
     weight_reserve = plan_decompression_reserve(plan)

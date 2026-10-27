@@ -1662,7 +1662,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         tile_axis = _stage_tile_axis(ag, stage, stage_ops)
 
         # Check if all ops are tileable
-        untileable: list[str] = []
+        untileable: list[tuple[str, str]] = []
         for op in stage_ops:
             cat = op_category(op)
             if (cat == TileCategory.UNTILEABLE
@@ -1670,7 +1670,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
                     or (_has_unequal_binary_operands(ag, op)
                         and not (tile_axis == TILE_AXIS_HEIGHT_OR_LENGTH
                                  and len(ag.tensors[op.inputs[0]].shape) == 4))):
-                untileable.append(f"{op.name} ({op.op_type})")
+                untileable.append((op.name, op.op_type))
 
         if tile_axis != TILE_AXIS_NONE and not _external_outputs_keep_their_rows(
             stage, stage_ops
