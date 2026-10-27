@@ -168,7 +168,8 @@ class TilePlan:
     original_height: int = 0
     tiled_peak_bytes: int = 0
     overhead_bytes: int = 0
-    untileable_ops: list[str] = field(default_factory=list)
+    # (name, op_type) of each operator that keeps the stage from tiling.
+    untileable_ops: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     # Which of the two swapped axes a layout conversion's band runs along.
     # The solver states it; the extents cannot tell the two axes apart when

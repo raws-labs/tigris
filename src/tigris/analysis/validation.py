@@ -811,8 +811,7 @@ def _execution_unit_requirement(
         if not tile_plan.tileable:
             if tile_plan.min_tile_bytes > 0 and not tile_plan.untileable_ops:
                 return tile_plan.min_tile_bytes, "smallest tile", False
-            # Untileable operators are recorded as "name (type)".
-            names = ", ".join(op.split(" (")[0] for op in tile_plan.untileable_ops)
+            names = ", ".join(name for name, _ in tile_plan.untileable_ops)
             reason = f"runs untiled: {names}" if names else "runs untiled"
             return stage.peak_bytes, reason, True
         if tile_plan.tiled_peak_bytes <= 0:

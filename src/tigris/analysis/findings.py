@@ -153,21 +153,15 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
     blocked_units = {issue.stage_id for issue in validation.issues if not issue.subgraph}
 
     # Tileable: a tile plan the validator accepts. Untileable: an operator that cannot tile.
-    untileable_ops: set[str] = set()
+    untileable_types: set[str] = set()
     for s in ag.stages:
         if s.tile_plan is not None:
             if s.tile_plan.tileable and s.stage_id not in blocked_units:
                 f.stages_tileable += 1
             elif s.tile_plan.untileable_ops:
                 f.stages_untileable += 1
-                for op_desc in s.tile_plan.untileable_ops:
-                    # op_desc is "name (OpType)" - extract the type
-                    if "(" in op_desc:
-                        op_type = op_desc.split("(")[-1].rstrip(")")
-                    else:
-                        op_type = op_desc
-                    untileable_ops.add(op_type)
-    f.untileable_op_types = sorted(untileable_ops)
+                untileable_types.update(op_type for _, op_type in s.tile_plan.untileable_ops)
+    f.untileable_op_types = sorted(untileable_types)
 
     f.scheduled_peak_bytes = validation.scheduled_peak_bytes
     f.feasibility_errors = [issue.describe() for issue in validation.issues]

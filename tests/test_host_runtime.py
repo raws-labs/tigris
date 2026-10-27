@@ -513,6 +513,7 @@ def test_multiple_inputs_and_named_outputs(tmp_path):
 
 def test_bool_passthrough_boundary_selects_data_dispatcher(tmp_path):
     from onnx import TensorProto, helper
+    from tigris.emitters.binary.reader import read_binary_plan
     from tigris.emitters.codegen import generate_c
 
     flag = helper.make_tensor_value_info("flag", TensorProto.BOOL, [4])
@@ -522,7 +523,7 @@ def test_bool_passthrough_boundary_selects_data_dispatcher(tmp_path):
                            [flag, data], [flag, output], ir_version=8)
     graph, _ = _run_pipeline(str(model_path), ("4K",))
     plan = emit_binary_bytes(graph)
-    assert "t->dtype == 9u" in generate_c(plan, "reference")
+    assert "t->dtype == 9u" in generate_c(read_binary_plan(plan), "reference")
     path = tmp_path / "boundary.tgrs"
     path.write_bytes(plan)
     flags = np.array([True, False, True, False], np.bool_)

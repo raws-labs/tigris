@@ -391,3 +391,16 @@ def test_analyze_lists_five_blocking_stages_then_counts_the_rest():
     result = CliRunner().invoke(cli, ["analyze", str(model), "-m", "1K"])
     assert result.exit_code == 0
     assert "  and 2 more; --json lists all" in result.output
+
+
+def test_a_stage_that_runs_untiled_names_its_operator_in_full(tmp_path):
+    w = numpy_helper.from_array(np.ones((10, 256), np.float32), "w")
+    nodes = [helper.make_node("Gemm", ["input", "w"], ["output"], name="fc (head)", transB=1)]
+    path = save_onnx(tmp_path, "fc_head", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 256])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 10])],
+                     [w], ir_version=8)
+    graph, _ = _run_pipeline(str(path), ("256",))
+
+    assert [issue.reason for issue in validate_memory_plan(graph).issues] == ["runs untiled: fc (head)"]
+    assert compute_findings(graph).untileable_op_types == ["Gemm"]

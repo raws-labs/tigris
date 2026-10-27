@@ -13,7 +13,7 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.cli import cli
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders import load_model
-from tigris.loaders.onnx.normalize.adoption import _adopt_detection
+from tigris.loaders.onnx.normalize.adoption import _adopt_compiler_ops
 from tigris.loaders.onnx.normalize.relabels import _transpose_product_weights
 
 
@@ -418,7 +418,7 @@ def test_a_detection_scratch_output_keeps_a_tensor_of_the_same_name():
         tensors={name: TensorInfo(name, shape, TensorProto.FLOAT) for name, shape in shapes.items()},
         weight_data={"anchors": np.zeros((6, 4), np.float32)})
 
-    ag = _adopt_detection(graph)
+    ag = _adopt_compiler_ops(graph)
 
     scratch = ag.ops[0].outputs[4]
     assert scratch != "d_boxes_scratch" and ag.tensors["d_boxes_scratch"].shape == (5,)

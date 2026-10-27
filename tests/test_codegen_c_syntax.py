@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.emitters.codegen import generate_c, generate_core_header
 
@@ -124,7 +125,7 @@ def test_generated_harness_is_valid_c99(
 
     mode = "int8" if quantized else "float32"
     source_path = tmp_path / f"generated-{backend}-{mode}.c"
-    source_path.write_text(generate_c(data, backend))
+    source_path.write_text(generate_c(read_binary_plan(data), backend))
 
     command = [
         _CC,
@@ -152,14 +153,11 @@ def test_generated_harness_is_valid_c99(
 def test_generated_core_is_valid_c99(qdq_conv_path, tmp_path, backend):
     source_path = tmp_path / "generated-core.c"
     header_path = tmp_path / "generated_core.h"
+    plan = read_binary_plan(emit_binary_bytes(full_pipeline(qdq_conv_path, 4096)))
     source_path.write_text(
-        generate_c(
-            emit_binary_bytes(full_pipeline(qdq_conv_path, 4096)), backend, output_format="core",
-            core_header=header_path.name,
-        )
+        generate_c(plan, backend, output_format="core", core_header=header_path.name)
     )
-    plan_data = emit_binary_bytes(full_pipeline(qdq_conv_path, 4096))
-    header_path.write_text(generate_core_header(plan_data))
+    header_path.write_text(generate_core_header(plan))
 
     command = [
         _CC, "-std=c99", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
@@ -184,11 +182,11 @@ def test_named_generated_cores_link_together(qdq_conv_path, tmp_path):
         object_path = tmp_path / f"{stem}.o"
         source_path.write_text(
             generate_c(
-                plan_data, "reference", output_format="core",
+                read_binary_plan(plan_data), "reference", output_format="core",
                 core_header=header_path.name, core_name=core_name,
             )
         )
-        header_path.write_text(generate_core_header(plan_data, core_name))
+        header_path.write_text(generate_core_header(read_binary_plan(plan_data), core_name))
         result = subprocess.run(
             [
                 _CC, "-std=c99", "-c", f"-I{_RUNTIME_INCLUDE}",
@@ -219,10 +217,10 @@ def test_bool_harness_and_core_are_valid_c99(tmp_path, kind, quantized):
     graph, _ = _run_pipeline(str(path), ("4K",))
     data = emit_binary_bytes(graph)
     header = tmp_path / "generated_core.h"
-    header.write_text(generate_core_header(data))
+    header.write_text(generate_core_header(read_binary_plan(data)))
     for fmt in ("app", "core"):
         source = tmp_path / f"bool_{fmt}.c"
-        source.write_text(generate_c(data, "reference", output_format=fmt, core_header=header.name))
+        source.write_text(generate_c(read_binary_plan(data), "reference", output_format=fmt, core_header=header.name))
         result = subprocess.run([_CC, "-std=c99", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
                                  f"-I{_RUNTIME_INCLUDE}", f"-I{tmp_path}", str(source)],
                                 text=True, capture_output=True, check=False)
@@ -235,7 +233,7 @@ def test_stateful_harness_and_core_are_valid_c99(tmp_path, backend):
     that reads and updates it."""
     data = (Path(__file__).parent / "schema_compat" / "schema-v10-state.tgrs").read_bytes()
     header = tmp_path / "generated_core.h"
-    header.write_text(generate_core_header(data))
+    header.write_text(generate_core_header(read_binary_plan(data)))
     assert "_STATE_BYTES 48u" in header.read_text()
     command = [_CC, "-std=c99", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
                f"-I{_RUNTIME_INCLUDE}", f"-I{tmp_path}"]
@@ -245,7 +243,7 @@ def test_stateful_harness_and_core_are_valid_c99(tmp_path, backend):
         _write_esp_stubs(stub_dir)
         command.append(f"-I{stub_dir}")
     for fmt in ("app", "core"):
-        code = generate_c(data, backend, output_format=fmt, core_header=header.name)
+        code = generate_c(read_binary_plan(data), backend, output_format=fmt, core_header=header.name)
         assert ("tigris_state_init" in code) == (fmt == "app")
         source = tmp_path / f"state_{fmt}.c"
         source.write_text(code)
@@ -287,9 +285,9 @@ def test_generated_code_stops_on_older_runtime_headers(
     for path in (qdq_conv_path, conv_relu_chain_path):
         data = emit_binary_bytes(full_pipeline(path, 4096))
         core_header = tmp_path / "generated_core.h"
-        core_header.write_text(generate_core_header(data))
+        core_header.write_text(generate_core_header(read_binary_plan(data)))
         source = tmp_path / f"generated-{fmt}.c"
-        source.write_text(generate_c(data, backend, output_format=fmt,
+        source.write_text(generate_c(read_binary_plan(data), backend, output_format=fmt,
                                      core_header=core_header.name))
         assert "tigris_input_alloc(" in source.read_text()
 
@@ -435,11 +433,11 @@ def test_generated_code_runs_on_the_host(
         data = emit_binary_bytes(full_pipeline(conv_relu_chain_path, 4096))
     plan_path = tmp_path / "model.tgrs"
     plan_path.write_bytes(data)
-    (tmp_path / "generated_core.h").write_text(generate_core_header(data))
+    (tmp_path / "generated_core.h").write_text(generate_core_header(read_binary_plan(data)))
     env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=1", "UBSAN_OPTIONS": "halt_on_error=1"}
 
     app = tmp_path / "app.c"
-    app.write_text(generate_c(data, "reference", output_format="app"))
+    app.write_text(generate_c(read_binary_plan(data), "reference", output_format="app"))
     binary = _sanitized_binary(sanitized_runtime, [app], tmp_path, tmp_path / "app")
     result = subprocess.run([str(binary), str(plan_path)], text=True, capture_output=True,
                             check=False, env=env)
@@ -447,7 +445,7 @@ def test_generated_code_runs_on_the_host(
     assert "OK  normal=" in result.stdout
 
     core = tmp_path / "core.c"
-    core.write_text(generate_c(data, "reference", output_format="core",
+    core.write_text(generate_c(read_binary_plan(data), "reference", output_format="core",
                                core_header="generated_core.h"))
     driver = tmp_path / "driver.c"
     driver.write_text(_CORE_DRIVER)
@@ -548,7 +546,6 @@ def test_runtime_derives_every_stated_tile_fact(sanitized_runtime, tmp_path):
     from tigris.analysis.plan_graph import graph_from_plan
     from tigris.analysis.validation import validate_memory_plan
     from tigris.cli import _run_pipeline
-    from tigris.emitters.binary.reader import read_binary_plan
 
     facts = ("tile_extent", "num_tiles", "original_extent", "halo", "band_axis", "band_kind", "band_mode")
     fields = ("tileable", "axis", "band_on_columns", "band_in_output_rows", "tile_height",

@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from tigris.cli import _run_pipeline
+from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.runtime import RuntimeError, Session
 
@@ -34,7 +35,6 @@ def _reference(case, inputs=None):
 @pytest.mark.parametrize("kind,axis,quantized,keep", [("ArgMax", 1, False, False), ("ArgMin", 2, True, True)])
 def test_arg_output_interface(tmp_path, kind, axis, quantized, keep):
     from scripts.contract_cases.reduction import _arg_case
-    from tigris.emitters.binary.reader import read_binary_plan
     from tigris.emitters.codegen import generate_c
 
     case = _arg_case(kind, axis, quantized, keep)
@@ -44,7 +44,7 @@ def test_arg_output_interface(tmp_path, kind, axis, quantized, keep):
     assert output["dtype"] == 6 and output["iface_dtype"] == 7
     for backend in (("reference", "cmsis-nn", "esp-nn") if quantized else ("reference",)):
         for fmt in ("app", "core"):
-            assert generate_c(data, backend, fmt)
+            assert generate_c(read_binary_plan(data), backend, fmt)
     path = tmp_path / "arg.tgrs"
     path.write_bytes(data)
     source = case.inputs["input"]
@@ -82,7 +82,7 @@ def test_runtime_indices(tmp_path, kind, variant, quantized):
 
     case = _runtime_index_case(kind, quantized, variant)
     binary = _compile(tmp_path, case, ("8K",))
-    assert generate_c(binary, "reference", "core")
+    assert generate_c(read_binary_plan(binary), "reference", "core")
     plan = tmp_path / "indices.tgrs"
     plan.write_bytes(binary)
     inputs = {name: _to_runtime_layout(value) if value.dtype.kind == "f" else value
@@ -113,7 +113,7 @@ def test_bool_model_boundaries_and_codegen(tmp_path, kind, quantized, tiled):
     data = _compile(tmp_path, case, budgets)
     for backend in ("reference", "cmsis-nn", "esp-nn"):
         for fmt in ("app", "core"):
-            assert generate_c(data, backend, fmt)
+            assert generate_c(read_binary_plan(data), backend, fmt)
     path = tmp_path / "bool.tgrs"
     path.write_bytes(data)
     expected = _reference(case)
