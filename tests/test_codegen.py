@@ -8,7 +8,11 @@ import pytest
 from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris.analysis.plan_graph import slow_arena_required
+from tigris.analysis.plan_graph import (
+    build_limits_needed,
+    executor_workspace_limits,
+    slow_arena_required,
+)
 from tigris.analysis.validation import OperatorSupportValidation
 from tigris.cli import cli
 from tigris.emitters.binary.defs import (
@@ -17,12 +21,7 @@ from tigris.emitters.binary.defs import (
 )
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
-from tigris.emitters.codegen import (
-    _build_limits_needed,
-    _executor_workspace_limits,
-    generate_c,
-    generate_core_header,
-)
+from tigris.emitters.codegen import generate_c, generate_core_header
 
 from conftest import full_pipeline, save_onnx, section_entries
 
@@ -310,13 +309,13 @@ def test_codegen_workspace_limits_include_only_executable_chain_capacity():
         ],
     }
 
-    assert _executor_workspace_limits(plan) == (9, 2, 3, 2, 2, 0)
+    assert executor_workspace_limits(plan) == (9, 2, 3, 2, 2, 0)
 
     # The chain's spatial operators are summed over its stages, while the
     # build limit stays the most in one stage.
     plan["ops"][2]["op_type"] = 1
-    assert _executor_workspace_limits(plan) == (9, 2, 3, 2, 3, 0)
-    assert _build_limits_needed(plan) == (9, 2, 3, 2, 2)
+    assert executor_workspace_limits(plan) == (9, 2, 3, 2, 3, 0)
+    assert build_limits_needed(plan) == (9, 2, 3, 2, 2)
 
 
 @pytest.mark.parametrize("name,depth", [("float_if", 1), ("float_if_if", 2),
@@ -326,7 +325,7 @@ def test_codegen_workspace_states_the_nesting_depth(name, depth, tmp_path):
     result = CliRunner().invoke(cli, ["compile", str(TFLITE_OPS / f"{name}.tflite"),
                                       "-m", "256K", "-o", str(plan_path)])
     assert result.exit_code == 0, result.output
-    assert _executor_workspace_limits(read_binary_plan(plan_path.read_bytes()))[5] == depth
+    assert executor_workspace_limits(read_binary_plan(plan_path.read_bytes()))[5] == depth
 
 
 def test_compressed_core_header_uses_plan_alignment_for_arena_requirement(

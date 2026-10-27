@@ -152,6 +152,30 @@ def test_capability_contract_counts_a_shared_switch_only_when_the_dispatcher_rea
     assert "'Gather'" in errors[0]
 
 
+@pytest.mark.parametrize("header,old,new,error", [
+    ("tigris_config.h", "#define TIGRIS_MAX_CHAIN_STAGES 16u", "#define TIGRIS_MAX_CHAIN_STAGES 32u",
+     "tigris_config.h TIGRIS_MAX_CHAIN_STAGES defaults to [32], the compiler to 16"),
+    ("tigris.h", "#define TIGRIS_SEC_MEMORY         14", "#define TIGRIS_SEC_MEMORY         15",
+     "tigris.h TIGRIS_SEC_MEMORY is [15], defs.py SEC_MEMORY is 14"),
+    ("tigris.h", "sizeof(tigris_weight_block_t) == 20", "sizeof(tigris_weight_block_t) == 24",
+     "tigris.h asserts sizeof(tigris_weight_block_t) == [24], defs.py has 20"),
+    ("tigris.h", "2u * (size_t)(candidates)", "3u * (size_t)(candidates)",
+     "TIGRIS_DETECTION_SCRATCH_BYTES(1, 1, 1) is 57, the compiler's is 53"),
+], ids=["build-limit-default", "wire-constant", "record-size", "detection-scratch"])
+def test_capability_contract_names_a_drifted_runtime_constant(tmp_path, header, old, new, error):
+    if not (RUNTIME / "include/tigris.h").is_file():
+        if _RUNTIME_SOURCE:
+            pytest.fail(f"TIGRIS_RUNTIME_SOURCE has no runtime headers: {RUNTIME}")
+        pytest.skip("tigris-runtime checkout not found; set TIGRIS_RUNTIME_SOURCE")
+    for part in ("include", "src"):
+        shutil.copytree(RUNTIME / part, tmp_path / part)
+    path = tmp_path / "include" / header
+    text = path.read_text()
+    assert text.count(old) == 1
+    path.write_text(text.replace(old, new))
+    assert error in validate_capabilities(tmp_path)
+
+
 def _document():
     return json.loads((ROOT / "compatibility.json").read_text())
 

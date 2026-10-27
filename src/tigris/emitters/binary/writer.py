@@ -14,7 +14,7 @@ from tigris import (
     TILE_AXIS_NONE,
 )
 from tigris.analysis.broadcast import BINARY_OPS, padded
-from tigris.analysis.memory import align_up
+from tigris.analysis.plan_graph import BUILD_LIMIT_DEFAULTS, decompression_reserve
 from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.graph.ir import (
     AnalyzedGraph,
@@ -129,17 +129,6 @@ from .defs import (
 # The optimized CMSIS-NN Cortex-M kernels read weights/bias with LDRD (8-byte)
 # and wide SIMD loads, which fault on unaligned data; 16 also covers Helium MVE.
 WEIGHT_ALIGN = PLAN_SECTION_ALIGNMENT
-
-# These are execution limits of the current runtime, rather than wire-format
-# limits. Keep them explicit here so the compiler fails before producing a plan
-# the loader will inevitably reject.
-# What the runtime carries by default. It states these at compile time, so a
-# plan that needs more is not wrong, it needs a target built for it. Nothing
-# here refuses such a plan: the target does.
-RUNTIME_MAX_TENSORS = 512
-RUNTIME_MAX_STAGE_INPUTS = 16
-RUNTIME_MAX_STAGE_OUTPUTS = 16
-RUNTIME_MAX_CHAIN_STAGES = 16
 
 
 def _require_uint(value: int, bits: int, field: str) -> None:
@@ -642,21 +631,10 @@ def compressed_weight_reserve_bytes(ag: AnalyzedGraph) -> int:
         return 0
 
     weight_idx, weights = _serialized_weights(ag, _StringTable())
-    block_bytes = {
-        stage_idx: align_up(len(data))
-        for stage_idx, _, _, data in _stage_blocks(ag, weight_idx, weights)
-    }
-
-    reserve = max(block_bytes.values(), default=0)
-    for stage in ag.stages:
-        if stage.chain_len < 2 or stage.chain_id != stage.stage_id:
-            continue
-        chain = sum(
-            block_bytes.get(stage_idx, 0)
-            for stage_idx in range(stage.stage_id, stage.stage_id + stage.chain_len)
-        )
-        reserve = max(reserve, chain)
-    return reserve
+    # Before compression a block's stored size is its data size.
+    blocks = [(stage_idx, len(data), len(data))
+              for stage_idx, _, _, data in _stage_blocks(ag, weight_idx, weights)]
+    return decompression_reserve(blocks, [(stage.chain_id, stage.chain_len) for stage in ag.stages])
 
 
 # Section builders
@@ -1328,10 +1306,11 @@ def _build_stages(
 
         # Stage inputs and outputs beyond the runtime's defaults are a build
         # option (TIGRIS_MAX_STAGE_INPUTS/OUTPUTS); the plan states what it needs.
-        if stage.chain_len > RUNTIME_MAX_CHAIN_STAGES:
+        chain_limit = BUILD_LIMIT_DEFAULTS["TIGRIS_MAX_CHAIN_STAGES"]
+        if stage.chain_len > chain_limit:
             raise ValueError(
                 f"stage {stage.stage_id} chain length {stage.chain_len} exceeds current runtime "
-                f"limit {RUNTIME_MAX_CHAIN_STAGES}"
+                f"limit {chain_limit}"
             )
         _require_uint(stage.chain_id, 16, f"stage {stage.stage_id} chain id")
         _require_uint(stage.chain_len, 16, f"stage {stage.stage_id} chain length")

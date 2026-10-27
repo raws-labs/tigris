@@ -28,12 +28,15 @@ from click import ClickException
 from onnx import TensorProto, helper, numpy_helper
 
 from tigris import SCHEMA_VERSION, TILE_AXIS_HW
-from tigris.analysis.plan_graph import graph_from_plan, slow_arena_required
+from tigris.analysis.plan_graph import (
+    executor_workspace_limits,
+    graph_from_plan,
+    slow_arena_required,
+)
 from tigris.analysis.validation import io_in_fast, slow_pool_usage, validate_memory_plan
 from tigris.capabilities import KERNEL_CAPABILITIES
 from tigris.cli import _run_pipeline
 from tigris.cli.compile import plan_model
-from tigris.emitters.codegen import _executor_workspace_limits
 from tigris.emitters.binary.defs import (
     COMPRESS_LZ4,
     FLAG_XIP,
@@ -720,7 +723,7 @@ def _run_case(case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Pa
             str(plan["_compiler_scheduled_peak"]),
             # Run with exactly the workspace generated code would reserve.
             "--workspace-limits=" + ",".join(
-                str(value) for value in _executor_workspace_limits(plan)),
+                str(value) for value in executor_workspace_limits(plan)),
         ],
         f"{case.name} runtime execution",
     )

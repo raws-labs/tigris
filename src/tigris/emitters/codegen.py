@@ -8,7 +8,6 @@ Backend selection implies the target platform:
 
 from __future__ import annotations
 
-import functools
 import re
 
 from tigris.capabilities import (
@@ -20,13 +19,16 @@ from tigris.capabilities import (
 )
 from tigris.dtypes import check_dtype_signatures
 from tigris.emitters.binary.defs import (
-    FLAG_XIP, NO_QUANT_PARAM, NO_WEIGHT, OP_ATTR_CONSTANT_OPERAND, OP_ATTR_SUBGRAPHS, OP_C_NAMES,
+    FLAG_XIP, NO_QUANT_PARAM, NO_WEIGHT, OP_ATTR_CONSTANT_OPERAND, OP_C_NAMES,
     OP_TYPE_MAP, TENSOR_FLAG_CONSTANT, TENSOR_FLAG_STATE,
 )
 from tigris.analysis.memory import TENSOR_ALIGN, align_up
-from tigris.analysis.plan_graph import fast_activation_bytes, slow_arena_required
+from tigris.analysis.plan_graph import (
+    BUILD_LIMIT_DEFAULTS, build_limits_needed, executor_workspace_limits,
+    fast_activation_bytes, plan_decompression_reserve, slow_arena_required,
+)
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.operator_contract import OP_TYPE_BY_CODE, operators_with
+from tigris.operator_contract import OP_TYPE_BY_CODE
 
 
 BACKENDS = CODEGEN_BACKENDS
@@ -42,118 +44,8 @@ _RUNTIME_CHECK = (
 )
 
 
-def _weight_decompression_overhead(plan: dict, alignment: int) -> int:
-    """Mirror the runtime's grouping at the selected allocation alignment."""
-    blocks = [
-        block
-        for block in plan.get("weight_blocks", [])
-        if block["compressed_size"] > 0
-    ]
-    if not blocks:
-        return 0
-
-    def block_size(block: dict) -> int:
-        return align_up(block["uncompressed_size"], alignment)
-
-    max_required = max(block_size(block) for block in blocks)
-    stages = plan.get("stages", [])
-    for stage_idx, stage in enumerate(stages):
-        chain_len = stage["chain_len"]
-        if (
-            chain_len < 2
-            or stage["chain_id"] != stage_idx
-            or chain_len > len(stages) - stage_idx
-        ):
-            continue
-
-        chain_required = 0
-        for member_idx in range(stage_idx, stage_idx + chain_len):
-            block = next(
-                (item for item in blocks if item["stage_idx"] == member_idx),
-                None,
-            )
-            if block is not None:
-                chain_required += block_size(block)
-        max_required = max(max_required, chain_required)
-
-    return max_required
-
-
-def _cmsis_weight_decompression_overhead(plan: dict) -> int:
-    """Return the exact compressed-weight reserve for CMSIS static codegen."""
-    return _weight_decompression_overhead(plan, _CMSIS_TENSOR_ALIGN)
-
-
-# The operators the executor reserves per-op tiling state for in a chain
-# (tigris_height_spatial_op in the runtime).
-_HEIGHT_SPATIAL_OPS = operators_with("spatial")
-
-
-def _chains(plan: dict) -> list[list[dict]]:
-    """The stages of each chain, from its head."""
-    stages = plan.get("stages", [])
-    chains = []
-    for stage_idx, stage in enumerate(stages):
-        chain_len = stage["chain_len"]
-        if chain_len < 2 or stage["chain_id"] != stage_idx:
-            continue
-        if stage_idx + chain_len > len(stages):
-            raise ValueError("Plan contains a chain beyond the stage table")
-        chains.append(stages[stage_idx : stage_idx + chain_len])
-    return chains
-
-
-def _spatial_ops(plan: dict, stage: dict) -> int:
-    ops = plan.get("ops", [])
-    return sum(OP_TYPE_BY_CODE.get(ops[op_idx]["op_type"]) in _HEIGHT_SPATIAL_OPS
-               for op_idx in stage["ops"])
-
-
-def _subgraph_depth(plan: dict) -> int:
-    """How many control-flow operators run one inside another at most."""
-    graphs = plan.get("subgraphs", [])
-    if not graphs:
-        return 0
-    runs = {attr["op_index"]: attr["data"] for attr in plan.get("op_attributes", [])
-            if attr["type"] == OP_ATTR_SUBGRAPHS}
-    stages = plan["stages"]
-
-    @functools.cache
-    def height(graph: int) -> int:
-        first, count = graphs[graph]["first_stage"], graphs[graph]["num_stages"]
-        children = [int.from_bytes(runs[op][slot:slot + 2], "little")
-                    for stage in stages[first:first + count] for op in stage["ops"]
-                    if op in runs for slot in (0, 2)]
-        return max((height(child) + 1 for child in children), default=0)
-
-    return height(0)
-
-
-def _build_limits_needed(plan: dict) -> tuple[int, int, int, int, int]:
-    """The build limits the plan asks for, in tigris_config.h's order."""
-    stages = plan.get("stages", [])
-    chains = _chains(plan)
-    return (
-        plan["num_tensors"],
-        max((len(stage["inputs"]) for stage in stages), default=0),
-        max((len(stage["outputs"]) for stage in stages), default=0),
-        max((len(chain) for chain in chains), default=0),
-        max((_spatial_ops(plan, stage) for chain in chains for stage in chain), default=0),
-    )
-
-
-def _executor_workspace_limits(plan: dict) -> tuple[int, int, int, int, int, int]:
-    """The arguments of TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS for the
-    plan: its tensors, the most inputs and outputs of a stage, the longest
-    chain, the most spatial operators in one chain and the nesting depth."""
-    tensors, inputs, outputs, chain, _ = _build_limits_needed(plan)
-    chain_spatial = max((sum(_spatial_ops(plan, stage) for stage in chain)
-                         for chain in _chains(plan)), default=0)
-    return tensors, inputs, outputs, chain, chain_spatial, _subgraph_depth(plan)
-
-
 def _executor_workspace_declaration(plan: dict) -> str:
-    args = ", ".join(f"{value}u" for value in _executor_workspace_limits(plan))
+    args = ", ".join(f"{value}u" for value in executor_workspace_limits(plan))
     return f"""\
 #define TIGRIS_GENERATED_EXECUTOR_WORKSPACE_BYTES \\
     TIGRIS_EXECUTOR_WORKSPACE_BYTES_FOR_LIMITS( \\
@@ -172,19 +64,11 @@ def _build_limit_assertions(plan: dict) -> str:
     loader refusing at run time, so this says what the build must set and
     fails while there is still a compiler to say it to.
     """
-    tensors, inputs, outputs, chain_stages, spatial_ops = _build_limits_needed(plan)
-    needed = (
-        ("TIGRIS_MAX_TENSORS", tensors),
-        ("TIGRIS_MAX_STAGE_INPUTS", inputs),
-        ("TIGRIS_MAX_STAGE_OUTPUTS", outputs),
-        ("TIGRIS_MAX_CHAIN_STAGES", chain_stages),
-        ("TIGRIS_MAX_SPATIAL_OPS_PER_STAGE", spatial_ops),
-    )
     lines = [
         f'_Static_assert({name} >= {value}u,\n'
         f'    "this plan needs {name} >= {value}; rebuild the runtime with '
         f'-D{name}={value}");'
-        for name, value in needed
+        for name, value in zip(BUILD_LIMIT_DEFAULTS, build_limits_needed(plan))
         if value > 0
     ]
     return "\n".join(lines) + "\n" if lines else ""
@@ -393,10 +277,10 @@ def generate_core_header(plan_data: bytes, core_name: str = "tigris_codegen") ->
     plan = read_binary_plan(plan_data)
     macro_prefix = core_name.upper()
     guard = f"{macro_prefix}_CORE_H"
-    weight_reserve = _weight_decompression_overhead(plan, TENSOR_ALIGN)
+    weight_reserve = plan_decompression_reserve(plan)
     fast_arena_required = fast_activation_bytes(plan) + weight_reserve
     slow_arena_bytes = slow_arena_required(plan)
-    workspace_limits = _executor_workspace_limits(plan)
+    workspace_limits = executor_workspace_limits(plan)
     workspace_limits_args = ", ".join(f"{value}u" for value in workspace_limits)
     if fast_arena_required > 0xFFFFFFFF:
         raise ValueError("Core fast-arena requirement exceeds uint32")
@@ -1052,7 +936,7 @@ cleanup:
 def _generate_cmsis(plan: dict, is_quantized: bool) -> str:
     dispatch = "tigris_dispatch_kernel_cmsis_nn" if is_quantized else "tigris_dispatch_kernel"
     kernel_include = '#include "tigris_kernels_cmsis_nn.h"' if is_quantized else '#include "tigris_kernels.h"'
-    weight_overhead = _cmsis_weight_decompression_overhead(plan)
+    weight_overhead = plan_decompression_reserve(plan, _CMSIS_TENSOR_ALIGN)
     core_fast_arena_size = align_up(
         (fast_activation_bytes(plan) or 65536) + weight_overhead, 16)
     if core_fast_arena_size > 0xFFFFFFFF:
