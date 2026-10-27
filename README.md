@@ -60,7 +60,7 @@ memory
   does not fit at    32.00 KiB
 
 flash
-  plan           13.31 MiB   weights 13.30 MiB, overhead 8.22 KiB
+  plan           13.31 MiB   weights 13.30 MiB, overhead 8.32 KiB
   as int8         3.33 MiB   estimate
   flash budget   16.00 MiB   fits
 ```

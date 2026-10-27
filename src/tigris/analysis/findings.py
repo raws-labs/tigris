@@ -1,6 +1,6 @@
 """Auto-generate actionable findings from an AnalyzedGraph.
 
-Pure data - no HTML, no formatting. Used by both CLI and report."""
+Pure data, no formatting. Used by the compile and analyze commands."""
 
 from dataclasses import dataclass, field
 
@@ -63,8 +63,8 @@ class Findings:
     lz4_plan_size_bytes: int = 0
     plan_fits_flash: bool = False
 
-    # slow memory (PSRAM) constraints for tiled execution
-    slow_peak_bytes: int = 0  # max(input + output) across tiled stages
+    # slow memory (PSRAM) residency
+    slow_peak_bytes: int = 0  # peak slow-pool residency over all execution groups
     slow_overflow_stages: list[int] = field(default_factory=list)
     slow_fits: bool = True
 
@@ -148,8 +148,7 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
     if largest_info:
         f.largest_tensor_shape = "x".join(str(d) for d in source_shape(ag, largest_info.shape))
 
-    # Analysis and deployment share one gate, so a CLI PASS cannot disagree
-    # with `tigris compile` about memory feasibility.
+    # Analysis and compile share one gate, so analyze cannot report a fit that compile refuses.
     validation = gate.budget.fast
     blocked_units = {issue.stage_id for issue in validation.issues if not issue.subgraph}
 
@@ -237,9 +236,9 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
     if ag.budget.flash > 0 and f.plan_size_bytes:
         f.plan_fits_flash = f.plan_size_bytes <= ag.budget.flash
 
-    # Slow memory check (PSRAM) for tiled execution
-    # Tiled execution pre-allocates full output in slow while input is
-    # still in slow. If input + output > slow_budget, allocation fails.
+    # Slow memory check (PSRAM)
+    # Slow residency is measured over every execution group; a group whose
+    # resident tensors exceed the slow budget overflows.
     usage = gate.budget.slow
     f.slow_peak_bytes = usage.slow_peak_bytes
     f.slow_overflow_stages = list(usage.overflow_stage_ids)

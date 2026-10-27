@@ -171,8 +171,8 @@ class TilePlan:
     untileable_ops: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     # Which of the two swapped axes a layout conversion's band runs along.
-    # The runtime used to derive it from the extents, which agrees with the
-    # solver only by coincidence when the two axes are equal.
+    # The solver states it; the extents cannot tell the two axes apart when
+    # they are equal.
     band_on_columns: bool = False
     # The band, its count and its extent are in output rows (height stripes and Resize).
     band_in_output_rows: bool = False

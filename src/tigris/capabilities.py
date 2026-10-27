@@ -1,15 +1,8 @@
-"""Audited runtime kernel capabilities used by codegen and documentation.
+"""Kernel capabilities per runtime backend, built from operator_contract's
+native operator sets; the capability matrix is generated from this module.
 
-The native operator sets mirror the dispatch switches in tigris-runtime:
-
-* ``src/tigris_kernels.c`` (reference float32)
-* ``src/tigris_kernels_s8.c`` (reference int8)
-* ``src/tigris_kernels_esp_nn.c`` (ESP-NN with explicit s8_ref fallback)
-* ``src/tigris_kernels_cmsis_nn.c`` (CMSIS-NN with explicit s8_ref fallback)
-
-Keep this as the single compiler-side capability source.  Accelerated
-backends list only operators with a native adapter; effective support follows
-their explicit runtime fallback chain.
+Accelerated backends list only operators with a native adapter; effective
+support follows their explicit runtime fallback chain.
 """
 
 from dataclasses import dataclass
@@ -30,8 +23,6 @@ class KernelCapabilities:
     dtype: DTypeMode
     native_operators: frozenset[str]
     fallback: str | None = None
-
-
 
 
 # Native accelerated adapters sometimes route a supported variant through the

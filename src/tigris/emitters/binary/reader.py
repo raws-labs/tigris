@@ -1,4 +1,4 @@
-"""Binary plan reader - deserialization for test validation."""
+"""Binary plan reader: decodes a plan for inspection, tracing and code generation."""
 
 import struct
 
@@ -289,10 +289,9 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
             "flags": stage_flags,
         })
 
-    # Schema v5 makes the stage table authoritative.  The byte retained in
-    # each operator is only the canonical low-byte hint needed to keep the
-    # v2-v4 record layout zero-copy.  Present callers with the full derived
-    # stage index so Python-side inspection also works beyond 256 stages.
+    # From schema 5 the stage table is authoritative and the operator record
+    # keeps only the low byte of the stage index, so the full index is derived
+    # from the stage table and inspection works beyond 256 stages.
     if version >= SCHEMA_VERSION_STAGE_TABLE_AUTHORITY:
         for stage_index, stage_record in enumerate(stages):
             for op_index in stage_record["ops"]:

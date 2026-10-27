@@ -15,8 +15,7 @@ SCHEMA_VERSION_STAGE_TABLE_AUTHORITY = 5
 SCHEMA_VERSION_INTERFACE_DTYPE = 6
 SCHEMA_VERSION_TENSOR_LAYOUT = 7
 # A plan may keep variables across invocations in a caller-supplied state
-# buffer. Only a plan that does is written at this version, so every other
-# plan stays loadable by runtimes that accept schema 9.
+# buffer. This is the first schema with the state section.
 SCHEMA_VERSION_STATE = 10
 # Every plan states its activations' fast-arena bytes for the runtime to check, so all are at 11.
 SCHEMA_VERSION_SCHEDULED_PEAK = 11
