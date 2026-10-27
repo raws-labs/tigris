@@ -327,6 +327,9 @@ def generate_core_header(plan: dict, core_name: str = "tigris_codegen") -> str:
  * scratch/workspace is prepared separately and is not included here. */
 #define {macro_prefix}_TENSOR_CAPACITY {plan['num_tensors']}u
 #define {macro_prefix}_PLAN_TENSOR_ALIGNMENT_BYTES {TENSOR_ALIGN}u
+#if TIGRIS_TENSOR_ALIGN > {macro_prefix}_PLAN_TENSOR_ALIGNMENT_BYTES
+#error "TIGRIS_TENSOR_ALIGN is above the {TENSOR_ALIGN}-byte alignment the arena sizes in this header assume; build with -DTIGRIS_TENSOR_ALIGN={TENSOR_ALIGN} or lower"
+#endif
 #define {macro_prefix}_PLAN_BUDGET_BYTES {plan['budget']}u
 #define {macro_prefix}_WEIGHT_DECOMPRESSION_RESERVE_BYTES {weight_reserve}u
 #define {macro_prefix}_CORE_FAST_ARENA_BYTES {fast_arena_required}u

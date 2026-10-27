@@ -173,6 +173,26 @@ def test_generated_core_is_valid_c99(qdq_conv_path, tmp_path, backend):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_generated_core_header_stops_above_plan_alignment(qdq_conv_path, tmp_path):
+    """The arena sizes in the core header assume 32-byte allocations, so a
+    runtime built with a larger TIGRIS_TENSOR_ALIGN does not compile it."""
+    header = tmp_path / "generated_core.h"
+    plan = read_binary_plan(emit_binary_bytes(plan_model(qdq_conv_path, (4096,))))
+    header.write_text(generate_core_header(plan))
+    source = tmp_path / "uses_core.c"
+    source.write_text('#include "generated_core.h"\n')
+    for alignment, builds in ((4, True), (16, True), (32, True), (64, False)):
+        result = subprocess.run(
+            [_CC, "-std=c99", "-Wall", "-Wextra", "-Werror", "-fsyntax-only",
+             f"-DTIGRIS_TENSOR_ALIGN={alignment}", f"-I{_RUNTIME_INCLUDE}", f"-I{tmp_path}",
+             str(source)],
+            text=True, capture_output=True, check=False,
+        )
+        assert (result.returncode == 0) == builds, (alignment, result.stderr)
+        if not builds:
+            assert "the arena sizes in this header assume" in result.stderr
+
+
 def test_named_generated_cores_link_together(qdq_conv_path, tmp_path):
     plan_data = emit_binary_bytes(plan_model(qdq_conv_path, (4096,)))
     cores = [("tigris_codegen", "default"), ("audio_codegen", "audio")]

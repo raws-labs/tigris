@@ -4,7 +4,7 @@ from tigris.graph.ir import AnalyzedGraph
 
 
 # The runtime rounds every allocation up to TIGRIS_TENSOR_ALIGN (tigris_mem.h).
-# 32 covers every value that macro takes except an SVE build, which uses 64.
+# 32 covers every value that macro auto-detects except SVE (64), whose build stops.
 TENSOR_ALIGN = 32
 
 
