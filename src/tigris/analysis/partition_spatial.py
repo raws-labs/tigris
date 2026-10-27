@@ -1731,6 +1731,21 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
             else:
                 largest = middle - 1
         num_tiles = math.ceil(output_h / band)
+
+        def rows_read(rows: int) -> int:
+            total = 0
+            for start in range(0, output_h, rows):
+                low, high = start, min(start + rows, output_h)
+                for op in reversed(stage_ops):
+                    low, high = _op_input_span(op, low, high, input_h, weight_shapes)
+                total += high - low
+            return total
+
+        # The smallest band with that tile count that reads no more input rows. Reads stop
+        # at the input's edges, so a short last band can read fewer rows in all.
+        reads = rows_read(band)
+        band = next(rows for rows in range(math.ceil(output_h / num_tiles), band + 1)
+                    if rows_read(rows) <= reads)
         tiled_peak = band_peak(band)
 
         # A single-row height tile that still overflows the budget cannot be
@@ -2245,6 +2260,15 @@ def _op_input_rows(op: OpNode, rows: int, weight_shapes) -> int:
         return rows
     ekh, stride = _window(op, 0, weight_shapes)
     return (rows - 1) * stride + ekh
+
+
+def _op_input_span(op: OpNode, start: int, stop: int, height: int, weight_shapes) -> tuple[int, int]:
+    """The rows of a `height`-row input an operator reads for its output rows [start, stop)."""
+    if op_category(op) not in (TileCategory.CONV, TileCategory.POOL):
+        return start, stop
+    ekh, stride = _window(op, 0, weight_shapes)
+    top = int((op.attrs.get("pads") or [0])[0])
+    return max(start * stride - top, 0), min((stop - 1) * stride - top + ekh, height)
 
 
 def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int, weight_shapes) -> int:

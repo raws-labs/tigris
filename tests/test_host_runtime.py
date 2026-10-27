@@ -68,11 +68,11 @@ def test_a_slow_arena_that_cannot_hold_an_input_is_reported(path):
                 session.run(inputs)
 
 
-@pytest.mark.parametrize("budget,bands", [("640", 16), ("1280", 8)])
-def test_a_strided_stripe_runs_the_bands_its_plan_states(strided_conv_path, tmp_path, budget, bands):
+@pytest.mark.parametrize("budget,rows,bands", [("640", 1, 16), ("1280", 2, 8), ("2688", 4, 4)])
+def test_a_strided_stripe_runs_the_bands_its_plan_states(strided_conv_path, tmp_path, budget, rows, bands):
     """The runtime runs the output bands the plan states within the working set it states,
     and they reproduce the unbanded result exactly. At 640 bytes the stage stripes one output
-    row at a time."""
+    row at a time; at 2688 bytes it runs 4 bands of 4 rows."""
     from tigris.emitters.binary.reader import read_binary_plan
 
     results = []
@@ -86,7 +86,8 @@ def test_a_strided_stripe_runs_the_bands_its_plan_states(strided_conv_path, tmp_
             outputs, _, counters = session.trace({item["name"]: image})
         results.append((read_binary_plan(path.read_bytes())["tile_plans"], outputs, counters))
     (banded, outputs, counters), (unbanded, reference, _) = results
-    assert [(record["axis"], record["num_tiles"]) for record in banded] == [(1, bands)] and not unbanded
+    assert [(record["axis"], record["tile_extent"], record["num_tiles"]) for record in banded] == [
+        (1, rows, bands)] and not unbanded
     assert counters["tiles"] == bands
     assert outputs.keys() == reference.keys()
     for key in outputs:
