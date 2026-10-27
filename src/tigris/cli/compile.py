@@ -107,12 +107,6 @@ def plan_model(
 def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None,
             compress: str, xip: bool, input_shape: dict[str, tuple[int, ...]], keep_names: bool):
     """Compile a model into an execution plan."""
-    from tigris.analysis.validation import (
-        validate_budget,
-        validate_execution_dtype,
-        validate_model_outputs,
-        validate_operator_support,
-    )
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     compress_arg = compress if compress != "none" else None
@@ -135,17 +129,18 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
     data = Path(model).read_bytes()
     findings = compute_findings(ag, names=keep_names)
     summary(model, ag, findings, budget, tflm_tensor_arena(data))
-    usable = (validate_model_outputs(ag).supported and validate_execution_dtype(ag).supported
-              and validate_operator_support(ag).supported)
-    result = validate_budget(ag) if usable else None
-    if result is None or not result.fast.feasible or not result.slow.fits:
+    if not findings.gate.passes:
         raise click.ClickException("no plan written")
 
     out = Path(output) if output else Path(model).with_suffix(".tgrs")
-    try:
-        plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip, names=keep_names)
-    except ValueError as exc:
-        raise click.ClickException(f"no plan written: {exc}") from exc
+    # Findings measured the plan without compression or XIP; an empty
+    # measurement leaves the writer to give its error.
+    plan_data = findings.plan if compress_arg is None and not xip else b""
+    if not plan_data:
+        try:
+            plan_data = emit_binary_bytes(ag, compress=compress_arg, xip=xip, names=keep_names)
+        except ValueError as exc:
+            raise click.ClickException(f"no plan written: {exc}") from exc
     if ag.budget.flash > 0 and len(plan_data) > ag.budget.flash:
         raise click.ClickException(
             f"no plan written: the plan is {fmt_bytes(len(plan_data))}, "

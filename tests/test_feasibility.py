@@ -198,6 +198,60 @@ def test_plan_within_budget_compiles(conv_relu_chain_path, tmp_path, budget):
     assert output.exists()
 
 
+@pytest.mark.parametrize("flags, xip, names", [
+    ([], False, False),
+    (["--keep-names"], False, True),
+    (["--xip"], True, False),
+], ids=["plain", "names", "xip"])
+def test_compile_writes_the_writer_bytes_for_its_flags(conv_relu_chain_path, tmp_path, flags, xip, names):
+    output = tmp_path / "out.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "16K", *flags, "-o", str(output)])
+    assert result.exit_code == 0, result.output
+    graph, _ = _run_pipeline(str(conv_relu_chain_path), ("16K",), report_bindings=False)
+    assert output.read_bytes() == emit_binary_bytes(graph, xip=xip, names=names)
+
+
+def test_a_graph_without_activations_is_gated_like_any_other(tmp_path):
+    """A constant output leaves no tensor with a lifetime; findings still carry the gate."""
+    value = numpy_helper.from_array(np.ones((1, 4), np.float32), "v")
+    model = helper.make_model(
+        helper.make_graph([helper.make_node("Constant", [], ["output"], value=value)], "const_only", [],
+                          [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])]),
+        opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "const_only.onnx"
+    onnx.save(model, path)
+    graph, _ = _run_pipeline(str(path), ("16K",), report_bindings=False)
+    assert not graph.lifetimes
+    findings = compute_findings(graph)
+    assert findings.verdict == "needs_work"
+    assert not findings.gate.usable and not findings.gate.passes
+    output = tmp_path / "should-not-exist.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-o", str(output)])
+    assert result.exit_code == 1
+    assert "output 'output' is not computed by any operator" in result.output
+    assert "Error: no plan written" in result.output
+    assert not output.exists()
+
+
+def test_compile_reports_the_writer_refusal_of_a_plan_the_gate_passes(
+    conv_relu_chain_path, tmp_path, monkeypatch
+):
+    import tigris.emitters.binary.writer
+
+    def refuse(*args, **kwargs):
+        raise ValueError("refused")
+
+    monkeypatch.setattr(tigris.emitters.binary.writer, "emit_binary_bytes", refuse)
+    output = tmp_path / "should-not-exist.tgrs"
+    result = CliRunner().invoke(
+        cli, ["compile", str(conv_relu_chain_path), "-m", "16K", "-o", str(output)])
+    assert result.exit_code == 1
+    assert "Error: no plan written: refused" in result.output
+    assert not output.exists()
+
+
 def test_analyze_displays_failing_verdict(conv_relu_chain_path):
     result = CliRunner().invoke(
         cli,

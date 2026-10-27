@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from tigris.analysis.memory import align_up
+from tigris.analysis.validation import PlanGate, plan_gate
 from tigris.graph.ir import AnalyzedGraph
 from tigris.utils import source_shape
 
@@ -67,6 +68,11 @@ class Findings:
     slow_overflow_stages: list[int] = field(default_factory=list)
     slow_fits: bool = True
 
+    # The gate compile applies, and the plan as compile writes it without
+    # compression or XIP; empty when there is no plan to measure.
+    gate: PlanGate | None = None
+    plan: bytes = field(default=b"", repr=False)
+
 
 def _weight_sizes(ag: AnalyzedGraph) -> tuple[list[int], list[int], int]:
     """Per-weight stored sizes, as written and with float weights as int8, and
@@ -126,23 +132,14 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
     peak = ag.peak_memory_bytes
     budget = ag.mem_budget
 
-    from tigris.analysis.validation import (
-        validate_execution_dtype,
-        validate_model_outputs,
-        validate_operator_support,
-    )
-
-    operator_validation = validate_operator_support(ag)
-    f.unsupported_operators = [
-        issue.describe() for issue in operator_validation.issues
-    ]
-    f.output_errors = list(validate_model_outputs(ag).issues)
-    dtype_validation = validate_execution_dtype(ag)
-    f.dtype_errors = list(dtype_validation.issues)
+    gate = f.gate = plan_gate(ag)
+    f.unsupported_operators = [issue.describe() for issue in gate.operators.issues]
+    f.output_errors = list(gate.outputs.issues)
+    f.dtype_errors = list(gate.dtype.issues)
+    if not gate.usable:
+        f.verdict = "needs_work"
 
     if not ag.lifetimes:
-        if f.unsupported_operators or f.output_errors or f.dtype_errors:
-            f.verdict = "needs_work"
         return f
 
     largest = max(ag.lifetimes.values(), key=lambda lt: lt.size_bytes)
@@ -151,11 +148,9 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
     if largest_info:
         f.largest_tensor_shape = "x".join(str(d) for d in source_shape(ag, largest_info.shape))
 
-    # Analysis and deployment share one execution-unit validator, so a CLI
-    # PASS cannot disagree with `tigris compile` about memory feasibility.
-    from tigris.analysis.validation import validate_memory_plan
-
-    validation = validate_memory_plan(ag)
+    # Analysis and deployment share one gate, so a CLI PASS cannot disagree
+    # with `tigris compile` about memory feasibility.
+    validation = gate.budget.fast
     blocked_units = {issue.stage_id for issue in validation.issues if not issue.subgraph}
 
     # Tileable: a tile plan the validator accepts. Untileable: an operator that cannot tile.
@@ -187,11 +182,12 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
     if f.blocking_stages:
         f.min_fast_for_partition = f.blocking_stages[0].required_bytes
 
-    # Verdict
     if budget > 0:
         f.stages_needing_tiling = sum(1 for s in ag.stages if s.warnings)
         f.total_stages = len(ag.stages)
 
+    # Verdict, when the gate has not already refused the graph
+    if gate.usable and budget > 0:
         if not validation.feasible:
             f.verdict = "needs_work"
         elif peak / budget <= 1.0:
@@ -202,9 +198,6 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
             f.verdict = "tiled"
         else:
             f.verdict = "needs_work"
-
-    if f.unsupported_operators or f.output_errors or f.dtype_errors:
-        f.verdict = "needs_work"
 
     f.is_float32 = any(
         ag.tensors.get(lt.tensor_name) and ag.tensors[lt.tensor_name].dtype == 1
@@ -225,7 +218,7 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
     sizes, int8_sizes, lz4_weight_bytes = _weight_sizes(whole)
     f.total_weight_bytes = sum(sizes)
     current_blob = _aligned_weight_blob_size(sizes, PLAN_SECTION_ALIGNMENT)
-    plan = _measure_plan(ag, names)
+    plan = f.plan = _measure_plan(ag, names)
     f.plan_size_bytes = len(plan)
     if plan:
         from tigris.inspection import _plan, _plan_requirements
@@ -247,9 +240,7 @@ def compute_findings(ag: AnalyzedGraph, names: bool = False) -> Findings:
     # Slow memory check (PSRAM) for tiled execution
     # Tiled execution pre-allocates full output in slow while input is
     # still in slow. If input + output > slow_budget, allocation fails.
-    from tigris.analysis.validation import slow_pool_usage
-
-    usage = slow_pool_usage(ag)
+    usage = gate.budget.slow
     f.slow_peak_bytes = usage.slow_peak_bytes
     f.slow_overflow_stages = list(usage.overflow_stage_ids)
     f.slow_fits = usage.fits

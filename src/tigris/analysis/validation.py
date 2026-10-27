@@ -1214,6 +1214,35 @@ def validate_budget(ag: AnalyzedGraph) -> BudgetValidation:
     return BudgetValidation(fast=validate_memory_plan(ag), slow=slow_pool_usage(ag))
 
 
+@dataclass(frozen=True)
+class PlanGate:
+    """The checks that decide whether compile writes a plan for a graph."""
+
+    outputs: ModelOutputValidation
+    dtype: ExecutionDTypeValidation
+    operators: OperatorSupportValidation
+    budget: BudgetValidation
+
+    @property
+    def usable(self) -> bool:
+        """Every output computed, every dtype and operator supported."""
+        return self.outputs.supported and self.dtype.supported and self.operators.supported
+
+    @property
+    def passes(self) -> bool:
+        """Usable, and every unit fits the fast budget and the slow budget."""
+        return self.usable and self.budget.feasible
+
+
+def plan_gate(ag: AnalyzedGraph) -> PlanGate:
+    return PlanGate(
+        outputs=validate_model_outputs(ag),
+        dtype=validate_execution_dtype(ag),
+        operators=validate_operator_support(ag),
+        budget=validate_budget(ag),
+    )
+
+
 def _bool_and_sum_reasons(ag: AnalyzedGraph, op: OpNode) -> list[str]:
     if op.op_type not in COMPARISONS | LOGICAL_BINARY | {"Not", "Where", "Cast", "Sum"}:
         return []

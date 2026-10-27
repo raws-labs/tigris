@@ -163,16 +163,10 @@ def render(model: str, plan: dict, events: list[dict], counters: dict[str, int],
 
 def _plan_bytes(ag) -> bytes | None:
     """The plan with names, or None when it is unusable or does not fit the fast and slow budgets."""
-    from tigris.analysis.validation import (
-        validate_budget, validate_execution_dtype, validate_model_outputs, validate_operator_support)
+    from tigris.analysis.validation import plan_gate
     from tigris.emitters.binary.writer import emit_binary_bytes
 
-    if ag.mem_budget <= 0:
-        return None
-    usable = (validate_model_outputs(ag).supported and validate_execution_dtype(ag).supported
-              and validate_operator_support(ag).supported)
-    result = validate_budget(ag) if usable else None
-    if result is None or not result.feasible:
+    if ag.mem_budget <= 0 or not plan_gate(ag).passes:
         return None
     try:
         # The trace names every operator and tensor it reports.
