@@ -116,11 +116,11 @@ def _fold_gemm_scalars(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Fold Gemm's alpha and beta into the constants they scale.
 
     The plan has no field for either, and the fully-connected kernel computes
-    Y = X * W^T + B, so a Gemm carrying them used to compile and return a
-    silently wrong answer. Scaling a constant weight by alpha and a constant
-    bias by beta is exact and leaves nothing for the plan to express. transA
-    transposes an activation, which no constant can absorb; validation refuses
-    it.
+    Y = X * W^T + B, so a Gemm carrying them would return a silently wrong
+    answer if they were left in place. Scaling a constant weight by alpha and a
+    constant bias by beta is exact and leaves nothing for the plan to express.
+    transA transposes an activation, which no constant can absorb; validation
+    refuses it.
     """
     reads = _Uses(ag).reads
     for op in ag.ops:

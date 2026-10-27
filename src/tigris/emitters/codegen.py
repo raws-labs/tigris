@@ -139,12 +139,12 @@ def generate_c(
 ) -> str:
     """Generate C deployment code for the given plan and backend.
 
-    ``app`` is the self-contained example program historically produced by the
-    command.  ``core`` is deliberately platform-neutral: an application owns
-    flash placement, arena placement, input contents, and its entry point,
-    while the generated source owns plan loading, backend preparation, and
-    dispatch.  That lets the same backend output be embedded in bare-metal,
-    RTOS, and benchmark applications without a target-specific codegen mode.
+    ``app`` is the self-contained example program.  ``core`` is deliberately
+    platform-neutral: an application owns flash placement, arena placement,
+    input contents, and its entry point, while the generated source owns plan
+    loading, backend preparation, and dispatch.  That lets the same backend
+    output be embedded in bare-metal, RTOS, and benchmark applications without
+    a target-specific codegen mode.
     """
     if backend not in BACKENDS:
         raise ValueError(f"Unknown backend: {backend!r}. Choose from: {', '.join(BACKENDS)}")

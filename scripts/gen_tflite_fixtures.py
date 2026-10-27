@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Generate one-operator TFLite models and their reference outputs.
 
-Each case is converted to an int8 TFLite model and run on seeded inputs through
-TFLite Micro and through TFLite's reference kernels. The recorded outputs are
-TFLite Micro's; where TFLite Micro disagrees with the reference kernels, the
-reference kernels' are recorded and the case is named as a deviation. Models and
-outputs go to tests/fixtures/tflite/ops/ so the frontend tests need neither
-package. Needs tensorflow, which is not a project dependency, and tflite-micro
-from the dev extra:
+Each case is an int8 TFLite model, converted from a TensorFlow function or
+built operator by operator; a `float_` case is not quantized, except
+float_boundaries, which keeps float32 inputs and outputs around an int8 body.
+Each is run on seeded inputs through TFLite Micro and through TFLite's
+reference kernels. The recorded outputs are TFLite Micro's; where
+TFLite Micro disagrees with the reference kernels, the reference kernels' are
+recorded and the case is named as a deviation. Models and outputs go to
+tests/fixtures/tflite/ops/ so the frontend tests need neither package. Needs
+tensorflow, which is not a project dependency, and tflite-micro from the dev
+extra:
 
     python scripts/gen_tflite_fixtures.py [case ...]
     python scripts/gen_tflite_fixtures.py --models

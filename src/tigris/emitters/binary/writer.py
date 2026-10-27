@@ -222,8 +222,8 @@ def _pack_spatial_attrs(
         kernel_h(u8) kernel_w(u8) stride_h(u8) stride_w(u8)
         pad_top(u16) pad_bottom(u16) pad_left(u16) pad_right(u16)
         dilation_h(u16) dilation_w(u16) group(u16 LE)
-    Total: 18 bytes. pad/dilation are u16 (was u8) so deep dilated convs
-    (dilation/pad up to 65535, e.g. TCN/WaveNet) no longer overflow.
+    Total: 18 bytes. pad and dilation are u16, so deep dilated convs
+    (dilation and pad up to 65535, e.g. TCN/WaveNet) are representable.
     """
     attrs = op.attrs
     ks = attrs.get("kernel_shape", [])
@@ -738,9 +738,6 @@ def _build_tensors(
         if declared is not None and declared != info.dtype:
             iface_dtype = declared
 
-        # tigris_tensor_t: 16 bytes
-        # name_str(u32) size_bytes(u32) shape_off(u16) ndim(u8) dtype(u8)
-        # flags(u8) quant_param_idx(u16) iface_dtype(u8)
         buf.extend(TENSOR_STRUCT.pack(
             name_off,
             info.size_bytes,
@@ -825,8 +822,9 @@ def _constant_operand_payload(
 ) -> bytes | None:
     """Which operand of a binary operator is its weight, and its quantization.
 
-    A float Add or Mul with its constant second is left without one: every
-    runtime reads that form, older ones included.
+    A float Add or Mul with its constant second is left without one: the
+    runtime takes the second input as the constant and reads its layout from
+    its length.
     """
     position = _constant_operand(ag, op)
     if position is None:
@@ -1264,15 +1262,8 @@ def _build_ops(
         fused_act = _fused_activation(op)
         act_min, act_max = _compute_act_bounds(ag, op, fused_act)
 
-        # tigris_op_t: 38 bytes (layout retained by schema v3)
-        # name_str(u32) op_type(u8) num_inputs(u8) num_outputs(u8)
-        # stage_hint(u8).  Schema v5 makes the stage table authoritative; this
-        # legacy byte retains the low stage-index byte for canonical encoding
-        # and v2-v4 compatibility without limiting v5 plans to 256 stages.
-        # inputs_offset(u16) outputs_offset(u16)
-        # spatial_attrs(18 bytes)
-        # weight_idx(u16) bias_idx(u16)
-        # fused_act(u8) act_min(i8) act_max(i8) _pad(u8)
+        # The stage byte is only the low byte of the stage index; the stage
+        # table is authoritative.
         buf.extend(OP_PREFIX_STRUCT.pack(
             name_off,
             op_type,
@@ -1319,14 +1310,6 @@ def _build_stages(
         inp_off, inp_count = index_pool.add(inp_indices)
         out_off, out_count = index_pool.add(out_indices)
 
-        # tigris_stage_t: 28 bytes
-        # peak_bytes(u32)
-        # ops_offset(u16) ops_count(u16)
-        # inputs_offset(u16) inputs_count(u16)
-        # outputs_offset(u16) outputs_count(u16)
-        # tile_plan_idx(u16) pad(u16)
-        # chain_id(u16) chain_len(u16)
-        # chain_tile_h(u16) _reserved1(u16)
         reserved1 = STAGE_FLAG_LINE_BUFFERED if stage.line_buffered else 0
         buf.extend(STAGE_STRUCT.pack(
             stage.peak_bytes,
@@ -1533,7 +1516,7 @@ def _build_quant_params(
 
     Section layout:
         uint16_t num_quant_params
-        uint16_t quant_data_pages (v3: 64K-element pages in data blob)
+        uint16_t quant_data_pages (64K-element pages in data blob)
         tigris_quant_param_t[num_quant_params]
         int32_t[] quant_data  (multiplier/shift arrays for all params)
     """
@@ -1574,16 +1557,15 @@ def _build_quant_params(
         # for per-channel weight quant), not the per-tensor activation scale -
         # otherwise per-channel conv requant is stored as per-tensor.
         num_channels = len(eff) if eff is not None else len(qp.scale)
-        # One v3 entry selects one 64K-element page for both arrays, so the
+        # One entry selects one 64K-element page for both arrays, so the
         # multiplier and shift arrays must fit together in that page.
         if num_channels > page_size // 2:
             raise ValueError(
                 f"quantization channels for {name!r} exceed the per-param "
                 f"limit ({num_channels} > {page_size // 2})")
 
-        # v3 retains the compact 16-byte entry and uses its former padding as
-        # a page number. Keep each multiplier/shift pair inside one 64K-element
-        # page so v2-sized offsets remain valid within that page.
+        # The 16-byte entry holds a page number beside page-relative offsets.
+        # Keep each multiplier/shift pair inside one 64K-element page.
         needed = 2 * num_channels
         if data_offset % page_size + needed > page_size:
             next_page = ((data_offset + page_size - 1) // page_size) * page_size
@@ -1609,7 +1591,7 @@ def _build_quant_params(
             num_channels,
             multiplier_off % page_size,
             shift_off % page_size,
-            multiplier_off // page_size,  # v3 quant-data page
+            multiplier_off // page_size,  # quant-data page
         ))
 
     if not quant_idx_map:
@@ -1620,7 +1602,7 @@ def _build_quant_params(
     pages = (data_offset + page_size - 1) // page_size
     if pages > 0xFFFF:
         raise ValueError("quantization data exceeds the plan page-count limit")
-    # v3 section header: num_quant_params(u16) + quant_data_pages(u16).
+    # Section header: num_quant_params(u16) + quant_data_pages(u16).
     header = QUANT_SECTION_HEADER_STRUCT.pack(len(quant_idx_map), pages)
     return header + bytes(entries_buf) + bytes(data_buf), quant_idx_map
 
@@ -1881,14 +1863,6 @@ def _emit(
         sec_dir.extend(SECTION_ENTRY_STRUCT.pack(sec_type, sec_off))
     sec_dir.extend(SECTION_ENTRY_STRUCT.pack(0, 0))  # sentinel
 
-    # Build header (48 bytes)
-    # magic(4) version(u32)
-    # file_size(u32) section_dir_offset(u32)
-    # num_tensors(u16) num_ops(u16) num_stages(u16) num_tile_plans(u16)
-    # budget(u32) peak(u32)
-    # model_name_str(u32)
-    # model_io_offset(u16) num_model_inputs(u8) num_model_outputs(u8)
-    # num_weights(u16) num_quant_params(u16) flags(u32)
     num_qp = len(quant_idx_map) if quant_idx_map else 0
     header_flags = 0
     if xip:

@@ -99,19 +99,17 @@ _RANK3_AXIS1_OPS = _RANK3_AXIS1_UNARY_OPS | _BINARY_OPS | {"Conv1D"}
 # must equal that literal whatever TIGRIS_TENSOR_ALIGN is.
 _BAND_COST_ALIGN = 32
 
-# tigris_tile_plan_t carries tile_height, num_tiles and original_height in
-# uint16 fields (TILE_PLAN_STRUCT in emitters/binary/defs.py). Every solver
-# that banded a single axis stayed inside that by the nature of the shapes
-# that fit an embedded budget. The conversion and row solvers band a product
-# of axes instead, which reaches the limit at ordinary sizes: a 256x256
-# feature map through a layout conversion is 65536 rows. A solver that
-# promises a banding the plan cannot carry would abort the compile in the
-# writer with no diagnosis, so it declines the stage and says why.
+# Largest tile height, tile count and original extent a solver may state. The
+# tile plan record holds them in 32-bit fields; the tile count meets the
+# runtime's 16-bit trace tile index, and the same cap applies to the height and
+# extent. The conversion and row solvers band a product of axes, which reaches
+# it at ordinary sizes: a 256x256 feature map through a layout conversion is
+# 65536 rows. Such a solver declines the stage and says why.
 _MAX_PLAN_EXTENT = 0xFFFF
 
 
 def _plan_extents_fit(tile_height: int, num_tiles: int, original: int) -> bool:
-    """Whether a banding fits the uint16 fields of the tile plan record."""
+    """Whether a banding stays within the solver's tile extent cap."""
     return max(tile_height, num_tiles, original) <= _MAX_PLAN_EXTENT
 
 
@@ -425,8 +423,8 @@ def _transpose_band_groups(
     It then transposes prod(A) by prod(B), repeated over prod(prefix), and
     carries prod(suffix) elements at each position. A layout conversion, an
     attention block's key transpose and its head permutation are all instances
-    of this; the prefix and the suffix are what tell them apart, and the three
-    permutations this used to name were the cases with neither.
+    of this; the prefix and the suffix are what tell them apart, and a
+    permutation with neither is a plain transpose of A and B.
 
     Returns the prefix length, the length of A, and the length of the middle,
     or None when the permutation is not of that shape.
@@ -2251,8 +2249,8 @@ def _chain_fast_bytes(
       - First stage's input tile (loaded from slow)
       - All op output tiles across all stages
 
-    Each allocation is rounded up to the graph's conservative deployment
-    alignment to match the runtime bump allocator's alignment overhead.
+    Each allocation is rounded up with align_up to match the runtime bump
+    allocator's alignment overhead.
 
     Within each stage, forward-computes the intermediate height through
     spatial ops to match the runtime executor's memory calculation.
@@ -2407,9 +2405,9 @@ def detect_and_solve_chains(ag: AnalyzedGraph) -> AnalyzedGraph:
         ag.stages[head_id].chain_tile_h = tile_h
 
         # A chain recomputes iff any member stage has a positive composed
-        # halo (eff_kh - stride > 0). Mark the head so the runtime can later
-        # keep the shared boundary rows in a line buffer instead of
-        # redundantly recomputing them per tile. Memory-neutral, no threshold.
+        # halo (eff_kh - stride > 0). Mark the head so the runtime keeps the
+        # shared boundary rows in a line buffer instead of recomputing them
+        # per tile. Memory-neutral, no threshold.
         recomputes = any(
             (eff_kh - stride) > 0
             for eff_kh, stride in (

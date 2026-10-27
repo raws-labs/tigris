@@ -75,7 +75,7 @@ def _flattened_into_a_product(ag: AnalyzedGraph, op: OpNode) -> bool:
 
     A flatten whose one reader is a product over a constant weight needs no
     conversion: the emitter permutes the weight's columns instead, which
-    costs nothing at inference. Mirrors _fc_inputs_flattening_spatial in the
+    costs nothing at inference. Mirrors _build_fc_layout_permutations in the
     binary writer, which performs that permutation; a flatten this does not
     describe has to be converted rather than left to a compensation nobody
     applies.
