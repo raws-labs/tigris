@@ -255,6 +255,17 @@ def strided_conv_path(tmp_path):
 
 
 @pytest.fixture
+def edge_conv_path(tmp_path):
+    """Conv5x5 with pad 2, [1,4,14,8] -> [1,8,14,8]."""
+    weights = numpy_helper.from_array(
+        np.linspace(-1.0, 1.0, 8 * 4 * 25, dtype=np.float32).reshape(8, 4, 5, 5), "weights")
+    conv = helper.make_node("Conv", ["input", "weights"], ["output"], name="conv0",
+                            kernel_shape=[5, 5], pads=[2, 2, 2, 2])
+    return save_onnx(tmp_path, "edge_conv", [conv], [vi("input", [1, 4, 14, 8])],
+                     [vi("output", [1, 8, 14, 8])], [weights], opset=17, ir_version=8)
+
+
+@pytest.fixture
 def qdq_conv_path(tmp_path):
     """Quantized Conv->Relu with QDQ operators (int8 weights + activation Q/DQ).
 

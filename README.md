@@ -52,7 +52,7 @@ fits 256.00 KiB fast memory, 58 stages, 53 tiled
 memory
   unscheduled         5.74 MiB
   largest tensor      4.59 MiB   1x96x112x112
-  this plan         252.00 KiB   4.00 KiB headroom
+  this plan         250.00 KiB   6.00 KiB headroom
   slow memory         5.17 MiB
   slow traffic       20.25 MiB   per inference: 7.21 MiB written, 13.04 MiB read
   also fits at      128.00 KiB   64 stages, 62 tiled

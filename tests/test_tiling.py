@@ -608,17 +608,39 @@ def test_a_strided_stripe_states_the_output_band_it_runs(strided_conv_path):
             record["halo"], record["band_axis"]) == (2, 8, 16, 2, 1)
 
 
-@pytest.mark.parametrize("budget,band", [(640, 1), (1280, 2), (1663, 2), (1664, 3)])
-def test_a_stripe_states_the_working_set_of_its_band(strided_conv_path, budget, band):
+@pytest.mark.parametrize("budget,band,tiles", [
+    (640, 1, 16), (1280, 2, 8), (1663, 2, 8), (1664, 3, 6), (2688, 4, 4), (3712, 6, 3)])
+def test_a_stripe_states_the_working_set_of_its_band(strided_conv_path, budget, band, tiles):
     """A band of B output rows reads 2B+1 input rows of 128 bytes and writes B rows of 256, and
-    the plan states exactly that working set for the largest band the budget holds. At 640 bytes
+    the plan states exactly that working set. The band is the smallest one with the tile count
+    of the largest band the budget holds, since every such band reads the same input rows here:
+    at 2688 bytes a band of 5 fits, and 4 rows cover the 16 in the same 4 tiles. At 640 bytes
     one output row fits as a height stripe, so the stage needs no 2D tile."""
     from tigris import TILE_AXIS_HEIGHT_OR_LENGTH
     from tigris.cli import _run_pipeline
 
+    # The largest band the budget holds needs as many tiles; one row less than `band` needs more.
+    largest = (budget - 128) // 512
+    assert -(-16 // largest) == tiles and (band == 1 or -(-16 // (band - 1)) > tiles)
     ag, _ = _run_pipeline(str(strided_conv_path), (str(budget),), report_bindings=False)
     tp = ag.stages[0].tile_plan
     assert tp.axis == TILE_AXIS_HEIGHT_OR_LENGTH and tp.tile_width == 0
-    assert (tp.tile_height, tp.num_tiles) == (band, -(-16 // band))
+    assert (tp.tile_height, tp.num_tiles) == (band, tiles)
     assert tp.tiled_peak_bytes == (2 * band + 1) * 128 + band * 256 <= budget
+    assert not tp.warnings
+
+
+@pytest.mark.parametrize("budget,band", [(4864, 7), (5119, 7), (5120, 13), (5375, 13)])
+def test_a_stripe_band_reads_no_more_rows_than_the_largest_that_fits(edge_conv_path, budget, band):
+    """Each band reads its rows plus two above and two below, within the 14 input rows. The
+    working set of a band of B rows is min(B+4, 14) input rows of 128 bytes plus B output rows
+    of 256. Up to 5119 bytes the largest band that fits is 12 or less, and two bands of 7 read
+    9 + 9 rows, as many as two bands of 12. At 5120 bytes a band of 13 fits, and its two bands
+    read 14 + 3 rows, one fewer, so the plan keeps it."""
+    from tigris.cli import _run_pipeline
+
+    ag, _ = _run_pipeline(str(edge_conv_path), (str(budget),), report_bindings=False)
+    tp = ag.stages[0].tile_plan
+    assert (tp.tile_height, tp.num_tiles, tp.tile_width) == (band, 2, 0)
+    assert tp.tiled_peak_bytes == min(band + 4, 14) * 128 + band * 256 <= budget
     assert not tp.warnings
