@@ -1409,7 +1409,9 @@ def _solve_forward_2d(
 
     The input rectangle of an output tile is ``(t - 1) * stride + eff_k``,
     clamped to the full input, exactly as the runtime back-computes it; a
-    stage without a spatial op reads the output rectangle itself.
+    stage without a spatial op reads the output rectangle itself. The caller
+    asks only for a stage the stripe solve found positive extents for and
+    _stage_2d_eligible admits, so the stage has a rank-4 input and output.
     """
     spatial = next(
         (op for op in stage_ops
@@ -1419,11 +1421,6 @@ def _solve_forward_2d(
     out_h = _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
     out_w = _find_output_dim_extent(ag, stage, dim=3, ranks={4})
     in_infos = _stage_rank4_input_infos(ag, stage)
-    if out_h <= 0 or out_w <= 0 or not in_infos:
-        return TilePlan(
-            tileable=False,
-            warnings=[f"Stage {stage.stage_id}: cannot determine 2D tile extents"],
-        )
     full_in_h = int(in_infos[0].shape[2])
     full_in_w = int(in_infos[0].shape[3])
     if spatial is None:
@@ -1614,6 +1611,10 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         # branch that grids the expanded OUTPUT extent. Every other stage falls
         # through to the existing byte-identical path below.
         if _stage_is_convtranspose_2d(stage_ops):
+            if not _ops_read_the_running_band(ag, stage, carries_operands=False, columns=True):
+                stage.tile_plan = TilePlan(
+                    tileable=False, warnings=[_OFF_BAND_WARNING.format(stage.stage_id)])
+                continue
             stage.tile_plan = _banded(_solve_convtranspose_2d(ag, stage, stage_ops, budget),
                                       TILE_BAND_KIND_HW)
             continue
@@ -1708,7 +1709,7 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
 
         # Serialized axis 1 of NHWC/NLC is the height or length, source NCHW/NCL dim 2.
         input_h = _find_source_dim_extent(ag, stage, dim=2, ranks={3, 4})
-        output_h = _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
+        output_h = _band_output_extent(ag, stage, stage_ops)
         if input_h <= 0 or output_h <= 0:
             stage.tile_plan = TilePlan(
                 tileable=False,
@@ -1910,6 +1911,18 @@ def _find_output_dim_extent(
     return 0
 
 
+def _band_output_extent(ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode]) -> int:
+    """The height or length of the tensor whose rows a stripe's output bands
+    cover: the output of its spatial op, else its first output. A stage output
+    produced ahead of the spatial op has the input's rows."""
+    spatial = next((op for op in stage_ops
+                    if op_category(op) in (TileCategory.CONV, TileCategory.POOL)), None)
+    if spatial is None:
+        return _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
+    shape = ag.tensors[spatial.outputs[0]].shape
+    return int(shape[2]) if len(shape) in (3, 4) else 0
+
+
 def _estimate_halo_bytes(ag: AnalyzedGraph, stage, halo: int, input_h: int) -> int:
     """Estimate bytes for one halo region of the stage's input tensor."""
     for name in _stage_candidates(ag, stage):
@@ -1973,44 +1986,81 @@ def _keeps_the_band(ag: AnalyzedGraph, op: OpNode, weight_shapes, columns: bool)
     return len(source) != 4 or len(result) != 4 or int(source[3]) == int(result[3])
 
 
+def _band_extents(info) -> tuple[int, ...]:
+    """The extents a banded executor hands an op: the rank, the stored rows
+    and, at rank 4, the stored width."""
+    stored = serialized_shape(info.shape, info.layout)
+    return (len(stored), *stored[1:3 if len(stored) == 4 else 2])
+
+
+def _one_row_operand(info) -> bool:
+    """A rank-4 tensor one stored row high, which the height stripe loads whole."""
+    stored = serialized_shape(info.shape, info.layout)
+    return len(stored) == 4 and stored[1] == 1
+
+
 def _ops_read_the_running_band(
     ag: AnalyzedGraph, stage: Stage, carries_operands: bool = True, columns: bool = False
 ) -> bool:
     """Whether every op of a stage reads the band its executor holds.
 
     The chain executor, the height stripe and the HW tile run a stage as one
-    band. The band starts at the stage input, and each resample, and each
-    convolution or pool that does not keep the band (see _keeps_the_band),
-    moves it to that op's output. Every op is handed the current band's
-    height and width. An op that reads a tensor from an earlier point of the
-    band, such as a branch off the input of a strided convolution, would be
-    handed rows or columns of the wrong extent and position. With
-    ``carries_operands``, as in the chain executor, a two-operand binary op is
-    the exception: the executor offsets a carried operand to the band's rows.
-    The height stripe and the HW tile offset none. ``columns`` states that the
-    band is an HW tile.
+    band. The band starts at the stage input, and each resample, each
+    ConvTranspose, and each convolution or pool that does not keep the band
+    (see _keeps_the_band), moves it to that op's output. Every op is handed
+    the current band's height and width. An op that reads a tensor from an
+    earlier point of the band, such as a branch off the input of a strided
+    convolution, would be handed rows or columns of the wrong extent and
+    position. With ``carries_operands``, as in the chain executor, a
+    two-operand binary op is the exception: the executor offsets a carried
+    operand to the band's rows. The height stripe and the HW tile offset none.
+    ``columns`` states that the band is an HW tile, which also writes every
+    stage output at the output tile, so each has to be on the final band.
+
+    The executor sizes each op by the band's extents (_band_extents), which
+    the band input sets and each move takes from the moving op's output, so a
+    tensor is on the band only with those extents and every op output has
+    them. The band input is the first stage input, for the height stripe the
+    first that is not one row high. The stripe loads a one-row operand whole,
+    so a binary op there may read one before the first move.
     """
     weight_shapes = _ag_weight_shapes(ag)
+    stripe = not carries_operands and not columns
+    inputs = [ag.tensors[name] for name in stage.input_tensors
+              if name in ag.tensors and not ag.tensors[name].is_constant]
+    if not inputs:
+        return False
+    extents = _band_extents(next((info for info in inputs
+                                  if not (stripe and _one_row_operand(info))), inputs[0]))
     level = dict.fromkeys(stage.input_tensors, 0)
     current = 0
     for op_i in stage.op_indices:
         op = ag.ops[op_i]
         dynamic = [name for name in op.inputs
                    if name in ag.tensors and not ag.tensors[name].is_constant]
-        on_band = [name for name in dynamic if level.get(name) == current]
-        if carries_operands and op.op_type in _BINARY_OPS and len(dynamic) == 2:
+        binary = op.op_type in _BINARY_OPS and len(dynamic) >= 2
+        on_band = [name for name in dynamic if level.get(name) == current and (
+            _band_extents(ag.tensors[name]) == extents
+            or (stripe and binary and _one_row_operand(ag.tensors[name])))]
+        if carries_operands and binary and len(dynamic) == 2:
             if not on_band:
                 return False
         elif len(on_band) != len(dynamic):
             return False
+        outputs = [ag.tensors[name] for name in op.outputs
+                   if name in ag.tensors and not ag.tensors[name].is_constant]
         category = op_category(op)
-        if category is TileCategory.UPSAMPLE or (
+        if category is TileCategory.UPSAMPLE or op.op_type == "ConvTranspose" or (
                 category in (TileCategory.CONV, TileCategory.POOL)
                 and not _keeps_the_band(ag, op, weight_shapes, columns)):
             current += 1
+            if outputs:
+                extents = _band_extents(outputs[0])
+        if any(_band_extents(info) != extents for info in outputs):
+            return False
         for name in op.outputs:
             level[name] = current
-    return True
+    return not columns or all(level.get(name) == current for name in stage.output_tensors)
 
 
 def _is_stage_tileable(ag: AnalyzedGraph, stage: Stage) -> bool:
