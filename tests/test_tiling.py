@@ -670,3 +670,23 @@ def test_a_stage_takes_the_tile_that_loads_fewer_input_bytes(wide_conv_path, bud
     else:
         assert (tp.axis, tp.tile_height, tp.tile_width) == (TILE_AXIS_HEIGHT_OR_LENGTH, band, 0)
     assert tp.tiled_peak_bytes <= budget and not tp.warnings
+
+
+def test_a_stripe_needs_the_rows_of_an_output(tmp_path):
+    """An Add of x and a constant that does not broadcast with it leaves its
+    output's shape unresolved, and nothing reads that output, so the Add's
+    stage has no output and no op output of known shape. The stripe cannot
+    state how many rows its bands cover, and the stage is not tiled."""
+    constant = numpy_helper.from_array(np.ones((1, 8, 5, 7), np.float32), "c")
+    path = save_onnx(tmp_path, "unresolved",
+                     [helper.make_node("Relu", ["x"], ["y"]),
+                      helper.make_node("Add", ["x", "c"], ["unread"])],
+                     [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 64, 64])],
+                     [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 64, 64])],
+                     [constant], opset=17, ir_version=8, filename="unresolved.onnx")
+    ag = plan_model(str(path), ("16K",))
+    assert "unread" not in ag.tensors
+    stage = next(s for s in ag.stages if [ag.ops[i].op_type for i in s.op_indices] == ["Add"])
+    assert (stage.input_tensors, stage.output_tensors) == (["x"], [])
+    assert not stage.tile_plan.tileable
+    assert stage.tile_plan.warnings == [f"Stage {stage.stage_id}: cannot determine spatial height"]

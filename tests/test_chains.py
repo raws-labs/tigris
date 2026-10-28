@@ -23,7 +23,7 @@ from tigris.analysis.partition_spatial import (
     solve_chain_tile_height,
 )
 from tigris.analysis.partition_temporal import partition_temporal
-from tigris.emitters.binary.defs import TILE_BAND_KIND_HW
+from tigris.emitters.binary.defs import TILE_BAND_KIND_HW, TILE_BAND_KIND_STRIPE
 from tigris.emitters.binary.reader import read_binary_plan
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.graph.ir import OpNode, Stage
@@ -488,12 +488,121 @@ def _wide_model(path, kernel):
                      inits, ir_version=8, filename=path.name)
 
 
-def _stripe_stages(path, budget):
-    """Stages {0}, {1, 2} and the rest, partitioned where they fit, then
+# A 2D window without pads: (kernel height, kernel width).
+_PRE_SPATIAL_WINDOWS = {"narrow": (1, 3), "short": (3, 1), "small": (3, 3)}
+
+
+def _tile_model(path, variant):
+    """A Conv stem to x, a stage of ops 1 and 2, then a join.
+
+    "narrow", "short" and "small": a Sigmoid of x to y, a Conv of y without
+    pads to z, a MaxPool of y on the same window and z + pooled. "transpose":
+    a ConvTranspose of x (2x2, stride 2) to b with a Relu of x to r, a Resize
+    of r and b + resized. "transpose_output": a Sigmoid of x to y, a
+    ConvTranspose of y to z, a Resize of y and z + resized.
+    "transpose_on_band": a ConvTranspose of x to b, a Relu of b to r, a
+    Resize of x and r + resized. "wide": x of 4 x 256, a Sigmoid of x to y, a
+    3x3 Conv of y to z and z + y. "length": x of length 4096, a Conv1D of x
+    (kernel 3) to b with a Relu of x to r, and b + r.
+    """
+    rng = np.random.default_rng(0)
+    inits = []
+
+    def weight(name, shape):
+        values = rng.standard_normal(shape).astype(np.float32) * 0.3
+        inits.append(helper.make_tensor(name, TensorProto.FLOAT, values.shape, values.ravel().tolist()))
+
+    def resize(source, output):
+        return helper.make_node("Resize", [source, "", "scales"], [output], mode="nearest",
+                                coordinate_transformation_mode="asymmetric", nearest_mode="floor")
+
+    def transpose(source, output):
+        weight("w1", (8, 8, 2, 2))
+        return helper.make_node("ConvTranspose", [source, "w1"], [output], kernel_shape=[2, 2],
+                                strides=[2, 2])
+
+    if variant == "length":
+        weight("w0", (8, 3, 3))
+        weight("w1", (8, 8, 3))
+        nodes = [helper.make_node("Conv", ["input", "w0"], ["x"], kernel_shape=[3], pads=[1, 1]),
+                 helper.make_node("Conv", ["x", "w1"], ["b"], kernel_shape=[3], pads=[1, 1]),
+                 helper.make_node("Relu", ["x"], ["r"]), helper.make_node("Add", ["b", "r"], ["output"])]
+        return save_onnx(path.parent, variant, nodes,
+                         [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 4096])],
+                         [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 4096])],
+                         inits, ir_version=8, filename=path.name)
+    channels, height, width = (16, 4, 256) if variant == "wide" else (8, 32, 32)
+    weight("w0", (channels, 3, 3, 3))
+    nodes = [helper.make_node("Conv", ["input", "w0"], ["x"], kernel_shape=[3, 3], pads=[1] * 4)]
+    out_h, out_w = height, width
+    if variant in _PRE_SPATIAL_WINDOWS:
+        kh, kw = _PRE_SPATIAL_WINDOWS[variant]
+        out_h, out_w = height - kh + 1, width - kw + 1
+        weight("w1", (8, 8, kh, kw))
+        nodes += [helper.make_node("Sigmoid", ["x"], ["y"]),
+                  helper.make_node("Conv", ["y", "w1"], ["z"], kernel_shape=[kh, kw], pads=[0] * 4),
+                  helper.make_node("MaxPool", ["y"], ["pooled"], kernel_shape=[kh, kw]),
+                  helper.make_node("Add", ["z", "pooled"], ["output"])]
+    elif variant == "wide":
+        weight("w1", (16, 16, 3, 3))
+        nodes += [helper.make_node("Sigmoid", ["x"], ["y"]),
+                  helper.make_node("Conv", ["y", "w1"], ["z"], kernel_shape=[3, 3], pads=[1] * 4),
+                  helper.make_node("Add", ["z", "y"], ["output"])]
+    else:
+        out_h, out_w = 2 * height, 2 * width
+        inits.append(helper.make_tensor("scales", TensorProto.FLOAT, [4], [1.0, 1.0, 2.0, 2.0]))
+        if variant == "transpose":
+            nodes += [transpose("x", "b"), helper.make_node("Relu", ["x"], ["r"]),
+                      resize("r", "resized"), helper.make_node("Add", ["b", "resized"], ["output"])]
+        elif variant == "transpose_output":
+            nodes += [helper.make_node("Sigmoid", ["x"], ["y"]), transpose("y", "z"),
+                      resize("y", "resized"), helper.make_node("Add", ["z", "resized"], ["output"])]
+        else:
+            nodes += [transpose("x", "b"), helper.make_node("Relu", ["b"], ["r"]),
+                      resize("x", "resized"), helper.make_node("Add", ["r", "resized"], ["output"])]
+    return save_onnx(path.parent, variant, nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, height, width])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT,
+                                                    [1, channels, out_h, out_w])],
+                     inits, ir_version=8, filename=path.name)
+
+
+def _extents_model(path, y_shape, add=False):
+    """x [1, 1, 8, 4] and y of `y_shape`, both model inputs: a Relu of x to a,
+    then a Relu of y or, with `add`, a + y to b."""
+    second = (helper.make_node("Add", ["a", "y"], ["b"]) if add
+              else helper.make_node("Relu", ["y"], ["b"]))
+    return save_onnx(path.parent, "extents", [helper.make_node("Relu", ["x"], ["a"]), second],
+                     [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 8, 4]),
+                      helper.make_tensor_value_info("y", TensorProto.FLOAT, list(y_shape))],
+                     [helper.make_tensor_value_info("a", TensorProto.FLOAT, [1, 1, 8, 4]),
+                      helper.make_tensor_value_info("b", TensorProto.FLOAT,
+                                                    [1, 1, 8, 4] if add else list(y_shape))],
+                     ir_version=8, filename=path.name)
+
+
+def _narrow_input_model(path):
+    """Model inputs x [1, 8, 32, 32] and y [1, 8, 32, 16]: a Relu of each, to
+    a and b, a 1x2 MaxPool of a (stride 1x2), and its sum with b. The loader
+    schedules the Relu of y first, then the Relu of x."""
+    window = {"kernel_shape": [1, 2], "strides": [1, 2]}
+    nodes = [helper.make_node("Relu", ["x"], ["a"]), helper.make_node("Relu", ["y"], ["b"]),
+             helper.make_node("MaxPool", ["a"], ["pooled"], **window),
+             helper.make_node("Add", ["pooled", "b"], ["output"])]
+    return save_onnx(path.parent, "narrow_input", nodes,
+                     [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 32, 32]),
+                      helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 32, 16])],
+                     [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8, 32, 16])],
+                     ir_version=8, filename=path.name)
+
+
+def _stripe_stages(path, budget, first=1):
+    """Ops `first` and `first` + 1 in one stage and every other op in its own
+    (by default {0}, {1, 2} and the rest), partitioned where they fit, then
     tiled at `budget`; the temporal partition never keeps more than one op in
     a stage it cannot fit, so this is the only way such a stage is tiled."""
     ag = compute_memory_timeline(compute_lifetimes(load_model(path)))
-    ag = partition_temporal(ag, 1 << 22, frozenset(range(len(ag.ops))) - {2})
+    ag = partition_temporal(ag, 1 << 22, frozenset(range(len(ag.ops))) - {first + 1})
     ag.budget = replace(ag.budget, fast=budget)
     return partition_spatial(ag)
 
@@ -525,7 +634,7 @@ _OFF_BAND_CHAINS = [
 
 
 class TestRunningBand:
-    """Every op of a chained stage reads the band the chain executor holds."""
+    """Every op of a chained or tiled stage reads the band its executor holds."""
 
     @pytest.mark.parametrize("strided", [True, False])
     def test_a_branch_off_an_earlier_band_is_refused(self, tmp_path, strided):
@@ -671,6 +780,122 @@ class TestRunningBand:
             plan = tmp_path / "wide.tgrs"
             plan.write_bytes(emit_binary_bytes(ag))
             _run_against_onnxruntime(path, plan)
+
+    @pytest.mark.parametrize("variant", sorted(_PRE_SPATIAL_WINDOWS))
+    def test_a_stripe_bands_its_spatial_ops_output(self, tmp_path, require_host_library, variant):
+        """The stage's first output y comes before the Conv and has the
+        input's rows and width. The stripe bands the rows of the Conv's
+        output, so the plan runs as the model; banded by y, it would write past
+        the Conv's band (narrow) or not fit its arena (short, small)."""
+        path = _tile_model(tmp_path / "tile.onnx", variant)
+        ag = _stripe_stages(path, 48 * 1024)
+        stage = next(s for s in ag.stages if s.op_indices == [1, 2])
+        assert stage.output_tensors[0] == "y"
+        assert stage.tile_plan.band_kind == TILE_BAND_KIND_STRIPE and stage.tile_plan.num_tiles > 1
+        assert stage.tile_plan.original_height == 32 - _PRE_SPATIAL_WINDOWS[variant][0] + 1
+        plan = tmp_path / "tile.tgrs"
+        plan.write_bytes(emit_binary_bytes(ag))
+        _run_against_onnxruntime(path, plan)
+
+    @pytest.mark.parametrize("variant, budget, on_band", [
+        ("transpose", 64 * 1024, False), ("transpose_output", 48 * 1024, False),
+        ("transpose_on_band", 48 * 1024, True)])
+    def test_a_convtranspose_tile_reads_its_band(self, tmp_path, require_host_library,
+                                                 variant, budget, on_band):
+        """A ConvTranspose moves the HW tile's band, so the Relu of its input
+        reads off the band, and an output from before it is not at the output
+        tile. Tiled, those plans would run with wrong output or not fit their
+        arena; a Relu of its output keeps the tile."""
+        path = _tile_model(tmp_path / "tile.onnx", variant)
+        ag = _stripe_stages(path, budget)
+        stage = next(s for s in ag.stages if s.op_indices == [1, 2])
+        assert _ops_read_the_running_band(ag, stage, carries_operands=False, columns=True) is on_band
+        assert stage.tile_plan.tileable is on_band
+        if not on_band:
+            assert stage.tile_plan.warnings == [f"Stage {stage.stage_id} reads rows a tile does not hold"]
+            return
+        assert stage.tile_plan.band_kind == TILE_BAND_KIND_HW
+        plan = tmp_path / "tile.tgrs"
+        plan.write_bytes(emit_binary_bytes(ag))
+        _run_against_onnxruntime(path, plan)
+
+    def test_an_hw_tile_writes_its_outputs_on_its_band(self, tmp_path):
+        """An HW tile writes every stage output at the output tile. The
+        Sigmoid's output leaves the stage from before the 3x3 Conv, so the
+        stage is not HW tiled; tiled, it would run with wrong output."""
+        path = _tile_model(tmp_path / "tile.onnx", "wide")
+        ag = _stripe_stages(path, 40 * 1024)
+        stage = next(s for s in ag.stages if s.op_indices == [1, 2])
+        assert stage.output_tensors[0] == "y"
+        assert not _stage_2d_eligible(ag, stage, [ag.ops[i] for i in stage.op_indices])
+        assert stage.tile_plan.band_kind != TILE_BAND_KIND_HW
+
+    @pytest.mark.parametrize("variant, budget", [
+        ("conv3", 48 * 1024), ("resize", 48 * 1024), ("transpose", 64 * 1024),
+        ("transpose_output", 48 * 1024), ("wide", 40 * 1024), ("length", 48 * 1024)])
+    def test_the_runtime_refuses_a_tile_off_its_band(self, tmp_path, require_host_library,
+                                                     monkeypatch, variant, budget):
+        """Without the band check the compiler tiles each stage, as a stripe
+        (conv3, resize, and length along the length) or an HW tile. The
+        runtime loader refuses that plan; run, the Resize stripe would write
+        past its arena."""
+        from tigris.analysis import partition_spatial as spatial
+        from tigris.runtime import RuntimeError as HostError, check_plan
+
+        model = _stripe_model if variant in ("conv3", "resize") else _tile_model
+        path = model(tmp_path / "tile.onnx", variant)
+        monkeypatch.setattr(spatial, "_ops_read_the_running_band", lambda *args, **kwargs: True)
+        ag = _stripe_stages(path, budget)
+        assert next(s for s in ag.stages if s.op_indices == [1, 2]).tile_plan.tileable
+        with pytest.raises(HostError) as refused:
+            check_plan(emit_binary_bytes(ag))
+        assert str(refused.value) == ("the runtime loader refuses the plan: tiled stage reads or "
+                                      "writes a tensor outside its band; recompile the model with "
+                                      "this TiGrIS release")
+
+    @pytest.mark.parametrize("y_shape, add, y_first, stripe, others", [
+        ((1, 1, 8, 2), False, False, False, False),
+        ((1, 1, 6, 4), False, False, False, False),
+        ((1, 1, 8, 4), False, True, True, True),
+        ((1, 1, 1, 4), False, False, False, False),
+        ((1, 1, 1, 4), True, True, True, False),
+    ])
+    def test_a_band_reads_stage_inputs_of_its_extents(self, tmp_path, y_shape, add, y_first,
+                                                      stripe, others):
+        """Each executor hands an op the rows and width of its band input:
+        the first stage input, for the height stripe the first that is not
+        one row high. A Relu of a narrower, shorter or one-row y is off the
+        band; run as a stripe, the narrower one would write past the fast
+        arena. The stripe reads a one-row operand of a binary op as a
+        broadcast."""
+        ag = load_model(_extents_model(tmp_path / "extents.onnx", y_shape, add))
+        stage = Stage(0, [0, 1], ["y", "x"] if y_first else ["x", "y"], ["a", "b"])
+        assert _ops_read_the_running_band(ag, stage, carries_operands=False) is stripe
+        assert _ops_read_the_running_band(ag, stage, carries_operands=False, columns=True) is others
+        assert _ops_read_the_running_band(ag, stage) is others
+
+    def test_the_runtime_refuses_a_tile_of_other_extents(self, tmp_path, require_host_library,
+                                                        monkeypatch):
+        """The stage of the two Relus reads x and the narrower y, so it is not
+        tiled. Without the extents rule the compiler tiles it, and the runtime
+        loader refuses that plan."""
+        from tigris.analysis import partition_spatial as spatial
+        from tigris.runtime import RuntimeError as HostError, check_plan
+
+        path = _narrow_input_model(tmp_path / "narrow_input.onnx")
+        ag = _stripe_stages(path, 48 * 1024, first=0)
+        stage = next(s for s in ag.stages if s.op_indices == [0, 1])
+        assert [ag.ops[i].inputs for i in stage.op_indices] == [["y"], ["x"]]
+        assert not stage.tile_plan.tileable
+        assert stage.tile_plan.warnings == [f"Stage {stage.stage_id} reads rows a tile does not hold"]
+        monkeypatch.setattr(spatial, "_ops_read_the_running_band", lambda *args, **kwargs: True)
+        ag = _stripe_stages(path, 48 * 1024, first=0)
+        assert next(s for s in ag.stages if s.op_indices == [0, 1]).tile_plan.tileable
+        with pytest.raises(HostError) as refused:
+            check_plan(emit_binary_bytes(ag))
+        assert str(refused.value) == ("the runtime loader refuses the plan: tiled stage reads or "
+                                      "writes a tensor outside its band; recompile the model with "
+                                      "this TiGrIS release")
 
     @pytest.mark.parametrize("model, cuts, budget, chained", [
         ("strided", frozenset(), 120 * 1024, [1]),
