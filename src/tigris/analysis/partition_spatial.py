@@ -1733,13 +1733,8 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
         num_tiles = math.ceil(output_h / band)
 
         def rows_read(rows: int) -> int:
-            total = 0
-            for start in range(0, output_h, rows):
-                low, high = start, min(start + rows, output_h)
-                for op in reversed(stage_ops):
-                    low, high = _op_input_span(op, low, high, input_h, weight_shapes)
-                total += high - low
-            return total
+            return sum(high - low for low, high in _tile_spans(
+                stage_ops, output_h, rows, input_h, weight_shapes))
 
         # The smallest band with that tile count that reads no more input rows. Reads stop
         # at the input's edges, so a short last band can read fewer rows in all.
@@ -1748,28 +1743,28 @@ def _assign_tile_plans(ag: AnalyzedGraph) -> AnalyzedGraph:
                     if rows_read(rows) <= reads)
         tiled_peak = band_peak(band)
 
-        # A single-row height tile that still overflows the budget cannot be
-        # rescued by any smaller height-only tile: height is already at its
-        # floor. If the stage is eligible for 2D (HW) tiling, try shrinking
-        # both axes together before falling back to the 1D infeasible
-        # warning below.
+        # Take the 2D tile when no stripe fits, or when it loads fewer input bytes than the stripe.
         min_2d_tile_infeasible = False
         min_2d_bytes = 0
         if (
-            band == 1
-            and tiled_peak > budget
-            and _stage_2d_eligible(ag, stage, stage_ops)
+            _stage_2d_eligible(ag, stage, stage_ops)
+            and _find_source_dim_extent(ag, stage, dim=3, ranks={4}) > 0
         ):
-            if _find_source_dim_extent(ag, stage, dim=3, ranks={4}) > 0:
-                plan_2d = _solve_forward_2d(ag, stage, stage_ops, budget, rf_h, weight_shapes)
-                if plan_2d.tileable:
-                    stage.tile_plan = _banded(plan_2d, TILE_BAND_KIND_HW)
-                    continue
+            plan_2d = _solve_forward_2d(ag, stage, stage_ops, budget, rf_h, weight_shapes)
+            if plan_2d.tileable and (
+                tiled_peak > budget
+                or _forward_2d_bytes_read(ag, stage, stage_ops, plan_2d, weight_shapes)
+                < _stripe_bytes_read(ag, stage, _tile_spans(
+                    stage_ops, output_h, band, input_h, weight_shapes))
+            ):
+                stage.tile_plan = _banded(plan_2d, TILE_BAND_KIND_HW)
+                continue
 
-                # Even a 1x1 output tile does not fit the budget. Mark this
-                # stage distinctly so the surfaced diagnostic names the 2D
-                # tile instead of falling back to the generic 1D minimum-tile
-                # message below. The 1x1 tile is what the stage needs.
+            # Even a 1x1 output tile does not fit the budget. Mark this
+            # stage distinctly so the surfaced diagnostic names the 2D
+            # tile instead of falling back to the generic 1D minimum-tile
+            # message below. The 1x1 tile is what the stage needs.
+            if tiled_peak > budget:
                 min_2d_tile_infeasible = True
                 min_2d_bytes = plan_2d.min_tile_bytes
 
@@ -2262,35 +2257,53 @@ def _op_input_rows(op: OpNode, rows: int, weight_shapes) -> int:
     return (rows - 1) * stride + ekh
 
 
-def _op_input_span(op: OpNode, start: int, stop: int, height: int, weight_shapes) -> tuple[int, int]:
-    """The rows of a `height`-row input an operator reads for its output rows [start, stop)."""
+def _op_input_span(
+    op: OpNode, start: int, stop: int, extent: int, weight_shapes, axis: int = 0
+) -> tuple[int, int]:
+    """The rows (``axis`` 0) or columns (1) of an input `extent` long an operator reads for its
+    output positions [start, stop)."""
     if op_category(op) not in (TileCategory.CONV, TileCategory.POOL):
         return start, stop
-    ekh, stride = _window(op, 0, weight_shapes)
-    top = int((op.attrs.get("pads") or [0])[0])
-    return max(start * stride - top, 0), min((stop - 1) * stride - top + ekh, height)
+    eff, stride = _window(op, axis, weight_shapes)
+    pads = op.attrs.get("pads") or ()
+    before = int(pads[axis]) if len(pads) > axis else 0
+    return max(start * stride - before, 0), min((stop - 1) * stride - before + eff, extent)
+
+
+def _tile_spans(
+    stage_ops: list[OpNode], out_extent: int, tile: int, in_extent: int, weight_shapes, axis: int = 0
+) -> list[tuple[int, int]]:
+    """The input span each tile of `tile` output positions reads along one axis, clamped to the
+    input as the runtime's tile loops clamp it."""
+    spans = []
+    for start in range(0, out_extent, tile):
+        low, high = start, min(start + tile, out_extent)
+        for op in reversed(stage_ops):
+            low, high = _op_input_span(op, low, high, in_extent, weight_shapes, axis)
+        spans.append((low, high))
+    return spans
+
+
+def _band_rows_bytes(info, rows: int) -> int:
+    """Bytes of `rows` rows of a tensor along serialized axis 1, the axis a band cuts."""
+    if len(info.shape) not in (3, 4):
+        return info.size_bytes
+    axis_map = serialized_axis_map(len(info.shape), info.layout)
+    height = int(info.shape[axis_map.index(1)])
+    if height <= 0:
+        return info.size_bytes
+    return -(-info.size_bytes * min(rows, height) // height)
 
 
 def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int, weight_shapes) -> int:
     """Fast memory one band of a height-striped stage takes, as the runtime
     allocates it: every stage input and every op output its own aligned band,
     op heights carried forward through the spatial ops."""
-
-    def band(info, rows: int) -> int:
-        # The band cuts serialized axis 1, whichever model axis that holds.
-        if len(info.shape) not in (3, 4):
-            return align_up(info.size_bytes)
-        axis_map = serialized_axis_map(len(info.shape), info.layout)
-        height = int(info.shape[axis_map.index(1)])
-        if height <= 0:
-            return align_up(info.size_bytes)
-        return align_up(-(-info.size_bytes * min(rows, height) // height))
-
     total = 0
     for name in stage.input_tensors:
         info = ag.tensors.get(name)
         if info is not None and not info.is_constant:
-            total += band(info, in_rows)
+            total += align_up(_band_rows_bytes(info, in_rows))
     rows = in_rows
     for op_i in stage.op_indices:
         op = ag.ops[op_i]
@@ -2298,8 +2311,31 @@ def _stage_band_bytes(ag: AnalyzedGraph, stage: Stage, in_rows: int, weight_shap
         for name in op.outputs:
             info = ag.tensors.get(name)
             if info is not None:
-                total += band(info, rows)
+                total += align_up(_band_rows_bytes(info, rows))
     return total
+
+
+def _stripe_bytes_read(ag: AnalyzedGraph, stage: Stage, spans: list[tuple[int, int]]) -> int:
+    """Bytes a height stripe loads from its stage inputs, each input over the rows of every span."""
+    infos = [info for info in map(ag.tensors.get, stage.input_tensors)
+             if info is not None and not info.is_constant]
+    return sum(_band_rows_bytes(info, high - low) for low, high in spans for info in infos)
+
+
+def _forward_2d_bytes_read(
+    ag: AnalyzedGraph, stage: Stage, stage_ops: list[OpNode], plan: TilePlan, weight_shapes
+) -> int:
+    """Bytes a 2D tile grid loads from its stage inputs, each input over the rectangle every
+    tile reads."""
+    in_infos = _stage_rank4_input_infos(ag, stage)
+    in_h, in_w = int(in_infos[0].shape[2]), int(in_infos[0].shape[3])
+    out_h = _find_output_dim_extent(ag, stage, dim=2, ranks={3, 4})
+    out_w = _find_output_dim_extent(ag, stage, dim=3, ranks={4})
+    rows = sum(high - low for low, high in _tile_spans(
+        stage_ops, out_h, plan.tile_height, in_h, weight_shapes))
+    columns = sum(high - low for low, high in _tile_spans(
+        stage_ops, out_w, plan.tile_width, in_w, weight_shapes, axis=1))
+    return rows * columns * sum(info.size_bytes // (in_h * in_w) for info in in_infos)
 
 
 def _chain_fast_bytes(

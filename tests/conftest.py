@@ -266,6 +266,17 @@ def edge_conv_path(tmp_path):
 
 
 @pytest.fixture
+def wide_conv_path(tmp_path):
+    """Conv3x3 with pad 1, [1,4,32,32] -> [1,8,32,32]."""
+    weights = numpy_helper.from_array(
+        np.linspace(-1.0, 1.0, 8 * 4 * 9, dtype=np.float32).reshape(8, 4, 3, 3), "weights")
+    conv = helper.make_node("Conv", ["input", "weights"], ["output"], name="conv0",
+                            kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    return save_onnx(tmp_path, "wide_conv", [conv], [vi("input", [1, 4, 32, 32])],
+                     [vi("output", [1, 8, 32, 32])], [weights], opset=17, ir_version=8)
+
+
+@pytest.fixture
 def qdq_conv_path(tmp_path):
     """Quantized Conv->Relu with QDQ operators (int8 weights + activation Q/DQ).
 

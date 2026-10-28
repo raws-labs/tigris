@@ -644,3 +644,35 @@ def test_a_stripe_band_reads_no_more_rows_than_the_largest_that_fits(edge_conv_p
     assert (tp.tile_height, tp.num_tiles, tp.tile_width) == (band, 2, 0)
     assert tp.tiled_peak_bytes == min(band + 4, 14) * 128 + band * 256 <= budget
     assert not tp.warnings
+
+
+@pytest.mark.parametrize("budget,band,tile,two_d", [
+    (4096, 2, (6, 12), True), (8192, 4, (10, 15), True), (10240, 6, (6, 32), False),
+    (17408, 8, (14, 24), False)])
+def test_a_stage_takes_the_tile_that_loads_fewer_input_bytes(wide_conv_path, budget, band, tile, two_d):
+    """Where a height stripe and a 2D tile both fit, the stage takes the one that loads fewer input
+    bytes, halo included, and a tie keeps the stripe. Every tile reads one more input row and column
+    on each side, within the 32; an input row is 512 bytes and an input pixel 16. At 4096 bytes
+    bands of 2 rows load 62 rows (31,744 bytes) and 6x12 tiles 42 x 36 pixels (24,192 bytes). At
+    10240 bytes the largest 2D tile is a full-width band of 6 rows, which loads as much as the
+    stripe. At 17408 bytes bands of 8 rows load 38 rows (19,456 bytes) and 14x24 tiles 36 x 34
+    pixels (19,584 bytes)."""
+    from tigris import TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW
+    from tigris.cli import _run_pipeline
+
+    def span(n):
+        return sum(min(start + n + 1, 32) - max(start - 1, 0) for start in range(0, 32, n))
+
+    th, tw = tile
+    # Both candidates fit: the stripe's input and output band, the tile's input and output rectangle.
+    assert (band + 2) * 512 + band * 1024 <= budget
+    assert min(th + 2, 32) * min(tw + 2, 32) * 16 + th * tw * 32 <= budget
+    assert (span(th) * span(tw) * 16 < span(band) * 512) == two_d
+    ag, _ = _run_pipeline(str(wide_conv_path), (str(budget),), report_bindings=False)
+    tp = ag.stages[0].tile_plan
+    if two_d:
+        assert (tp.axis, tp.tile_height, tp.tile_width) == (TILE_AXIS_HW, th, tw)
+        assert tp.num_tiles == -(-32 // th) * -(-32 // tw)
+    else:
+        assert (tp.axis, tp.tile_height, tp.tile_width) == (TILE_AXIS_HEIGHT_OR_LENGTH, band, 0)
+    assert tp.tiled_peak_bytes <= budget and not tp.warnings

@@ -94,6 +94,30 @@ def test_a_strided_stripe_runs_the_bands_its_plan_states(strided_conv_path, tmp_
         np.testing.assert_array_equal(outputs[key], reference[key])
 
 
+def test_a_2d_tile_that_loads_fewer_bytes_runs_as_stated(wide_conv_path, tmp_path):
+    """At 4096 bytes the stage runs 18 tiles of 6x12 output pixels, which load 24,192 input bytes
+    against 31,744 for the stripe that also fits, and they reproduce the unbanded result exactly."""
+    from tigris.emitters.binary.reader import read_binary_plan
+
+    results = []
+    for size in ("4096", "64K"):
+        graph, _ = _run_pipeline(str(wide_conv_path), (size,), report_bindings=False)
+        path = tmp_path / f"wide-{size}.tgrs"
+        path.write_bytes(emit_binary_bytes(graph))
+        with Session(path) as session:
+            (item,) = session.inputs
+            image = np.random.default_rng(0).standard_normal(item["shape"]).astype(np.float32)
+            outputs, _, counters = session.trace({item["name"]: image})
+        results.append((read_binary_plan(path.read_bytes())["tile_plans"], outputs, counters))
+    (tiled, outputs, counters), (untiled, reference, _) = results
+    assert [(record["axis"], record["tile_extent"], record["output_width_extent"], record["num_tiles"])
+            for record in tiled] == [(3, 6, 12, 18)] and not untiled
+    assert (counters["tiles"], counters["load_bytes"]) == (18, 24192)
+    assert outputs.keys() == reference.keys()
+    for key in outputs:
+        np.testing.assert_array_equal(outputs[key], reference[key])
+
+
 @pytest.fixture
 def override_library(tmp_path):
     directory = Path(runtime.__file__).with_name("native")

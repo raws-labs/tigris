@@ -15,6 +15,7 @@ from tigris import (
     SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
     TILE_AXIS_HEIGHT_OR_LENGTH,
+    TILE_AXIS_HW,
 )
 from tigris.cli.compile import _run_compressed_pipeline
 from tigris.emitters.binary import defs
@@ -28,6 +29,7 @@ from tigris.emitters.binary.defs import (
     TENSOR_FLAG_LINEAR,
     TENSOR_FLAG_MODEL_INPUT,
     TENSOR_FLAG_MODEL_OUTPUT,
+    TILE_BAND_KIND_HW,
     TILE_BAND_KIND_LEADING,
     TILE_BAND_KIND_STRIPE,
     TILE_BAND_MODE_LEADING,
@@ -175,7 +177,7 @@ def test_roundtrip_conv_chain(conv_relu_chain_path):
 
 
 def test_roundtrip_conv_pool(conv_pool_chain_path):
-    # This fixture has a feasible 4 KiB tile plan.
+    # This fixture has a feasible 4 KiB tile plan: both Conv stages take 2D tiles, the pool a stripe.
     ag = full_pipeline(conv_pool_chain_path, budget=4096)
     data = emit_binary_bytes(ag)
     plan = read_binary_plan(data)
@@ -197,12 +199,15 @@ def test_roundtrip_conv_pool(conv_pool_chain_path):
         assert tp_bin["tileable"] == tp.tileable
         assert tp_bin["axis"] == tp.axis
         assert tp_bin["tile_extent"] == tp.tile_height
+        assert tp_bin["output_width_extent"] == tp.tile_width
         assert tp_bin["num_tiles"] == tp.num_tiles
         assert tp_bin["halo"] == tp.halo
         assert tp_bin["original_extent"] == tp.original_height
         assert tp_bin["band_axis"] == tp.band_axis
         assert (tp_bin["band_kind"], tp_bin["band_mode"]) == (tp.band_kind, tp.band_mode)
-        assert tp.band_kind == TILE_BAND_KIND_STRIPE
+        assert tp.band_kind == (TILE_BAND_KIND_HW if tp.axis == TILE_AXIS_HW else TILE_BAND_KIND_STRIPE)
+    assert [stage.tile_plan.axis for stage in tiled_stages] == [
+        TILE_AXIS_HW, TILE_AXIS_HEIGHT_OR_LENGTH, TILE_AXIS_HW]
 
 
 # Tensor validation
