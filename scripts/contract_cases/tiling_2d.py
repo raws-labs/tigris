@@ -38,10 +38,9 @@ def _2d_tiled_conv_case() -> ContractCase:
     4x8 output tile. 66 is not divisible by 4 or 8, so the last row, the last
     column, and the bottom-right corner tile are all partial.
 
-    Height-only tiling is infeasible first: partition_spatial only attempts
-    the 2D solve after its 1D tile_h == 1 candidate still exceeds budget, so
-    an emitted axis == TILE_AXIS_HW plan is itself proof the 1D path failed
-    closed at this budget.
+    Height-only tiling is infeasible at this budget: a one-row stripe holds
+    three input rows and one output row of 16,896 bytes each (67,584 bytes),
+    more than 24K, so the stage takes the 2D tile.
     """
     rng = np.random.default_rng(0)
     conv, initializers = _conv0(rng, "input", "output", 64, 64)

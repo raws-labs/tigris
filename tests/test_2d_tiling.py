@@ -104,8 +104,8 @@ def test_op_supports_axis_excludes_conv1d_for_hw():
     assert _op_supports_axis(conv2d, TILE_AXIS_HW) is True
 
 
-# Axis selection: HW only kicks in once the 1D height solve is infeasible
-# even at a single-row tile.
+# Axis selection: HW is taken when the 1D height solve is infeasible even at a
+# single-row tile, or when the 2D tile loads fewer input bytes than the stripe.
 
 
 def _conv(inp, out, kernel=3, stride=1):
@@ -142,7 +142,7 @@ def plan_for_single_stage(ag: AnalyzedGraph):
     return ag.stages[0].tile_plan
 
 
-def test_axis_is_hw_only_when_height_infeasible():
+def test_axis_is_hw_when_height_infeasible():
     # [1,256,256] row = 64K; a single row does not fit a 24K budget.
     ag = build_high_res_conv_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
     ag = partition_spatial(ag)
@@ -151,8 +151,9 @@ def test_axis_is_hw_only_when_height_infeasible():
     assert stage_plan.tileable is True
 
 
-def test_axis_stays_height_when_1d_feasible():
-    # [1,64,32] row = 2K, fits a 64K budget without needing HW tiling.
+def test_axis_stays_height_when_2d_loads_no_fewer_bytes():
+    # [1,64,32] row = 2K. At 64K the largest 2D tile is a full-width band of
+    # 15 rows, which loads as many input bytes as the stripe.
     ag = build_high_res_conv_graph(h=256, w=64, c=32, mem_budget=64 * 1024)
     ag = partition_spatial(ag)
     stage_plan = plan_for_single_stage(ag)
@@ -208,7 +209,7 @@ def build_high_res_conv_sigmoid_graph(h, w, c, mem_budget):
 
 def test_binary_op_stage_does_not_go_hw():
     # End to end through partition_spatial(): same budget that forces a bare
-    # Conv stage to TILE_AXIS_HW (see test_axis_is_hw_only_when_height_infeasible)
+    # Conv stage to TILE_AXIS_HW (see test_axis_is_hw_when_height_infeasible)
     # must NOT do so once a binary Add against an uncotiled skip tensor is
     # in the stage. It falls back to the 1D height axis instead.
     ag = build_high_res_conv_add_graph(h=256, w=256, c=256, mem_budget=24 * 1024)
