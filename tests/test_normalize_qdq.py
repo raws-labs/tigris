@@ -3,8 +3,10 @@
 import numpy as np
 import onnx
 import pytest
+from click.testing import CliRunner
 from onnx import TensorProto, helper, numpy_helper
 
+from tigris.cli import cli
 from tigris.loaders import load_model
 from tigris.loaders.onnx.loader import load_model as load_raw
 from tigris.loaders.onnx.normalize import normalize
@@ -774,3 +776,86 @@ def test_transposed_quantized_weight_matches_onnx_runtime(tmp_path):
     with Session(binary) as session:
         actual = session.run({"input": values})["output"]
     assert np.abs(np.round((actual - expected) / 0.05)).max() <= 1
+
+
+def _qdq(name, source, target):
+    """QuantizeLinear and DequantizeLinear from ``source`` to ``target`` at scale 0.05."""
+    return [helper.make_node("QuantizeLinear", [source, "s", "zp"], [f"{target}_q"], name=f"{name}_q"),
+            helper.make_node("DequantizeLinear", [f"{target}_q", "s", "zp"], [target], name=f"{name}_dq")]
+
+
+_QDQ_SCALE = [numpy_helper.from_array(np.array(0.05, np.float32), "s"),
+              numpy_helper.from_array(np.array(0, np.int8), "zp")]
+
+
+def _float(name, shape):
+    return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+
+
+def test_an_input_only_removed_operators_read_stays_int8(tmp_path):
+    """z feeds only a Sigmoid nothing reads; the Sigmoid goes and z keeps the
+    quantization its QuantizeLinear states, so the interface is unchanged."""
+    nodes = (_qdq("x", "x", "xd") + [helper.make_node("Relu", ["xd"], ["r"], name="relu")]
+             + _qdq("r", "r", "y") + _qdq("z", "z", "zd")
+             + [helper.make_node("Sigmoid", ["zd"], ["g"], name="sigmoid")] + _qdq("g", "g", "unread"))
+    ag = load_model(save_onnx(tmp_path, "unused_input", nodes,
+                              [_float(name, [1, 8, 16, 16]) for name in "xz"], [_float("y", [1, 8, 16, 16])],
+                              _QDQ_SCALE))
+
+    assert [op.op_type for op in ag.ops] == ["Relu"]
+    assert ag.model_inputs == ["x", "z"]
+    assert [(ag.tensors[name].dtype, ag.tensors[name].quant.scale) for name in ag.model_inputs] == [
+        (TensorProto.INT8, pytest.approx([0.05]))] * 2
+
+
+def test_an_output_nothing_reads_keeps_the_quantization_its_pair_states(tmp_path):
+    """The Split stays for the half the model returns, and the half nothing
+    reads is int8 at the scale its QuantizeLinear states."""
+    nodes = (_qdq("x", "x", "xd")
+             + [helper.make_node("Split", ["xd", "halves"], ["top", "bottom"], axis=2, name="split")]
+             + _qdq("top", "top", "td") + [helper.make_node("Relu", ["td"], ["r"], name="relu")]
+             + _qdq("r", "r", "y") + _qdq("bottom", "bottom", "unread"))
+    halves = numpy_helper.from_array(np.array([8, 8], np.int64), "halves")
+    ag = load_model(save_onnx(tmp_path, "split_half", nodes, [_float("x", [1, 8, 16, 16])],
+                              [_float("y", [1, 8, 8, 16])], _QDQ_SCALE + [halves]))
+
+    assert [op.op_type for op in ag.ops] == ["Split", "Relu"]
+    bottom = ag.tensors[ag.ops[0].outputs[1]]
+    assert (bottom.dtype, bottom.quant.scale) == (TensorProto.INT8, pytest.approx([0.05]))
+
+
+@pytest.mark.usefixtures("require_host_library")
+def test_a_pair_nothing_reads_keeps_the_operator_that_defines_its_scale(tmp_path):
+    """The pair on r takes its scale from an Identity. The Identity stays with
+    the pair, so the fold finds the scale, every read has a definer, and the
+    model compiles."""
+    nodes = (_qdq("x", "x", "xd") + [helper.make_node("Relu", ["xd"], ["r"], name="relu")]
+             + _qdq("r", "r", "y")
+             + [helper.make_node("Identity", ["s"], ["s1"], name="shared_scale"),
+                helper.make_node("QuantizeLinear", ["r", "s1", "zp"], ["rq"], name="unread_q"),
+                helper.make_node("DequantizeLinear", ["rq", "s1", "zp"], ["unread"], name="unread_dq")])
+    path = save_onnx(tmp_path, "shared_scale", nodes, [_float("x", [1, 8, 64, 64])],
+                     [_float("y", [1, 8, 64, 64])], _QDQ_SCALE)
+    ag = load_model(path)
+
+    assert [op.op_type for op in ag.ops] == ["Relu"]
+    defined = set(ag.model_inputs) | ag.weight_data.keys() | {name for op in ag.ops for name in op.outputs}
+    assert {name for op in ag.ops for name in op.inputs if name} <= defined
+    result = CliRunner().invoke(cli, ["compile", str(path), "-m", "16K", "-o", str(tmp_path / "plan.tgrs")])
+    assert result.exit_code == 0, result.output
+
+
+def test_a_read_the_fold_leaves_without_a_producer_keeps_what_precedes_it(tmp_path):
+    """The fold removes the QuantizeLinear a QLinearMatMul reads, so nothing
+    defines that read; the Relu before it stays, and the refusal names the
+    model's operators as they are."""
+    nodes = [helper.make_node("Relu", ["x"], ["r"], name="relu"),
+             helper.make_node("QuantizeLinear", ["r", "s", "zp"], ["rq"], name="quantize"),
+             helper.make_node("QLinearMatMul", ["rq", "s", "zp", "w", "s", "zp", "s", "zp"], ["yq"],
+                              name="product"),
+             helper.make_node("DequantizeLinear", ["yq", "s", "zp"], ["y"], name="dequantize")]
+    weight = numpy_helper.from_array(np.ones((8, 8), np.int8), "w")
+    ag = load_model(save_onnx(tmp_path, "qoperator", nodes, [_float("x", [4, 8])], [_float("y", [4, 8])],
+                              _QDQ_SCALE + [weight]))
+
+    assert [op.name for op in ag.ops] == ["relu", "product", "dequantize"]

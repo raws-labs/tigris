@@ -4,6 +4,7 @@ import numpy as np
 from onnx.helper import np_dtype_to_tensor_dtype
 
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
+from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.loaders.onnx.normalize.common import _Uses
 from tigris.loaders.onnx.shapes import static_value
 
@@ -17,6 +18,70 @@ def _drop_unreferenced_weights(ag: AnalyzedGraph) -> AnalyzedGraph:
     uses = _Uses(ag)
     for name in [n for n in ag.weight_data if not uses.reader_count(n)]:
         del ag.weight_data[name]
+    return ag
+
+
+def _drop_dead_ops(ag: AnalyzedGraph) -> AnalyzedGraph:
+    """Remove operators whose results neither the model returns nor a kept
+    operator reads, and the subgraphs only a removed If or While runs.
+
+    Such an operator changes no model output, yet it would take memory and a
+    stage of its own, and a stage that writes nothing has no band to tile.
+    A QuantizeLinear on a model input or a kept operator's output, with the
+    DequantizeLinear reading it, is kept: the pair states the quantization of
+    that tensor, which the QDQ fold moves onto it, also where nothing reads it.
+    The operators that define the pair's scale and zero point are kept with it.
+    A graph is left as it is when an operator reads a value that no operator,
+    input or constant defines, as what the read depends on is unknown, or when
+    an operator other than If and While holds a subgraph, as neither what the
+    subgraph reads nor which attributes name it is recorded.
+    """
+    def held(ops) -> list[int]:
+        return [op.attrs[key] for op in ops for key in CONTROL_FLOW.get(op.op_type, ())]
+
+    producers = {name: index for index, op in enumerate(ag.ops) for name in op.outputs if name}
+    defined = producers.keys() | set(ag.model_inputs) | ag.weight_data.keys()
+    if (any(name and name not in defined for op in ag.ops for name in op.inputs)
+            or sorted(held(ag.ops)) != list(range(len(ag.subgraphs)))):
+        return ag
+    kept: set[int] = set()
+    pairs: set[int] = set()
+    pending = [producers[name] for name in ag.model_outputs if name in producers]
+    while pending:
+        while pending:
+            index = pending.pop()
+            if index not in kept:
+                kept.add(index)
+                pending.extend(producers[name] for name in ag.ops[index].inputs if name in producers)
+        present = set(ag.model_inputs) | {name for index in kept for name in ag.ops[index].outputs}
+        stated = {op.outputs[0]: index for index, op in enumerate(ag.ops)
+                  if op.op_type == "QuantizeLinear" and op.inputs[0] in present}
+        added = (set(stated.values()) | {index for index, op in enumerate(ag.ops)
+                                         if op.op_type == "DequantizeLinear" and op.inputs[0] in stated})
+        added -= kept | pairs
+        pairs |= added
+        pending = [producers[name] for index in added for name in ag.ops[index].inputs[1:]
+                   if name in producers]
+    kept |= pairs
+    if len(kept) == len(ag.ops):
+        return ag
+
+    removed = [op for index, op in enumerate(ag.ops) if index not in kept]
+    ag.ops = [op for index, op in enumerate(ag.ops) if index in kept]
+    named = {name for op in ag.ops for name in op.inputs + op.outputs}
+    named |= set(ag.model_inputs) | set(ag.model_outputs)
+    for op in removed:
+        for name in op.outputs:
+            if name not in named:
+                ag.tensors.pop(name, None)
+
+    order = sorted(held(ag.ops))
+    if len(order) < len(ag.subgraphs):
+        renumbered = {old: new for new, old in enumerate(order)}
+        for op in ag.ops:
+            for key in CONTROL_FLOW.get(op.op_type, ()):
+                op.attrs[key] = renumbered[op.attrs[key]]
+        ag.subgraphs = [ag.subgraphs[old] for old in order]
     return ag
 
 

@@ -29,7 +29,7 @@ from tigris.loaders.onnx.normalize.relabels import (
     _standalone_bn_as_affine, _whole_map_average_pool_to_gap
 )
 from tigris.loaders.onnx.normalize.static import (
-    _drop_inference_identities, _drop_unreferenced_weights, _fold_static_subgraphs
+    _drop_dead_ops, _drop_inference_identities, _drop_unreferenced_weights, _fold_static_subgraphs
 )
 
 __all__ = ["detection_scratch_bytes", "normalize"]
@@ -41,6 +41,8 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     declared_outputs = list(ag.model_outputs)
     transposed: dict[str, str] = {}
     ag = _adopt_compiler_ops(ag)
+    # The folds below then see only the readers that execute.
+    ag = _drop_dead_ops(ag)
     ag = _normalize_arg_outputs(ag)
     # Names tigris::Gather and tigris::GatherND: _normalize_movement strips the prefix.
     ag = _narrow_index_casts(ag)
@@ -89,6 +91,8 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _gather_one_index_to_split(ag)
     ag = _relabel_shape_ops_to_reshape(ag)
     ag = _lower_linear_matmul(ag, transposed)
+    # A fold can take the last reader of an operator, as a folded Shape does.
+    ag = _drop_dead_ops(ag)
     ag = _drop_unreferenced_weights(ag)
     ag = _restore_output_names(ag, declared_outputs)
     for step, op in enumerate(ag.ops):
