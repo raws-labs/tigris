@@ -622,7 +622,7 @@ def test_analyze_reports_json_with_tflite_micro_arena_and_exact_plan_size(tmp_pa
     assert (report["report"], report["version"]) == ("tigris-analysis", 1)
     assert report["model"]["format"] == "tflite" and report["model"]["dtype"] == "int8"
     assert report["model"]["inputs"] == [{"name": "x", "shape": [1, 6, 6, 4]}]
-    # Several subgraphs: TFLite Micro's figure is not modelled.
+    # Several subgraphs: TFLite Micro's figure is not modeled.
     assert report["tflite_micro"] is None
     plan = tmp_path / "m.tgrs"
     assert CliRunner().invoke(cli, ["compile", str(model), "-m", "256K", "-o", str(plan)]).exit_code == 0
