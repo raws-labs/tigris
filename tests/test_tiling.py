@@ -672,18 +672,41 @@ def test_a_stage_takes_the_tile_that_loads_fewer_input_bytes(wide_conv_path, bud
     assert tp.tiled_peak_bytes <= budget and not tp.warnings
 
 
-def test_a_stripe_needs_the_rows_of_an_output(tmp_path):
-    """An Add of x and a constant that does not broadcast with it leaves its
-    output's shape unresolved, and nothing reads that output, so the Add's
-    stage has no output and no op output of known shape. The stripe cannot
-    state how many rows its bands cover, and the stage is not tiled."""
+def _add_nothing_reads(tmp_path, name, nodes, init=()):
+    """Save ``nodes`` with an Add of x and a constant that does not broadcast
+    with it, so its output's shape stays unresolved, and nothing reads it."""
     constant = numpy_helper.from_array(np.ones((1, 8, 5, 7), np.float32), "c")
-    path = save_onnx(tmp_path, "unresolved",
-                     [helper.make_node("Relu", ["x"], ["y"]),
-                      helper.make_node("Add", ["x", "c"], ["unread"])],
+    return save_onnx(tmp_path, name, nodes + [helper.make_node("Add", ["x", "c"], ["unread"])],
                      [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8, 64, 64])],
                      [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 64, 64])],
-                     [constant], opset=17, ir_version=8, filename="unresolved.onnx")
+                     [constant, *init], opset=17, ir_version=8)
+
+
+def test_an_add_nothing_reads_leaves_no_stage(tmp_path):
+    """Normalization removes the Add, and the Relu's stage is tiled."""
+    path = _add_nothing_reads(tmp_path, "unread_add", [helper.make_node("Relu", ["x"], ["y"])])
+    ag = plan_model(str(path), ("16K",))
+    assert "unread" not in ag.tensors
+    (stage,) = ag.stages
+    assert [ag.ops[i].op_type for i in stage.op_indices] == ["Relu"]
+    assert (stage.input_tensors, stage.output_tensors) == (["x"], ["y"])
+    assert stage.tile_plan.tileable and not stage.tile_plan.warnings
+
+
+def test_a_stripe_needs_the_rows_of_an_output(tmp_path):
+    """Normalization leaves a graph with a Loop as it is, so the Add's stage
+    has no output and no op output of known shape. The stripe cannot state
+    how many rows its bands cover, and the stage is not tiled."""
+    body = helper.make_graph(
+        [helper.make_node("Identity", ["go"], ["go_out"]), helper.make_node("Relu", ["v"], ["v_out"])],
+        "body", [helper.make_tensor_value_info("i", TensorProto.INT64, []),
+                 helper.make_tensor_value_info("go", TensorProto.BOOL, []),
+                 helper.make_tensor_value_info("v", TensorProto.FLOAT, [1, 8, 64, 64])],
+        [helper.make_tensor_value_info("go_out", TensorProto.BOOL, []),
+         helper.make_tensor_value_info("v_out", TensorProto.FLOAT, [1, 8, 64, 64])])
+    path = _add_nothing_reads(tmp_path, "loop_unread_add",
+                              [helper.make_node("Loop", ["n", "", "x"], ["y"], body=body)],
+                              [numpy_helper.from_array(np.asarray(2, np.int64), "n")])
     ag = plan_model(str(path), ("16K",))
     assert "unread" not in ag.tensors
     stage = next(s for s in ag.stages if [ag.ops[i].op_type for i in s.op_indices] == ["Add"])
