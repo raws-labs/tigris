@@ -18,6 +18,12 @@ int8 inputs and TFLite Micro's outputs, written by
 `.npz` holds seeded inputs and the outputs TFLite Micro produces for them.
 The `float_` models are converted without quantization.
 
+TFLite Micro's float ELU, TANH and LSTM call the C library's expm1f and tanhf,
+whose results depend on the libm. The cases listed in
+`scripts/libm_goldens.py` keep the outputs of glibc 2.39 in `<case>.npz` and
+those of a correctly rounded libm (glibc 2.43) in `<case>_cr.npz`; the tests
+pick the set by the running libm's results on probe inputs.
+
 Where TFLite Micro disagrees with TFLite's reference kernels, the reference
 kernels' outputs are recorded instead. Two cases do: `relu6`, because TFLite
 Micro's int8 RELU6 ignores the output quantization, and `space_to_batch`,

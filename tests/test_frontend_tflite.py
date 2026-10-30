@@ -22,6 +22,7 @@ from tigris.frontends.tflite_export import tflm_tensor_arena
 from tigris.frontends.tflite_schema import BUILTIN_OPERATORS
 from tigris.inspection import inspect_file
 from tigris.runtime import Session
+from scripts.libm_goldens import CASES as LIBM_CASES, golden_suffix
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tflite"
 KWS = FIXTURES / "kws_ref_model.tflite"
@@ -103,11 +104,26 @@ def test_reference_model_matches_tflite_micro(name, budget, tiled, tmp_path):
     assert bool(tiled_stages) == tiled
 
 
+def _golden(model: Path):
+    """The recorded outputs for `model`, from the set that matches the running libm."""
+    return np.load(model.with_name(model.stem + golden_suffix(model.stem) + ".npz"))
+
+
+def test_libm_dependent_cases_keep_both_goldens():
+    """Both sets hold the same inputs, and the outputs differ somewhere."""
+    for name in LIBM_CASES:
+        legacy, rounded = (np.load(FIXTURES / "ops" / f"{name}{suffix}.npz") for suffix in ("", "_cr"))
+        assert sorted(legacy.files) == sorted(rounded.files)
+        same = {key: np.array_equal(legacy[key], rounded[key]) for key in legacy.files}
+        assert all(same[key] for key in same if key.startswith("input_")), name
+        assert not all(same[key] for key in same if key.startswith("output_")), name
+
+
 @pytest.mark.parametrize("model", sorted((FIXTURES / "ops").glob("*.tflite")), ids=lambda p: p.stem)
 @pytest.mark.usefixtures("require_host_library")
 def test_single_operator_matches_tflite_micro(model, tmp_path):
     assert tflite.unsupported(model.read_bytes()) == []
-    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), "256K", tmp_path)
+    _assert_matches_tflite_micro(model, _golden(model), "256K", tmp_path)
 
 
 # The fixtures that compile untiled at the tight budget.
@@ -229,7 +245,7 @@ def test_single_operator_at_a_tight_budget(model, tmp_path, request):
             return
         budget, limit = "1K", 1024
     request.getfixturevalue("require_host_library")
-    _assert_matches_tflite_micro(model, np.load(model.with_suffix(".npz")), budget, tmp_path)
+    _assert_matches_tflite_micro(model, _golden(model), budget, tmp_path)
     plan = read_binary_plan((tmp_path / "model.tgrs").read_bytes())
     for tile in plan["tile_plans"]:
         assert tile["tileable"] and tile["tiled_peak_bytes"] <= limit
