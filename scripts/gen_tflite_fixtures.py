@@ -8,9 +8,10 @@ Each is run on seeded inputs through TFLite Micro and through TFLite's
 reference kernels. The recorded outputs are TFLite Micro's; where
 TFLite Micro disagrees with the reference kernels, the reference kernels' are
 recorded and the case is named as a deviation. Models and outputs go to
-tests/fixtures/tflite/ops/ so the frontend tests need neither package. Needs
-tensorflow, which is not a project dependency, and tflite-micro from the dev
-extra:
+tests/fixtures/tflite/ops/ so the frontend tests need neither package. On a
+correctly rounded libm, the cases in libm_goldens.CASES are written as
+`<case>_cr.npz`. Needs tensorflow, which is not a project dependency, and
+tflite-micro from the dev extra:
 
     python scripts/gen_tflite_fixtures.py [case ...]
     python scripts/gen_tflite_fixtures.py --models
@@ -28,6 +29,8 @@ from flatbuffers import flexbuffers
 import tensorflow as tf
 from tflite_micro.python.tflite_micro import runtime as micro
 from tflite_micro.tensorflow.lite.micro.python import schema_py_generated as schema
+
+from libm_goldens import golden_suffix
 
 OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "tflite" / "ops"
 SAMPLES = 4
@@ -1103,7 +1106,7 @@ def generate(name: str) -> bool:
         arrays[f"output_{index}"] = np.stack([sample[index] for sample in outputs])
     if wide_boundary:
         arrays["reference"] = "TFLite Micro with checked int32 boundary values"
-    np.savez_compressed(OUT / f"{name}.npz", **arrays)
+    np.savez_compressed(OUT / f"{name}{golden_suffix(name)}.npz", **arrays)
     print(f"{name}: {len(model)} bytes" + (", TFLite Micro deviates" if deviates else ""))
     return deviates
 
