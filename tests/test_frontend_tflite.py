@@ -684,7 +684,7 @@ def test_analyze_reports_json_with_tflite_micro_arena_and_exact_plan_size(tmp_pa
     result = CliRunner().invoke(cli, ["analyze", str(model), "-m", "256K", "--json"])
     assert result.exit_code == 0, result.output
     report = json.loads(result.output)
-    assert (report["report"], report["version"]) == ("tigris-analysis", 1)
+    assert (report["report"], report["version"]) == ("tigris-analysis", 2)
     assert report["model"]["format"] == "tflite" and report["model"]["dtype"] == "int8"
     assert report["model"]["inputs"] == [{"name": "x", "shape": [1, 6, 6, 4]}]
     # Several subgraphs: TFLite Micro's figure is not modeled.

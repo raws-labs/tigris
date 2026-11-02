@@ -107,7 +107,7 @@ def test_analyze_lists_unsupported_operator_as_failure(acos_model_path):
         cli, ["analyze", str(acos_model_path), "-m", "4K"]
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
     assert "cannot compile" in result.output
     assert "unsupported_acos (Acos)" in result.output
 

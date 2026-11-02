@@ -1027,7 +1027,7 @@ def test_analyze_reports_the_tflite_micro_arena_after_export():
                                  "modeled")
     reduction = CliRunner().invoke(cli, ["analyze", str(FIXTURES / "ops" / "mean_channels.tflite"),
                                          "-m", "64K"])
-    assert ("TFLite Micro arena        368 B   its planner and reduction scratch; persistent "
+    assert ("TFLite Micro arena    368 B   its planner and reduction scratch; persistent "
             "allocations and other kernel scratch excluded") in reduction.output
 
 
@@ -1074,7 +1074,7 @@ def _tflite_micro_json(model) -> dict:
     result = CliRunner().invoke(cli, ["analyze", str(model), "-m", "64K", "--json"])
     assert result.exit_code == 0, result.output
     report = json.loads(result.output)
-    assert (report["report"], report["version"]) == ("tigris-analysis", 1)
+    assert (report["report"], report["version"]) == ("tigris-analysis", 2)
     return report["tflite_micro"]
 
 
