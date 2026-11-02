@@ -141,7 +141,7 @@ def test_trace_refuses_a_plan_compile_refuses_for_slow_overflow(conv_relu_chain_
     assert result.exit_code == 1, result.output
     assert "no plan to trace" in result.output
     result = CliRunner().invoke(cli, ["analyze", model, "-m", "16K", "-m", "1K"])
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
     assert "slow traffic" not in result.output
 
 

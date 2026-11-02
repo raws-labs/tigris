@@ -7,22 +7,20 @@ from pathlib import Path
 import click
 
 from tigris import TILE_AXIS_HW
+from tigris.analysis.memory import TENSOR_ALIGN, align_up
 from tigris.cli import _int8_io_option, _memory_sizes, _parse_input_shape, _planned, cli, text
 from tigris.pipeline import parse_size
 from tigris.utils import describe_interface, fmt_bytes, plural, source_shape
 
-# Budgets tried beyond the one given, halving below a fit or doubling above a failure.
-_BUDGETS_TRIED = 3
 
-
-def _report(ag, findings, budget: int, source: str, tflm_arena: int | None, tried: list,
+def _report(ag, findings, budget: int, source: str, tflm_arena: int | None, smallest: dict | None,
             traffic, tflm_export=None) -> dict:
     """The analysis as versioned JSON; byte counts are integers."""
     from tigris.cli.export import export_report
     f = findings
     return {
         "report": "tigris-analysis",
-        "version": 1,
+        "version": 2,
         "model": {
             "name": ag.model_name,
             "format": source,
@@ -79,8 +77,7 @@ def _report(ag, findings, budget: int, source: str, tflm_arena: int | None, trie
         },
         # Runtime build limits the plan needs above their defaults.
         "runtime_build": list(f.build_limits),
-        "budgets_tried": [{"budget_bytes": b, "fits": fits, "stages": stages, "tiled": tiled}
-                          for b, fits, stages, tiled in tried],
+        "smallest_fit": smallest,
         "stages": [{
             "stage": s.stage_id,
             "operators": len(s.op_indices),
@@ -96,32 +93,66 @@ def _report(ag, findings, budget: int, source: str, tflm_arena: int | None, trie
     }
 
 
+def smallest_fit(model: str, fitting_budget: int, slow: int, peak: int, input_shape,
+                 int8_io: bool) -> dict:
+    """The smallest fast budget whose plan fits memory with the slow budget
+    `slow` (0: unbounded), as the report's smallest_fit. Candidates are the
+    multiples of TENSOR_ALIGN up to one compiled and found to fit:
+    `fitting_budget`, a budget known to fit, rounded down to a multiple, or
+    else `peak`, the largest unscheduled peak of any graph, aligned up.
+    Bisection compiles both ends it reports and assumes nothing between them."""
+    from tigris.analysis.validation import plan_gate
 
-
-def _tried(model: str, budget: int, fits: bool, input_shape) -> list[tuple[int, bool, int, int]]:
-    """Other budgets compiled for comparison, as (budget, fits, stages,
-    tiled stages): halving from a budget that fits, doubling from one that
-    does not, until the answer changes. Only budgets actually compiled are
-    reported; a budget that fits does not imply every larger one does."""
-    from tigris.analysis.validation import validate_memory_plan
-
-    tried = []
-    candidate = budget
-    for _ in range(_BUDGETS_TRIED):
-        candidate = candidate // 2 if fits else candidate * 2
-        if candidate <= 0 or candidate > 0xFFFFFFFF:
-            break
+    def fits(multiple: int) -> bool:
+        candidate = multiple * TENSOR_ALIGN
+        mem = (str(candidate), str(slow)) if slow else (str(candidate),)
         try:
-            graph = _planned(model, (str(candidate),), input_shapes=input_shape,
-                             report_bindings=False)
+            graph = _planned(model, mem, input_shapes=input_shape, report_bindings=False,
+                             int8_io=int8_io)
         except click.ClickException:
-            break
-        ok = validate_memory_plan(graph).feasible
-        tiled = sum(runs_tiled(s) for s in graph.stages)
-        tried.append((candidate, ok, len(graph.stages), tiled))
-        if ok != fits:
-            break
-    return tried
+            return False
+        return plan_gate(graph).passes
+
+    found = {"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": slow or None}
+    top = fitting_budget // TENSOR_ALIGN
+    if not top or (top * TENSOR_ALIGN != fitting_budget and not fits(top)):
+        top = max(1, align_up(peak) // TENSOR_ALIGN)
+        if not fits(top):
+            return found
+    # Fits at high * TENSOR_ALIGN, fails at low * TENSOR_ALIGN (0: none below).
+    low, high = 0, top
+    while high - low > 1:
+        middle = (low + high) // 2
+        if fits(middle):
+            high = middle
+        else:
+            low = middle
+    found["budget_bytes"] = high * TENSOR_ALIGN
+    found["below_bytes"] = low * TENSOR_ALIGN or None
+    return found
+
+
+def smallest_row(smallest: dict) -> list[str] | None:
+    """The memory row for smallest_fit: the budget, then what does not fit.
+    None when no budget fits without a slow budget, which an unbounded slow
+    pool and the model's peak are not expected to give."""
+    slow, below = smallest["slow_budget_bytes"], smallest["below_bytes"]
+    pool = [f"with {fmt_bytes(slow)} slow memory"] if slow else []
+    if smallest["budget_bytes"] is None:
+        return ["smallest budget", "none", text.dim(f"no fast budget fits {pool[0]}")] if slow else None
+    failed = [f"{fmt_bytes(below)} does not fit"] if below is not None else []
+    return ["smallest budget", fmt_bytes(smallest["budget_bytes"]), text.dim("; ".join(pool + failed))]
+
+
+def _loads(plan: bytes) -> bool:
+    """Whether the host runtime's loader takes the plan, as compile checks it."""
+    from tigris.runtime import RuntimeError as HostRuntimeError, check_plan
+
+    try:
+        check_plan(plan)
+    except HostRuntimeError:
+        return False
+    return True
 
 
 def _lz4_compiles(model: str, mem: tuple[str, ...], input_shape) -> bool:
@@ -191,12 +222,13 @@ def verdict_lines(findings, budget: int, ag) -> list[str]:
 
 
 def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
-            tried: list | None = None, traffic=None, lz4_tried: bool = False,
+            smallest: dict | None = None, traffic=None, lz4_tried: bool = False,
             tflm_export=None) -> None:
     """The header, verdict, memory and flash, shared by analyze and compile.
-    `traffic` is what trace.traffic measured; None leaves the row out. The LZ4
-    row needs `lz4_tried`: the estimate stands only where -c lz4 compiles.
-    `tflm_export` is what tflite_export.export found; None leaves its row out."""
+    `smallest` is what smallest_fit found; None leaves its row out. `traffic`
+    is what trace.traffic measured; None leaves the row out. The LZ4 row needs
+    `lz4_tried`: the estimate stands only where -c lz4 compiles. `tflm_export`
+    is what tflite_export.export found; None leaves its row out."""
     f = findings
     dtype = "int8" if f.is_quantized else "float32" if f.is_float32 else "mixed"
     graphs = len(getattr(ag, "subgraphs", []) or [])
@@ -233,11 +265,9 @@ def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
                                 f"{fmt_bytes(traffic['read'])} read")])
     elif traffic is not None:
         memory.append(["slow traffic", "", text.dim(f"not measured: {traffic}")])
-    fits_here = not f.blocking_stages
-    for b, fits, stages, tiled in tried or []:
-        label = ("also fits at" if fits_here else "fits at") if fits else "does not fit at"
-        detail = _stage_count(stages) + (f", {tiled} tiled" if tiled else "") if fits else ""
-        memory.append([label, fmt_bytes(b), text.dim(detail)])
+    row = smallest_row(smallest) if smallest is not None else None
+    if row is not None:
+        memory.append(row)
     text.section("memory", memory, "<>")
 
     if f.total_weight_bytes > 0 or f.plan_size_bytes > 0:
@@ -307,6 +337,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     from tigris.analysis.findings import compute_findings
     from tigris.frontends.tflite import is_tflite
     from tigris.frontends.tflite_export import export, tflm_tensor_arena
+    from tigris.graph.subgraphs import all_graphs
 
     if as_json and trace:
         raise click.UsageError("--json and --trace are two different outputs; choose one")
@@ -316,11 +347,9 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     flash_budget = parse_size(flash) if flash else 0
     budget = mem_pools[0] if mem_pools else 0
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
-    # Only the fast tier is planned: analyze interprets the slow tier itself
-    # and stays display-only.
-    ag = _planned(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json,
+    ag = _planned(model, mem, input_shapes=input_shape, report_bindings=not as_json,
                   int8_io=int8_io)
-    ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
+    ag.budget = replace(ag.budget, flash=flash_budget)
     if trace:
         from tigris.cli.trace import trace_model
         trace_model(model, ag, input_files, verbose)
@@ -330,8 +359,15 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     tflm_arena = tflm_tensor_arena(data)
     findings = compute_findings(ag)
     supported = findings.gate.usable
-    tried = (_tried(model, budget, not findings.blocking_stages, input_shape)
-             if budget > 0 and supported else [])
+    # The bound covers every subgraph, which can need more than the main graph.
+    peak = max(graph.peak_memory_bytes for graph in all_graphs(ag))
+    smallest = (smallest_fit(model, budget if budget > 0 and findings.gate.passes else 0,
+                             slow_budget, peak, input_shape, int8_io)
+                if supported else None)
+    # As compile decides: the gate, a plan the writer produced, the flash
+    # budget, and the runtime loader.
+    writes = supported and (budget <= 0 or (findings.gate.passes and bool(findings.plan) and not (
+        flash_budget and findings.plan_size_bytes > flash_budget) and _loads(findings.plan)))
     if findings.lz4_plan_size_bytes and not (
             supported and not findings.blocking_stages and _lz4_compiles(model, mem, input_shape)):
         findings.lz4_plan_size_bytes = 0
@@ -340,10 +376,12 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     tflm_export = None if tflm_arena is None else export(data)
     if as_json:
         click.echo(json.dumps(_report(ag, findings, budget, "tflite" if is_tflite(data) else "onnx",
-                                      tflm_arena, tried, traffic, tflm_export),
+                                      tflm_arena, smallest, traffic, tflm_export),
                               indent=2, ensure_ascii=True, allow_nan=False))
-        return
-    summary(model, ag, findings, budget, tflm_arena, tried, traffic, lz4_tried=True,
-            tflm_export=tflm_export)
-    if verbose and ag.stages:
-        _stages(ag)
+    else:
+        summary(model, ag, findings, budget, tflm_arena, smallest, traffic, lz4_tried=True,
+                tflm_export=tflm_export)
+        if verbose and ag.stages:
+            _stages(ag)
+    if not writes:
+        click.get_current_context().exit(1)

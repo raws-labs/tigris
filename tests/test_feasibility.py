@@ -260,7 +260,7 @@ def test_analyze_displays_failing_verdict(conv_relu_chain_path):
         ["analyze", str(conv_relu_chain_path), "-m", "300"],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert "does not fit 300 B fast memory" in result.output
     # The blocking stage is named once, with what it needs.
     assert result.output.count("smallest 2D tile") == 1
@@ -404,7 +404,7 @@ def test_int8_global_pool_refuses_an_overflowing_sum(tmp_path, budget):
 def test_analyze_lists_five_blocking_stages_then_counts_the_rest():
     model = Path(__file__).parent / "fixtures" / "tflite" / "vww_96_int8.tflite"
     result = CliRunner().invoke(cli, ["analyze", str(model), "-m", "1K"])
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert "  and 2 more; --json lists all" in result.output
 
 
@@ -419,3 +419,220 @@ def test_a_stage_that_runs_untiled_names_its_operator_in_full(tmp_path):
 
     assert [issue.reason for issue in validate_memory_plan(graph).issues] == ["runs untiled: fc (head)"]
     assert compute_findings(graph).untileable_op_types == ["Gemm"]
+
+
+_TFLITE = Path(__file__).parent / "fixtures" / "tflite"
+
+
+def _wide_if(tmp_path):
+    """An If whose then branch widens x [1, 4] to [256, 4] and sums it back,
+    so the branch needs more memory than the main graph."""
+    def branch(name, wide):
+        x, y = f"{name}_x", f"{name}_y"
+        nodes = [helper.make_node("Relu", [x], [y])]
+        constants = []
+        if wide:
+            nodes = [helper.make_node("Mul", [x, f"{name}_c"], [f"{name}_wide"]),
+                     helper.make_node("Reshape", [f"{name}_wide", f"{name}_s"], [f"{name}_w3"]),
+                     helper.make_node("ReduceSum", [f"{name}_w3", f"{name}_ax"], [y], keepdims=0)]
+            constants = [numpy_helper.from_array(np.ones((256, 4), np.float32), f"{name}_c"),
+                         numpy_helper.from_array(np.asarray([1, 256, 4], np.int64), f"{name}_s"),
+                         numpy_helper.from_array(np.asarray([1], np.int64), f"{name}_ax")]
+        return helper.make_graph(nodes, name, [helper.make_tensor_value_info(x, TensorProto.FLOAT, [1, 4])],
+                                 [helper.make_tensor_value_info(y, TensorProto.FLOAT, [1, 4])], constants)
+
+    weights = [numpy_helper.from_array(np.asarray(0.0, np.float32), "zero"),
+               numpy_helper.from_array(np.asarray([2], np.int64), "axes"),
+               numpy_helper.from_array(np.asarray([1, 1, 4], np.int64), "rows")]
+    nodes = [helper.make_node("Reshape", ["x", "rows"], ["row"]),
+             helper.make_node("ReduceSum", ["row", "axes"], ["sum"], keepdims=0),
+             helper.make_node("Greater", ["sum", "zero"], ["positive"]),
+             helper.make_node("If", ["positive", "x"], ["y"], domain="tigris",
+                              then_branch=branch("then", True), else_branch=branch("else", False))]
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
+    graph = helper.make_graph(nodes, "wide_if", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])],
+                              [y], weights, value_info=[y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17),
+                                                    helper.make_opsetid("tigris", 1)])
+    model.ir_version = 9
+    path = tmp_path / "wide_if.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def _cli_model(name, tmp_path, conv_relu_chain_path, qdq_conv_path=None):
+    """A model for the analyze and compile parity cases, by short name."""
+    if name == "chain":
+        return conv_relu_chain_path
+    if name == "qdq":
+        return qdq_conv_path
+    if name == "wide_if":
+        return _wide_if(tmp_path)
+    if name == "relu":
+        return save_onnx(tmp_path, "relu", [helper.make_node("Relu", ["input"], ["output"])],
+                         [helper.make_tensor_value_info("input", TensorProto.FLOAT, ["batch", 64])],
+                         [helper.make_tensor_value_info("output", TensorProto.FLOAT, ["batch", 64])],
+                         opset=17, ir_version=8)
+    if name == "acos":
+        return save_onnx(tmp_path, "acos", [helper.make_node("Acos", ["input"], ["output"])],
+                         [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])],
+                         [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])],
+                         ir_version=8)
+    return {"vww": _TFLITE / "vww_96_int8.tflite", "while": _TFLITE / "ops" / "float_while.tflite"}[name]
+
+
+@pytest.mark.parametrize("model, options, writes", [
+    ("chain", ["-m", "64K"], True),
+    ("chain", ["-m", "64K", "-f", "1M"], True),
+    ("chain", ["-m", "300"], False),
+    ("chain", ["-m", "16K", "-m", "64K"], True),
+    ("chain", ["-m", "16K", "-m", "8K"], False),
+    ("chain", ["-m", "64K", "-f", "1K"], False),
+    ("chain", [], True),
+    ("acos", ["-m", "4K"], False),
+    ("acos", [], False),
+    ("vww", ["-m", "32K", "-m", "1M"], True),
+    ("vww", ["-m", "1K"], False),
+    ("while", ["-m", "1K", "-m", "64"], False),
+    ("while", [], True),
+    ("wide_if", [], True),
+    ("wide_if", ["-m", "64"], False),
+    ("wide_if", ["-m", "64K"], True),
+    ("chain", ["-m", "65535"], True),
+    ("chain", ["-m", "319"], False),
+    ("qdq", ["--int8-io"], True),
+    ("qdq", ["-m", "100", "--int8-io"], True),
+    ("qdq", ["-m", "32", "--int8-io"], False),
+    ("relu", ["--input-shape", "input:16x64"], True),
+    ("relu", ["-m", "4K", "-m", "2K", "--input-shape", "input:16x64"], False),
+    ("relu", ["-m", "8K", "-m", "4K", "--input-shape", "input:16x64"], True),
+], ids=["fits", "flash_fits", "fast_too_small", "slow_fits", "slow_too_small", "flash_too_small",
+        "no_budget", "unsupported", "unsupported_no_budget", "tflite_fits", "tflite_fast_too_small",
+        "slow_too_small_at_every_budget", "control_flow_no_budget", "wide_branch_no_budget",
+        "wide_branch_fast_too_small", "wide_branch_fits", "unaligned_fits", "unaligned_too_small",
+        "int8_io_no_budget", "int8_io_unaligned_fits", "int8_io_fast_too_small",
+        "input_shape_no_budget", "input_shape_slow_too_small", "input_shape_slow_fits"])
+def test_analyze_exits_1_exactly_when_compile_writes_no_plan(
+        tmp_path, conv_relu_chain_path, qdq_conv_path, model, options, writes):
+    """Without -m, compile runs at the smallest budget analyze reports, or at
+    64M when it reports none."""
+    import json
+
+    path = str(_cli_model(model, tmp_path, conv_relu_chain_path, qdq_conv_path))
+    text_run = CliRunner().invoke(cli, ["analyze", path, *options])
+    json_run = CliRunner().invoke(cli, ["analyze", path, *options, "--json"])
+    report = json.loads(json_run.output)
+    if "-m" not in options:
+        fit = report["smallest_fit"]
+        options = ["-m", str(fit["budget_bytes"] if fit and fit["budget_bytes"] else "64M"), *options]
+    output = tmp_path / "m.tgrs"
+    compiled = CliRunner().invoke(cli, ["compile", path, *options, "-o", str(output)])
+    assert output.exists() == writes, compiled.output
+    assert [text_run.exit_code, json_run.exit_code, compiled.exit_code] == [0 if writes else 1] * 3, (
+        text_run.output)
+
+
+def _row(output, label):
+    return " ".join(next(line for line in output.splitlines() if line.strip().startswith(label)).split())
+
+
+@pytest.mark.parametrize("model, pools, rest", [
+    ("chain", ["64K"], []),
+    ("chain", ["300"], []),
+    ("chain", ["16K", "8K"], []),
+    ("chain", [], []),
+    ("chain", ["1000"], []),
+    ("wide_if", ["64"], []),
+    ("qdq", ["100"], ["--int8-io"]),
+    ("relu", ["8K", "4K"], ["--input-shape", "input:16x64"]),
+], ids=["fits", "fast_too_small", "slow_too_small", "no_budget", "unaligned", "wide_branch",
+        "int8_io", "input_shape"])
+def test_analyze_reports_the_smallest_budget_and_compiles_both_ends(
+        tmp_path, conv_relu_chain_path, qdq_conv_path, model, pools, rest):
+    """The smallest budget fits and the one 32 bytes below does not, with the
+    slow pool and the other options given; both are compiled to check it."""
+    import json
+
+    from tigris.analysis.memory import TENSOR_ALIGN
+    from tigris.pipeline import parse_size
+    from tigris.utils import fmt_bytes
+
+    path = str(_cli_model(model, tmp_path, conv_relu_chain_path, qdq_conv_path))
+    options = [*(word for pool in pools for word in ("-m", pool)), *rest]
+    report = json.loads(CliRunner().invoke(cli, ["analyze", path, *options, "--json"]).output)
+    assert report["version"] == 2 and "budgets_tried" not in report
+    fit = report["smallest_fit"]
+    smallest, below, slow = fit["budget_bytes"], fit["below_bytes"], fit["slow_budget_bytes"]
+    assert slow == (parse_size(pools[1]) if len(pools) > 1 else None)
+    assert smallest % TENSOR_ALIGN == 0 and below == smallest - TENSOR_ALIGN
+    pool = ["-m", str(slow)] if slow else []
+    for fast, writes in ((smallest, True), (below, False)):
+        output = tmp_path / f"{fast}.tgrs"
+        CliRunner().invoke(cli, ["compile", path, "-m", str(fast), *pool, *rest, "-o", str(output)])
+        assert output.exists() == writes
+    result = CliRunner().invoke(cli, ["analyze", path, *options], env={"NO_COLOR": "1"})
+    clause = f"with {fmt_bytes(slow)} slow memory; " if slow else ""
+    assert _row(result.output, "smallest budget") == (
+        f"smallest budget {fmt_bytes(smallest)} {clause}{fmt_bytes(below)} does not fit")
+    assert "fits at" not in result.output
+
+
+@pytest.mark.parametrize("model, budgets", [
+    ("chain", [[], ["-m", "64K"], ["-m", "65535"], ["-m", "1000"], ["-m", "320"]]),
+    ("wide_if", [[], ["-m", "64"], ["-m", "64K"], ["-m", "1056"]]),
+], ids=["unaligned_budgets", "wide_branch"])
+def test_the_smallest_budget_does_not_depend_on_the_budget_given(
+        tmp_path, conv_relu_chain_path, model, budgets):
+    """Candidates are multiples of TENSOR_ALIGN whatever -m is, and the search
+    reaches what a subgraph needs above the main graph's peak."""
+    import json
+
+    from tigris.analysis.memory import TENSOR_ALIGN
+
+    path = str(_cli_model(model, tmp_path, conv_relu_chain_path))
+    reports = [json.loads(CliRunner().invoke(cli, ["analyze", path, *budget, "--json"]).output)
+               for budget in budgets]
+    fits = [report["smallest_fit"] for report in reports]
+    assert all(fit == fits[0] for fit in fits), fits
+    assert fits[0]["budget_bytes"] % TENSOR_ALIGN == 0
+    if model == "wide_if":
+        assert fits[0]["budget_bytes"] > reports[0]["model"]["unscheduled_peak_bytes"]
+
+
+def test_analyze_reports_no_smallest_budget_when_the_slow_pool_never_suffices():
+    """The loop's result always lives in slow memory, 128 bytes of it."""
+    import json
+
+    path = str(_TFLITE / "ops" / "float_while.tflite")
+    report = json.loads(CliRunner().invoke(cli, ["analyze", path, "-m", "1K", "-m", "64", "--json"]).output)
+    assert report["smallest_fit"] == {"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": 64}
+    result = CliRunner().invoke(cli, ["analyze", path, "-m", "1K", "-m", "64"], env={"NO_COLOR": "1"})
+    assert _row(result.output, "smallest budget") == (
+        "smallest budget none no fast budget fits with 64 B slow memory")
+
+
+def test_analyze_reports_no_smallest_budget_for_a_model_that_cannot_compile(tmp_path, conv_relu_chain_path):
+    import json
+
+    path = str(_cli_model("acos", tmp_path, conv_relu_chain_path))
+    report = json.loads(CliRunner().invoke(cli, ["analyze", path, "--json"]).output)
+    assert report["smallest_fit"] is None
+    assert "smallest budget" not in CliRunner().invoke(cli, ["analyze", path]).output
+
+
+@pytest.mark.parametrize("slow, detail", [(None, ""), (4 << 20, "with 4.00 MiB slow memory")])
+def test_a_smallest_budget_with_nothing_below_names_no_budget_below(slow, detail):
+    """Only reached when the lowest candidate fits, so the row is built directly."""
+    import click
+
+    from tigris.cli.analyze import smallest_row
+
+    row = smallest_row({"budget_bytes": 32, "below_bytes": None, "slow_budget_bytes": slow})
+    assert [click.unstyle(cell) for cell in row] == ["smallest budget", "32 B", detail]
+
+
+def test_no_smallest_budget_without_a_slow_budget_leaves_the_row_out():
+    """Not expected with an unbounded slow pool; the report still says null."""
+    from tigris.cli.analyze import smallest_row
+
+    assert smallest_row({"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": None}) is None
