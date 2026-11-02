@@ -5,7 +5,7 @@ from pathlib import Path
 
 import click
 
-from tigris.cli import _memory_sizes, _parse_input_shape, _planned, cli, text
+from tigris.cli import _int8_io_option, _memory_sizes, _parse_input_shape, _planned, cli, text
 from tigris.pipeline import parse_size
 from tigris.utils import fmt_bytes
 
@@ -26,13 +26,16 @@ from tigris.utils import fmt_bytes
               help="Shape to compile an input for (e.g. --input-shape input:1x3x224x224)")
 @click.option("--keep-names", is_flag=True,
               help="Keep operator and tensor names in the plan for inspect")
+@_int8_io_option
 def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | None,
-            compress: str, xip: bool, input_shape: dict[str, tuple[int, ...]], keep_names: bool):
+            compress: str, xip: bool, input_shape: dict[str, tuple[int, ...]], keep_names: bool,
+            int8_io: bool):
     """Compile a model into an execution plan."""
     from tigris.emitters.binary.writer import emit_binary_bytes
 
     compress_arg = compress if compress != "none" else None
-    ag = _planned(model, mem, compress=compress_arg, input_shapes=input_shape)
+    ag = _planned(model, mem, compress=compress_arg, input_shapes=input_shape,
+                  int8_io=int8_io)
     budget = parse_size(mem[0])
 
     ag.budget = replace(ag.budget, flash=parse_size(flash) if flash else 0)

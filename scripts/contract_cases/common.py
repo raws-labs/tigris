@@ -51,6 +51,8 @@ class ContractCase:
     expect_inputs_in_fast: bool = False
     # The compiler's slow figure is the runtime's slow peak, so the gate also runs the plan in it.
     exact_slow: bool = False
+    # Compile with the int8 interface: quantized boundaries are handed over and read back as int8.
+    int8_io: bool = False
 
 
 def _model(

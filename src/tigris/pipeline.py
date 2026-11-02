@@ -46,13 +46,53 @@ def _pools(mem: Budgets) -> tuple[int, int]:
     return (pools[0] if pools else 0), (pools[1] if len(pools) > 1 else 0)
 
 
-def load(model: str | Path, input_shapes: dict[str, tuple[int, ...]] | None = None):
-    """Load a model and compute its tensor lifetimes and unscheduled memory."""
+def load(model: str | Path, input_shapes: dict[str, tuple[int, ...]] | None = None,
+         *, int8_io: bool = False):
+    """Load a model and compute its tensor lifetimes and unscheduled memory.
+
+    With ``int8_io`` every model input and output stored as quantized int8 is
+    handed over and read back in that encoding, whatever dtype the model
+    declares there.
+    """
     from tigris.analysis.lifetime import compute_lifetimes
     from tigris.analysis.memory import compute_memory_timeline
     from tigris.loaders import load_model
 
-    return compute_memory_timeline(compute_lifetimes(load_model(Path(model), input_shapes)))
+    ag = load_model(Path(model), input_shapes)
+    if int8_io:
+        _declare_int8_interface(ag)
+    return compute_memory_timeline(compute_lifetimes(ag))
+
+
+_INT8 = 3
+
+
+def _declare_int8_interface(ag) -> None:
+    """Declare int8 each model input and output stored as quantized int8.
+
+    Variables kept across runs and boundaries stored in another dtype keep the
+    dtype the model declares. Raises when no declaration changes.
+    """
+    state = ({("in", port.input) for port in ag.state_ports}
+             | {("out", port.output) for port in ag.state_ports if port.output is not None})
+    quantized = changed = 0
+    for side, names, dtypes in (("in", ag.model_inputs, ag.model_input_dtypes),
+                                ("out", ag.model_outputs, ag.model_output_dtypes)):
+        for index, name in enumerate(names[:len(dtypes)]):
+            info = ag.tensors.get(name)
+            if (side, index) in state or info is None or info.dtype != _INT8 or info.quant is None:
+                continue
+            quantized += 1
+            if dtypes[index] != _INT8:
+                dtypes[index] = _INT8
+                changed += 1
+    if not quantized:
+        raise ValueError(
+            "int8 interface changes nothing: no model input or output is stored as quantized int8")
+    if not changed:
+        raise ValueError(
+            "int8 interface changes nothing: every quantized model input and output "
+            "is already declared int8")
 
 
 def plan(ag, mem: Budgets = (), *, chains: bool = True):
@@ -132,24 +172,25 @@ def plan_model(
     compress: str | None = None,
     input_shapes: dict[str, tuple[int, ...]] | None = None,
     chains: bool = True,
+    int8_io: bool = False,
 ):
     """Load and plan a model the way ``tigris compile`` does.
 
-    ``mem`` holds the fast pool, then optionally the slow pool. With
-    ``compress="lz4"`` each stage's weights are decompressed into fast memory,
-    so the activations are planned against what is left: weight blocks follow
-    the stage layout and the layout follows the memory left, so the model is
-    re-planned until the reservation it needs fits the one it was planned
-    with. The graph's ``fast_memory_reserve_bytes`` is then that reservation.
+    ``mem`` holds the fast pool, then optionally the slow pool; ``int8_io``
+    is as for ``load``. With ``compress="lz4"`` each stage's weights are
+    decompressed into fast memory, so the activations are planned against
+    what is left: weight blocks follow the stage layout and the layout follows
+    the memory left, so the model is re-planned until the reservation it needs
+    fits the one it was planned with. The graph's ``fast_memory_reserve_bytes`` is then that reservation.
     """
     if compress not in (None, "lz4"):
         raise ValueError(f"unknown weight compression {compress!r}: expected None or 'lz4'")
     total, slow = _pools(mem)
     if compress is None:
-        return _planned(load(model, input_shapes), total, slow, 0, chains)
+        return _planned(load(model, input_shapes, int8_io=int8_io), total, slow, 0, chains)
     reserve = 0
     for _ in range(_RESERVE_ATTEMPTS):
-        ag = _planned(load(model, input_shapes), total, slow, reserve, chains)
+        ag = _planned(load(model, input_shapes, int8_io=int8_io), total, slow, reserve, chains)
         required = _weight_reserve(ag)
         if required <= reserve:
             # Keeping the larger reservation on a changing layout is

@@ -98,11 +98,13 @@ def _compile_plan(
     compression: str | None,
     xip: bool,
     force_one_op_stages: bool = False,
+    int8_io: bool = False,
 ) -> dict:
     budgets = (mem_budget,) if slow_budget is None else (mem_budget, slow_budget)
     # Forced stages replace the planned ones, so their weights are reserved
     # for the stages emitted rather than for the discarded layout.
-    graph = plan_model(model_path, budgets, compress=None if force_one_op_stages else compression)
+    graph = plan_model(model_path, budgets, compress=None if force_one_op_stages else compression,
+                       int8_io=int8_io)
     if force_one_op_stages:
         stages: list[Stage] = []
         for index, op in enumerate(graph.ops):
@@ -547,6 +549,7 @@ def _prepare_case(case: ContractCase, work_dir: Path) -> tuple[Path, dict, list[
         compression=case.compression,
         xip=case.xip,
         force_one_op_stages=case.force_one_op_stages,
+        int8_io=case.int8_io,
     )
     _assert_plan_mode(case, plan)
     reference_outputs = _reference_session(case, case_dir / "reference.onnx").run(
@@ -662,7 +665,7 @@ def _section_reference_outputs(
     variant_plan = _compile_plan(
         variant_path, variant_plan_path, mem_budget=case.mem_budget,
         slow_budget=case.slow_budget, compression=case.compression, xip=case.xip,
-        force_one_op_stages=case.force_one_op_stages,
+        force_one_op_stages=case.force_one_op_stages, int8_io=case.int8_io,
     )
     oracle = onnx.shape_inference.infer_shapes(case.reference_model)
     oracle_infos = {item.name: item for item in
@@ -770,7 +773,7 @@ def _run_case(case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Pa
             plan["tile_plans"][stage["tile_plan_idx"]]["num_tiles"] > 1 for stage in banded_stages)
         untiled_path = case_dir / "untiled.tgrs"
         untiled = _compile_plan(compile_path, untiled_path, mem_budget="64K", slow_budget="16K",
-                                compression=None, xip=False)
+                                compression=None, xip=False, int8_io=case.int8_io)
         assert not any(tile["tileable"] for tile in untiled["tile_plans"])
         assert untiled["version"] == SCHEMA_VERSION
         untiled_outputs = case_dir / "untiled.bin"
@@ -781,7 +784,7 @@ def _run_case(case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Pa
         plain_path = case_dir / "uncompressed.tgrs"
         plain = _compile_plan(compile_path, plain_path, mem_budget=case.mem_budget,
                               slow_budget=case.slow_budget, compression=None, xip=case.xip,
-                              force_one_op_stages=case.force_one_op_stages)
+                              force_one_op_stages=case.force_one_op_stages, int8_io=case.int8_io)
         plain_outputs = case_dir / "uncompressed.bin"
         _run([str(runner), str(plain_path), str(inputs_path), str(plain_outputs),
               str(plain["_compiler_scheduled_peak"])], f"{case.name} uncompressed execution")
@@ -1210,6 +1213,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         models._squeeze_excitation_case(quantized=True),
         qdq._qdq_bilinear_upsample_case(),
         qdq._quantized_boundary_case(),
+        qdq._int8_interface_case(),
         qdq._quantized_batchnorm_case(),
         reduction._whole_map_average_pool_case(),
         elementwise._traced_shape_scale_case(),

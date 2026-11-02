@@ -7,7 +7,7 @@ from pathlib import Path
 import click
 
 from tigris import TILE_AXIS_HW
-from tigris.cli import _memory_sizes, _parse_input_shape, _planned, cli, text
+from tigris.cli import _int8_io_option, _memory_sizes, _parse_input_shape, _planned, cli, text
 from tigris.pipeline import parse_size
 from tigris.utils import describe_interface, fmt_bytes, plural, source_shape
 
@@ -299,9 +299,10 @@ def _stages(ag) -> None:
               help="Run the plan on the host runtime and print what it did instead")
 @click.option("--input", "input_files", multiple=True,
               help="Input for --trace as .bin or .npy; NAME=FILE for several (default: zeros)")
+@_int8_io_option
 def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
             input_shape: dict[str, tuple[int, ...]], as_json: bool, trace: bool,
-            input_files: tuple[str, ...]):
+            input_files: tuple[str, ...], int8_io: bool):
     """Check whether a model fits a memory budget, and why not."""
     from tigris.analysis.findings import compute_findings
     from tigris.frontends.tflite import is_tflite
@@ -317,7 +318,8 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     slow_budget = mem_pools[1] if len(mem_pools) > 1 else 0
     # Only the fast tier is planned: analyze interprets the slow tier itself
     # and stays display-only.
-    ag = _planned(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json)
+    ag = _planned(model, mem[:1], input_shapes=input_shape, report_bindings=not as_json,
+                  int8_io=int8_io)
     ag.budget = replace(ag.budget, slow=slow_budget, flash=flash_budget)
     if trace:
         from tigris.cli.trace import trace_model
