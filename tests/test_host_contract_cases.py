@@ -150,3 +150,40 @@ def test_rank2_row_band_equals_one_pass(tmp_path, kind, constant):
             outputs.append(session.run(case.inputs)["output"])
     assert outputs[0].tobytes() == outputs[1].tobytes()
     np.testing.assert_allclose(outputs[0], _reference(case), rtol=1e-5, atol=1e-5)
+
+
+def test_int8_interface_is_bit_exact_with_onnx_runtime(tmp_path):
+    """With the int8 interface the plan takes the int8 tensor the model's input
+    QuantizeLinear makes and returns the one its output DequantizeLinear reads,
+    byte for byte as ONNX Runtime computes both from the same float input."""
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper
+    from scripts.contract_cases.qdq import _int8_interface_case
+    from scripts.crossrepo_contract import _to_runtime_layout
+
+    case = _int8_interface_case()
+    model_path = tmp_path / "case.onnx"
+    onnx.save(case.compile_model, model_path)
+    path = tmp_path / "int8.tgrs"
+    path.write_bytes(emit_binary_bytes(plan_model(str(model_path), ("4K",), int8_io=True)))
+
+    oracle = onnx.ModelProto()
+    oracle.CopyFrom(case.compile_model)
+    del oracle.graph.output[:]
+    oracle.graph.output.extend([helper.make_tensor_value_info("input_q", TensorProto.INT8, [1, 3, 8, 8]),
+                                helper.make_tensor_value_info("output_q", TensorProto.INT8, [1, 4, 8, 8])])
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    reference = ort.InferenceSession(oracle.SerializeToString(), options, providers=["CPUExecutionProvider"])
+    data = np.random.default_rng(5).normal(scale=8.0, size=(1, 3, 8, 8)).astype(np.float32)
+    # Past the input's int8 range at scale 0.25, so the input quantization saturates.
+    data[0, 0, 0, :2] = (-100.0, 100.0)
+    quantized, expected = reference.run(None, {"input": data})
+    with Session(path) as session:
+        assert [item["dtype"] for item in session.inputs + session.outputs] == [np.dtype("int8")] * 2
+        actual = session.run({"input": _to_runtime_layout(quantized)})["output"]
+    assert actual.dtype == np.int8
+    assert np.count_nonzero(expected) > 0
+    assert actual.tobytes() == _to_runtime_layout(expected).tobytes()

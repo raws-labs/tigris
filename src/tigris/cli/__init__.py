@@ -73,20 +73,27 @@ def _report_shape_bindings(ag) -> None:
         text.echo(text.warn("warning: ") + str(binding), err=True)
 
 
+_int8_io_option = click.option(
+    "--int8-io", is_flag=True,
+    help="Hand over model inputs and read back outputs in the plan's int8 encoding; "
+         "the application quantizes and dequantizes")
+
+
 def _planned(model: str, mem: tuple[str, ...], *, compress: str | None = None,
              input_shapes: dict[str, tuple[int, ...]] | None = None,
-             report_bindings: bool = True):
+             report_bindings: bool = True, int8_io: bool = False):
     """Plan a model as ``pipeline.plan_model`` does, for a command: dimensions
     the compiler bound are reported once, an error is a ClickException."""
     from tigris import pipeline
 
     try:
         if compress is None:
-            ag = pipeline.load(model, input_shapes)
+            ag = pipeline.load(model, input_shapes, int8_io=int8_io)
             if report_bindings:
                 _report_shape_bindings(ag)
             return pipeline.plan(ag, mem)
-        ag = pipeline.plan_model(model, mem, compress=compress, input_shapes=input_shapes)
+        ag = pipeline.plan_model(model, mem, compress=compress, input_shapes=input_shapes,
+                                 int8_io=int8_io)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     if report_bindings:

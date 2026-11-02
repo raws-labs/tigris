@@ -56,9 +56,10 @@ def describe_interface(ag) -> list[tuple[str, str]]:
                 else info.dtype
             )
             text = f"{name} {shape} {_DTYPE_NAMES.get(declared, declared)}"
-            if declared != info.dtype and info.quant is not None:
+            if info.quant is not None:
+                if declared != info.dtype:
+                    text += f", stored as {_DTYPE_NAMES.get(info.dtype, info.dtype)}"
                 text += (
-                    f", stored as {_DTYPE_NAMES.get(info.dtype, info.dtype)}"
                     f" at scale {float(info.quant.scale[0]):.6g}"
                     f", zero point {int(info.quant.zero_point[0])}"
                 )

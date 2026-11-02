@@ -111,6 +111,42 @@ def _quantized_boundary_case() -> ContractCase:
     return ContractCase("uint8_boundary", model, copy.deepcopy(model), {"image": data}, ("Conv",))
 
 
+def _int8_interface_case() -> ContractCase:
+    """A float-declared QDQ Conv and Relu compiled with the int8 interface.
+
+    The reference is the same graph without the input QuantizeLinear and the
+    output DequantizeLinear, so it takes and returns the int8 tensors the plan
+    exposes. Input and weight scales multiply to the output scale and the
+    weights are whole steps, so requantization rounds nothing and the int8
+    values match bit for bit.
+    """
+    rng = np.random.default_rng(26)
+    weight = rng.integers(-1, 2, size=(4, 3, 3, 3)).astype(np.float32) * 0.25
+    initializers = [numpy_helper.from_array(weight, "weight")] + _scalars(
+        inp=(0.25, 3), w=(0.25, 0), out=(0.0625, -7))
+    body = [
+        *_qdq("weight", "w_s", "w_z", "wdq"),
+        helper.make_node("Conv", ["x", "wdq"], ["conv"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        helper.make_node("Relu", ["conv"], ["raw"]),
+    ]
+
+    def build(dtype: int, nodes: list[onnx.NodeProto]) -> onnx.ModelProto:
+        return _model(f"int8_interface_{'int8' if dtype == TensorProto.INT8 else 'float'}", nodes,
+                      [_vi("input", [1, 3, 8, 8], dtype)], [_vi("output", [1, 4, 8, 8], dtype)],
+                      initializers)
+
+    compile_model = build(TensorProto.FLOAT, [
+        *_qdq("input", "inp_s", "inp_z", "x", "input_q"), *body,
+        *_qdq("raw", "out_s", "out_z", "output", "output_q")])
+    reference_model = build(TensorProto.INT8, [
+        helper.make_node("DequantizeLinear", ["input", "inp_s", "inp_z"], ["x"]), *body,
+        helper.make_node("QuantizeLinear", ["raw", "out_s", "out_z"], ["output"])])
+    data = rng.integers(-40, 40, size=(1, 3, 8, 8)).astype(np.int8)
+    data[0, 0, 0, :2] = (-128, 127)
+    return ContractCase("int8_interface_conv_relu", compile_model, reference_model, {"input": data},
+                        ("Conv",), int8_io=True, exact=True, reference_unoptimized=True)
+
+
 def _qdq_conv1d_case() -> ContractCase:
     """An int8 Conv1D, whose kernel requantizes its int32 accumulator.
 
