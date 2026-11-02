@@ -14,7 +14,7 @@ import onnx
 from onnx import TensorProto, helper
 
 from tigris.frontends.flatbuffer import Table, flexbuffer_map
-from tigris.frontends.qdq import GraphBuilder, same_padding
+from tigris.frontends.qdq import GraphBuilder, quantize_int8, same_padding
 from tigris.frontends.tflite_schema import (
     BUILTIN_OPERATORS, B_DATA, B_OFFSET, B_SIZE, MODEL_BUFFERS, MODEL_DESCRIPTION, MODEL_OPCODES,
     MODEL_SUBGRAPHS, MODEL_VERSION, OC_CODE, OC_CUSTOM, OC_DEPRECATED_CODE, OC_VERSION,
@@ -30,6 +30,10 @@ BOUNDARY_LAYOUT_KEY = "tigris.boundary_layout"
 # Variables a model keeps across invocations: a JSON list of
 # {"input", "output", "initial"} value names, one entry per variable.
 STATE_KEY = "tigris.state"
+# How float32 values quantize to int8: "half_to_even" as ONNX QuantizeLinear,
+# the default when absent, or "half_away_from_zero" as TFLite's QUANTIZE.
+QUANTIZE_ROUNDING_KEY = "tigris.quantize_rounding"
+QUANTIZE_ROUNDING = {"half_to_even": True, "half_away_from_zero": False}
 
 _ACTIVATIONS = {0: "none", 1: "relu", 2: "relu_n1_to_1", 3: "relu6", 4: "tanh", 5: "sign_bit"}
 _NUMPY = {"FLOAT32": np.float32, "INT32": np.int32, "INT8": np.int8, "UINT8": np.uint8,
@@ -204,9 +208,7 @@ def _constant_result(op: "_Operator", tensors) -> "np.ndarray | None":
         return ins[0].array().transpose(ins[1].array().reshape(-1))
     if op.kind == "QUANTIZE" and ins[0].type == "FLOAT32" and out.type == "INT8" and len(out.scale) == 1:
         # TFLite Micro's QUANTIZE: a float32 division, rounded half away from zero.
-        ratio = (ins[0].array() / np.float32(out.scale[0])).astype(np.float32).astype(np.float64)
-        rounded = np.sign(ratio) * np.floor(np.abs(ratio) + 0.5)
-        return np.clip(rounded + int(out.zero_point[0]), -128, 127).astype(np.int8)
+        return quantize_int8(ins[0].array(), out.scale[0], out.zero_point[0], ties_even=False)
     if op.kind == "FILL":
         return np.full(ins[0].array().reshape(-1), ins[1].array().reshape(-1)[0], _NUMPY[out.type])
     if op.kind == "BROADCAST_ARGS":
@@ -2477,7 +2479,7 @@ def to_onnx(data: bytes, name: str) -> onnx.ModelProto:
                                                 b.initializers, value_info=converter.value_info),
                               opset_imports=opsets)
     model.ir_version = 8
-    props = {BOUNDARY_LAYOUT_KEY: "channels_last"}
+    props = {BOUNDARY_LAYOUT_KEY: "channels_last", QUANTIZE_ROUNDING_KEY: "half_away_from_zero"}
     if state:
         props[STATE_KEY] = json.dumps(state)
     onnx.helper.set_model_props(model, props)

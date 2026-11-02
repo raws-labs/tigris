@@ -892,9 +892,10 @@ def _assert_output_parity(
                     f"{expected.dtype}{list(expected.shape)}, {mismatched} elements differ"
                 )
         elif scale > 0.0:
-            # The runtime uses integer half-away-from-zero quantization while
-            # this ONNX Runtime QDQ reference follows a different half-tie
-            # rule. Keep the same one-LSB acceptance bound used by benchmark
+            # The runtime requantizes inside its kernels with fixed-point
+            # multipliers, which round ties away from zero or up, while this
+            # ONNX Runtime QDQ reference rounds in float with ties to even.
+            # Keep the same one-LSB acceptance bound used by benchmark
             # validation, while rejecting any larger contract drift.
             steps = np.abs(np.rint((actual - expected) / scale))
             worst = float(steps.max()) if steps.size else 0.0
@@ -1332,6 +1333,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         matmul._gemm_no_transpose_case(),
         qdq._qdq_matmul_case(),
         qdq._quint8_activation_case(),
+        qdq._qdq_input_ties_case(),
+        qdq._qdq_quantize_ties_case(),
         convolution._convtranspose_case("convtranspose", 19, kernel=2, pads=[0, 0, 0, 0]),
         convolution._conv_then_convtranspose_case(),
         convolution._convtranspose_case("convtranspose_overlap", 29, kernel=4, pads=[1, 1, 1, 1]),

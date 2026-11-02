@@ -16,7 +16,7 @@ from tigris.analysis.lifetime import compute_lifetimes
 from tigris.analysis.memory import compute_memory_timeline
 from tigris.emitters.binary.writer import emit_binary_bytes
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.emitters.binary.defs import NO_QUANT_PARAM
+from tigris.emitters.binary.defs import FLAG_QUANTIZE_TIES_EVEN, NO_QUANT_PARAM
 from tigris.pipeline import plan_model
 
 from conftest import save_onnx
@@ -421,6 +421,104 @@ def test_quantized_matmul_weight_keeps_its_channel_axis(tmp_path):
     quant = ag.tensors["weight"].quant
     assert quant.axis == 0
     assert quant.scale.tolist() == [0.5, 0.25, 0.125]
+
+
+_TIES = np.array([0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 3.0, -3.25], np.float32) * np.float32(0.25)
+
+
+def _rounding_model(path, rounding=None):
+    """A QDQ Gemm whose weight holds exact ties at its scale, and a Pad whose
+    fill is one, stating ``rounding`` in the model metadata when given."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])
+    initializers = [
+        numpy_helper.from_array(np.array([0.25], np.float32), "s"),
+        numpy_helper.from_array(np.array([-3], np.int8), "z"),
+        numpy_helper.from_array(_TIES.reshape(2, 4), "weight"),
+        numpy_helper.from_array(np.array([0, 1, 0, 1], np.int64), "pads"),
+        numpy_helper.from_array(np.array(2.5 * 0.25, np.float32), "fill"),
+    ]
+    nodes = [
+        helper.make_node("QuantizeLinear", ["input", "s", "z"], ["in_q"]),
+        helper.make_node("DequantizeLinear", ["in_q", "s", "z"], ["in_dq"]),
+        helper.make_node("QuantizeLinear", ["weight", "s", "z"], ["w_q"]),
+        helper.make_node("DequantizeLinear", ["w_q", "s", "z"], ["w_dq"]),
+        helper.make_node("Gemm", ["in_dq", "w_dq"], ["product"], transB=1),
+        helper.make_node("QuantizeLinear", ["product", "s", "z"], ["product_q"]),
+        helper.make_node("DequantizeLinear", ["product_q", "s", "z"], ["product_dq"]),
+        helper.make_node("Pad", ["product_dq", "pads", "fill"], ["padded"]),
+        helper.make_node("QuantizeLinear", ["padded", "s", "z"], ["out_q"]),
+        helper.make_node("DequantizeLinear", ["out_q", "s", "z"], ["output"]),
+    ]
+    model = helper.make_model(helper.make_graph(nodes, "rounding", [X], [Y], initializers),
+                              opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    if rounding is not None:
+        helper.set_model_props(model, {"tigris.quantize_rounding": rounding})
+    onnx.save(model, path)
+    return path
+
+
+@pytest.mark.parametrize("rounding", [None, "half_to_even", "half_away_from_zero"])
+def test_constant_quantization_follows_the_stated_rounding(tmp_path, rounding):
+    """A folded QuantizeLinear of a weight and a quantized Pad fill round
+    ties as the model's source does: ONNX Runtime's ties to even unless the
+    model states TFLite's ties away from zero. The plan's header records it."""
+    import onnxruntime as ort
+
+    path = _rounding_model(tmp_path / "rounding.onnx", rounding)
+    ag = plan_model(str(path))
+    even = rounding != "half_away_from_zero"
+    assert ag.quantize_ties_even == even
+    gemm = next(op for op in ag.ops if op.op_type == "Gemm")
+    pad = next(op for op in ag.ops if op.op_type == "Pad")
+    weight, fill = ag.weight_data[gemm.inputs[1]], ag.weight_data[pad.inputs[1]]
+
+    probe = helper.make_model(helper.make_graph(
+        [helper.make_node("QuantizeLinear", ["x", "s", "z"], ["q"])], "probe",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [9])],
+        [helper.make_tensor_value_info("q", TensorProto.INT8, [9])],
+        [numpy_helper.from_array(np.array(0.25, np.float32), "s"),
+         numpy_helper.from_array(np.array(-3, np.int8), "z")]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    probe.ir_version = 8
+    values = np.append(_TIES, np.float32(2.5 * 0.25))
+    onnx_levels = ort.InferenceSession(probe.SerializeToString(), providers=["CPUExecutionProvider"]
+                                       ).run(None, {"x": values})[0]
+    away = np.array([-2, -1, 0, -4, -5, -6, 0, -6, 0], np.int8)
+    assert np.array_equal(onnx_levels, [-3, -1, -1, -3, -5, -5, 0, -6, -1])
+    assert np.array_equal(np.append(weight.reshape(-1), fill), onnx_levels if even else away)
+
+    flags = read_binary_plan(emit_binary_bytes(ag))["flags"]
+    assert bool(flags & FLAG_QUANTIZE_TIES_EVEN) == even
+
+
+def test_unknown_rounding_metadata_is_refused(tmp_path):
+    path = _rounding_model(tmp_path / "rounding.onnx", "nearest")
+    with pytest.raises(ValueError, match="tigris.quantize_rounding is 'nearest'"):
+        load_model(path)
+
+
+@pytest.mark.parametrize("ties_even", [True, False])
+def test_constant_quantization_of_nan_and_infinity_matches_onnx_runtime(ties_even):
+    import onnxruntime as ort
+
+    from tigris.frontends.qdq import quantize_int8
+
+    values = np.array([np.nan, np.inf, -np.inf, 1e30, -1e30], np.float32)
+    probe = helper.make_model(helper.make_graph(
+        [helper.make_node("QuantizeLinear", ["x", "s", "z"], ["q"])], "probe",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [5])],
+        [helper.make_tensor_value_info("q", TensorProto.INT8, [5])],
+        [numpy_helper.from_array(np.array(0.1, np.float32), "s"),
+         numpy_helper.from_array(np.array(3, np.int8), "z")]),
+        opset_imports=[helper.make_opsetid("", 17)])
+    probe.ir_version = 8
+    onnx_levels = ort.InferenceSession(probe.SerializeToString(), providers=["CPUExecutionProvider"]
+                                       ).run(None, {"x": values})[0]
+    assert onnx_levels.tolist() == [-128, 127, -128, 127, -128]
+    with np.errstate(invalid="raise"):
+        assert np.array_equal(quantize_int8(values, 0.1, 3, ties_even), onnx_levels)
 
 
 # uint8 activations

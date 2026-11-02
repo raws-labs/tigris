@@ -268,6 +268,10 @@ class AnalyzedGraph:
     # a terminal Transpose included, and reports give shapes in the file's
     # order. A plain ONNX model keeps a terminal Transpose in ONNX order.
     channels_last_source: bool = False
+    # Populated by loader - True when float32 quantizes to int8 with ties to
+    # even, as ONNX QuantizeLinear does; False for a TFLite model, whose
+    # QUANTIZE rounds ties away from zero. The plan's header flags record it.
+    quantize_ties_even: bool = True
     # Variables kept across invocations: each a model input holding the value
     # from the last invocation and, when this one assigns it, a model output,
     # by position in model_inputs and model_outputs, with its initial value.

@@ -3,6 +3,7 @@
 import numpy as np
 
 from tigris.analysis.broadcast import DENSE, GENERAL, PERIODIC, stored_operands
+from tigris.frontends.qdq import quantize_int8
 from tigris.graph.ir import AnalyzedGraph, OpNode, TensorInfo
 from tigris.loaders.onnx.normalize.common import _fresh_name
 
@@ -111,9 +112,9 @@ def _lift_pad_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
     """Move a constant Pad's widths into an attribute and keep its fill as
     the operator's weight.
 
-    The fill is stored in the output's encoding, quantized to it for int8. A
-    fill of zero is dropped: the runtime pads with 0, or the output's zero
-    point, by default.
+    The fill is stored in the output's encoding, quantized to it for int8 by
+    the plan's rule. A fill of zero is dropped: the runtime pads with 0, or the
+    output's zero point, by default.
     """
     for op in ag.ops:
         if op.op_type != "Pad" or len(op.inputs) < 2 or len(op.outputs) != 1:
@@ -131,9 +132,8 @@ def _lift_pad_operands(ag: AnalyzedGraph) -> AnalyzedGraph:
         output = ag.tensors.get(op.outputs[0])
         name = _fresh_name(ag, f"{op.name}_fill")
         if output is not None and output.quant is not None:
-            scale = float(output.quant.scale[0])
-            zero_point = int(output.quant.zero_point[0])
-            data = np.array([np.clip(np.round(value / scale) + zero_point, -128, 127)], np.int8)
+            data = quantize_int8([value], output.quant.scale[0], output.quant.zero_point[0],
+                                  ag.quantize_ties_even)
             dtype = 3
         else:
             data = np.array([value], np.float32)

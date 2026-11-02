@@ -29,6 +29,10 @@ def schema_package() -> dict[str, object]:
             "ordering": ["op_index", "type"],
             "payload_length_bits": 8,
         },
+        "header_flags": {
+            "quantize_ties_even": defs.FLAG_QUANTIZE_TIES_EVEN,
+            "xip": defs.FLAG_XIP,
+        },
         "op_types": dict(sorted(defs.OP_TYPE_MAP.items())),
         "record_sizes": {
             "header": defs.HEADER_SIZE,
@@ -55,6 +59,12 @@ def schema_package() -> dict[str, object]:
             "scope": "wire_format",
             "stage_assignment_v5": (
                 "stage table authoritative; operator byte is canonical low-byte hint"
+            ),
+            "quantize_rule_v12": (
+                "header flag quantize_ties_even set: float32 quantizes to int8 with ties to "
+                "even, as ONNX QuantizeLinear; clear, or before schema 12, ties away from zero, "
+                "as TFLite QUANTIZE; both divide by the scale in float32; from schema 12 the "
+                "runtime refuses a header flag it does not know"
             ),
             "memory_v11": (
                 "every plan is written at schema 11 with a memory section; scheduled_peak "

@@ -137,7 +137,8 @@ def graph_from_plan(plan: dict, fast_reserve: int = 0) -> AnalyzedGraph:
         graphs.append(AnalyzedGraph(
             model_name=plan["model_name"], ops=ops, tensors=tensors,
             model_inputs=inputs, model_outputs=outputs, stages=stages, budget=budget,
-            state_ports=ports, schema_version=plan["version"]))
+            state_ports=ports, schema_version=plan["version"],
+            quantize_ties_even=plan["quantize_ties_even"]))
     # Every graph names the graphs it runs by their place in the plan.
     for graph in graphs:
         graph.subgraphs = graphs
