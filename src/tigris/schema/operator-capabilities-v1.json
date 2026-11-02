@@ -1182,7 +1182,7 @@
     },
     {
       "constraints": [
-        "float32, or int8 in another encoding, to a per-tensor int8 encoding as TFLite Micro's QUANTIZE; float32 only where an int8 plan keeps a control-flow boundary in float32; pointwise"
+        "float32, or int8 in another encoding, to a per-tensor int8 encoding; float32 is divided by the scale in float32 and rounded as the plan states, ties to even from ONNX and away from zero from TFLite; float32 only where an int8 plan keeps a control-flow boundary in float32; pointwise"
       ],
       "opcode": 90,
       "operator": "Quantize",
@@ -1217,7 +1217,7 @@
       }
     }
   ],
-  "schema_version": 11,
+  "schema_version": 12,
   "scope": "post-normalization operator dispatch; model-specific shape, attribute, quantization, memory, and tiling validation still applies",
   "source": "tigris.capabilities"
 }

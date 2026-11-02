@@ -9,9 +9,10 @@ from onnx import helper as onnx_helper
 from onnx import numpy_helper, shape_inference
 
 from tigris.frontends import load_onnx
-from tigris.frontends.tflite import BOUNDARY_LAYOUT_KEY, STATE_KEY
+from tigris.frontends.tflite import (
+    BOUNDARY_LAYOUT_KEY, QUANTIZE_ROUNDING, QUANTIZE_ROUNDING_KEY, STATE_KEY)
 from tigris.graph.ir import AnalyzedGraph, OpNode, StatePort, TensorInfo
-from tigris.graph.subgraphs import CONTROL_FLOW
+from tigris.graph.subgraphs import CONTROL_FLOW, all_graphs
 from tigris.loaders.onnx.shapes import (
     bind_free_dims, bodies, body_reads, constant_value, fold_shape_subgraph, outer_reads)
 
@@ -116,6 +117,11 @@ def load_model(
     channels_last = any(
         prop.key == BOUNDARY_LAYOUT_KEY and prop.value == "channels_last"
         for prop in model.metadata_props)
+    rounding = next((prop.value for prop in model.metadata_props
+                     if prop.key == QUANTIZE_ROUNDING_KEY), "half_to_even")
+    if rounding not in QUANTIZE_ROUNDING:
+        raise ValueError(f"Model metadata {QUANTIZE_ROUNDING_KEY} is {rounding!r}; expected "
+                         + " or ".join(repr(name) for name in QUANTIZE_ROUNDING))
     if channels_last and input_shapes:
         input_shapes = _file_shapes_only(model, input_shapes)
     # Checked before shape resolution, which can fail on a cycle or fold one of its edges away.
@@ -126,6 +132,8 @@ def load_model(
     ag = _graph_to_ag(model.graph, model.opset_import)
     ag.model_name = Path(path).stem
     ag.channels_last_source = channels_last
+    for graph in all_graphs(ag):
+        graph.quantize_ties_even = QUANTIZE_ROUNDING[rounding]
     ag.shape_bindings = bindings
     state = next((json.loads(prop.value) for prop in model.metadata_props
                   if prop.key == STATE_KEY), [])

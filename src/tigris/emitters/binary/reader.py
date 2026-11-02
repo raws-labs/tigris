@@ -3,6 +3,7 @@
 import struct
 
 from tigris import (
+    SCHEMA_VERSION_QUANTIZE_RULE,
     SCHEMA_VERSION_SCHEDULED_PEAK,
     SCHEMA_VERSION_TILE_AXIS,
     SCHEMA_VERSION_STATE,
@@ -15,6 +16,8 @@ from tigris import (
 )
 
 from .defs import (
+    FLAG_QUANTIZE_TIES_EVEN,
+    FLAG_XIP,
     HEADER_SIZE,
     HEADER_STRUCT,
     MEMORY_SIZE,
@@ -82,9 +85,9 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
     """Parse a binary plan, optionally leaving weight blocks compressed.
 
     Returns a dict with keys: magic, version, file_size, num_tensors, num_ops,
-    num_stages, num_tile_plans, budget, peak, scheduled_peak (None before
-    schema 11), model_name, tensors, ops, stages, tile_plans, model_inputs,
-    model_outputs.
+    num_stages, num_tile_plans, flags, quantize_ties_even, budget, peak,
+    scheduled_peak (None before schema 11), model_name, tensors, ops, stages,
+    tile_plans, model_inputs, model_outputs.
     """
     if len(data) < HEADER_SIZE:
         raise ValueError(f"File too small: {len(data)} < {HEADER_SIZE}")
@@ -107,6 +110,8 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         raise ValueError(
             f"Unsupported schema version: {version} (expected one of: {supported})"
         )
+    if version >= SCHEMA_VERSION_QUANTIZE_RULE and flags & ~(FLAG_XIP | FLAG_QUANTIZE_TIES_EVEN):
+        raise ValueError(f"Unknown header flags: {flags:#010x}")
     if file_size != len(data):
         raise ValueError(f"File size mismatch: header says {file_size}, got {len(data)}")
 
@@ -524,6 +529,9 @@ def read_binary_plan(data: bytes, *, decompress_weights: bool = True) -> dict:
         "num_weights": num_weights,
         "num_quant_params": num_quant_params,
         "flags": flags,
+        # Before schema 12 every plan rounds ties away from zero, whatever its flags.
+        "quantize_ties_even": (version >= SCHEMA_VERSION_QUANTIZE_RULE
+                               and bool(flags & FLAG_QUANTIZE_TIES_EVEN)),
         "budget": budget,
         "peak": peak,
         "scheduled_peak": scheduled_peak,

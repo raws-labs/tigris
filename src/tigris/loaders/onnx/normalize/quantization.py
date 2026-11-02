@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from tigris.capabilities import effective_operators
+from tigris.frontends.qdq import quantize_int8
 from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, TensorInfo
 from tigris.loaders.onnx.normalize.common import _fresh_name, _own_constant, _Uses
 
@@ -503,15 +504,13 @@ def _fold_weight_dequantizers(ag: AnalyzedGraph, fold: _QdqFold) -> None:
                 if qp is None:
                     continue
 
-                # Quantize the float weight to int8
+                # Quantize the float weight to int8, as the QuantizeLinear does
                 scale = qp.scale
                 zp = qp.zero_point.astype(np.int32)
                 float_w = ag.weight_data[original_weight]
 
                 if scale.size == 1:
-                    int8_w = np.clip(
-                        np.round(float_w / scale[0]) + zp[0], -128, 127
-                    ).astype(np.int8)
+                    s, z = scale[0], zp[0]
                 else:
                     # Per-channel: reshape scale for broadcasting
                     axis = qp.axis if qp.axis >= 0 else 1
@@ -519,9 +518,7 @@ def _fold_weight_dequantizers(ag: AnalyzedGraph, fold: _QdqFold) -> None:
                     bc_shape[axis] = scale.size
                     s = scale.reshape(bc_shape)
                     z = zp.reshape(bc_shape)
-                    int8_w = np.clip(np.round(float_w / s) + z, -128, 127).astype(
-                        np.int8
-                    )
+                int8_w = quantize_int8(float_w, s, z, ag.quantize_ties_even)
 
                 # Replace float weight with int8
                 ag.weight_data[original_weight] = int8_w

@@ -13,6 +13,7 @@ from onnx import TensorProto, helper, numpy_helper
 
 from tigris import (
     SCHEMA_VERSION,
+    SCHEMA_VERSION_SCHEDULED_PEAK,
     SUPPORTED_SCHEMA_VERSIONS,
     TILE_AXIS_HEIGHT_OR_LENGTH,
     TILE_AXIS_HW,
@@ -392,6 +393,13 @@ def test_immutable_supported_schema_fixtures():
             2,
             0,
         ),
+        (
+            12,
+            "schema-v12-quantize-ties-even.tgrs",
+            "5a6d60e4790b56e6dfa5a9be217555d43ba199b62edbff387389eff100bcac2b",
+            2,
+            0,
+        ),
     )
     assert tuple(item[0] for item in fixtures) == SUPPORTED_SCHEMA_VERSIONS
 
@@ -426,8 +434,14 @@ def test_immutable_supported_schema_fixtures():
             assert (tile["tile_extent"], tile["num_tiles"], tile["original_extent"],
                     tile["halo"], tile["band_axis"]) == (1, 7, 7, 2, 1)
             assert (tile["band_kind"], tile["band_mode"]) == (TILE_BAND_KIND_STRIPE, 0)
-        else:
+        elif version < SCHEMA_VERSION_SCHEDULED_PEAK:
             assert plan["scheduled_peak"] is None
+        if version == 12:
+            # An ONNX QDQ model: its float32 input quantizes with ties to even.
+            assert plan["flags"] == defs.FLAG_QUANTIZE_TIES_EVEN
+            assert plan["quantize_ties_even"]
+        else:
+            assert plan["flags"] == 0 and not plan["quantize_ties_even"]
         if version == 5:
             assert plan["tile_plans"][0]["axis"] == 1
             assert plan["tile_plans"][0]["num_tiles"] > 1
@@ -575,6 +589,32 @@ def test_reader_rejects_count_crossing_section_end(reader_plan, field, kind, siz
     defs.HEADER_STRUCT.pack_into(data, 0, *header)
     with pytest.raises(ValueError, match=f"Data exceeds section {kind}"):
         read_binary_plan(bytes(data))
+
+
+@pytest.mark.parametrize("flags", [0, defs.FLAG_XIP, defs.FLAG_QUANTIZE_TIES_EVEN,
+                                   defs.FLAG_XIP | defs.FLAG_QUANTIZE_TIES_EVEN])
+def test_reader_accepts_known_header_flags(flags):
+    data = bytearray((Path(__file__).parent / "schema_compat" / "schema-v12-quantize-ties-even.tgrs").read_bytes())
+    struct.pack_into("<I", data, 44, flags)
+    plan = read_binary_plan(bytes(data))
+    assert plan["quantize_ties_even"] == bool(flags & defs.FLAG_QUANTIZE_TIES_EVEN)
+
+
+@pytest.mark.parametrize("flags", [0x4, 0x80000000])
+def test_reader_rejects_unknown_header_flags_from_schema_12(flags):
+    data = bytearray((Path(__file__).parent / "schema_compat" / "schema-v12-quantize-ties-even.tgrs").read_bytes())
+    struct.pack_into("<I", data, 44, flags | defs.FLAG_QUANTIZE_TIES_EVEN)
+    with pytest.raises(ValueError, match="Unknown header flags"):
+        read_binary_plan(bytes(data))
+
+
+def test_reader_ignores_header_flags_before_schema_12(reader_plan):
+    """An older plan rounds ties away from zero, whatever its flags say."""
+    data, header, _ = reader_plan
+    header[-1] = 0xFFFFFFFE
+    defs.HEADER_STRUCT.pack_into(data, 0, *header)
+    plan = read_binary_plan(bytes(data))
+    assert plan["version"] == 6 and not plan["quantize_ties_even"]
 
 
 def test_reader_rejects_unterminated_string(reader_plan):

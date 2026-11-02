@@ -47,6 +47,12 @@ def test_conversion_keeps_the_interface_names():
     assert [o.name for o in model.graph.output] == ["Identity"]
 
 
+def test_conversion_states_tflite_rounding():
+    model = tflite.to_onnx(KWS.read_bytes(), "kws")
+    props = {prop.key: prop.value for prop in model.metadata_props}
+    assert props[tflite.QUANTIZE_ROUNDING_KEY] == "half_away_from_zero"
+
+
 def _assert_matches_tflite_micro(model: Path, golden: dict, budget: str, tmp_path: Path):
     """Runs the compiled plan on TFLite Micro's recorded inputs, in the
     model's own dtypes, and compares the outputs bit for bit. The slow arena
@@ -102,6 +108,49 @@ def test_reference_model_matches_tflite_micro(name, budget, tiled, tmp_path):
     stages = read_binary_plan((tmp_path / "model.tgrs").read_bytes())["stages"]
     tiled_stages = [s for s in stages if s["tile_plan_idx"] != 0xFFFF or s["chain_id"] != 0xFFFF]
     assert bool(tiled_stages) == tiled
+
+
+def _quantize_model(scale: float, zero_point: int, count: int) -> bytes:
+    """float32 [1, count] through one QUANTIZE to an int8 model output."""
+    from tigris.frontends import tflite_writer as tw
+
+    tensors = [tw.Tensor([1, count], 0, 0, b"x"),
+               tw.Tensor([1, count], 9, 0, b"y", tw.Quantization([scale], [zero_point]))]
+    code = BUILTIN_OPERATORS.index("QUANTIZE")
+    graph = tw.Subgraph(tensors, [0], [1], [tw.Operator(0, [0], [1])], b"main")
+    return tw.write(tw.Model(3, [tw.OperatorCode(code, 1, None, code)], [graph], [None], b"test"))
+
+
+@pytest.mark.usefixtures("require_host_library")
+def test_quantize_rounds_ties_away_from_zero_as_tflite_micro(tmp_path):
+    """Exact ties of both signs, their neighbors and values beyond the clamp
+    quantize as TFLite Micro does, ties away from zero."""
+    try:
+        from tflite_micro.python.tflite_micro import runtime
+    except ImportError:
+        if os.environ.get("CI"):
+            pytest.fail("tflite-micro is not installed")
+        pytest.skip("tflite-micro is not installed")
+    scale, zero_point = 2.0 ** -4, -3
+    ties = (np.arange(-140, 140, dtype=np.float32) + np.float32(0.5)) * np.float32(scale)
+    values = np.concatenate([ties, np.nextafter(ties, np.float32(-np.inf)),
+                             np.nextafter(ties, np.float32(np.inf)),
+                             np.float32([0.0, -0.0, 1e6, -1e6])]).astype(np.float32)
+    model = tmp_path / "quantize.tflite"
+    model.write_bytes(_quantize_model(scale, zero_point, values.size))
+    interpreter = runtime.Interpreter.from_bytes(model.read_bytes(), arena_size=1 << 16)
+    interpreter.set_input(values[None], 0)
+    interpreter.invoke()
+    expected = interpreter.get_output(0).copy()
+    ratio = (values / np.float32(scale)).astype(np.float64)
+    away = np.sign(ratio) * np.floor(np.abs(ratio) + 0.5)
+    assert np.array_equal(expected[0], np.clip(away + zero_point, -128, 127).astype(np.int8))
+    even = np.clip(np.rint(ratio) + zero_point, -128, 127).astype(np.int8)
+    assert np.count_nonzero(expected[0] != even) == 128
+    _assert_matches_tflite_micro(model, {"input_0": values[None, None], "output_0": expected[None]},
+                                 "16K", tmp_path)
+    plan = read_binary_plan((tmp_path / "model.tgrs").read_bytes())
+    assert not plan["quantize_ties_even"] and plan["flags"] == 0
 
 
 def _golden(model: Path):

@@ -712,3 +712,67 @@ def _qdq_convtranspose_per_channel_case() -> ContractCase:
         {"input": rng.uniform(-1.0, 1.0, size=input_shape).astype(np.float32)},
         ("ConvTranspose",),
     )
+
+
+def _tie_values(scale: float) -> np.ndarray:
+    """Exact ties (k + 0.5) * scale of both signs, from inside the int8 range to
+    beyond its clamp, with the float32 values just below and just above each."""
+    ties = (np.arange(-140, 140, dtype=np.float32) + np.float32(0.5)) * np.float32(scale)
+    return np.concatenate([ties, np.nextafter(ties, np.float32(-np.inf)),
+                           np.nextafter(ties, np.float32(np.inf))]).astype(np.float32)
+
+
+def _qdq_input_ties_case() -> ContractCase:
+    """A float32 model input quantized at exact ties and their neighbors.
+
+    The Transpose between two equal encodings moves every level unchanged, so
+    the int8 output is the input's quantization itself, compared byte for byte
+    with ONNX Runtime's QuantizeLinear, which rounds ties to even. The scale is
+    a power of two, so a division and a multiplication by its reciprocal agree.
+    """
+    scale, zero_point = 2.0 ** -4, -3
+    values = _tie_values(scale)
+    scaled = values / np.float32(scale)
+    split = np.rint(scaled) != np.trunc(scaled + np.copysign(np.float32(0.5), scaled))
+    assert np.count_nonzero(split & (values < 0)) > 0 and np.count_nonzero(split & (values > 0)) > 0
+    count = values.size // 2
+    shape = [2, count]
+    nodes = [
+        *_qdq("input", "s", "z", "x"),
+        helper.make_node("Transpose", ["x"], ["raw"], perm=[1, 0]),
+        helper.make_node("QuantizeLinear", ["raw", "s", "z"], ["output"]),
+    ]
+    model = _model("qdq_input_ties", nodes, [_vi("input", shape)],
+                   [_vi("output", [count, 2], TensorProto.INT8)],
+                   _qparams("s", "z", scale, zero_point))
+    return ContractCase("int8_input_ties", model, copy.deepcopy(model),
+                        {"input": values.reshape(shape)}, ("Transpose",),
+                        mem_budget="64K", exact=True, reference_unoptimized=True)
+
+
+def _qdq_quantize_ties_case() -> ContractCase:
+    """A float32 result quantized inside the graph at exact ties.
+
+    A non-uniform float constant keeps the Add in float32 between a
+    Dequantize and a Quantize. Inputs on the 2^-5 grid plus odd multiples of
+    2^-5 sum exactly, so the Quantize at 2^-4 meets ties of both signs and
+    values beyond the clamp; its int8 output is compared byte for byte with
+    ONNX Runtime.
+    """
+    count = 280
+    levels = np.arange(-count // 2, count // 2, dtype=np.float32)
+    values = (levels * np.float32(2.0 ** -5)).reshape(1, count)
+    odd = (2 * np.random.default_rng(57).integers(-160, 160, count) + 1).astype(np.float32)
+    constant = (odd * np.float32(2.0 ** -5)).reshape(1, count)
+    nodes = [
+        *_qdq("input", "in_s", "in_z", "x"),
+        helper.make_node("Add", ["x", "constant"], ["sum"]),
+        helper.make_node("QuantizeLinear", ["sum", "out_s", "out_z"], ["output"]),
+    ]
+    initializers = [*_qparams("in_s", "in_z", 2.0 ** -5, 0), *_qparams("out_s", "out_z", 2.0 ** -4, 5),
+                    numpy_helper.from_array(constant, "constant")]
+    model = _model("qdq_quantize_ties", nodes, [_vi("input", [1, count])],
+                   [_vi("output", [1, count], TensorProto.INT8)], initializers)
+    return ContractCase("int8_quantize_ties", model, copy.deepcopy(model), {"input": values},
+                        ("Dequantize", "Add", "Quantize"),
+                        mem_budget="64K", exact=True, reference_unoptimized=True)

@@ -1,5 +1,6 @@
-"""QDQ ONNX graph building for the TFLite importer, and TensorFlow's split of
-SAME padding into explicit begin and end pads."""
+"""QDQ ONNX graph building for the TFLite importer, TensorFlow's split of
+SAME padding into explicit begin and end pads, and the float32 to int8
+quantization a plan states."""
 
 import numpy as np
 from onnx import helper, numpy_helper
@@ -75,3 +76,15 @@ def same_padding(input_size: int, output_size: int, kernel: int, stride: int) ->
     with the extra row or column at the end as TensorFlow places it."""
     total = max((output_size - 1) * stride + kernel - input_size, 0)
     return total // 2, total - total // 2
+
+
+def quantize_int8(values, scale, zero_point, ties_even: bool) -> np.ndarray:
+    """Float values in an int8 encoding as the plan's rule computes it: a
+    float32 division by the scale, rounded with ties to even (ONNX
+    QuantizeLinear) or away from zero (TFLite QUANTIZE), plus the zero point,
+    clamped; NaN gives -128, as the runtime and ONNX Runtime give.
+    ``scale`` and ``zero_point`` broadcast against ``values``."""
+    ratio = (np.asarray(values, np.float32) / np.asarray(scale, np.float32)).astype(np.float64)
+    rounded = np.rint(ratio) if ties_even else np.sign(ratio) * np.floor(np.abs(ratio) + 0.5)
+    level = np.where(np.isnan(rounded), -128.0, rounded + np.asarray(zero_point, np.float64))
+    return np.clip(level, -128, 127).astype(np.int8)

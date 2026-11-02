@@ -104,7 +104,7 @@ CONTRACT = {
 
 def test_schema_version():
     """Schema version constant must match the current runtime contract."""
-    assert SCHEMA_VERSION == 11
+    assert SCHEMA_VERSION == 12
 
 
 @pytest.mark.parametrize("name", CONTRACT)

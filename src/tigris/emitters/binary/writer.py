@@ -42,6 +42,7 @@ from .defs import (
     ACT_RELU,
     ACT_RELU6,
     COMPRESS_LZ4,
+    FLAG_QUANTIZE_TIES_EVEN,
     FLAG_XIP,
     HEADER_SIZE,
     HEADER_STRUCT,
@@ -1845,7 +1846,7 @@ def _emit(
     sec_dir.extend(SECTION_ENTRY_STRUCT.pack(0, 0))  # sentinel
 
     num_qp = len(quant_idx_map) if quant_idx_map else 0
-    header_flags = 0
+    header_flags = FLAG_QUANTIZE_TIES_EVEN if ag.quantize_ties_even else 0
     if xip:
         header_flags |= FLAG_XIP
     header = HEADER_STRUCT.pack(

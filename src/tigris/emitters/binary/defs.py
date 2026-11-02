@@ -121,6 +121,9 @@ COMPRESS_LZ4 = 1
 
 # Header flags
 FLAG_XIP = 0x01  # weights are execute-in-place from flash
+# Schema 12+: float32 quantizes to int8 with ties to even (ONNX QuantizeLinear);
+# clear, ties go away from zero (TFLite QUANTIZE). Both divide in float32.
+FLAG_QUANTIZE_TIES_EVEN = 0x02
 
 # Tensor flags
 TENSOR_FLAG_CONSTANT = 0x01
