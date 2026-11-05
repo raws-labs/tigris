@@ -533,6 +533,42 @@ def test_leading_band_cannot_cut_the_operator_axis(kind):
     assert not _independent_band(AnalyzedGraph(tensors=tensors, ops=[op]), op, leading=True)
 
 
+def test_a_leading_band_takes_no_operand_of_rank_1_outside_a_table_gather():
+    """The runtime bands operands of rank 2 to 6 only."""
+    from tigris.analysis.partition_spatial import _independent_band
+    from tigris.graph.ir import Layout
+
+    tensors = {"x": TensorInfo("x", (6, 4), dtype=1, layout=Layout.LINEAR),
+               "y": TensorInfo("y", (6,), dtype=6, layout=Layout.LINEAR)}
+    op = OpNode("band", "ArgMax", ["x"], ["y"], attrs={"axes": [1]})
+    assert not _independent_band(AnalyzedGraph(tensors=tensors, ops=[op]), op, leading=True)
+
+
+def test_an_arg_max_into_a_gather_compiles_to_a_plan_the_loader_takes(tmp_path):
+    """Its rank-1 index output cannot be banded, so 96 B is too small for
+    the stage and 128 B, the smallest budget, gives a plan the loader takes."""
+    import json
+    from pathlib import Path
+
+    from click.testing import CliRunner
+
+    from tigris.cli import cli
+    from tigris.runtime import check_plan
+
+    path = str(Path(__file__).parent / "fixtures" / "tflite" / "ops" / "float_arg_max_gather.tflite")
+    report = json.loads(CliRunner().invoke(cli, ["analyze", path, "-m", "96", "--json"]).output)
+    assert report["fast"]["blocking_stages"] == [
+        {"stage": 0, "required_bytes": 128, "reason": "runs untiled: ArgMax_0"}]
+    assert report["smallest_fit"]["budget_bytes"] == 128
+    output = tmp_path / "arg_max_gather.tgrs"
+    result = CliRunner().invoke(cli, ["compile", path, "-m", "96", "-o", str(output)])
+    assert result.exit_code == 1 and result.output.endswith("Error: no plan written\n")
+    assert not output.exists()
+    result = CliRunner().invoke(cli, ["compile", path, "-m", "128", "-o", str(output)])
+    assert result.exit_code == 0, result.output
+    check_plan(output.read_bytes())
+
+
 @pytest.mark.parametrize("source,target", [((1, 37, 8), (2, 37, 4)), ((2, 37, 4), (1, 37, 8))])
 def test_leading_band_requires_one_block_before_its_axis(source, target):
     from tigris.analysis.partition_spatial import _independent_band
