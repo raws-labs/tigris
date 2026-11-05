@@ -506,22 +506,31 @@ def _cli_model(name, tmp_path, conv_relu_chain_path, qdq_conv_path=None):
     ("relu", ["--input-shape", "input:16x64"], True),
     ("relu", ["-m", "4K", "-m", "2K", "--input-shape", "input:16x64"], False),
     ("relu", ["-m", "8K", "-m", "4K", "--input-shape", "input:16x64"], True),
+    ("chain", ["-f", "1M"], True),
+    ("chain", ["-f", "1K"], False),
 ], ids=["fits", "flash_fits", "fast_too_small", "slow_fits", "slow_too_small", "flash_too_small",
         "no_budget", "unsupported", "unsupported_no_budget", "tflite_fits", "tflite_fast_too_small",
         "slow_too_small_at_every_budget", "control_flow_no_budget", "wide_branch_no_budget",
         "wide_branch_fast_too_small", "wide_branch_fits", "unaligned_fits", "unaligned_too_small",
         "int8_io_no_budget", "int8_io_unaligned_fits", "int8_io_fast_too_small",
-        "input_shape_no_budget", "input_shape_slow_too_small", "input_shape_slow_fits"])
+        "input_shape_no_budget", "input_shape_slow_too_small", "input_shape_slow_fits",
+        "flash_fits_no_budget", "flash_too_small_no_budget"])
 def test_analyze_exits_1_exactly_when_compile_writes_no_plan(
         tmp_path, conv_relu_chain_path, qdq_conv_path, model, options, writes):
     """Without -m, compile runs at the smallest budget analyze reports, or at
-    64M when it reports none."""
+    64M when it reports none. Compile with the other options writes a plan at
+    the smallest budget and none at the budget below it."""
     import json
 
     path = str(_cli_model(model, tmp_path, conv_relu_chain_path, qdq_conv_path))
     text_run = CliRunner().invoke(cli, ["analyze", path, *options])
     json_run = CliRunner().invoke(cli, ["analyze", path, *options, "--json"])
     report = json.loads(json_run.output)
+    fit = report["smallest_fit"]
+    if fit and fit["budget_bytes"]:
+        for fast, fast_writes in ((fit["budget_bytes"], True), (fit["below_bytes"], False)):
+            if fast is not None:
+                assert _compile_writes(tmp_path, path, _at_fast(options, fast)) == fast_writes, fast
     if "-m" not in options:
         fit = report["smallest_fit"]
         options = ["-m", str(fit["budget_bytes"] if fit and fit["budget_bytes"] else "64M"), *options]
@@ -530,6 +539,52 @@ def test_analyze_exits_1_exactly_when_compile_writes_no_plan(
     assert output.exists() == writes, compiled.output
     assert [text_run.exit_code, json_run.exit_code, compiled.exit_code] == [0 if writes else 1] * 3, (
         text_run.output)
+
+
+def _at_fast(options, fast):
+    """The options with the fast budget `fast`, the other options kept."""
+    if "-m" not in options:
+        return ["-m", str(fast), *options]
+    at = options.index("-m")
+    return [*options[:at + 1], str(fast), *options[at + 2:]]
+
+
+def _compile_writes(tmp_path, path, options):
+    output = tmp_path / "at_budget.tgrs"
+    output.unlink(missing_ok=True)
+    CliRunner().invoke(cli, ["compile", path, *options, "-o", str(output)])
+    return output.exists()
+
+
+def test_the_smallest_budget_is_where_the_plan_fits_the_flash_budget(tmp_path, conv_relu_chain_path):
+    """The plan is larger at the smallest budget that fits memory than at
+    64K; with a flash budget between the two, the smallest budget is where
+    compile writes a plan, above the one that only fits memory."""
+    import json
+
+    path = str(conv_relu_chain_path)
+
+    def smallest(options):
+        report = json.loads(CliRunner().invoke(cli, ["analyze", path, *options, "--json"]).output)
+        return report["smallest_fit"]
+
+    def plan_size(fast):
+        output = tmp_path / f"{fast}.tgrs"
+        CliRunner().invoke(cli, ["compile", path, "-m", str(fast), "-o", str(output)])
+        return output.stat().st_size
+
+    memory_fit = smallest([])["budget_bytes"]
+    large, small = plan_size(memory_fit), plan_size(64 * 1024)
+    assert large > small
+    flash = ["-f", str(large - 1)]
+    fit = smallest(["-m", "64K", *flash])
+    assert fit["budget_bytes"] > memory_fit and fit == smallest(flash)
+    assert _compile_writes(tmp_path, path, ["-m", str(fit["budget_bytes"]), *flash])
+    assert not _compile_writes(tmp_path, path, ["-m", str(fit["below_bytes"]), *flash])
+    # The budget below fits memory: only the flash budget refuses it.
+    assert _compile_writes(tmp_path, path, ["-m", str(fit["below_bytes"])])
+    result = CliRunner().invoke(cli, ["analyze", path, "-m", str(memory_fit), *flash])
+    assert result.exit_code == 1
 
 
 def _row(output, label):
@@ -605,10 +660,75 @@ def test_analyze_reports_no_smallest_budget_when_the_slow_pool_never_suffices():
 
     path = str(_TFLITE / "ops" / "float_while.tflite")
     report = json.loads(CliRunner().invoke(cli, ["analyze", path, "-m", "1K", "-m", "64", "--json"]).output)
-    assert report["smallest_fit"] == {"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": 64}
+    assert report["smallest_fit"] == {"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": 64,
+                                      "reason": "memory"}
     result = CliRunner().invoke(cli, ["analyze", path, "-m", "1K", "-m", "64"], env={"NO_COLOR": "1"})
     assert _row(result.output, "smallest budget") == (
         "smallest budget none no fast budget fits with 64 B slow memory")
+
+
+@pytest.mark.parametrize("pools", [[], ["-m", "16K", "-m", "64K"]], ids=["no_budget", "slow"])
+def test_analyze_reports_no_smallest_budget_when_no_plan_fits_the_flash_budget(
+        conv_relu_chain_path, pools):
+    import json
+
+    path = str(conv_relu_chain_path)
+    options = [*pools, "-f", "1K"]
+    report = json.loads(CliRunner().invoke(cli, ["analyze", path, *options, "--json"]).output)
+    assert report["smallest_fit"] == {"budget_bytes": None, "below_bytes": None,
+                                      "slow_budget_bytes": 65536 if pools else None,
+                                      "reason": "flash"}
+    result = CliRunner().invoke(cli, ["analyze", path, *options], env={"NO_COLOR": "1"})
+    assert result.exit_code == 1
+    assert _row(result.output, "smallest budget") == (
+        "smallest budget none no plan fits the 1.00 KiB flash budget")
+
+
+@pytest.mark.parametrize("pools", [[], ["-m", "16K", "-m", "64K"]], ids=["no_budget", "slow"])
+def test_analyze_reports_no_smallest_budget_when_the_loader_refuses_every_plan(
+        conv_relu_chain_path, monkeypatch, pools):
+    import json
+
+    import tigris.runtime
+
+    def refuse(data):
+        raise tigris.runtime.RuntimeError("refused")
+
+    monkeypatch.setattr(tigris.runtime, "check_plan", refuse)
+    path = str(conv_relu_chain_path)
+    report = json.loads(CliRunner().invoke(cli, ["analyze", path, *pools, "--json"]).output)
+    assert report["smallest_fit"]["budget_bytes"] is None
+    assert report["smallest_fit"]["reason"] == "loader"
+    result = CliRunner().invoke(cli, ["analyze", path, *pools], env={"NO_COLOR": "1"})
+    assert result.exit_code == 1
+    assert _row(result.output, "smallest budget") == (
+        "smallest budget none the runtime loader refuses the plan at every fast budget")
+
+
+def test_analyze_reports_no_smallest_budget_when_the_writer_refuses_every_plan(
+        conv_relu_chain_path, monkeypatch):
+    """A plan the writer refuses at the largest budget is a model that does
+    not compile: no smallest_fit, no row."""
+    import json
+
+    import tigris.emitters.binary.writer
+
+    def refuse(*args, **kwargs):
+        raise ValueError("refused")
+
+    monkeypatch.setattr(tigris.emitters.binary.writer, "emit_binary_bytes", refuse)
+    path = str(conv_relu_chain_path)
+    report = json.loads(CliRunner().invoke(cli, ["analyze", path, "--json"]).output)
+    assert report["smallest_fit"] is None
+    result = CliRunner().invoke(cli, ["analyze", path])
+    assert result.exit_code == 1 and "smallest budget" not in result.output
+
+
+def test_a_found_smallest_budget_has_no_reason(conv_relu_chain_path):
+    import json
+
+    report = json.loads(CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "--json"]).output)
+    assert report["smallest_fit"]["budget_bytes"] and report["smallest_fit"]["reason"] is None
 
 
 def test_analyze_reports_no_smallest_budget_for_a_model_that_cannot_compile(tmp_path, conv_relu_chain_path):
@@ -627,7 +747,8 @@ def test_a_smallest_budget_with_nothing_below_names_no_budget_below(slow, detail
 
     from tigris.cli.analyze import smallest_row
 
-    row = smallest_row({"budget_bytes": 32, "below_bytes": None, "slow_budget_bytes": slow})
+    row = smallest_row({"budget_bytes": 32, "below_bytes": None, "slow_budget_bytes": slow,
+                        "reason": None}, 0)
     assert [click.unstyle(cell) for cell in row] == ["smallest budget", "32 B", detail]
 
 
@@ -635,4 +756,5 @@ def test_no_smallest_budget_without_a_slow_budget_leaves_the_row_out():
     """Not expected with an unbounded slow pool; the report still says null."""
     from tigris.cli.analyze import smallest_row
 
-    assert smallest_row({"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": None}) is None
+    assert smallest_row({"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": None,
+                         "reason": "memory"}, 0) is None

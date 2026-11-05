@@ -93,37 +93,48 @@ def _report(ag, findings, budget: int, source: str, tflm_arena: int | None, smal
     }
 
 
-def smallest_fit(model: str, fitting_budget: int, slow: int, peak: int, input_shape,
-                 int8_io: bool) -> dict:
-    """The smallest fast budget whose plan fits memory with the slow budget
-    `slow` (0: unbounded), as the report's smallest_fit. Candidates are the
-    multiples of TENSOR_ALIGN up to one compiled and found to fit:
-    `fitting_budget`, a budget known to fit, rounded down to a multiple, or
-    else `peak`, the largest unscheduled peak of any graph, aligned up.
-    Bisection compiles both ends it reports and assumes nothing between them."""
+def smallest_fit(model: str, fitting_budget: int, slow: int, flash: int, peak: int, input_shape,
+                 int8_io: bool) -> dict | None:
+    """The smallest fast budget at which compile writes a plan with the slow
+    budget `slow` (0: unbounded) and the flash budget `flash` (0: none), as
+    the report's smallest_fit. Candidates are the multiples of TENSOR_ALIGN
+    up to one compiled and found to fit: `fitting_budget`, a budget known to
+    fit, rounded down to a multiple, or else `peak`, the largest unscheduled
+    peak of any graph, aligned up. Bisection compiles both ends it reports
+    and assumes nothing between them. Without a budget, the reason is what
+    stops the plan at the largest candidate tried: "memory", "flash" or
+    "loader". None when the writer refuses the plan there: the model does
+    not compile at any budget the search tries."""
     from tigris.analysis.validation import plan_gate
 
-    def fits(multiple: int) -> bool:
+    def refusal(multiple: int) -> str | None:
+        """What stops compile writing a plan at this candidate; None: it writes."""
         candidate = multiple * TENSOR_ALIGN
         mem = (str(candidate), str(slow)) if slow else (str(candidate),)
         try:
             graph = _planned(model, mem, input_shapes=input_shape, report_bindings=False,
                              int8_io=int8_io)
         except click.ClickException:
-            return False
-        return plan_gate(graph).passes
+            return "memory"
+        graph.budget = replace(graph.budget, flash=flash)
+        step = _refusal(graph, plan_gate(graph))
+        return "memory" if step == "gate" else step
 
-    found = {"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": slow or None}
+    found = {"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": slow or None,
+             "reason": None}
     top = fitting_budget // TENSOR_ALIGN
-    if not top or (top * TENSOR_ALIGN != fitting_budget and not fits(top)):
+    if not top or (top * TENSOR_ALIGN != fitting_budget and refusal(top) is not None):
         top = max(1, align_up(peak) // TENSOR_ALIGN)
-        if not fits(top):
+        found["reason"] = refusal(top)
+        if found["reason"] == "writer":
+            return None
+        if found["reason"] is not None:
             return found
     # Fits at high * TENSOR_ALIGN, fails at low * TENSOR_ALIGN (0: none below).
     low, high = 0, top
     while high - low > 1:
         middle = (low + high) // 2
-        if fits(middle):
+        if refusal(middle) is None:
             high = middle
         else:
             low = middle
@@ -132,27 +143,34 @@ def smallest_fit(model: str, fitting_budget: int, slow: int, peak: int, input_sh
     return found
 
 
-def smallest_row(smallest: dict) -> list[str] | None:
-    """The memory row for smallest_fit: the budget, then what does not fit.
-    None when no budget fits without a slow budget, which an unbounded slow
+def smallest_row(smallest: dict, flash: int) -> list[str] | None:
+    """The memory row for smallest_fit with the flash budget `flash`: the
+    budget, then what does not fit. Without a budget, the reason; None when
+    memory stops the plan without a slow budget, which an unbounded slow
     pool and the model's peak are not expected to give."""
     slow, below = smallest["slow_budget_bytes"], smallest["below_bytes"]
     pool = [f"with {fmt_bytes(slow)} slow memory"] if slow else []
     if smallest["budget_bytes"] is None:
-        return ["smallest budget", "none", text.dim(f"no fast budget fits {pool[0]}")] if slow else None
+        detail = {"memory": f"no fast budget fits {pool[0]}" if slow else None,
+                  "flash": f"no plan fits the {fmt_bytes(flash)} flash budget",
+                  "loader": "the runtime loader refuses the plan at every fast budget",
+                  }.get(smallest["reason"])
+        return ["smallest budget", "none", text.dim(detail)] if detail else None
     failed = [f"{fmt_bytes(below)} does not fit"] if below is not None else []
     return ["smallest budget", fmt_bytes(smallest["budget_bytes"]), text.dim("; ".join(pool + failed))]
 
 
-def _loads(plan: bytes) -> bool:
-    """Whether the host runtime's loader takes the plan, as compile checks it."""
-    from tigris.runtime import RuntimeError as HostRuntimeError, check_plan
+def _refusal(ag, gate, measured: bytes = b"") -> str | None:
+    """The step that stops compile writing a plan for the planned graph `ag`
+    with the gate `gate`, as NoPlan names it; None when compile writes one.
+    `measured` is the plan findings serialized, when there is one."""
+    from tigris.cli.compile import NoPlan, plan_to_write
 
     try:
-        check_plan(plan)
-    except HostRuntimeError:
-        return False
-    return True
+        plan_to_write(ag, gate, measured)
+    except NoPlan as exc:
+        return exc.step
+    return None
 
 
 def _lz4_compiles(model: str, mem: tuple[str, ...], input_shape) -> bool:
@@ -265,7 +283,7 @@ def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
                                 f"{fmt_bytes(traffic['read'])} read")])
     elif traffic is not None:
         memory.append(["slow traffic", "", text.dim(f"not measured: {traffic}")])
-    row = smallest_row(smallest) if smallest is not None else None
+    row = smallest_row(smallest, ag.budget.flash) if smallest is not None else None
     if row is not None:
         memory.append(row)
     text.section("memory", memory, "<>")
@@ -361,13 +379,13 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     supported = findings.gate.usable
     # The bound covers every subgraph, which can need more than the main graph.
     peak = max(graph.peak_memory_bytes for graph in all_graphs(ag))
-    smallest = (smallest_fit(model, budget if budget > 0 and findings.gate.passes else 0,
-                             slow_budget, peak, input_shape, int8_io)
+    # As compile decides at this budget; without one, at the smallest budget.
+    writes = supported and budget > 0 and _refusal(ag, findings.gate, findings.plan) is None
+    smallest = (smallest_fit(model, budget if writes else 0, slow_budget, flash_budget, peak,
+                             input_shape, int8_io)
                 if supported else None)
-    # As compile decides: the gate, a plan the writer produced, the flash
-    # budget, and the runtime loader.
-    writes = supported and (budget <= 0 or (findings.gate.passes and bool(findings.plan) and not (
-        flash_budget and findings.plan_size_bytes > flash_budget) and _loads(findings.plan)))
+    if budget <= 0:
+        writes = smallest is not None and smallest["budget_bytes"] is not None
     if findings.lz4_plan_size_bytes and not (
             supported and not findings.blocking_stages and _lz4_compiles(model, mem, input_shape)):
         findings.lz4_plan_size_bytes = 0
