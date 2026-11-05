@@ -694,6 +694,11 @@ def _independent_band(ag: AnalyzedGraph, op: OpNode, row_tiled: bool = True,
         return False
     source, target = ag.tensors[op.inputs[0]], ag.tensors[op.outputs[0]]
     whole = _whole_band_operands([op])
+    # The runtime bands only operands of rank 2 to 6, whole-band inputs aside.
+    if any(not 2 <= len(serialized_shape(ag.tensors[n].shape, ag.tensors[n].layout)) <= 6
+           for n in [*op.inputs, *op.outputs]
+           if not ag.tensors[n].is_constant and not (n in whole and n in op.inputs)):
+        return False
     if not leading and any(not ag.tensors[n].is_constant for n in whole):
         return False
     trailing = leading == 2
