@@ -1,5 +1,6 @@
 """``tigris analyze``: does a model fit a budget, and if not, why."""
 
+import copy
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -105,16 +106,19 @@ def smallest_fit(model: str, fitting_budget: int, slow: int, flash: int, peak: i
     stops the plan at the largest candidate tried: "memory", "flash" or
     "loader". None when the writer refuses the plan there: the model does
     not compile at any budget the search tries."""
+    from tigris import pipeline
     from tigris.analysis.validation import plan_gate
+
+    # Planning changes the graph it is given, so each candidate plans a copy.
+    loaded = pipeline.load(model, input_shape, int8_io=int8_io)
 
     def refusal(multiple: int) -> str | None:
         """What stops compile writing a plan at this candidate; None: it writes."""
         candidate = multiple * TENSOR_ALIGN
         mem = (str(candidate), str(slow)) if slow else (str(candidate),)
         try:
-            graph = _planned(model, mem, input_shapes=input_shape, report_bindings=False,
-                             int8_io=int8_io)
-        except click.ClickException:
+            graph = pipeline.plan(copy.deepcopy(loaded), mem)
+        except ValueError:
             return "memory"
         graph.budget = replace(graph.budget, flash=flash)
         step = _refusal(graph, plan_gate(graph))

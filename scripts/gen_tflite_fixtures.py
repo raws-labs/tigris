@@ -829,6 +829,25 @@ def _detection(regular, quantized=False, boxes=16, classes=3, max_detections=8):
     return _operators(ops, tensors, inputs, [3, 4, 5, 6])
 
 
+def _fully_connected_relu6():
+    """int8 FULLY_CONNECTED with a fused RELU6 at output scale 0.8, where 6 / 0.8
+    is exactly 7.5 in float32, so the ceiling is code 8; seeded weights spread
+    the outputs below, at and above it."""
+    rng = np.random.default_rng(80)
+    x_scale, w_scale = 0.05, 0.005
+    b_scale = float(np.float32(x_scale) * np.float32(w_scale))
+    options = schema.FullyConnectedOptionsT()
+    options.fusedActivationFunction = schema.ActivationFunctionType.RELU6
+    T = schema.TensorType
+    tensors = [((8, 16), T.INT8, None, x_scale, 0, False),
+               ((4, 16), T.INT8, rng.integers(-127, 128, (4, 16)).astype(np.int8), w_scale, 0, False),
+               ((4,), T.INT32, rng.integers(-1000, 1000, 4).astype(np.int32), b_scale, 0, False),
+               ((8, 4), T.INT8, None, 0.8, 0, False)]
+    return _one_operator(schema.BuiltinOperator.FULLY_CONNECTED,
+                         schema.BuiltinOptions.FullyConnectedOptions, options, tensors,
+                         [0, 1, 2], [3], [0], [3])
+
+
 # Models no converter writes, built operator by operator.
 _RELU = schema.ActivationFunctionType.RELU
 _NONE = schema.ActivationFunctionType.NONE
@@ -854,6 +873,7 @@ HANDMADE = {
     "float_shape_arithmetic": lambda: _shape_ops("shape_arithmetic"),
     "float_shape_reverse_reshape": lambda: _shape_ops("reverse_reshape"),
     "lstm_time_major_clip": lambda: _lstm(True, 2, 3, 3, 4, cell_clip=0.8, quantized=True),
+    "fully_connected_relu6": _fully_connected_relu6,
 }
 # TFLite's float SVDF and LSTM compute in another order than TFLite Micro, so
 # the two differ in the last bits; TFLite Micro's outputs are recorded for these.

@@ -440,10 +440,11 @@ def _get_quant_param(ag: AnalyzedGraph, op: OpNode) -> tuple[QuantParam | None, 
         zp = ag.weight_data[op.inputs[2]].flatten()
         unsigned = zp.dtype == np.uint8
     else:
-        # An omitted zero point means zero in the operator's own output
-        # type, which ONNX defaults to uint8.
-        produced = ag.tensors.get(op.outputs[0])
-        unsigned = produced is not None and produced.dtype == 2
+        # An omitted zero point is zero of the quantized type: the output of a
+        # QuantizeLinear, which ONNX defaults to uint8, or the input of a
+        # DequantizeLinear.
+        quantized = ag.tensors.get(op.inputs[0] if op.op_type == "DequantizeLinear" else op.outputs[0])
+        unsigned = quantized is not None and quantized.dtype == 2
         zp = np.zeros_like(scale, dtype=np.int8)
     if unsigned:
         zp = (zp.astype(np.int32) - 128).astype(np.int32)
@@ -460,10 +461,38 @@ def _to_signed(arr: np.ndarray) -> np.ndarray:
     return (arr.astype(np.int16) - 128).astype(np.int8)
 
 
+def _encoded_constant(ag: AnalyzedGraph, folds: dict[str, list[tuple[tuple, str]]], source: str,
+                      encoding: tuple, codes: np.ndarray, qp: QuantParam) -> str:
+    """The int8 constant holding ``codes``, the ``encoding`` of ``source``, decoded by ``qp``.
+
+    The first fold of ``source`` stores them under its name. A later fold with
+    the same encoding and parameters reads that constant, and any other fold
+    gets a copy under a fresh name.
+    """
+    made = folds.setdefault(source, [])
+    for known, name in made:
+        quant = ag.tensors[name].quant
+        if known == encoding and quant.same_scale_and_zero_point(qp) and quant.axis == qp.axis:
+            return name
+    name = _fresh_name(ag, source) if made else source
+    ag.weight_data[name] = codes
+    info = ag.tensors.get(source)
+    ag.tensors[name] = (TensorInfo(name=name, shape=tuple(codes.shape), dtype=3, is_constant=True, quant=qp)
+                        if info is None else replace(info, name=name, dtype=3, quant=qp))
+    made.append((encoding, name))
+    return name
+
+
 def _fold_weight_dequantizers(ag: AnalyzedGraph, fold: _QdqFold) -> None:
     """Fold each DequantizeLinear of a constant, of a QuantizeLinear of a float
     constant, and of a quantized model input."""
     uses = fold.uses
+    # Parameters and data as the model states them: a fold restates the dtype
+    # and the data of a tensor that more than one DequantizeLinear may read.
+    params = {i: _get_quant_param(ag, op) for i, op in enumerate(ag.ops) if op.op_type in _QDQ_TYPES}
+    stated = dict(ag.weight_data)
+    folds: dict[str, list[tuple[tuple, str]]] = {}
+    folded_inputs: set[str] = set()
     # Pattern: weight_init -> QuantizeLinear -> int8 -> DequantizeLinear -> fake_float
     # Or simply: int8_init -> DequantizeLinear -> fake_float
     for i, op in enumerate(ag.ops):
@@ -477,19 +506,13 @@ def _fold_weight_dequantizers(ag: AnalyzedGraph, fold: _QdqFold) -> None:
         # Case 1: int8 initializer -> DequantizeLinear
         if dql_input in ag.weight_data:
             is_weight_dql = True
-            qp, unsigned = _get_quant_param(ag, op)
+            qp, unsigned = params[i]
             if qp is None:
                 continue
-
-            if unsigned:
-                ag.weight_data[dql_input] = _to_signed(ag.weight_data[dql_input])
-
-            # Store QuantParam on the weight tensor
-            if dql_input in ag.tensors:
-                ag.tensors[dql_input].quant = qp
-                ag.tensors[dql_input].dtype = 3  # INT8
-
-            _bypass_dql(ag, fold, i, dql_input, constant=True)
+            raw = stated[dql_input]
+            codes = _to_signed(raw) if unsigned else raw
+            source = _encoded_constant(ag, folds, dql_input, ("stored", unsigned), codes, qp)
+            _bypass_dql(ag, fold, i, source, constant=True)
 
         # Case 2: QuantizeLinear -> DequantizeLinear on a weight
         elif dql_input in uses.producers:
@@ -499,34 +522,29 @@ def _fold_weight_dequantizers(ag: AnalyzedGraph, fold: _QdqFold) -> None:
                 is_weight_dql = True
                 original_weight = ql_op.inputs[0]
 
-                # Get quant params from the DQL op
-                qp, unsigned = _get_quant_param(ag, op)
-                if qp is None:
+                # The QuantizeLinear's parameters encode the weight and the
+                # DequantizeLinear's decode it, which may differ in value and axis.
+                ql_qp, _ = params[ql_idx]
+                qp, _ = params[i]
+                if ql_qp is None or qp is None:
                     continue
 
-                # Quantize the float weight to int8, as the QuantizeLinear does
-                scale = qp.scale
-                zp = qp.zero_point.astype(np.int32)
-                float_w = ag.weight_data[original_weight]
+                scale = ql_qp.scale
+                zp = ql_qp.zero_point.astype(np.int32)
+                float_w = stated[original_weight]
 
                 if scale.size == 1:
                     s, z = scale[0], zp[0]
                 else:
-                    # Per-channel: reshape scale for broadcasting
-                    axis = qp.axis if qp.axis >= 0 else 1
                     bc_shape = [1] * float_w.ndim
-                    bc_shape[axis] = scale.size
+                    bc_shape[ql_qp.axis % float_w.ndim] = scale.size
                     s = scale.reshape(bc_shape)
                     z = zp.reshape(bc_shape)
                 int8_w = quantize_int8(float_w, s, z, ag.quantize_ties_even)
+                encoding = ("quantized", scale.tobytes(), zp.tobytes(), ql_qp.axis)
+                source = _encoded_constant(ag, folds, original_weight, encoding, int8_w, qp)
 
-                # Replace float weight with int8
-                ag.weight_data[original_weight] = int8_w
-                if original_weight in ag.tensors:
-                    ag.tensors[original_weight].dtype = 3  # INT8
-                    ag.tensors[original_weight].quant = qp
-
-                _bypass_dql(ag, fold, i, original_weight, constant=True)
+                _bypass_dql(ag, fold, i, source, constant=True)
                 ag.tensors.pop(dql_input, None)
                 fold.removed.add(ql_idx)
 
@@ -545,8 +563,13 @@ def _fold_weight_dequantizers(ag: AnalyzedGraph, fold: _QdqFold) -> None:
                 for cons_idx, _ in uses.readers(dql_input)
             )
         ):
-            qp, _ = _get_quant_param(ag, op)
+            qp, _ = params[i]
             if qp is not None:
+                held = ag.tensors[dql_input].quant
+                if dql_input in folded_inputs and not (
+                        held.same_scale_and_zero_point(qp) and held.axis == qp.axis):
+                    raise ValueError(f"model input {dql_input!r} is dequantized with differing parameters")
+                folded_inputs.add(dql_input)
                 ag.is_quantized = True
                 ag.tensors[dql_input].quant = qp
                 ag.tensors[dql_input].dtype = 3  # INT8
