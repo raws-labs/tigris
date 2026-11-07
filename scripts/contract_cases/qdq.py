@@ -835,3 +835,29 @@ def _tflite_relu6_ceiling_case() -> ContractCase:
     return ContractCase("tflite_fully_connected_relu6", model, model,
                         {model.graph.input[0].name: samples["input_0"][0]}, ("Gemm",),
                         exact=True, recorded_outputs=(expected,))
+
+
+def _qdq_relu6_ceiling_ties_case() -> ContractCase:
+    """A standalone int8 Clip(0, 6) whose ceiling is a tie.
+
+    The Clip reads the dequantized model input, so nothing precedes it to fuse
+    into. At scale 0.48, 6.0 is 12.5 steps, which ONNX Runtime's QuantizeLinear
+    rounds to 12, so every input at or above the ceiling becomes 12; the int8
+    output is compared byte for byte.
+    """
+    scale = 0.48
+    codes = np.array([-128, -5, 0, 2, 11, 12, 13, 14, 20, 83, 127], dtype=np.float32)
+    values = (codes * np.float32(scale)).reshape(1, codes.size)
+    nodes = [
+        *_qdq("input", "s", "z", "x"),
+        helper.make_node("Clip", ["x", "lo", "hi"], ["clipped"]),
+        helper.make_node("QuantizeLinear", ["clipped", "s", "z"], ["output"]),
+    ]
+    initializers = [*_qparams("s", "z", scale, 0),
+                    numpy_helper.from_array(np.array(0.0, dtype=np.float32), "lo"),
+                    numpy_helper.from_array(np.array(6.0, dtype=np.float32), "hi")]
+    model = _model("qdq_relu6_ceiling_ties", nodes, [_vi("input", [1, codes.size])],
+                   [_vi("output", [1, codes.size], TensorProto.INT8)], initializers)
+    return ContractCase("int8_relu6_ceiling_ties", model, copy.deepcopy(model), {"input": values},
+                        ("Relu6",), mem_budget="64K", exact=True, reference_unoptimized=True)
+

@@ -1338,6 +1338,7 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         qdq._qdq_quantize_ties_case(),
         qdq._qdq_conv_relu6_ceiling_case(),
         qdq._tflite_relu6_ceiling_case(),
+        qdq._qdq_relu6_ceiling_ties_case(),
         convolution._convtranspose_case("convtranspose", 19, kernel=2, pads=[0, 0, 0, 0]),
         convolution._conv_then_convtranspose_case(),
         convolution._convtranspose_case("convtranspose_overlap", 29, kernel=4, pads=[1, 1, 1, 1]),
