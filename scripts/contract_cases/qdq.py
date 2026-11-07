@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 import numpy as np
 import onnx
@@ -776,3 +777,61 @@ def _qdq_quantize_ties_case() -> ContractCase:
     return ContractCase("int8_quantize_ties", model, copy.deepcopy(model), {"input": values},
                         ("Dequantize", "Add", "Quantize"),
                         mem_budget="64K", exact=True, reference_unoptimized=True)
+
+
+def _qdq_conv_relu6_ceiling_case() -> ContractCase:
+    """A QDQ Conv and Clip(0, 6) at output scale 0.48, which the Conv absorbs.
+
+    6 / 0.48 is 12.5 in float32, and ONNX Runtime's QuantizeLinear rounds it
+    to even, so every output at or above 6 is code 12. Input and weight scales
+    multiply to the output scale and the weights are whole steps, so each
+    accumulator is its output code and only the ceiling clamps it.
+    """
+    rng = np.random.default_rng(48)
+    steps = rng.integers(-1, 2, size=(4, 3, 1, 1))
+    initializers = [
+        numpy_helper.from_array(steps.astype(np.float32) * np.float32(2.0), "weight"),
+        numpy_helper.from_array(np.array(0.0, dtype=np.float32), "low"),
+        numpy_helper.from_array(np.array(6.0, dtype=np.float32), "high"),
+    ] + _scalars(inp=(0.24, 0), w=(2.0, 0), out=(0.48, 0))
+    body = [
+        *_qdq("weight", "w_s", "w_z", "wdq"),
+        helper.make_node("Conv", ["x", "wdq"], ["conv"], kernel_shape=[1, 1]),
+        helper.make_node("Clip", ["conv", "low", "high"], ["raw"]),
+    ]
+
+    def build(dtype: int, nodes: list[onnx.NodeProto]) -> onnx.ModelProto:
+        return _model(f"qdq_conv_relu6_ceiling_{'int8' if dtype == TensorProto.INT8 else 'float'}",
+                      nodes, [_vi("input", [1, 3, 8, 8], dtype)], [_vi("output", [1, 4, 8, 8], dtype)],
+                      initializers)
+
+    compile_model = build(TensorProto.FLOAT, [
+        *_qdq("input", "inp_s", "inp_z", "x", "input_q"), *body,
+        *_qdq("raw", "out_s", "out_z", "output", "output_q")])
+    reference_model = build(TensorProto.INT8, [
+        helper.make_node("DequantizeLinear", ["input", "inp_s", "inp_z"], ["x"]), *body,
+        helper.make_node("QuantizeLinear", ["raw", "out_s", "out_z"], ["output"])])
+    data = rng.integers(-40, 40, size=(1, 3, 8, 8)).astype(np.int8)
+    codes = np.einsum("oc,nchw->nohw", steps[:, :, 0, 0], data.astype(np.int64))
+    assert np.count_nonzero(codes == 12) and np.count_nonzero(codes > 12)
+    return ContractCase("int8_conv_relu6_ceiling", compile_model, reference_model, {"input": data},
+                        ("Conv",), int8_io=True, exact=True, reference_unoptimized=True)
+
+
+def _tflite_relu6_ceiling_case() -> ContractCase:
+    """An int8 FULLY_CONNECTED with a fused RELU6 at output scale 0.8, compared
+    byte for byte with the outputs TFLite recorded for one of its samples.
+
+    6 / 0.8 is exactly 7.5 in float32, which TFLite rounds away from zero, so
+    the ceiling is code 8.
+    """
+    from tigris.frontends import tflite
+
+    path = Path(__file__).resolve().parents[2] / "tests/fixtures/tflite/ops/fully_connected_relu6.tflite"
+    model = tflite.to_onnx(path.read_bytes(), path.stem)
+    samples = np.load(path.with_suffix(".npz"))
+    expected = samples["output_0"][0]
+    assert np.count_nonzero(expected == 8)
+    return ContractCase("tflite_fully_connected_relu6", model, model,
+                        {model.graph.input[0].name: samples["input_0"][0]}, ("Gemm",),
+                        exact=True, recorded_outputs=(expected,))

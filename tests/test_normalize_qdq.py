@@ -426,14 +426,18 @@ def test_quantized_matmul_weight_keeps_its_channel_axis(tmp_path):
 _TIES = np.array([0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 3.0, -3.25], np.float32) * np.float32(0.25)
 
 
-def _rounding_model(path, rounding=None):
+def _rounding_model(path, rounding=None, in_branch=False):
     """A QDQ Gemm whose weight holds exact ties at its scale, and a Pad whose
-    fill is one, stating ``rounding`` in the model metadata when given."""
+    fill is one, stating ``rounding`` in the model metadata when given. The
+    weight has zero point 0, as the int8 products require. With ``in_branch``
+    they sit in the then branch of an If whose else branch requantizes the input."""
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 4])
+    out = "then_y" if in_branch else "output"
     initializers = [
         numpy_helper.from_array(np.array([0.25], np.float32), "s"),
         numpy_helper.from_array(np.array([-3], np.int8), "z"),
+        numpy_helper.from_array(np.array([0], np.int8), "wz"),
         numpy_helper.from_array(_TIES.reshape(2, 4), "weight"),
         numpy_helper.from_array(np.array([0, 1, 0, 1], np.int64), "pads"),
         numpy_helper.from_array(np.array(2.5 * 0.25, np.float32), "fill"),
@@ -441,16 +445,27 @@ def _rounding_model(path, rounding=None):
     nodes = [
         helper.make_node("QuantizeLinear", ["input", "s", "z"], ["in_q"]),
         helper.make_node("DequantizeLinear", ["in_q", "s", "z"], ["in_dq"]),
-        helper.make_node("QuantizeLinear", ["weight", "s", "z"], ["w_q"]),
-        helper.make_node("DequantizeLinear", ["w_q", "s", "z"], ["w_dq"]),
+        helper.make_node("QuantizeLinear", ["weight", "s", "wz"], ["w_q"]),
+        helper.make_node("DequantizeLinear", ["w_q", "s", "wz"], ["w_dq"]),
         helper.make_node("Gemm", ["in_dq", "w_dq"], ["product"], transB=1),
         helper.make_node("QuantizeLinear", ["product", "s", "z"], ["product_q"]),
         helper.make_node("DequantizeLinear", ["product_q", "s", "z"], ["product_dq"]),
         helper.make_node("Pad", ["product_dq", "pads", "fill"], ["padded"]),
         helper.make_node("QuantizeLinear", ["padded", "s", "z"], ["out_q"]),
-        helper.make_node("DequantizeLinear", ["out_q", "s", "z"], ["output"]),
+        helper.make_node("DequantizeLinear", ["out_q", "s", "z"], [out]),
     ]
-    model = helper.make_model(helper.make_graph(nodes, "rounding", [X], [Y], initializers),
+    inputs = [X]
+    if in_branch:
+        then = helper.make_graph(nodes, "then", [], [helper.make_tensor_value_info(out, TensorProto.FLOAT, [1, 4])],
+                                 initializers[2:])
+        other = helper.make_graph(
+            [helper.make_node("QuantizeLinear", ["input", "s", "z"], ["else_q"]),
+             helper.make_node("DequantizeLinear", ["else_q", "s", "z"], ["else_y"])], "else", [],
+            [helper.make_tensor_value_info("else_y", TensorProto.FLOAT, [1, 4])])
+        nodes = [helper.make_node("If", ["cond"], ["output"], then_branch=then, else_branch=other)]
+        inputs.append(helper.make_tensor_value_info("cond", TensorProto.BOOL, [1]))
+        initializers = initializers[:2]
+    model = helper.make_model(helper.make_graph(nodes, "rounding", inputs, [Y], initializers),
                               opset_imports=[helper.make_opsetid("", 17)])
     model.ir_version = 8
     if rounding is not None:
@@ -459,34 +474,41 @@ def _rounding_model(path, rounding=None):
     return path
 
 
+@pytest.mark.parametrize("in_branch", [False, True], ids=["main_graph", "if_branch"])
 @pytest.mark.parametrize("rounding", [None, "half_to_even", "half_away_from_zero"])
-def test_constant_quantization_follows_the_stated_rounding(tmp_path, rounding):
+def test_constant_quantization_follows_the_stated_rounding(tmp_path, rounding, in_branch):
     """A folded QuantizeLinear of a weight and a quantized Pad fill round
-    ties as the model's source does: ONNX Runtime's ties to even unless the
-    model states TFLite's ties away from zero. The plan's header records it."""
+    ties as the model's source does, in the main graph and in a subgraph:
+    ONNX Runtime's ties to even unless the model states TFLite's ties away
+    from zero. The plan's header records it."""
     import onnxruntime as ort
 
-    path = _rounding_model(tmp_path / "rounding.onnx", rounding)
+    path = _rounding_model(tmp_path / "rounding.onnx", rounding, in_branch)
     ag = plan_model(str(path))
     even = rounding != "half_away_from_zero"
     assert ag.quantize_ties_even == even
-    gemm = next(op for op in ag.ops if op.op_type == "Gemm")
-    pad = next(op for op in ag.ops if op.op_type == "Pad")
-    weight, fill = ag.weight_data[gemm.inputs[1]], ag.weight_data[pad.inputs[1]]
+    graph = ag.subgraphs[ag.ops[0].attrs["then_branch"]] if in_branch else ag
+    assert graph.quantize_ties_even == even
+    gemm = next(op for op in graph.ops if op.op_type == "Gemm")
+    pad = next(op for op in graph.ops if op.op_type == "Pad")
+    weight, fill = graph.weight_data[gemm.inputs[1]], graph.weight_data[pad.inputs[1]]
 
     probe = helper.make_model(helper.make_graph(
-        [helper.make_node("QuantizeLinear", ["x", "s", "z"], ["q"])], "probe",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [9])],
-        [helper.make_tensor_value_info("q", TensorProto.INT8, [9])],
+        [helper.make_node("QuantizeLinear", ["x", "s", "wz"], ["wq"]),
+         helper.make_node("QuantizeLinear", ["fill", "s", "z"], ["fq"])], "probe",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [8]),
+         helper.make_tensor_value_info("fill", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("wq", TensorProto.INT8, [8]),
+         helper.make_tensor_value_info("fq", TensorProto.INT8, [1])],
         [numpy_helper.from_array(np.array(0.25, np.float32), "s"),
+         numpy_helper.from_array(np.array(0, np.int8), "wz"),
          numpy_helper.from_array(np.array(-3, np.int8), "z")]),
         opset_imports=[helper.make_opsetid("", 17)])
     probe.ir_version = 8
-    values = np.append(_TIES, np.float32(2.5 * 0.25))
-    onnx_levels = ort.InferenceSession(probe.SerializeToString(), providers=["CPUExecutionProvider"]
-                                       ).run(None, {"x": values})[0]
-    away = np.array([-2, -1, 0, -4, -5, -6, 0, -6, 0], np.int8)
-    assert np.array_equal(onnx_levels, [-3, -1, -1, -3, -5, -5, 0, -6, -1])
+    onnx_levels = np.concatenate(ort.InferenceSession(probe.SerializeToString(), providers=["CPUExecutionProvider"]
+                                                      ).run(None, {"x": _TIES, "fill": np.float32([2.5 * 0.25])}))
+    away = np.array([1, 2, 3, -1, -2, -3, 3, -3, 0], np.int8)
+    assert np.array_equal(onnx_levels, [0, 2, 2, 0, -2, -2, 3, -3, -1])
     assert np.array_equal(np.append(weight.reshape(-1), fill), onnx_levels if even else away)
 
     flags = read_binary_plan(emit_binary_bytes(ag))["flags"]
@@ -519,6 +541,198 @@ def test_constant_quantization_of_nan_and_infinity_matches_onnx_runtime(ties_eve
     assert onnx_levels.tolist() == [-128, 127, -128, 127, -128]
     with np.errstate(invalid="raise"):
         assert np.array_equal(quantize_int8(values, 0.1, 3, ties_even), onnx_levels)
+
+
+# Weights quantized in the model
+
+_FLOAT_WEIGHT = np.array([[0.35, -0.25, 0.45, 0.15], [-0.6, 0.3, 0.1, -0.2]], np.float32)
+
+
+def _weight_pair_model(tmp_path, ql, dql, weight=None, second=None):
+    """A QDQ Gemm whose float weight passes a QuantizeLinear and a
+    DequantizeLinear with parameters ``ql`` and ``dql``, each (scale, zero
+    point or None, axis or None). With ``weight``, that integer initializer
+    feeds the DequantizeLinear instead. With ``second``, a (ql, dql) pair, a
+    second Gemm reads the weight through a DequantizeLinear of its own, after a
+    QuantizeLinear of its own when that ql is not None, and the products add."""
+    initializers = [numpy_helper.from_array(np.array(0.05, np.float32), "in_s"),
+                    numpy_helper.from_array(np.array(0, np.int8), "zp"),
+                    numpy_helper.from_array(np.array(0.025, np.float32), "out_s")]
+    nodes = [helper.make_node("QuantizeLinear", ["input", "in_s", "zp"], ["in_q"]),
+             helper.make_node("DequantizeLinear", ["in_q", "in_s", "zp"], ["in_dq"])]
+
+    def pair_node(op_type, source, target, prefix, params):
+        scale, zero, axis = params
+        initializers.append(numpy_helper.from_array(np.asarray(scale, np.float32), f"{prefix}_s"))
+        inputs = [source, f"{prefix}_s"]
+        if zero is not None:
+            initializers.append(numpy_helper.from_array(np.asarray(zero), f"{prefix}_zp"))
+            inputs.append(f"{prefix}_zp")
+        nodes.append(helper.make_node(op_type, inputs, [target], **({} if axis is None else {"axis": axis})))
+
+    if weight is None:
+        initializers.append(numpy_helper.from_array(_FLOAT_WEIGHT, "weight"))
+        pair_node("QuantizeLinear", "weight", "w_q", "ql", ql)
+    else:
+        initializers.append(numpy_helper.from_array(weight, "w_q"))
+    pair_node("DequantizeLinear", "w_q", "w_dq", "dql", dql)
+    nodes += [helper.make_node("Gemm", ["in_dq", "w_dq"], ["product"], transB=1),
+              helper.make_node("QuantizeLinear", ["product", "out_s", "zp"], ["out_q"]),
+              helper.make_node("DequantizeLinear", ["out_q", "out_s", "zp"],
+                               ["output" if second is None else "product_dq"])]
+    if second is not None:
+        if second[0] is not None:
+            pair_node("QuantizeLinear", "weight", "w_q2", "ql2", second[0])
+        pair_node("DequantizeLinear", "w_q" if second[0] is None else "w_q2", "w_dq2", "dql2", second[1])
+        nodes += [helper.make_node("Gemm", ["in_dq", "w_dq2"], ["product2"], transB=1),
+                  helper.make_node("QuantizeLinear", ["product2", "out_s", "zp"], ["out2_q"]),
+                  helper.make_node("DequantizeLinear", ["out2_q", "out_s", "zp"], ["product2_dq"]),
+                  helper.make_node("Add", ["product_dq", "product2_dq"], ["sum"]),
+                  helper.make_node("QuantizeLinear", ["sum", "out_s", "zp"], ["sum_q"]),
+                  helper.make_node("DequantizeLinear", ["sum_q", "out_s", "zp"], ["output"])]
+    return save_onnx(tmp_path, "weight_pair", nodes, [_float("input", [1, 4])], [_float("output", [1, 2])],
+                     initializers, opset=13, ir_version=8)
+
+
+def _onnx_runtime(model, outputs, feeds):
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return ort.InferenceSession(model.SerializeToString(), options,
+                                providers=["CPUExecutionProvider"]).run(outputs, feeds)
+
+
+_WEIGHT_PAIRS = {
+    "int8": ((0.1, np.int8(0), None), (0.2, np.int8(0), None)),
+    "uint8": ((0.1, np.uint8(128), None), (0.2, np.uint8(128), None)),
+    "per_channel_encoding": (([0.1, 0.05], np.zeros(2, np.int8), 0), (0.2, np.int8(0), None)),
+    "per_channel_decoding": ((0.1, np.int8(0), None), ([0.1, 0.05], np.zeros(2, np.int8), 0)),
+    "encoding_on_the_last_axis": (([0.1, 0.05, 0.2, 0.025], np.zeros(4, np.int8), -1),
+                                  (0.1, np.int8(0), None)),
+}
+
+
+@pytest.mark.usefixtures("require_host_library")
+@pytest.mark.parametrize("pair", _WEIGHT_PAIRS)
+def test_weight_pair_with_differing_parameters_matches_onnx_runtime(tmp_path, pair):
+    """The QuantizeLinear's parameters encode the float weight and the
+    DequantizeLinear's decode the codes, as ONNX Runtime evaluates the pair."""
+    from tigris.runtime import Session
+
+    path = _weight_pair_model(tmp_path, *_WEIGHT_PAIRS[pair])
+    values = np.array([[1.0, 0.5, 1.0, 0.25]], np.float32)
+    expected = _onnx_runtime(onnx.load(path), ["output"], {"input": values})[0]
+    ag = plan_model(str(path), ("16K",))
+    binary = tmp_path / "weight_pair.tgrs"
+    binary.write_bytes(emit_binary_bytes(ag))
+    with Session(binary) as session:
+        actual = session.run({"input": values})["output"]
+    np.testing.assert_array_equal(actual, expected)
+
+
+_UINT8_WEIGHT = np.array([[200, 10, 128, 60], [0, 255, 37, 99]], np.uint8)
+
+
+@pytest.mark.parametrize("readers", [1, 2])
+@pytest.mark.parametrize("encoded", ["quantize", "initializer"])
+def test_omitted_zero_point_of_a_uint8_weight_is_uint8_zero(tmp_path, encoded, readers):
+    """A DequantizeLinear without a zero point decodes a uint8 weight about
+    uint8 zero, so the stored codes decode to what ONNX Runtime dequantizes,
+    for every DequantizeLinear that reads the weight."""
+    weight = None if encoded == "quantize" else _UINT8_WEIGHT
+    pair = ((0.01, None, None), (0.02, None, None))
+    path = _weight_pair_model(tmp_path, *pair, weight, second=(None, pair[1]) if readers == 2 else None)
+    model = onnx.load(path)
+    model.graph.output.append(_float("w_dq", [2, 4]))
+    expected = _onnx_runtime(model, ["w_dq"], {"input": np.zeros((1, 4), np.float32)})[0]
+
+    ag = load_model(path)
+    gemms = [op for op in ag.ops if op.op_type == "Gemm"]
+    assert len(gemms) == readers
+    for gemm in gemms:
+        codes, quant = ag.weight_data[gemm.inputs[1]], ag.tensors[gemm.inputs[1]].quant
+        assert codes.dtype == np.int8 and quant.zero_point.tolist() == [-128]
+        decoded = (codes.astype(np.int32) - quant.zero_point.astype(np.int32)).astype(np.float32) * quant.scale
+        np.testing.assert_array_equal(decoded, expected)
+
+
+_INT8_PAIR = (0.01, np.int8(0), None)
+_UINT8_DECODING = (0.002, np.uint8(128), None)
+_SHARED_WEIGHTS = {
+    "initializer": (_UINT8_WEIGHT, _UINT8_DECODING, (None, _UINT8_DECODING)),
+    "initializer_decoded_twice": (_UINT8_WEIGHT, _UINT8_DECODING, (None, (0.004, np.uint8(128), None))),
+    "one_quantize": (None, _INT8_PAIR, (None, _INT8_PAIR)),
+    "two_quantizes": (None, _INT8_PAIR, (_INT8_PAIR, _INT8_PAIR)),
+    "two_differing_quantizes": (None, _INT8_PAIR, ((0.02, np.int8(0), None), (0.02, np.int8(0), None))),
+}
+
+
+@pytest.mark.usefixtures("require_host_library")
+@pytest.mark.parametrize("shared", _SHARED_WEIGHTS)
+def test_weight_read_by_two_dequantizers_matches_onnx_runtime(tmp_path, shared):
+    """Each DequantizeLinear of one weight reads codes encoded once from the
+    weight as the model states it, as ONNX Runtime evaluates them."""
+    from tigris.runtime import Session
+
+    weight, pair, second = _SHARED_WEIGHTS[shared]
+    path = _weight_pair_model(tmp_path, pair, pair, weight, second)
+    values = np.array([[1.0, 0.5, 1.0, 0.3]], np.float32)
+    expected = _onnx_runtime(onnx.load(path), ["output"], {"input": values})[0]
+    binary = tmp_path / "shared_weight.tgrs"
+    binary.write_bytes(emit_binary_bytes(plan_model(str(path), ("16K",))))
+    with Session(binary) as session:
+        actual = session.run({"input": values})["output"]
+    np.testing.assert_array_equal(actual, expected)
+
+
+def _uint8_input_model(tmp_path, readers, second_scale="s"):
+    """A uint8 model input that ``readers`` DequantizeLinears without a zero
+    point read, the second at ``second_scale``, each into a QDQ Relu; two add."""
+    nodes = [helper.make_node("DequantizeLinear", ["input", "s"], ["x"]),
+             helper.make_node("Relu", ["x"], ["r"])]
+    if readers == 1:
+        nodes += _qdq("r", "r", "output")
+    else:
+        nodes += _qdq("r", "r", "r_dq") + [
+            helper.make_node("DequantizeLinear", ["input", second_scale], ["x2"]),
+            helper.make_node("Relu", ["x2"], ["r2"])] + _qdq("r2", "r2", "r2_dq") + [
+            helper.make_node("Add", ["r_dq", "r2_dq"], ["sum"])] + _qdq("sum", "sum", "output")
+    initializers = _QDQ_SCALE + [numpy_helper.from_array(np.array(0.1, np.float32), "s2")]
+    return save_onnx(tmp_path, "uint8_input", nodes,
+                     [helper.make_tensor_value_info("input", TensorProto.UINT8, [1, 4])],
+                     [_float("output", [1, 4])], initializers, opset=13, ir_version=8)
+
+
+@pytest.mark.usefixtures("require_host_library")
+@pytest.mark.parametrize("readers", [1, 2])
+def test_uint8_model_input_without_a_zero_point_matches_onnx_runtime(tmp_path, readers):
+    from tigris.runtime import Session
+
+    path = _uint8_input_model(tmp_path, readers)
+    values = np.array([[0, 100, 128, 200]], np.uint8)
+    expected = _onnx_runtime(onnx.load(path), ["output"], {"input": values})[0]
+    binary = tmp_path / "uint8_input.tgrs"
+    binary.write_bytes(emit_binary_bytes(plan_model(str(path), ("16K",))))
+    with Session(binary) as session:
+        actual = session.run({"input": values})["output"]
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_model_input_dequantized_with_differing_parameters_is_refused(tmp_path):
+    """The int8 input the kernels read carries one encoding."""
+    with pytest.raises(ValueError, match="'input' is dequantized with differing parameters"):
+        load_model(_uint8_input_model(tmp_path, 2, second_scale="s2"))
+
+
+def test_int8_product_with_a_nonzero_weight_zero_point_is_refused(tmp_path):
+    """The int8 product kernels take the weight codes as values about zero."""
+    from tigris.analysis.validation import validate_operator_support
+
+    params = (0.1, np.uint8(130), None)
+    result = validate_operator_support(load_model(_weight_pair_model(tmp_path, params, params)))
+    assert not result.supported
+    assert "an int8 Gemm needs weight zero point 0" in result.describe()
 
 
 # uint8 activations

@@ -53,6 +53,8 @@ class ContractCase:
     exact_slow: bool = False
     # Compile with the int8 interface: quantized boundaries are handed over and read back as int8.
     int8_io: bool = False
+    # Outputs another interpreter recorded for these inputs, compared in place of ONNX Runtime's.
+    recorded_outputs: tuple[Array, ...] = ()
 
 
 def _model(

@@ -275,6 +275,12 @@ def validate_operator_support(ag: AnalyzedGraph) -> OperatorSupportValidation:
                 and len(op.inputs) >= 3 and op.inputs[2] in ag.weight_data
                 and ag.weight_data[op.inputs[2]].dtype != np.int32):
             reasons.append(f"an int8 {op.op_type} needs an int32 bias")
+        # The int8 product kernels read the weight codes as values about zero.
+        weight = ag.tensors.get(op.inputs[1]) if len(op.inputs) >= 2 else None
+        if (quantized_op and op.op_type in {"Conv", "DepthwiseConv", "Conv1D", "ConvTranspose", "Gemm"}
+                and weight is not None and weight.quant is not None
+                and np.any(np.asarray(weight.quant.zero_point) != 0)):
+            reasons.append(f"an int8 {op.op_type} needs weight zero point 0")
         backend = "s8_ref" if quantized_op else "reference"
         if op.op_type not in effective_operators(backend):
             dtype = "int8" if quantized_op else "float32"

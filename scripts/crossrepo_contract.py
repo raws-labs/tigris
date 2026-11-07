@@ -535,7 +535,8 @@ def _parse_rows(case: ContractCase, runtime_stdout: str) -> dict[str, int]:
 def _prepare_case(case: ContractCase, work_dir: Path) -> tuple[Path, dict, list[Array]]:
     """Save the case's models, compile and check its plan, and pack its inputs.
 
-    Returns the case directory, the plan and the ONNX Runtime outputs.
+    Returns the case directory, the plan and the ONNX Runtime outputs, or the
+    case's recorded outputs.
     """
     case_dir = work_dir / case.name
     case_dir.mkdir()
@@ -552,8 +553,8 @@ def _prepare_case(case: ContractCase, work_dir: Path) -> tuple[Path, dict, list[
         int8_io=case.int8_io,
     )
     _assert_plan_mode(case, plan)
-    reference_outputs = _reference_session(case, case_dir / "reference.onnx").run(
-        None, case.inputs)
+    reference_outputs = list(case.recorded_outputs) or _reference_session(
+        case, case_dir / "reference.onnx").run(None, case.inputs)
     (case_dir / "inputs.bin").write_bytes(_pack_inputs(plan, case.inputs))
     return case_dir, plan, reference_outputs
 
@@ -1335,6 +1336,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         qdq._quint8_activation_case(),
         qdq._qdq_input_ties_case(),
         qdq._qdq_quantize_ties_case(),
+        qdq._qdq_conv_relu6_ceiling_case(),
+        qdq._tflite_relu6_ceiling_case(),
         convolution._convtranspose_case("convtranspose", 19, kernel=2, pads=[0, 0, 0, 0]),
         convolution._conv_then_convtranspose_case(),
         convolution._convtranspose_case("convtranspose_overlap", 29, kernel=4, pads=[1, 1, 1, 1]),

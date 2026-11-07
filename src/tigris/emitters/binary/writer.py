@@ -15,6 +15,7 @@ from tigris import (
 )
 from tigris.analysis.broadcast import BINARY_OPS, padded
 from tigris.analysis.plan_graph import BUILD_LIMIT_DEFAULTS, decompression_reserve
+from tigris.frontends.qdq import quantize_int8
 from tigris.graph.subgraphs import CONTROL_FLOW
 from tigris.graph.ir import (
     AnalyzedGraph,
@@ -1108,7 +1109,7 @@ def _round_half_away(x: float) -> int:
     """Round half away from zero (TFLite TfLiteRound / C std::round), NOT Python's
     banker's round-half-to-even. The compiler's quant params must round the same
     way as tflite/gemmlowp/CMSIS-NN and the runtime, or a per-channel requant
-    multiplier (or a ReLU6 act_max) lands 1 off for any scale on a .5 boundary."""
+    multiplier lands 1 off for any scale on a .5 boundary."""
     return math.floor(x + 0.5) if x >= 0.0 else math.ceil(x - 0.5)
 
 
@@ -1134,13 +1135,12 @@ def _compute_act_bounds(
         return -128, 127
 
     output_zp = int(qp.zero_point[0])
-    output_scale = float(qp.scale[0])
 
     act_min = max(output_zp, -128)
     if fused_act == ACT_RELU:
         return act_min, 127
-    # ACT_RELU6
-    return act_min, min(_round_half_away(6.0 / output_scale) + output_zp, 127)
+    # ACT_RELU6: 6.0 in the output encoding, by the plan's float32 quantization rule.
+    return act_min, int(quantize_int8([6.0], qp.scale[0], output_zp, ag.quantize_ties_even)[0])
 
 
 def _fused_activation(op: OpNode) -> int:

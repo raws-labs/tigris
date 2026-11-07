@@ -4,9 +4,10 @@ import numpy as np
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from tigris.emitters.binary.defs import ACT_RELU, OP_TYPE_MAP
+from tigris.emitters.binary.defs import ACT_RELU, ACT_RELU6, OP_TYPE_MAP
 from tigris.emitters.binary.reader import read_binary_plan
-from tigris.emitters.binary.writer import emit_binary_bytes
+from tigris.emitters.binary.writer import _compute_act_bounds, emit_binary_bytes
+from tigris.graph.ir import AnalyzedGraph, OpNode, QuantParam, TensorInfo
 from tigris.loaders import load_model
 
 from conftest import save_onnx
@@ -266,3 +267,19 @@ def test_quantized_add_relu_carries_the_output_scale(tmp_path):
     assert quant is not None
     assert float(quant.scale[0]) == 0.5
     assert int(quant.zero_point[0]) == -8
+
+
+@pytest.mark.parametrize("scale, ties_even, ceiling", [
+    (0.48, True, 12), (0.48, False, 13), (0.8, False, 8), (0.8, True, 8),
+])
+def test_relu6_ceiling_quantizes_six_by_the_plan_rule(scale, ties_even, ceiling):
+    """The fused Relu6 ceiling is 6.0 quantized as the plan quantizes float32.
+
+    6 / 0.48 is 12.5 in float32, so the rounding rule picks the code; 6 / 0.8
+    is exactly 7.5 in float32 but just below it in float64.
+    """
+    ag = AnalyzedGraph(quantize_ties_even=ties_even)
+    ag.tensors["y"] = TensorInfo("y", (1, 4), 3, quant=QuantParam(
+        np.array([scale], np.float32), np.array([0], np.int8)))
+    op = OpNode("fc", "Gemm", ["x"], ["y"], {"fused_activation": "Relu6"})
+    assert _compute_act_bounds(ag, op, ACT_RELU6) == (0, ceiling)

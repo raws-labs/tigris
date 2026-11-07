@@ -190,7 +190,7 @@ FITS_UNTILED = {
     "float_while_feature_map", "float_while_if_through", "float_while_through",
     "float_while_two_variables", "float_zeros_like",
     "fully_connected_bias", "fully_connected_rank3", "fully_connected_rank3_relu",
-    "fully_connected_row_relu", "gather_batch", "gather_batch_matrix", "gather_index_arithmetic",
+    "fully_connected_relu6", "fully_connected_row_relu", "gather_batch", "gather_batch_matrix", "gather_index_arithmetic",
     "log_softmax", "lstm", "lstm_time_major_clip", "lstm_unrolled", "mean_spatial",
     "mean_spatial_flat", "mul_broadcast_both", "pack", "pack_outer", "requantize_shared", "reshape",
     "resize_bilinear", "resize_bilinear_asymmetric", "resize_nearest", "shape_pack_reshape",
