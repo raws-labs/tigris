@@ -59,6 +59,51 @@ jobs:
             [ "$pinned" = "v$VERSION" ] || { echo "runtime-host.json pins $pinned, not v$VERSION" >&2; exit 1; }
           fi
 
+      - name: Check that published consumers accept the plan schemas
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -f scripts/check_version_sources.py ]; then
+            # Runtime: every zoo artifact that declares this release compatible
+            # has a schema the loader still accepts.
+            floor="$(printf '#include "tigris.h"\nTIGRIS_SCHEMA_VERSION_MIN\n' | cc -E -P -I include -x c - | tail -n 1)"
+            curl -fsSL https://huggingface.co/raws-labs/tigris-zoo/resolve/main/catalog.json -o "$RUNNER_TEMP/catalog.json"
+            python3 - "$floor" "$VERSION" "$RUNNER_TEMP/catalog.json" <<'PY'
+          import json, sys
+          floor, catalog = int(sys.argv[1]), sys.argv[3]
+          def release(text):
+              return tuple(int(part) for part in text.split("."))
+          version = release(sys.argv[2])
+          refused = []
+          for artifact in json.load(open(catalog))["artifacts"]:
+              runtime = artifact["runtime"]
+              if artifact.get("withdrawn") or release(runtime["min"]) > version:
+                  continue
+              if runtime["max"] is not None and release(runtime["max"]) < version:
+                  continue
+              if artifact["schema"] < floor:
+                  refused.append(f'{artifact["id"]} (schema {artifact["schema"]})')
+          print(f"zoo artifacts checked against schema floor {floor}")
+          if refused:
+              sys.exit("the loader refuses zoo artifacts that declare this release compatible: " + ", ".join(refused))
+          PY
+          elif [ -f runtime-host.json ]; then
+            # Compiler: the runtime that the Cortex-M board support pins accepts
+            # the schema this compiler emits.
+            schema="$(sed -n 's/^SCHEMA_VERSION = \([0-9][0-9]*\)$/\1/p' src/tigris/__init__.py)"
+            pin="$(curl -fsSL https://raw.githubusercontent.com/raws-labs/tigris-cortex-m/main/cmake/deps.cmake \
+              | sed -n '/FetchContent_Declare(tigris_runtime/,/)/s/.*GIT_TAG \([0-9a-f]\{40\}\).*/\1/p')"
+            [ -n "$schema" ] && [ -n "$pin" ] || { echo "schema or runtime pin not found" >&2; exit 1; }
+            mkdir -p "$RUNNER_TEMP/pinned"
+            for header in tigris.h tigris_config.h; do
+              curl -fsSL "https://raw.githubusercontent.com/raws-labs/tigris-runtime/$pin/include/$header" \
+                -o "$RUNNER_TEMP/pinned/$header"
+            done
+            echo "plan schema $schema against tigris-cortex-m's runtime pin $pin"
+            printf '#include "tigris.h"\n_Static_assert(TIGRIS_SCHEMA_VERSION_MIN <= SCHEMA && SCHEMA <= TIGRIS_SCHEMA_VERSION, "the runtime tigris-cortex-m pins refuses this plan schema");\n' \
+              | cc -std=c11 -fsyntax-only -DSCHEMA="$schema" -I "$RUNNER_TEMP/pinned" -x c -
+          fi
+
       - name: Check that CI passed on the commit
         env:
           GH_TOKEN: ${{ github.token }}
