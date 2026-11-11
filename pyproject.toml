@@ -35,13 +35,20 @@ dependencies = [
     "packaging>=23.2",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "build>=1.2",
     "pytest>=7.0",
     "onnxruntime>=1.17",
     "ruff>=0.6",
     "tflite-micro==0.dev20261023044614; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+# torch comes from PyTorch's CPU index (CONTRIBUTING); PyPI has no +cpu build.
+pytorch = [
+    "torch==2.15.0+cpu; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "onnxscript==0.7.2; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "executorch==1.5.1; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tosa-tools==2026.5.0; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.urls]

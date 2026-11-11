@@ -10,12 +10,13 @@ import click
 from tigris import TILE_AXIS_HW
 from tigris.analysis.memory import TENSOR_ALIGN, align_up
 from tigris.cli import _int8_io_option, _memory_sizes, _parse_input_shape, _planned, cli, text
+from tigris.frontends.pt2 import EXECUTORCH_CPU
 from tigris.pipeline import parse_size
 from tigris.utils import describe_interface, fmt_bytes, plural, source_shape
 
 
 def _report(ag, findings, budget: int, source: str, tflm_arena: int | None, smallest: dict | None,
-            traffic, tflm_export=None) -> dict:
+            traffic, tflm_export=None, executorch=None) -> dict:
     """The analysis as versioned JSON; byte counts are integers."""
     from tigris.cli.export import export_report
     f = findings
@@ -45,6 +46,12 @@ def _report(ag, findings, budget: int, source: str, tflm_arena: int | None, smal
             "excludes": ["kernel scratch buffers other than those of MEAN, SUM, REDUCE_MAX, "
                          "REDUCE_MIN and REDUCE_ALL", "persistent allocations"],
             "export": None if tflm_export is None else export_report(tflm_export),
+        },
+        "executorch": None if executorch is None else {
+            "arena_bytes": executorch[0],
+            "cpu": EXECUTORCH_CPU,
+            "includes": ["CMSIS-NN scratch"],
+            "reason": executorch[1],
         },
         "fast": {
             "budget_bytes": budget,
@@ -245,12 +252,13 @@ def verdict_lines(findings, budget: int, ag) -> list[str]:
 
 def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
             smallest: dict | None = None, traffic=None, lz4_tried: bool = False,
-            tflm_export=None) -> None:
+            tflm_export=None, executorch=None) -> None:
     """The header, verdict, memory and flash, shared by analyze and compile.
     `smallest` is what smallest_fit found; None leaves its row out. `traffic`
     is what trace.traffic measured; None leaves the row out. The LZ4 row needs
     `lz4_tried`: the estimate stands only where -c lz4 compiles. `tflm_export`
-    is what tflite_export.export found; None leaves its row out."""
+    is what tflite_export.export found; None leaves its row out. `executorch`
+    is what pt2.executorch_arena found; None leaves its row out."""
     f = findings
     dtype = "int8" if f.is_quantized else "float32" if f.is_float32 else "mixed"
     graphs = len(getattr(ag, "subgraphs", []) or [])
@@ -271,6 +279,11 @@ def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
     if tflm_export is not None:
         from tigris.cli.export import export_line
         memory.append(export_line(tflm_export))
+    if executorch is not None:
+        arena, reason = executorch
+        memory.append(["ExecuTorch arena", "", text.dim(f"not measured: {reason}")] if arena is None
+                      else ["ExecuTorch arena", fmt_bytes(arena),
+                            text.dim("its Cortex-M7 lowering, CMSIS-NN scratch included")])
     memory.append(["unscheduled", fmt_bytes(ag.peak_memory_bytes), ""])
     if f.largest_tensor_bytes:
         memory.append(["largest tensor", fmt_bytes(f.largest_tensor_bytes),
@@ -357,6 +370,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
             input_files: tuple[str, ...], int8_io: bool):
     """Check whether a model fits a memory budget, and why not."""
     from tigris.analysis.findings import compute_findings
+    from tigris.frontends import pt2
     from tigris.frontends.tflite import is_tflite
     from tigris.frontends.tflite_export import export, tflm_tensor_arena
     from tigris.graph.subgraphs import all_graphs
@@ -379,6 +393,7 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
 
     data = Path(model).read_bytes()
     tflm_arena = tflm_tensor_arena(data)
+    executorch = pt2.executorch_arena(model) if pt2.is_pt2(model) else None
     findings = compute_findings(ag)
     supported = findings.gate.usable
     # The bound covers every subgraph, which can need more than the main graph.
@@ -397,12 +412,13 @@ def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
     traffic = measure_traffic(ag) if supported else None
     tflm_export = None if tflm_arena is None else export(data)
     if as_json:
-        click.echo(json.dumps(_report(ag, findings, budget, "tflite" if is_tflite(data) else "onnx",
-                                      tflm_arena, smallest, traffic, tflm_export),
+        source = "tflite" if is_tflite(data) else "pt2" if executorch is not None else "onnx"
+        click.echo(json.dumps(_report(ag, findings, budget, source, tflm_arena, smallest, traffic,
+                                      tflm_export, executorch),
                               indent=2, ensure_ascii=True, allow_nan=False))
     else:
         summary(model, ag, findings, budget, tflm_arena, smallest, traffic, lz4_tried=True,
-                tflm_export=tflm_export)
+                tflm_export=tflm_export, executorch=executorch)
         if verbose and ag.stages:
             _stages(ag)
     if not writes:

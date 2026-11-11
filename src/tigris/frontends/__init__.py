@@ -10,11 +10,11 @@ from pathlib import Path
 import onnx
 from google.protobuf.message import DecodeError
 
-from tigris.frontends import tflite
+from tigris.frontends import pt2, tflite
 
 __all__ = ["SUFFIXES", "is_onnx", "load_onnx", "not_a_model"]
 
-SUFFIXES = (".onnx", ".tflite")
+SUFFIXES = (".onnx", ".tflite", ".pt2")
 
 
 def load_onnx(path: str | Path) -> onnx.ModelProto:
@@ -24,6 +24,8 @@ def load_onnx(path: str | Path) -> onnx.ModelProto:
         head = stream.read(8)
     if tflite.is_tflite(head):
         return tflite.to_onnx(path.read_bytes(), path.stem)
+    if pt2.is_pt2(path):
+        return pt2.to_onnx(path)
     try:
         model = onnx.load(str(path))
     except DecodeError:
@@ -46,4 +48,5 @@ def _is_model(model: onnx.ModelProto | None) -> bool:
 
 
 def not_a_model(path: str | Path) -> str:
-    return f"{Path(path).name} is not an ONNX model, a TFLite model or a plan"
+    return (f"{Path(path).name} is not an ONNX model, a TFLite model, "
+            "an exported PyTorch program or a plan")

@@ -2,9 +2,23 @@
 
 `develop` is the default branch. Use topic branches from `develop` and target
 pull requests there. Pull requests use rebase-merge only; linear history is
-required. Install development dependencies with `pip install -e ".[dev]"`.
-Stage the host library as described below before running `pytest`; also run
-`ruff check src tests scripts setup.py` before submitting changes.
+required. Install development dependencies with `pip install -e . --group dev`
+(pip 25.1 or later). Stage the host library as described below before running
+`pytest`; also run `ruff check src tests scripts setup.py` before submitting
+changes.
+
+The tests for exported PyTorch programs need the `pytorch` group, which pins
+PyTorch's CPU build. That build is published on PyTorch's own index, so install
+it from there first, then the group:
+
+```bash
+pip install --no-deps --index-url https://download.pytorch.org/whl/cpu torch==2.15.0+cpu
+pip install -e . --group dev --group pytorch
+TIGRIS_REQUIRE_PYTORCH=1 pytest tests/test_frontend_pt2.py
+```
+
+Without the group these tests skip; `TIGRIS_REQUIRE_PYTORCH=1` makes them fail
+instead.
 
 ## Host library and wheels
 

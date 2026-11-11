@@ -9,7 +9,7 @@ import numpy as np
 
 from tigris.cli import cli, text
 from tigris.emitters.binary.defs import MAGIC
-from tigris.frontends import is_onnx, not_a_model, tflite
+from tigris.frontends import is_onnx, not_a_model, pt2, tflite
 from tigris.runtime import Session
 from tigris.utils import fmt_bytes
 
@@ -50,7 +50,7 @@ def _check_plan(path: Path) -> None:
     data = path.read_bytes()
     if data.startswith(MAGIC):
         return
-    if tflite.is_tflite(data) or is_onnx(data):
+    if tflite.is_tflite(data) or is_onnx(data) or pt2.is_pt2(path):
         raise ValueError(f"not a plan: compile {path.name} with tigris compile first")
     raise ValueError(not_a_model(path))
 

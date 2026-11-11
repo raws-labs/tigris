@@ -664,7 +664,7 @@ def test_int64_run_time_indices_with_an_excessive_range_are_refused(monkeypatch)
 
 
 @pytest.mark.parametrize(("name", "arena"), [
-    # TFLite Micro's own "Arena allocation head" (the dev-extra tflite-micro) for
+    # TFLite Micro's own "Arena allocation head" (the dev-group tflite-micro) for
     # models whose kernels request no scratch buffer or a reduction's.
     ("vww_96_int8.tflite", 73728), ("pretrainedResnet_quant.tflite", 49152),
     ("ops/conv_bias.tflite", 512), ("ops/mean_channels.tflite", 368),
