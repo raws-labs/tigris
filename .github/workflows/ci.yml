@@ -30,7 +30,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e . --group dev
       - uses: ./.github/actions/runtime
         with:
           build-host: 'true'
@@ -38,6 +38,28 @@ jobs:
         env:
           TIGRIS_REQUIRE_HOST: "1"
           TIGRIS_RUNTIME_SOURCE: runtime-source
+
+  pytorch:
+    name: Exported PyTorch programs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      # The CPU build, from PyTorch's index only; the pytorch group pins the same version.
+      - run: python -m pip install --no-deps --index-url https://download.pytorch.org/whl/cpu torch==2.15.0+cpu
+      - run: python -m pip install -e . --group dev --group pytorch
+      - uses: ./.github/actions/runtime
+        with:
+          build-host: 'true'
+      - run: python -m pytest -q tests/test_frontend_pt2.py
+        env:
+          TIGRIS_REQUIRE_PYTORCH: "1"
 
   quality-and-package:
     name: Lint, package, CLI, and generated C
@@ -51,7 +73,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip install -e . --group dev
       - uses: ./.github/actions/runtime
       - run: python -m ruff check src tests scripts setup.py
       - run: tigris --help

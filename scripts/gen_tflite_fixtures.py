@@ -11,7 +11,7 @@ recorded and the case is named as a deviation. Models and outputs go to
 tests/fixtures/tflite/ops/ so the frontend tests need neither package. On a
 correctly rounded libm, the cases in libm_goldens.CASES are written as
 `<case>_cr.npz`. Needs tensorflow, which is not a project dependency, and
-tflite-micro from the dev extra:
+tflite-micro from the dev group:
 
     python scripts/gen_tflite_fixtures.py [case ...]
     python scripts/gen_tflite_fixtures.py --models

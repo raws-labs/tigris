@@ -202,6 +202,6 @@ TiGrIS is maintained by RAWS Labs. For applied embedded-ML engineering or collab
 ```bash
 git clone https://github.com/raws-labs/tigris
 cd tigris
-pip install -e ".[dev]"
+pip install -e . --group dev
 pytest
 ```

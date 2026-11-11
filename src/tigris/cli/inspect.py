@@ -84,7 +84,8 @@ def _tensors(title, tensors, *, plan=False):
     text.section(title, rows, ">   >")
 
 
-_FORMATS = {"tgrs": "plan", "onnx": "ONNX", "tflite": "TFLite"}
+_FORMATS = {"tgrs": "plan", "onnx": "ONNX", "tflite": "TFLite",
+            "pt2": "PyTorch program, exported to ONNX"}
 
 
 def _render(report, verbose, path: Path):

@@ -10,6 +10,7 @@ __all__ = ["load_model"]
 _EXTENSION_MAP = {
     ".onnx": "tigris.loaders.onnx",
     ".tflite": "tigris.loaders.onnx",
+    ".pt2": "tigris.loaders.onnx",
 }
 
 

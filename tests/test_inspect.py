@@ -225,8 +225,8 @@ def test_compressed_metadata_without_decompression(linear_3op_path, tmp_path, mo
 
 @pytest.mark.parametrize("data, message", [
     (b"TGRS", "File too small"),
-    (b"", "model is not an ONNX model, a TFLite model or a plan"),
-    (b"not a model", "model is not an ONNX model, a TFLite model or a plan"),
+    (b"", "model is not an ONNX model, a TFLite model, an exported PyTorch program or a plan"),
+    (b"not a model", "model is not an ONNX model, a TFLite model, an exported PyTorch program or a plan"),
 ])
 def test_invalid_files_are_cli_errors(tmp_path, data, message):
     path = tmp_path / "model"
@@ -246,7 +246,7 @@ def test_a_file_that_is_no_model_is_a_cli_error(tmp_path, data, command):
     result = CliRunner().invoke(cli, [command[0], str(path), *command[1:]])
     assert result.exit_code == 1
     assert result.output.strip().endswith(
-        "Error: model.onnx is not an ONNX model, a TFLite model or a plan")
+        "Error: model.onnx is not an ONNX model, a TFLite model, an exported PyTorch program or a plan")
 
 
 def test_run_points_a_model_to_compile(tmp_path):

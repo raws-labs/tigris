@@ -78,13 +78,15 @@ def compile(model: str, mem: tuple[str, ...], output: str | None, flash: str | N
 
     from tigris.analysis.findings import compute_findings
     from tigris.cli.analyze import summary
+    from tigris.frontends import pt2
     from tigris.frontends.tflite_export import tflm_tensor_arena
 
     # The same summary analyze prints: what was decided, and why not when it
     # was not. A plan is written only when everything holds.
     data = Path(model).read_bytes()
     findings = compute_findings(ag, names=keep_names)
-    summary(model, ag, findings, budget, tflm_tensor_arena(data))
+    summary(model, ag, findings, budget, tflm_tensor_arena(data),
+            executorch=pt2.executorch_arena(model) if pt2.is_pt2(model) else None)
     plan_data = plan_to_write(ag, findings.gate, findings.plan, compress=compress_arg, xip=xip,
                               names=keep_names)
     out = Path(output) if output else Path(model).with_suffix(".tgrs")

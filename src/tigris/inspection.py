@@ -9,7 +9,7 @@ from pathlib import Path
 import onnx
 from google.protobuf.message import DecodeError
 
-from tigris.frontends import not_a_model, tflite
+from tigris.frontends import not_a_model, pt2, tflite
 from tigris import SCHEMA_VERSION_INTERFACE_DTYPE, SCHEMA_VERSION_TENSOR_LAYOUT
 from tigris.emitters.binary import defs
 from tigris.emitters.binary.reader import read_binary_plan
@@ -256,15 +256,18 @@ def inspect_file(path: str | Path) -> dict:
         report.update(format="tflite", **model)
         operators = model["graph"]["operators"]
     else:
-        try:
-            model = onnx.load_model_from_string(data)
-        except DecodeError as exc:
-            raise ValueError(not_a_model(path)) from exc
+        if pt2.is_pt2(path):
+            model, source = pt2.to_onnx(path), "pt2"
+        else:
+            try:
+                model, source = onnx.load_model_from_string(data), "onnx"
+            except DecodeError as exc:
+                raise ValueError(not_a_model(path)) from exc
         if not model.HasField("graph") or model.ir_version <= 0:
             raise ValueError(not_a_model(path))
         graph = _graph(model.graph)
         report.update(
-            format="onnx", name=graph["name"], ir_version=model.ir_version,
+            format=source, name=graph["name"], ir_version=model.ir_version,
             producer=model.producer_name, producer_version=model.producer_version,
             model_version=model.model_version,
             opsets=[{"domain": item.domain, "version": item.version} for item in model.opset_import],
