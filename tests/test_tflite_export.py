@@ -26,10 +26,12 @@ from tigris.frontends.tflite import Window, window
 from tigris.frontends.tflite_export import (
     Export,
     _conv_geometry,
+    _host_exact,
     _kind,
     _option,
     arena,
     export,
+    host_arena,
     input_rows,
     persistent,
     tflm_tensor_arena,
@@ -841,7 +843,7 @@ def test_export_declines_when_no_rewrite_lowers_the_arena():
     b = _Builder(6)
     x = b.activation([1, 4, 4, 4])
     result = export(b.model(x, b.max_pool(x, 2, 2, padding=1)))
-    assert result.data is None and result.reason == "no rewrite lowers the arena"
+    assert result.data is None and result.reason == "no smaller arena found"
     # No strided or pooling operator: no region to band.
     assert export((FIXTURES / "ops" / "conv_bias.tflite").read_bytes()).data is None
 
@@ -1003,12 +1005,52 @@ def test_export_command_names_a_single_banded_operator(monkeypatch, tmp_path):
     assert result.output.splitlines()[1] == "operator 1 computed in 3 row bands; 7 operators after export"
 
 
-def test_export_command_writes_nothing_when_it_declines(tmp_path):
+def test_export_command_copies_a_model_it_cannot_lower(tmp_path):
+    source = FIXTURES / "kws_ref_model.tflite"
     out = tmp_path / "kws.tflite"
-    result = CliRunner().invoke(cli, ["export", str(FIXTURES / "kws_ref_model.tflite"), "-o", str(out)])
-    assert result.exit_code == 1
-    assert "no model written: no rewrite lowers the arena" in result.output
+    result = CliRunner().invoke(cli, ["export", str(source), "-o", str(out),
+                                      "--json", str(tmp_path / "kws.json")])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[1] == f"no smaller arena found; {out} is an unchanged copy"
+    assert out.read_bytes() == source.read_bytes()
+    report = json.loads((tmp_path / "kws.json").read_text())
+    assert report == {"runtime": "tflite-micro", "source": "model",
+                      **export_report(export(source.read_bytes()))}
+    assert report["reason"] == "no smaller arena found"
+    assert report["change_bytes"] is None
+    gain = CliRunner().invoke(cli, ["export", str(source), "-o", str(out), "--require-gain"])
+    assert gain.exit_code == 3
+    assert f"no smaller arena found; {out} is an unchanged copy" in gain.output
+
+
+def test_export_command_reports_a_written_model_as_json(tmp_path):
+    source = FIXTURES / "vww_96_int8.tflite"
+    result = CliRunner().invoke(cli, ["export", str(source), "-o", str(tmp_path / "vww.tflite"),
+                                      "--json", str(tmp_path / "vww.json"), "--require-gain"])
+    assert result.exit_code == 0, result.output
+    report = json.loads((tmp_path / "vww.json").read_text())
+    assert report["runtime"] == "tflite-micro" and report["source"] == "model"
+    assert report["arena_head_after_bytes"] == 45 * 1024 and report["reason"] is None
+
+
+@pytest.mark.parametrize("option", [["--cpu", "M7"], ["--allow-input-overwrite"],
+                                    ["--arena", "64K"], ["--method", "32K"],
+                                    ["--max-extra-macs", "5%"], ["--header", "x.h"]])
+def test_executorch_options_are_a_usage_error_for_tflite(option, tmp_path):
+    out = tmp_path / "vww.tflite"
+    result = CliRunner().invoke(cli, ["export", str(FIXTURES / "vww_96_int8.tflite"), "-o",
+                                      str(out), *option])
+    assert result.exit_code == 2
+    assert f"Error: {option[0]} applies to ExecuTorch programs" in result.output
     assert not out.exists()
+
+
+def test_export_refuses_a_file_of_another_format(tmp_path):
+    other = tmp_path / "model.bin"
+    other.write_bytes(b"\0" * 64)
+    result = CliRunner().invoke(cli, ["export", str(other)])
+    assert result.exit_code == 1
+    assert "Error: model.bin is neither a TFLite model nor an ExecuTorch program" in result.output
 
 
 def test_analyze_reports_the_tflite_micro_arena_after_export():
@@ -1018,7 +1060,7 @@ def test_analyze_reports_the_tflite_micro_arena_after_export():
     assert row.rstrip().endswith("head 72.00 KiB -> 45.00 KiB, persistent +2.31 KiB, +0.25% MACs, "
                                  "reference kernels on arm-none-eabi")
     declined = CliRunner().invoke(cli, ["analyze", str(FIXTURES / "kws_ref_model.tflite"), "-m", "64K"])
-    assert ("TFLite Micro export        none   no rewrite lowers the arena, reference kernels on "
+    assert ("TFLite Micro export        none   no smaller arena found, reference kernels on "
             "arm-none-eabi") in declined.output
     # Declined before any figure was planned: the reason alone.
     unmodeled = CliRunner().invoke(cli, ["analyze", str(FIXTURES / "ops" / "gelu.tflite"), "-m", "64K"])
@@ -1055,9 +1097,11 @@ def test_analyze_leaves_out_both_tflite_micro_rows_where_the_arena_is_not_modele
         report = json.loads(CliRunner().invoke(cli, ["analyze", str(model), "-m", "64K",
                                                      "--json"]).output)
         assert report["tflite_micro"] is None
-        declined = CliRunner().invoke(cli, ["export", str(model), "-o", str(tmp_path / "out")])
+        declined = CliRunner().invoke(cli, ["export", str(model), "-o", str(tmp_path / "out"),
+                                            "--json", str(tmp_path / "out.json")])
         assert declined.exit_code == 1
         assert f"no model written: {reason}" in declined.output
+        assert not (tmp_path / "out").exists() and not (tmp_path / "out.json").exists()
 
 
 def test_top_level_help_shows_every_command_summary_whole():
@@ -1066,7 +1110,8 @@ def test_top_level_help_shows_every_command_summary_whole():
                             capture_output=True, text=True, check=True,
                             env={**os.environ, "COLUMNS": "80", "NO_COLOR": "1"})
     rows = result.stdout.split("Commands:\n", 1)[1].splitlines()
-    assert "  export   Rewrite a TFLite model for a smaller TFLite Micro arena." in rows
+    assert ("  export   Rewrite a TFLite model or an ExecuTorch program to run in less RAM."
+            in rows)
     assert not [row for row in rows if row.endswith("...")]
 
 
@@ -1093,7 +1138,7 @@ def test_analyze_json_reports_the_written_export():
 def test_analyze_json_reports_a_declined_export(tmp_path):
     declined = {"arena_head_after_bytes": None, "persistent_growth_bytes": None,
                 "change_bytes": None, "region": None, "bands": None, "pads_folded": None,
-                "extra_macs": None, "target": "arm-none-eabi", "reason": "no rewrite lowers the arena"}
+                "extra_macs": None, "target": "arm-none-eabi", "reason": "no smaller arena found"}
     assert _export_json(FIXTURES / "kws_ref_model.tflite") == {
         **declined, "arena_head_before_bytes": 16000, "macs": 2656768}
     # Planned without convolutions: zero MACs, not null.
@@ -1112,3 +1157,555 @@ def test_analyze_json_reports_a_declined_export(tmp_path):
     assert _export_json(path) == {
         **declined, "arena_head_before_bytes": None, "macs": None,
         "reason": "metadata OfflineMemoryAllocation is not supported"}
+
+
+# tigris run on TFLite Micro
+
+def _run_tflite(model: Path, given: Path, out: Path, *options):
+    return CliRunner().invoke(cli, ["run", str(model), "--input", str(given), "--output", str(out),
+                                    *options])
+
+
+def test_run_gives_tflite_micros_recorded_bytes(tflite_micro, tmp_path):
+    """The recorded inputs of the keyword-spotting model, as .bin and as
+    .npy, give the outputs TFLite Micro recorded, byte for byte."""
+    recorded = np.load(FIXTURES / "kws_ref_model_tflm.npz")
+    for k, (row, expected) in enumerate(zip(recorded["inputs"], recorded["outputs"])):
+        suffix = ".npy" if k % 2 else ".bin"
+        given = tmp_path / f"x{k}{suffix}"
+        if k % 2:
+            np.save(given, row)
+        else:
+            row.tofile(given)
+        out = tmp_path / f"y{k}.bin"
+        result = _run_tflite(FIXTURES / "kws_ref_model.tflite", given, out)
+        assert result.exit_code == 0, result.output
+        assert out.read_bytes() == expected.tobytes()
+
+
+@pytest.mark.usefixtures("require_host_library")
+def test_run_gives_the_same_bytes_for_a_model_and_its_plan(tflite_micro, tmp_path):
+    model = FIXTURES / "kws_ref_model.tflite"
+    plan = tmp_path / "kws.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(model), "-m", "16K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    recorded = np.load(FIXTURES / "kws_ref_model_tflm.npz")
+    recorded["inputs"][0].tofile(tmp_path / "x.bin")
+    for name in (model, plan):
+        out = tmp_path / f"{name.suffix[1:]}.bin"
+        result = _run_tflite(name, tmp_path / "x.bin", out)
+        assert result.exit_code == 0, result.output
+        assert out.read_bytes() == recorded["outputs"][0].tobytes()
+
+
+@pytest.mark.parametrize("name", ["vww_96_int8", "pretrainedResnet_quant"])
+def test_run_gives_the_same_bytes_for_a_model_and_its_export(tflite_micro, tmp_path, name):
+    model = FIXTURES / f"{name}.tflite"
+    written = tmp_path / f"{name}_export.tflite"
+    result = CliRunner().invoke(cli, ["export", str(model), "-o", str(written)])
+    assert result.exit_code == 0, result.output
+    assert written.read_bytes() != model.read_bytes()
+    recorded = np.load(FIXTURES / f"{name}_tflm.npz")
+    for k, (row, expected) in enumerate(zip(recorded["input_0"], recorded["output_0"])):
+        row.tofile(tmp_path / f"x{k}.bin")
+        for program in (model, written):
+            out = tmp_path / f"{program.stem}_{k}.bin"
+            result = _run_tflite(program, tmp_path / f"x{k}.bin", out)
+            assert result.exit_code == 0, result.output
+            assert out.read_bytes() == expected.tobytes()
+
+
+def test_run_report_and_json(tflite_micro, tmp_path):
+    from importlib.metadata import version
+
+    model = FIXTURES / "kws_ref_model.tflite"
+    np.load(FIXTURES / "kws_ref_model_tflm.npz")["inputs"][0].tofile(tmp_path / "x.bin")
+    out = tmp_path / "y.npz"
+    result = _run_tflite(model, tmp_path / "x.bin", out)
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        f"kws_ref_model.tflite   TFLite Micro {version('tflite-micro')}, reference kernels",
+        "",
+        f"wrote {out}   1x12 int8",
+    ]
+    with np.load(out) as values:
+        assert values.files == ["Identity"]
+    result = _run_tflite(model, tmp_path / "x.bin", tmp_path / "y.bin", "--json")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "runtime": "tflite-micro", "runtime_version": version("tflite-micro"),
+        "backend": "reference", "output": str(tmp_path / "y.bin"),
+        "tensors": [{"name": "Identity", "dtype": "int8", "shape": [1, 12]}],
+    }
+
+
+def test_the_host_arena_is_head_tail_and_the_planning_bound():
+    # 35 tensors, no scratch buffers: (32 + 40) x 35 + 16 x 12 + 64 bytes of planning.
+    data = (FIXTURES / "kws_ref_model.tflite").read_bytes()
+    assert host_arena(data) == 16000 + _wheel_tail(data) + 2776 == 27048
+
+
+# Allocates each model given as an argument in the arena host_arena sizes for it;
+# one that fails there is tried in 64 MB to tell a short arena from a kernel
+# TFLite Micro lacks.
+_HOST_ARENA_CHILD = r"""
+import sys
+from tflite_micro.python.tflite_micro import runtime
+from tigris.frontends.tflite_export import host_arena
+for path in sys.argv[1:]:
+    data = open(path, 'rb').read()
+    try:
+        runtime.Interpreter.from_bytes(data, arena_size=host_arena(data))
+    except RuntimeError:
+        try:
+            runtime.Interpreter.from_bytes(data, arena_size=64 << 20)
+        except RuntimeError:
+            print("cannot load", path)
+            continue
+        print("too small", path)
+"""
+
+_GELU = {"float_gelu", "float_gelu_approximate", "float_gelu_approximate_wide", "float_gelu_wide",
+         "gelu", "gelu_approximate", "gelu_approximate_offset", "gelu_wide"}
+
+
+def _fixtures() -> list[Path]:
+    return sorted([*FIXTURES.glob("*.tflite"), *FIXTURES.glob("ops/*.tflite")])
+
+
+def test_the_host_arena_fits_every_model_tflite_micro_loads(tflite_micro):
+    """TFLite Micro allocates every fixture it can load in the arena
+    host_arena gives it, the models the arena model covers and those the
+    upper bound sizes; the only ones it cannot load use GELU, which the
+    package does not register."""
+    paths = [str(path) for path in _fixtures()]
+    assert len(paths) > 340
+    result = subprocess.run([sys.executable, "-c", _HOST_ARENA_CHILD, *paths],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-2000:]
+    lines = result.stdout.splitlines()
+    assert [line for line in lines if line.startswith("too small")] == []
+    assert {Path(line.split(" ", 2)[2]).stem for line in lines} == _GELU
+
+
+def test_the_bound_covers_what_tflite_micro_allocates(tflite_micro, tmp_path):
+    """For each fixture the arena model does not cover and TFLite Micro
+    loads, the upper bound is at least the head and tail TFLite Micro
+    records: several subgraphs, LSTM, SVDF, TRANSPOSE_CONV, MIRROR_PAD,
+    ADD_N and the detection postprocess."""
+    paths = [path for path in _fixtures() if path.stem not in _GELU
+             and _host_exact(tw.read(path.read_bytes())) is None]
+    assert len(paths) == 37
+    result = subprocess.run([sys.executable, "-c", _ARENA_CHILD, *map(str, paths)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    sections = re.split(r"^@@model (\d+)$", result.stderr, flags=re.MULTILINE)[1:]
+    assert len(sections) == 2 * len(paths)
+    for index, text in zip(sections[::2], sections[1::2]):
+        path = paths[int(index)]
+        assert host_arena(path.read_bytes()) >= sum(_arena(text)), path.name
+
+
+def test_run_reports_tflite_micros_message_for_a_kind_it_lacks(tflite_micro, tmp_path):
+    np.zeros((1, 6, 6, 4), np.float32).tofile(tmp_path / "x.bin")
+    result = _run_tflite(FIXTURES / "ops" / "float_gelu_approximate.tflite", tmp_path / "x.bin",
+                         tmp_path / "y.bin")
+    assert result.exit_code == 1
+    assert result.output.splitlines() == [
+        "Error: TFLite Micro cannot run float_gelu_approximate.tflite: Didn't find op for "
+        "builtin opcode 'GELU'"]
+
+
+@pytest.mark.parametrize("name", ["lstm", "float_lstm", "float_if", "float_while", "if_conv",
+                                  "while_conv", "detection_fast", "float_detection_regular"])
+def test_run_executes_a_model_the_bound_sizes(tflite_micro, tmp_path, name):
+    """LSTM, control flow and the detection postprocess run in the arena the
+    upper bound gives and produce what TFLite Micro produces in 16 MB; the
+    detection outputs past the detections it reports are left unwritten."""
+    from tflite_micro.python.tflite_micro import runtime
+
+    data = (FIXTURES / "ops" / f"{name}.tflite").read_bytes()
+    graph = tflite.describe(data)["graph"]
+    rng = np.random.default_rng(0)
+    given, values = [], []
+    for k, item in enumerate(graph["inputs"]):
+        dtype = np.dtype(item["dtype"])
+        value = (rng.integers(-100, 100, item["shape"]).astype(dtype) if dtype.kind == "i"
+                 else rng.uniform(0, 1, item["shape"]).astype(dtype))
+        np.save(tmp_path / f"x{k}.npy", value)
+        given += ["--input", f"{item['name']}={tmp_path / f'x{k}.npy'}"]
+        values.append(value)
+    out = tmp_path / "y.npz"
+    result = CliRunner().invoke(cli, ["run", str(FIXTURES / "ops" / f"{name}.tflite"), *given,
+                                      "--output", str(out)])
+    assert result.exit_code == 0, result.output
+    interpreter = runtime.Interpreter.from_bytes(data, arena_size=16 << 20)
+    for k, value in enumerate(values):
+        interpreter.set_input(value, k)
+    interpreter.invoke()
+    expected = [interpreter.get_output(k) for k in range(len(graph["outputs"]))]
+    with np.load(out) as written:
+        got = [written[item["name"]] for item in graph["outputs"]]
+    if "detection" in name:
+        count = int(expected[3][0])
+        assert got[3] == expected[3] and count > 0
+        got, expected = ([a[:, :count] for a in arrays[:3]] for arrays in (got, expected))
+    assert [a.tobytes() for a in got] == [a.tobytes() for a in expected]
+
+
+def test_run_folds_what_tflite_micro_prints_into_the_error(tflite_micro, tmp_path, capfd,
+                                                           monkeypatch):
+    """An arena TFLite Micro finds too small, and a kernel it lacks: the line
+    it prints from C becomes the reason, and nothing else reaches stderr."""
+    import tigris.frontends.tflite_export as te
+
+    monkeypatch.setattr(te, "host_arena", lambda data: 24000)
+    np.load(FIXTURES / "kws_ref_model_tflm.npz")["inputs"][0].tofile(tmp_path / "x.bin")
+    result = _run_tflite(FIXTURES / "kws_ref_model.tflite", tmp_path / "x.bin",
+                         tmp_path / "y.bin")
+    assert result.exit_code == 1
+    assert result.output.splitlines() == [
+        "Error: TFLite Micro reports the arena too small for kws_ref_model.tflite: Failed to "
+        "resize buffer. Requested: 16000, available 15952, missing: 48; tigris run sized it at "
+        "24000 bytes from its model of TFLite Micro's arena"]
+    # The reference build has no GELU kernel.
+    monkeypatch.setattr(te, "host_arena", lambda data: 1 << 16)
+    np.zeros((1, 6, 6, 4), np.float32).tofile(tmp_path / "x.bin")
+    result = _run_tflite(FIXTURES / "ops" / "float_gelu_approximate.tflite", tmp_path / "x.bin",
+                         tmp_path / "y.bin")
+    assert result.exit_code == 1
+    assert result.output.splitlines() == [
+        "Error: TFLite Micro cannot run float_gelu_approximate.tflite: Didn't find op for "
+        "builtin opcode 'GELU'"]
+    assert capfd.readouterr().err == ""
+    assert not (tmp_path / "y.bin").exists()
+
+
+def test_run_without_tflite_micro_names_the_package(tmp_path, monkeypatch):
+    for name in ("tflite_micro", "tflite_micro.python", "tflite_micro.python.tflite_micro"):
+        monkeypatch.setitem(sys.modules, name, None)
+    np.zeros((1, 49, 10, 1), np.int8).tofile(tmp_path / "x.bin")
+    result = _run_tflite(FIXTURES / "kws_ref_model.tflite", tmp_path / "x.bin", tmp_path / "y.bin")
+    assert result.exit_code == 1
+    assert result.output.splitlines() == [
+        "Error: running a TFLite model needs tflite-micro, which has wheels for Linux x86_64: "
+        "pip install tflite-micro"]
+
+
+def test_run_refuses_executorch_for_a_tflite_model(tmp_path):
+    result = _run_tflite(FIXTURES / "kws_ref_model.tflite", tmp_path / "x.bin", tmp_path / "y.bin",
+                         "--executorch", str(tmp_path))
+    assert result.exit_code == 2
+    assert "Error: --executorch applies to ExecuTorch programs" in result.output
+
+
+def test_custom_options_read_as_tflite_micro_reads_them():
+    """By position, a slot of the map's width cut to 32 bits; by key,
+    flexbuffers' AsInt32: a float truncated, a bool as 1, a string parsed
+    whole as a decimal integer or else 0, a vector as its length, a null or
+    a missing key as 0."""
+    import flatbuffers.flexbuffers as flex
+
+    from tigris.frontends.flatbuffer import flexbuffer_int, flexbuffer_slots
+
+    assert flexbuffer_slots(bytes(flex.Dumps({"delay_length": 7, "z": -3})), 2) == [7, -3]
+    data = bytes(flex.Dumps({"a": 7, "b": " -12", "c": [1, "x"], "d": 2.9, "e": True, "f": "1x",
+                             "h": None}))
+    assert [flexbuffer_int(data, key) for key in "abcdefhz"] == [7, -12, 2, 2, 1, 0, 0, 0]
+
+
+# Loads the model in the first argument in each arena size that follows and
+# prints ok or fail for each, then its allocations in 1 MB.
+_SIZES_CHILD = r"""
+import sys
+from tflite_micro.python.tflite_micro import runtime
+data = open(sys.argv[1], 'rb').read()
+for size in map(int, sys.argv[2:]):
+    try:
+        runtime.Interpreter.from_bytes(data, arena_size=size)
+        print("ok", size)
+    except RuntimeError:
+        print("fail", size)
+sys.stdout.flush()
+runtime.Interpreter.from_bytes(data, arena_size=1 << 20).print_allocations()
+"""
+
+
+def _loads(data: bytes, sizes, tmp_path: Path) -> tuple[list[bool], str]:
+    """Whether TFLite Micro loads the model in each arena size, and what it
+    prints of its allocations."""
+    path = tmp_path / "model.tflite"
+    path.write_bytes(data)
+    result = subprocess.run([sys.executable, "-c", _SIZES_CHILD, str(path), *map(str, sizes)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-2000:]
+    return [line.startswith("ok") for line in result.stdout.splitlines()], result.stderr
+
+
+def _per_channel_fully_connected(channels: int) -> bytes:
+    """An int8 FULLY_CONNECTED of one input element with per-channel weights and bias."""
+    b = _Builder(16)
+    scales = [float(v) for v in b.rng.uniform(0.002, 0.01, channels).astype(np.float32)]
+    x = b.activation([1, 1])
+    weights = b.constant(b.rng.integers(-127, 128, (channels, 1), dtype=np.int8), _INT8,
+                         tw.Quantization(scales, [0] * channels))
+    bias = b.constant(b.rng.integers(-100, 100, channels, dtype=np.int32), _INT32,
+                      tw.Quantization([0.05 * s for s in scales], [0] * channels))
+    return b.model(x, b.operator("FULLY_CONNECTED", [x, weights, bias],
+                                 b.activation([1, channels], 0.1, 1), 8))
+
+
+def test_the_exact_arena_holds_the_temporaries_a_kernel_prepares_with(tflite_micro, tmp_path):
+    """A kernel's temporary tensors sit past the tail while it prepares, before
+    the head is planned: per-channel quantization of 1000 channels takes more
+    there than head and planning do, and the arena holds it."""
+    from tigris.frontends.tflite_export import HOST_TARGET
+    from tigris.frontends.tflm import tflm_planning
+
+    data = _per_channel_fully_connected(1000)
+    model = tw.read(data)
+    planned = (arena(model) + _wheel_tail(data)
+               + tflm_planning(len(model.subgraphs[0].tensors), 0, HOST_TARGET))
+    assert host_arena(data) > planned
+    assert _loads(data, [host_arena(data), planned], tmp_path)[0] == [True, False]
+
+
+def _custom_model(custom: str, options, inputs: list, outputs: list) -> bytes:
+    """One custom operator. Each operand is (shape, type) or (array, type) for
+    a constant, optionally followed by its quantization."""
+    import flatbuffers.flexbuffers as flex
+
+    tensors, buffers = [], [None]
+    for value, type_, *quantization in [*inputs, *outputs]:
+        buffer = 0
+        if isinstance(value, np.ndarray):
+            buffers.append(value.tobytes())
+            value, buffer = value.shape, len(buffers) - 1
+        tensors.append(tw.Tensor(list(value), type_, buffer, f"t{len(tensors)}".encode(),
+                                 *quantization))
+    ins, outs = list(range(len(inputs))), list(range(len(inputs), len(tensors)))
+    code = tw.OperatorCode(BUILTIN_OPERATORS.index("CUSTOM"), 1, custom.encode(), 32)
+    op = tw.Operator(0, ins, outs, None, None if options is None else bytes(flex.Dumps(options)))
+    graph = tw.Subgraph(tensors, [k for k in ins if not tensors[k].buffer], outs, [op], b"main")
+    return tw.write(tw.Model(3, [code], [graph], buffers, b"test"))
+
+
+_UINT8, _BOOL, _UINT64, _UINT32 = 3, 6, 12, 15
+
+
+def _int16(count: int) -> np.ndarray:
+    return np.arange(count, dtype=np.int16)
+
+
+# A loadable one-operator model of each kind the package registers that no
+# fixture carries: (custom code, custom options, inputs, outputs).
+_BOUND_KINDS = {
+    "BasicClassifier": (None, [([4], _INT32), (np.array([0, 1], np.int32), _INT32),
+                               (np.array([5, 5], np.int32), _INT32)], [([2], _BOOL), ([2], _INT32)]),
+    "CIRCULAR_BUFFER": ({"cycles_max": 1}, [([1, 1, 1, 8], _INT8)], [([1, 3, 1, 8], _INT8)]),
+    "SignalDelay": ({"delay_length": 7}, [([3, 16], _INT16)], [([3, 16], _INT16)]),
+    "SignalEnergy": ({"end_index": 8, "start_index": 1}, [([18], _INT16)], [([9], _UINT32)]),
+    "SignalFftAutoScale": (None, [([64], _INT16)], [([64], _INT16), ([], _INT32)]),
+    "SignalFilterBank": ({"num_channels": 6}, [([33], _UINT32), *[(_int16(n), _INT16)
+                                                                  for n in (20, 20, 7, 7, 7)]],
+                         [([7], _UINT64)]),
+    "SignalFilterBankLog": ({"input_correction_bits": 3, "output_scale": 1600}, [([6], _UINT32)],
+                            [([6], _INT16)]),
+    "SignalFilterBankSpectralSubtraction": (
+        {"alternate_one_minus_smoothing": 15729, "alternate_smoothing": 655, "clamping": False,
+         "min_signal_remaining": 819, "num_channels": 6, "one_minus_smoothing": 15729,
+         "smoothing": 655, "smoothing_bits": 10, "spectral_subtraction_bits": 14},
+        [([6], _UINT32)], [([6], _UINT32), ([6], _UINT32)]),
+    "SignalFilterBankSquareRoot": (None, [([6], _UINT64), (np.array(3, np.int32), _INT32)],
+                                   [([6], _UINT32)]),
+    "SignalFramer": ({"frame_size": 40, "frame_step": 16, "prefill": False}, [([2, 16], _INT16)],
+                     [([2, 1, 40], _INT16), ([], _BOOL)]),
+    "SignalIrfft": ({"T": 7, "fft_length": 64}, [([66], _INT16)], [([64], _INT16)]),
+    "SignalOverlapAdd": ({"T": 0, "frame_step": 8}, [([2, 3, 16], _FLOAT32)],
+                         [([2, 24], _FLOAT32)]),
+    "SignalPCAN": ({"snr_shift": 6}, [([6], _UINT32), ([6], _UINT32), (_int16(10), _INT16)],
+                   [([6], _UINT32)]),
+    "SignalRfft": ({"T": 2, "fft_length": 64}, [([64], _INT32)], [([66], _INT32)]),
+    "SignalStacker": ({"num_channels": 8, "stacker_left_context": 2, "stacker_right_context": 1,
+                       "stacker_step": 1}, [([8], _INT16)], [([32], _INT16), ([], _BOOL)]),
+    "SignalWindow": ({"shift": 12}, [([16], _INT16), (_int16(16), _INT16)], [([16], _INT16)]),
+    # A pruned int8 tensor with per-channel zero points: the largest decode state and its copy
+    # of the zero points. The 16-byte header holds the type, 2, and the version, 1, twice.
+    "TFLM_DECODE": (None, [(np.zeros(8, np.uint8), _UINT8),
+                           (np.array([2, 1, 0, 0, 1] + [0] * 15, np.uint8), _UINT8)],
+                    [([4, 2], _INT8, tw.Quantization([0.1, 0.2], [1, -1]))]),
+}
+
+# Allocates each model given as an argument in the arena host_arena sizes for it,
+# a marker line before each.
+_BOUND_CHILD = r"""
+import os, sys
+from tflite_micro.python.tflite_micro import runtime
+from tigris.frontends.tflite_export import host_arena
+for index, path in enumerate(sys.argv[1:]):
+    os.write(2, f"\n@@model {index}\n".encode())
+    data = open(path, 'rb').read()
+    runtime.Interpreter.from_bytes(data, arena_size=host_arena(data)).print_allocations()
+"""
+
+
+def _kernel_allocations(data: bytes) -> tuple[int, int, int]:
+    """For a one-operator model, the bytes and count of the persistent buffers
+    the bound gives the kernel and the graph boundary's pointer arrays, and
+    the head: every placed tensor and scratch buffer, 16-byte aligned."""
+    from tigris.frontends.tflite_export import (HOST_TARGET, _host_kind, _host_options,
+                                                _host_tensors)
+    from tigris.frontends.tflm import (TFLM_BOUND_KERNELS, _tflm_bound_scratch, _tflm_bytes,
+                                       _tflm_layout)
+
+    model = tw.read(data)
+    graph = model.subgraphs[0]
+    (op,) = graph.operators
+    kind = _host_kind(model, op.opcode)
+    options = _host_options(op, kind)
+    tensors = [(*t, t[1]) for t in _host_tensors(model, graph)]
+    _, init, prepare, _ = TFLM_BOUND_KERNELS[kind]
+    sizes = [_tflm_layout(init, HOST_TARGET)[0]] if init else []
+    sizes += prepare(tensors, op.inputs, op.outputs, options, HOST_TARGET) if prepare else []
+    sizes += [HOST_TARGET.pointer * len(graph.inputs), HOST_TARGET.pointer * len(graph.outputs)]
+    scratch = _tflm_bound_scratch(kind, tensors, op.inputs, op.outputs, options, HOST_TARGET,
+                                  False)
+    head = sum((size + 15) // 16 * 16 for size in [
+        *(_tflm_bytes(t) for t in tensors if not t[2] and not t[5]), *scratch])
+    return sum(sizes), len(sizes), head
+
+
+def test_the_bound_sizes_each_kernel_as_tflite_micro_allocates_it(tflite_micro, tmp_path):
+    """For one operator of each kind no fixture carries, TFLite Micro loads in
+    the arena the bound gives, and the kernel's persistent buffers, counted
+    with the graph boundary's, and the head it records are those the bound
+    takes."""
+    paths = []
+    for kind, (options, inputs, outputs) in _BOUND_KINDS.items():
+        paths.append(tmp_path / f"{kind}.tflite")
+        paths[-1].write_bytes(_custom_model(kind, options, inputs, outputs))
+    result = subprocess.run([sys.executable, "-c", _BOUND_CHILD, *map(str, paths)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-2000:]
+    sections = re.split(r"^@@model (\d+)$", result.stderr, flags=re.MULTILINE)[1:]
+    assert len(sections) == 2 * len(paths)
+    for index, text in zip(sections[::2], sections[1::2]):
+        path = paths[int(index)]
+        buffers = re.search(r"'Persistent buffer data' used \d+ bytes with alignment overhead "
+                            r"\(requested (\d+) bytes for (\d+) allocations\)", text)
+        head = _arena(text)[0]
+        assert (int(buffers.group(1)), int(buffers.group(2)), head) == _kernel_allocations(
+            path.read_bytes()), path.stem
+
+
+def _compression_metadata(tensor: int, value_buffer: int, bit_width: int) -> bytes:
+    """TFLite Micro's compression Metadata table with one LutTensor in one subgraph."""
+    import flatbuffers
+
+    b = flatbuffers.Builder(0)
+    b.StartObject(3)
+    b.PrependInt32Slot(0, tensor, 0)
+    b.PrependUint32Slot(1, value_buffer, 0)
+    b.PrependUint8Slot(2, bit_width, 0)
+    tables = b.EndObject()
+    for fields in (1, 2):
+        b.StartVector(4, 1, 4)
+        b.PrependUOffsetTRelative(tables)
+        vector = b.EndVector()
+        b.StartObject(fields)
+        if fields == 2:
+            b.PrependUint32Slot(0, 1, 1)
+        b.PrependUOffsetTRelativeSlot(fields - 1, vector, 0)
+        tables = b.EndObject()
+    b.Finish(tables)
+    return bytes(b.Output())
+
+
+def _compressed_fully_connected() -> bytes:
+    """A float FULLY_CONNECTED whose 64x32 weights are 2-bit indices into a
+    table of four values, which its kernel decompresses into a scratch buffer."""
+    rng = np.random.default_rng(17)
+    indices = np.packbits(np.unpackbits(rng.integers(0, 4, 64 * 32).astype(np.uint8)[:, None],
+                                        axis=1)[:, -2:]).tobytes()
+    values = np.array([-1.0, -0.5, 0.5, 1.0], np.float32).tobytes()
+    tensors = [tw.Tensor([1, 32], _FLOAT32, 0, b"x"), tw.Tensor([64, 32], _FLOAT32, 1, b"w"),
+               tw.Tensor([1, 64], _FLOAT32, 0, b"y")]
+    graph = tw.Subgraph(tensors, [0], [2], [tw.Operator(0, [0, 1, -1], [2],
+                                                         tw.Options(8, None, {}))], b"main")
+    code = BUILTIN_OPERATORS.index("FULLY_CONNECTED")
+    return tw.write(tw.Model(3, [tw.OperatorCode(code, 1, None, code)], [graph],
+                             [None, indices, values, _compression_metadata(1, 2, 2)], b"test",
+                             None, [(b"COMPRESSION_METADATA", 3)]))
+
+
+def _offline_planned_abs() -> bytes:
+    """ABS whose input the OfflineMemoryAllocation metadata places at 64 KB."""
+    tensors = [tw.Tensor([1000], _FLOAT32, 0, b"x"), tw.Tensor([1000], _FLOAT32, 0, b"y")]
+    code = BUILTIN_OPERATORS.index("ABS")
+    graph = tw.Subgraph(tensors, [0], [1], [tw.Operator(0, [0], [1])], b"main")
+    offsets = np.array([1, 0, 2, 65536, -1], np.int32).tobytes()
+    return tw.write(tw.Model(3, [tw.OperatorCode(code, 1, None, code)], [graph], [None, offsets],
+                             b"test", None, [(b"OfflineMemoryAllocation", 1)]))
+
+
+def test_the_bound_places_offline_planned_and_decompressed_buffers(tflite_micro, tmp_path):
+    """TFLite Micro loads in the arena the bound gives a model with an
+    offline planned buffer at 64 KB, and one whose weights it decompresses
+    into an 8 KB scratch buffer; the compression records it allocates are
+    those the bound counts for each tensor."""
+    from tigris.frontends.tflite_export import HOST_TARGET
+    from tigris.frontends.tflm import _tflm_layout
+
+    data = _offline_planned_abs()
+    loaded, printed = _loads(data, [host_arena(data)], tmp_path)
+    assert loaded == [True] and _arena(printed)[0] == 65536 + 4000
+    data = _compressed_fully_connected()
+    loaded, printed = _loads(data, [host_arena(data)], tmp_path)
+    assert loaded == [True] and _arena(printed)[0] == 128 + 256 + 64 * 32 * 4
+    records = sum(_tflm_layout(name, HOST_TARGET)[0]
+                  for name in ("CompressionTensorData", "LookupTableData"))
+    assert re.search(r"'Persistent compression data' used \d+ bytes with alignment overhead "
+                     r"\(requested (\d+) bytes for 3 allocations\)", printed).group(1) == str(
+                         records + 3 * HOST_TARGET.pointer)
+
+
+def test_the_bound_gives_a_resource_variable_the_bytes_its_value_declares(tflite_micro, tmp_path):
+    """ASSIGN_VARIABLE's resource buffer takes the bytes of its value's
+    declared shape, not of the shape GATHER writes into it."""
+    tensors = [tw.Tensor([1], _INT32, 0, b"coords"), tw.Tensor([10], _FLOAT32, 1, b"params"),
+               tw.Tensor([100000], _FLOAT32, 0, b"gathered"), tw.Tensor([], 13, 0, b"resource")]
+    codes = [tw.OperatorCode(BUILTIN_OPERATORS.index(kind))
+             for kind in ("VAR_HANDLE", "GATHER", "ASSIGN_VARIABLE")]
+    ops = [tw.Operator(0, [], [3], tw.Options(111, None, {0: ("s", b""), 1: ("s", b"v")})),
+           tw.Operator(1, [1, 0], [2], tw.Options(23, None, {0: ("i", 0), 1: ("i", 0)})),
+           tw.Operator(2, [3, 2], [], tw.Options(113, None, {}))]
+    graph = tw.Subgraph(tensors, [0], [2], ops, b"main")
+    data = tw.write(tw.Model(3, codes, [graph], [None, np.arange(10, dtype=np.float32).tobytes()],
+                             b"test"))
+    assert host_arena(data) > 400000
+    assert _loads(data, [host_arena(data)], tmp_path)[0] == [True]
+
+
+def test_run_refuses_a_model_tflite_micro_cannot_plan(tflite_micro, tmp_path):
+    """No arena is enough where TFLite Micro plans scratch buffers from
+    memory it never sets, a MEAN in a subgraph nothing invokes, or for a
+    model without subgraphs: run refuses both instead of crashing."""
+    mean = tw.Subgraph([tw.Tensor([2, 8], _FLOAT32, 0, b"a"), tw.Tensor([1], _INT32, 1, b"axis"),
+                        tw.Tensor([2], _FLOAT32, 0, b"m")], [0], [2],
+                       [tw.Operator(1, [0, 1], [2], tw.Options(27, None, {0: ("b", 0)}))],
+                       b"other")
+    main = tw.Subgraph([tw.Tensor([4], _FLOAT32, 0, b"x"), tw.Tensor([4], _FLOAT32, 0, b"y")],
+                       [0], [1], [tw.Operator(0, [0], [1])], b"main")
+    codes = [tw.OperatorCode(BUILTIN_OPERATORS.index(kind)) for kind in ("ABS", "MEAN")]
+    unreached = tw.Model(3, codes, [main, mean], [None, np.array([1], np.int32).tobytes()],
+                         b"test")
+    np.zeros(4, np.float32).tofile(tmp_path / "x.bin")
+    for name, model, reason in [
+            ("unreached", unreached, "no IF, WHILE or CALL_ONCE reaches subgraph 1, so TFLite "
+             "Micro plans the scratch buffers of its MEAN from uninitialized memory"),
+            ("empty", replace(unreached, subgraphs=[]), "the model has no subgraphs")]:
+        (tmp_path / f"{name}.tflite").write_bytes(tw.write(model))
+        result = _run_tflite(tmp_path / f"{name}.tflite", tmp_path / "x.bin", tmp_path / "y.bin")
+        assert result.exit_code == 1
+        assert result.output.splitlines() == [
+            f"Error: tigris run cannot size TFLite Micro's arena for {name}.tflite: {reason}"]

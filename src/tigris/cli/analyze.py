@@ -10,6 +10,7 @@ import click
 from tigris import TILE_AXIS_HW
 from tigris.analysis.memory import TENSOR_ALIGN, align_up
 from tigris.cli import _int8_io_option, _memory_sizes, _parse_input_shape, _planned, cli, text
+from tigris.cli.export import cpu_option, macs_option, overwrite_option, refuse_options
 from tigris.frontends.pt2 import EXECUTORCH_CPU
 from tigris.pipeline import parse_size
 from tigris.utils import describe_interface, fmt_bytes, plural, source_shape
@@ -281,9 +282,11 @@ def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
         memory.append(export_line(tflm_export))
     if executorch is not None:
         arena, reason = executorch
-        memory.append(["ExecuTorch arena", "", text.dim(f"not measured: {reason}")] if arena is None
-                      else ["ExecuTorch arena", fmt_bytes(arena),
-                            text.dim("its Cortex-M7 lowering, CMSIS-NN scratch included")])
+        memory.append(["ExecuTorch model memory", "", text.dim(f"not measured: {reason}")]
+                      if arena is None else
+                      ["ExecuTorch model memory", fmt_bytes(arena),
+                       text.dim("planned buffer of its Cortex-M7 lowering: activations and "
+                                "CMSIS-NN scratch")])
     memory.append(["unscheduled", fmt_bytes(ag.peak_memory_bytes), ""])
     if f.largest_tensor_bytes:
         memory.append(["largest tensor", fmt_bytes(f.largest_tensor_bytes),
@@ -349,6 +352,51 @@ def _stages(ag) -> None:
     text.section("stages", rows, ">>>>>")
 
 
+# Options of models tigris compiles, which an ExecuTorch program does not take.
+_COMPILED_OPTIONS = {"mem": "-m", "flash": "-f", "verbose": "--verbose",
+                     "input_shape": "--input-shape", "trace": "--trace", "input_files": "--input",
+                     "int8_io": "--int8-io"}
+_PTE_OPTIONS = {"cpu": "--cpu", "allow_input_overwrite": "--allow-input-overwrite",
+                "max_extra_macs": "--max-extra-macs"}
+
+
+def _analyze_pte(path: Path, cpu: str | None, allow_input_overwrite: bool,
+                 max_extra_macs: float | None, as_json: bool) -> None:
+    """What tigris export would make of an ExecuTorch program; nothing is written."""
+    from tigris.cli.export import (pte_change, pte_percent, pte_pools, pte_reason, pte_report,
+                                   pte_title, pte_warnings)
+    from tigris.frontends.pte_export import export
+
+    data = path.read_bytes()
+    result = export(data, cpu=cpu, allow_input_overwrite=allow_input_overwrite,
+                    max_extra_macs=max_extra_macs)
+    pte_warnings(result)
+    if result.refused:
+        raise click.ClickException(f"{path.name} {result.reason}")
+    reason = pte_reason(result, None, None, max_extra_macs)
+    if as_json:
+        click.echo(json.dumps({"report": "tigris-analysis", "version": 2,
+                               "model": {"name": path.name, "format": "pte"},
+                               "executorch_export": pte_report(result, cpu, data, reason)},
+                              indent=2, ensure_ascii=True, allow_nan=False))
+        return
+    text.echo(pte_title(path.name, result, cpu))
+    rows = [["as lowered", fmt_bytes(result.total_before),
+             text.dim(pte_pools(sum(result.planned_before), result.method_before,
+                                result.temp_before))]]
+    if result.written:
+        rows.append(["after tigris export", fmt_bytes(result.total_after),
+                     text.dim(f"{pte_change(result.total_before, result.total_after)}; "
+                              + pte_pools(sum(result.planned_after), result.method_after,
+                                          result.temp_after)
+                              + f"; {pte_percent(result.extra_macs, result.macs)} MACs")])
+    else:
+        rows.append(["after tigris export", fmt_bytes(result.total_before),
+                     text.dim(reason)])
+    text.section("ExecuTorch RAM on Cortex-M, from the program", rows, "<>")
+    text.echo(text.dim("  plus the runner's own input and output buffers, stack and statics"))
+
+
 @cli.command()
 @click.argument("model", type=click.Path(exists=True))
 @click.option("--mem", "-m", multiple=True, callback=_memory_sizes,
@@ -365,15 +413,31 @@ def _stages(ag) -> None:
 @click.option("--input", "input_files", multiple=True,
               help="Input for --trace as .bin or .npy; NAME=FILE for several (default: zeros)")
 @_int8_io_option
+@cpu_option
+@overwrite_option
+@macs_option
 def analyze(model: str, mem: tuple[str, ...], flash: str | None, verbose: bool,
             input_shape: dict[str, tuple[int, ...]], as_json: bool, trace: bool,
-            input_files: tuple[str, ...], int8_io: bool):
+            input_files: tuple[str, ...], int8_io: bool, cpu: str | None,
+            allow_input_overwrite: bool, max_extra_macs: float | None):
     """Check whether a model fits a memory budget, and why not."""
     from tigris.analysis.findings import compute_findings
     from tigris.frontends import pt2
+    from tigris.frontends.pte_schema import is_pte
     from tigris.frontends.tflite import is_tflite
     from tigris.frontends.tflite_export import export, tflm_tensor_arena
     from tigris.graph.subgraphs import all_graphs
+
+    ctx = click.get_current_context()
+    path = Path(model)
+    if path.is_file():
+        with path.open("rb") as stream:
+            head = stream.read(8)
+        if is_pte(head):
+            refuse_options(ctx, _COMPILED_OPTIONS, "ONNX, TFLite and .pt2 models")
+            _analyze_pte(path, cpu, allow_input_overwrite, max_extra_macs, as_json)
+            return
+    refuse_options(ctx, _PTE_OPTIONS, "ExecuTorch programs")
 
     if as_json and trace:
         raise click.UsageError("--json and --trace are two different outputs; choose one")

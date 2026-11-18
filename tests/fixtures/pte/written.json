@@ -1,0 +1,996 @@
+{
+ "bands_m0.pte": {
+  "as given": {
+   "sha256": "6e04e25db40662d0dcd1f464e4cc6fcdbc4682dd7ff10888f35d4146d299280b",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "allow_input_overwrite": {
+   "sha256": "6e04e25db40662d0dcd1f464e4cc6fcdbc4682dd7ff10888f35d4146d299280b",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M0": {
+   "sha256": "6e04e25db40662d0dcd1f464e4cc6fcdbc4682dd7ff10888f35d4146d299280b",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M0 allow_input_overwrite": {
+   "sha256": "6e04e25db40662d0dcd1f464e4cc6fcdbc4682dd7ff10888f35d4146d299280b",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved as given": {
+   "sha256": "6fcf9df7bdc2b8bcf2d09153b2347e7786bc8ae2d4b1f1858195ca6e2ec0b486",
+   "planned": [
+    0,
+    19008
+   ],
+   "method": 8776,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     7,
+     6,
+     false
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved allow_input_overwrite": {
+   "sha256": "6e04e25db40662d0dcd1f464e4cc6fcdbc4682dd7ff10888f35d4146d299280b",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M0": {
+   "sha256": "6fcf9df7bdc2b8bcf2d09153b2347e7786bc8ae2d4b1f1858195ca6e2ec0b486",
+   "planned": [
+    0,
+    19008
+   ],
+   "method": 8776,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     7,
+     6,
+     false
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved cpu=M0 allow_input_overwrite": {
+   "sha256": "6e04e25db40662d0dcd1f464e4cc6fcdbc4682dd7ff10888f35d4146d299280b",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "bands_m55.pte": {
+  "as given": {
+   "sha256": "5bbdc0fe4e95eb1690e15038c44c16eddfeacb239f9e7c80e6b328ef21558e30",
+   "planned": [
+    0,
+    13680
+   ],
+   "method": 7788,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "allow_input_overwrite": {
+   "sha256": "5bbdc0fe4e95eb1690e15038c44c16eddfeacb239f9e7c80e6b328ef21558e30",
+   "planned": [
+    0,
+    13680
+   ],
+   "method": 7788,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M55": {
+   "sha256": "5bbdc0fe4e95eb1690e15038c44c16eddfeacb239f9e7c80e6b328ef21558e30",
+   "planned": [
+    0,
+    13680
+   ],
+   "method": 7788,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M55 allow_input_overwrite": {
+   "sha256": "5bbdc0fe4e95eb1690e15038c44c16eddfeacb239f9e7c80e6b328ef21558e30",
+   "planned": [
+    0,
+    13680
+   ],
+   "method": 7788,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved as given": {
+   "sha256": "08c19378219a32445bac8e3b3faf8f8213d093ab9d1cd8c7ba15783e2eb13846",
+   "planned": [
+    0,
+    19008
+   ],
+   "method": 8784,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     7,
+     6,
+     false
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved allow_input_overwrite": {
+   "sha256": "5bbdc0fe4e95eb1690e15038c44c16eddfeacb239f9e7c80e6b328ef21558e30",
+   "planned": [
+    0,
+    13680
+   ],
+   "method": 7788,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M55": {
+   "sha256": "08c19378219a32445bac8e3b3faf8f8213d093ab9d1cd8c7ba15783e2eb13846",
+   "planned": [
+    0,
+    19008
+   ],
+   "method": 8784,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     7,
+     6,
+     false
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved cpu=M55 allow_input_overwrite": {
+   "sha256": "5bbdc0fe4e95eb1690e15038c44c16eddfeacb239f9e7c80e6b328ef21558e30",
+   "planned": [
+    0,
+    13680
+   ],
+   "method": 7788,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "bands_m7.pte": {
+  "as given": {
+   "sha256": "586c028c2cb15e6e42ca401e7c7598d3a77cfa6e38cb53d906e14a8fe2be4acf",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "allow_input_overwrite": {
+   "sha256": "586c028c2cb15e6e42ca401e7c7598d3a77cfa6e38cb53d906e14a8fe2be4acf",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M7": {
+   "sha256": "586c028c2cb15e6e42ca401e7c7598d3a77cfa6e38cb53d906e14a8fe2be4acf",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M7 allow_input_overwrite": {
+   "sha256": "586c028c2cb15e6e42ca401e7c7598d3a77cfa6e38cb53d906e14a8fe2be4acf",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved as given": {
+   "sha256": "e9bd31d8521ec783b6e04d7f4cf866b88dcbce07be67ce330627540379702544",
+   "planned": [
+    0,
+    19008
+   ],
+   "method": 8776,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     7,
+     6,
+     false
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved allow_input_overwrite": {
+   "sha256": "586c028c2cb15e6e42ca401e7c7598d3a77cfa6e38cb53d906e14a8fe2be4acf",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M7": {
+   "sha256": "e9bd31d8521ec783b6e04d7f4cf866b88dcbce07be67ce330627540379702544",
+   "planned": [
+    0,
+    19008
+   ],
+   "method": 8776,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     7,
+     6,
+     false
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved cpu=M7 allow_input_overwrite": {
+   "sha256": "586c028c2cb15e6e42ca401e7c7598d3a77cfa6e38cb53d906e14a8fe2be4acf",
+   "planned": [
+    0,
+    13632
+   ],
+   "method": 7780,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     7,
+     6,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "chain_m0.pte": {
+  "as given": {
+   "sha256": "16a2f3c088d96e4345a87df008480b6ff5820b0df44e0eabb72a0e8dda6a3006",
+   "planned": [
+    0,
+    2464
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "allow_input_overwrite": {
+   "sha256": "16a2f3c088d96e4345a87df008480b6ff5820b0df44e0eabb72a0e8dda6a3006",
+   "planned": [
+    0,
+    2464
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M0": {
+   "sha256": "16a2f3c088d96e4345a87df008480b6ff5820b0df44e0eabb72a0e8dda6a3006",
+   "planned": [
+    0,
+    2464
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M0 allow_input_overwrite": {
+   "sha256": "16a2f3c088d96e4345a87df008480b6ff5820b0df44e0eabb72a0e8dda6a3006",
+   "planned": [
+    0,
+    2464
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved as given": {
+   "sha256": "34a34fddb1306b5e76ab7b5f53aac8b62d0a4c23cb30c4740799623824a243d6",
+   "planned": [
+    0,
+    3232
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     false
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved allow_input_overwrite": {
+   "sha256": "16a2f3c088d96e4345a87df008480b6ff5820b0df44e0eabb72a0e8dda6a3006",
+   "planned": [
+    0,
+    2464
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M0": {
+   "sha256": "34a34fddb1306b5e76ab7b5f53aac8b62d0a4c23cb30c4740799623824a243d6",
+   "planned": [
+    0,
+    3232
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     false
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved cpu=M0 allow_input_overwrite": {
+   "sha256": "16a2f3c088d96e4345a87df008480b6ff5820b0df44e0eabb72a0e8dda6a3006",
+   "planned": [
+    0,
+    2464
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "chain_m55.pte": {
+  "as given": {
+   "sha256": "199870e93aac265879406458aebd6bf7494ace91d976c732e833645c90e3d6f6",
+   "planned": [
+    0,
+    13936
+   ],
+   "method": 2456,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     3,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "allow_input_overwrite": {
+   "sha256": "199870e93aac265879406458aebd6bf7494ace91d976c732e833645c90e3d6f6",
+   "planned": [
+    0,
+    13936
+   ],
+   "method": 2456,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     3,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M55": {
+   "sha256": "199870e93aac265879406458aebd6bf7494ace91d976c732e833645c90e3d6f6",
+   "planned": [
+    0,
+    13936
+   ],
+   "method": 2456,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     3,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "cpu=M55 allow_input_overwrite": {
+   "sha256": "199870e93aac265879406458aebd6bf7494ace91d976c732e833645c90e3d6f6",
+   "planned": [
+    0,
+    13936
+   ],
+   "method": 2456,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     3,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved as given": {
+   "sha256": "d4e5a928c40312af7db5db0702501f808b32cffdebfc197bd9c8bddc628114a3",
+   "planned": [
+    0,
+    14704
+   ],
+   "method": 2456,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     3,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved allow_input_overwrite": {
+   "sha256": "199870e93aac265879406458aebd6bf7494ace91d976c732e833645c90e3d6f6",
+   "planned": [
+    0,
+    13936
+   ],
+   "method": 2456,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     3,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M55": {
+   "sha256": "d4e5a928c40312af7db5db0702501f808b32cffdebfc197bd9c8bddc628114a3",
+   "planned": [
+    0,
+    14704
+   ],
+   "method": 2456,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     3,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved cpu=M55 allow_input_overwrite": {
+   "sha256": "199870e93aac265879406458aebd6bf7494ace91d976c732e833645c90e3d6f6",
+   "planned": [
+    0,
+    13936
+   ],
+   "method": 2456,
+   "temp": 448,
+   "regions": [
+    [
+     2,
+     3,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "chain_m7.pte": {
+  "as given": null,
+  "allow_input_overwrite": null,
+  "cpu=M7": null,
+  "cpu=M7 allow_input_overwrite": null,
+  "input moved as given": {
+   "sha256": "53981d5c2dfb94eb245d2af7e5fcbbe2bf5765cb36715e733930120cacb36c1c",
+   "planned": [
+    0,
+    3616
+   ],
+   "method": 2380,
+   "temp": 448,
+   "regions": [
+    [
+     1,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved allow_input_overwrite": {
+   "sha256": "a69c7813cbe34c5251adc0aeb50f2aa6bf1dbce61e1487f90c75e3e80937028b",
+   "planned": [
+    0,
+    2848
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M7": {
+   "sha256": "53981d5c2dfb94eb245d2af7e5fcbbe2bf5765cb36715e733930120cacb36c1c",
+   "planned": [
+    0,
+    3616
+   ],
+   "method": 2380,
+   "temp": 448,
+   "regions": [
+    [
+     1,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": false
+  },
+  "input moved cpu=M7 allow_input_overwrite": {
+   "sha256": "a69c7813cbe34c5251adc0aeb50f2aa6bf1dbce61e1487f90c75e3e80937028b",
+   "planned": [
+    0,
+    2848
+   ],
+   "method": 2516,
+   "temp": 448,
+   "regions": [
+    [
+     0,
+     1,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "ops_m7.pte": {
+  "as given": null,
+  "allow_input_overwrite": null,
+  "cpu=M7": null,
+  "cpu=M7 allow_input_overwrite": null,
+  "input moved as given": null,
+  "input moved allow_input_overwrite": null,
+  "input moved cpu=M7": null,
+  "input moved cpu=M7 allow_input_overwrite": null
+ },
+ "resblock_align64_m7.pte": {
+  "as given": null,
+  "allow_input_overwrite": null,
+  "cpu=M7": null,
+  "cpu=M7 allow_input_overwrite": null,
+  "input moved as given": null,
+  "input moved allow_input_overwrite": {
+   "sha256": "58b822f3d369869fe50c79696ff4b61cf8ef38d069b8108b9b04b2d5db19310e",
+   "planned": [
+    0,
+    3264
+   ],
+   "method": 2888,
+   "temp": 420,
+   "regions": [
+    [
+     2,
+     2,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M7": null,
+  "input moved cpu=M7 allow_input_overwrite": {
+   "sha256": "58b822f3d369869fe50c79696ff4b61cf8ef38d069b8108b9b04b2d5db19310e",
+   "planned": [
+    0,
+    3264
+   ],
+   "method": 2888,
+   "temp": 420,
+   "regions": [
+    [
+     2,
+     2,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "resblock_m0.pte": {
+  "as given": null,
+  "allow_input_overwrite": null,
+  "cpu=M0": null,
+  "cpu=M0 allow_input_overwrite": null,
+  "input moved as given": null,
+  "input moved allow_input_overwrite": {
+   "sha256": "4fcdd5be02d5c0f29e1695c4f66d3671d3344fb0eeff40a813d39bb2f456a275",
+   "planned": [
+    0,
+    3264
+   ],
+   "method": 2888,
+   "temp": 420,
+   "regions": [
+    [
+     2,
+     2,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M0": null,
+  "input moved cpu=M0 allow_input_overwrite": {
+   "sha256": "4fcdd5be02d5c0f29e1695c4f66d3671d3344fb0eeff40a813d39bb2f456a275",
+   "planned": [
+    0,
+    3264
+   ],
+   "method": 2888,
+   "temp": 420,
+   "regions": [
+    [
+     2,
+     2,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "resblock_m55.pte": {
+  "as given": null,
+  "allow_input_overwrite": null,
+  "cpu=M55": null,
+  "cpu=M55 allow_input_overwrite": null,
+  "input moved as given": null,
+  "input moved allow_input_overwrite": {
+   "sha256": "c58a7da4afb76607adae7773249b49c8584e4004e52e8a0508467a2260588eab",
+   "planned": [
+    0,
+    3264
+   ],
+   "method": 2896,
+   "temp": 420,
+   "regions": [
+    [
+     2,
+     2,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M55": null,
+  "input moved cpu=M55 allow_input_overwrite": {
+   "sha256": "c58a7da4afb76607adae7773249b49c8584e4004e52e8a0508467a2260588eab",
+   "planned": [
+    0,
+    3264
+   ],
+   "method": 2896,
+   "temp": 420,
+   "regions": [
+    [
+     2,
+     2,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ },
+ "resblock_m7.pte": {
+  "as given": null,
+  "allow_input_overwrite": null,
+  "cpu=M7": null,
+  "cpu=M7 allow_input_overwrite": null,
+  "input moved as given": null,
+  "input moved allow_input_overwrite": {
+   "sha256": "5460581cb203f5f5293aae92942508bbb49895ec05d98e0a16095d5bcc71e45d",
+   "planned": [
+    0,
+    3264
+   ],
+   "method": 2888,
+   "temp": 420,
+   "regions": [
+    [
+     2,
+     2,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  },
+  "input moved cpu=M7": null,
+  "input moved cpu=M7 allow_input_overwrite": {
+   "sha256": "5460581cb203f5f5293aae92942508bbb49895ec05d98e0a16095d5bcc71e45d",
+   "planned": [
+    0,
+    3264
+   ],
+   "method": 2888,
+   "temp": 420,
+   "regions": [
+    [
+     2,
+     2,
+     2,
+     true
+    ]
+   ],
+   "input_overwritten": true
+  }
+ }
+}

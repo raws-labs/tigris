@@ -12,6 +12,13 @@ from click.testing import CliRunner
 from tigris.cli import cli
 from tigris.frontends import pt2
 from tigris.inspection import inspect_file
+from tigris.utils import fmt_bytes
+
+
+def _row(output: str, label: str) -> str:
+    """The output line that starts with `label`, its column gaps closed."""
+    return next(" ".join(line.split()) for line in output.splitlines()
+                if line.strip().startswith(label))
 
 
 def _require(module: str):
@@ -127,7 +134,9 @@ def test_analyze_reports_executorchs_arena(quantized_program):
     assert arena["arena_bytes"] >= 8 * 16 * 16
     assert arena["arena_bytes"] == pt2.executorch_arena(program)[0]
     text = CliRunner().invoke(cli, ["analyze", str(program), "-m", "64K"]).output
-    assert "its Cortex-M7 lowering, CMSIS-NN scratch included" in text
+    assert _row(text, "ExecuTorch model memory") == (
+        f"ExecuTorch model memory {fmt_bytes(arena['arena_bytes'])} planned buffer of its "
+        f"Cortex-M7 lowering: activations and CMSIS-NN scratch")
 
 
 def test_without_executorch_the_arena_is_not_measured(float_program, monkeypatch):
@@ -136,8 +145,8 @@ def test_without_executorch_the_arena_is_not_measured(float_program, monkeypatch
     assert pt2.executorch_arena(float_program) == (None, "executorch is not installed")
     result = CliRunner().invoke(cli, ["analyze", str(float_program), "-m", "64K"])
     assert result.exit_code == 0, result.output
-    assert "ExecuTorch arena" in result.output
-    assert "not measured: executorch is not installed" in result.output
+    assert _row(result.output, "ExecuTorch model memory") == (
+        "ExecuTorch model memory not measured: executorch is not installed")
 
 
 def test_inspect_and_run_know_a_program(float_program, tmp_path):
@@ -147,4 +156,6 @@ def test_inspect_and_run_know_a_program(float_program, tmp_path):
     out = CliRunner().invoke(cli, ["run", str(float_program), "--input", str(tmp_path / "x.npy"),
                                    "--output", str(tmp_path / "y.npy")])
     assert out.exit_code != 0
-    assert "not a plan: compile net.pt2 with tigris compile first" in out.output
+    assert out.output.splitlines() == [
+        "Error: net.pt2 is an exported PyTorch program; compile it with tigris compile and run "
+        "the plan"]

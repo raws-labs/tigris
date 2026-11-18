@@ -7,14 +7,15 @@ required. Install development dependencies with `pip install -e . --group dev`
 `pytest`; also run `ruff check src tests scripts setup.py` before submitting
 changes.
 
-The tests for exported PyTorch programs need the `pytorch` group, which pins
+The tests for exported PyTorch programs, and the ExecuTorch program tests that
+compare against `torch` and `executorch`, need the `pytorch` group, which pins
 PyTorch's CPU build. That build is published on PyTorch's own index, so install
 it from there first, then the group:
 
 ```bash
 pip install --no-deps --index-url https://download.pytorch.org/whl/cpu torch==2.15.0+cpu
 pip install -e . --group dev --group pytorch
-TIGRIS_REQUIRE_PYTORCH=1 pytest tests/test_frontend_pt2.py
+TIGRIS_REQUIRE_PYTORCH=1 pytest tests/test_frontend_pt2.py tests/test_pte_format.py tests/test_pte_model.py
 ```
 
 Without the group these tests skip; `TIGRIS_REQUIRE_PYTORCH=1` makes them fail
@@ -39,9 +40,11 @@ TIGRIS_WHEEL_VARIANT=native python -m build --wheel
 
 An existing archive can be staged with `--archive ARCHIVE --sha256 SHA256`.
 The staging command checks archive and library hashes, ABI, and platform.
-Editable installations can use the staged library too. Execution never downloads
-native code. `run` requires the bundled library; inspection, compilation,
-analysis, code generation, and zoo downloads also work in the pure wheel.
+Editable installations can use the staged library too. Running a plan never
+downloads native code and requires the bundled library; running an ExecuTorch
+program builds its host runner from the user's ExecuTorch checkout, which
+fetches CMSIS-NN. Inspection, compilation, analysis, code generation, export
+and zoo downloads also work in the pure wheel.
 
 CI builds runtime source from the same branch when available, otherwise from
 `develop`. Tag builds test against the matching runtime tag. Pull requests build

@@ -141,7 +141,7 @@ def _run(data: bytes, input_files: tuple[str, ...], traced: bool):
         with Session(path) as session:
             if input_files:
                 from tigris.cli.run import read_inputs
-                inputs = read_inputs(session, input_files)
+                inputs = read_inputs(session.inputs, input_files)
                 described = "given input"
             else:
                 inputs = {info["name"]: np.zeros(info["shape"], dtype=info["dtype"])
