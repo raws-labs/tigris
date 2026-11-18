@@ -57,7 +57,7 @@ jobs:
       - uses: ./.github/actions/runtime
         with:
           build-host: 'true'
-      - run: python -m pytest -q tests/test_frontend_pt2.py
+      - run: python -m pytest -q tests/test_frontend_pt2.py tests/test_pte_format.py tests/test_pte_model.py
         env:
           TIGRIS_REQUIRE_PYTORCH: "1"
 

@@ -6,6 +6,8 @@ Every offset is bounds-checked, so a truncated or hostile file raises
 ValueError instead of reading past the buffer.
 """
 
+import math
+import re
 import struct
 
 
@@ -88,6 +90,12 @@ class Table:
         length = struct.unpack_from("<I", self.data, start)[0]
         return start + 4, length
 
+    def vector_start(self, slot: int) -> int | None:
+        """Absolute offset of the first element of vector field `slot`, or None
+        when the field is absent."""
+        vector = self._vector(slot)
+        return None if vector is None else vector[0]
+
     def tables(self, slot: int) -> list["Table"]:
         vector = self._vector(slot)
         if vector is None:
@@ -116,11 +124,25 @@ class Table:
     def string(self, slot: int) -> str:
         return self.bytes(slot).decode("utf-8", errors="replace")
 
+    def text(self, slot: int) -> str:
+        """A string field held to the format: UTF-8 followed by a zero byte."""
+        vector = self._vector(slot)
+        if vector is None:
+            return ""
+        start, length = vector
+        self._check(start, length + 1)
+        if self.data[start + length]:
+            raise ValueError(f"the string at byte {start} is not terminated")
+        try:
+            return self.data[start:start + length].decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(f"the string at byte {start} is not UTF-8") from None
 
-# FlexBuffers value types read by flexbuffer_map.
+
+# FlexBuffers value types the readers below know.
 _FLEX_NULL, _FLEX_INT, _FLEX_UINT, _FLEX_FLOAT = 0, 1, 2, 3
 _FLEX_INDIRECT = {6: _FLEX_INT, 7: _FLEX_UINT, 8: _FLEX_FLOAT}
-_FLEX_MAP, _FLEX_BOOL = 9, 26
+_FLEX_STRING, _FLEX_MAP, _FLEX_VECTOR, _FLEX_BOOL = 5, 9, 10, 26
 
 
 def _flex_read(data: bytes, position: int, width: int, kind: int):
@@ -138,10 +160,9 @@ def _flex_target(data: bytes, position: int, width: int) -> int:
     return position - _flex_read(data, position, width, _FLEX_UINT)
 
 
-def flexbuffer_map(data: bytes) -> dict:
-    """The scalar entries of a FlexBuffer whose root is a map, as TFLite stores
-    custom operator options: int, unsigned, float and bool values by key, None
-    for a null or a value of another type."""
+def _flex_map(data: bytes) -> tuple[int, int, int]:
+    """Where the values of a FlexBuffer whose root is a map start, how many
+    there are and the byte width of each."""
     if len(data) < 3:
         raise ValueError("buffer too short for a FlexBuffer")
     root_width, packed = data[-1], data[-2]
@@ -151,18 +172,33 @@ def flexbuffer_map(data: bytes) -> dict:
     width = 1 << (packed & 3)
     values = _flex_target(data, root, root_width)
     length = _flex_read(data, values - width, width, _FLEX_UINT)
-    keys = _flex_target(data, values - 3 * width, width)
-    key_width = _flex_read(data, values - 2 * width, width, _FLEX_UINT)
     if values + length * (width + 1) > len(data):
         raise ValueError("FlexBuffer map runs past the buffer")
-    entries = {}
+    return values, length, width
+
+
+def _flex_entries(data: bytes):
+    """Each key of a FlexBuffer root map with its value's type byte, position
+    and the map's byte width, in key order."""
+    values, length, width = _flex_map(data)
+    keys = _flex_target(data, values - 3 * width, width)
+    key_width = _flex_read(data, values - 2 * width, width, _FLEX_UINT)
     for i in range(length):
         start = _flex_target(data, keys + i * key_width, key_width)
         end = data.find(b"\0", start) if 0 <= start < len(data) else -1
         if end < 0:
             raise ValueError("FlexBuffer key runs past the buffer")
-        element = data[values + length * width + i]
-        kind, position, element_width = element >> 2, values + i * width, width
+        yield (data[start:end].decode("utf-8", errors="replace"), data[values + length * width + i],
+               values + i * width, width)
+
+
+def flexbuffer_map(data: bytes) -> dict:
+    """The scalar entries of a FlexBuffer whose root is a map, as TFLite stores
+    custom operator options: int, unsigned, float and bool values by key, None
+    for a null or a value of another type."""
+    entries = {}
+    for key, element, position, width in _flex_entries(data):
+        kind, element_width = element >> 2, width
         if kind in _FLEX_INDIRECT:
             position = _flex_target(data, position, width)
             kind, element_width = _FLEX_INDIRECT[kind], 1 << (element & 3)
@@ -172,5 +208,52 @@ def flexbuffer_map(data: bytes) -> dict:
             value = bool(_flex_read(data, position, element_width, _FLEX_UINT))
         else:
             value = None
-        entries[data[start:end].decode("utf-8", errors="replace")] = value
+        entries[key] = value
     return entries
+
+
+def flexbuffer_slots(data: bytes, count: int) -> list[int]:
+    """The first `count` value slots of a FlexBuffer whose root is a map, in
+    key order, each read as a signed integer of the map's width and cut to
+    32 bits, as TFLite Micro's FlexbufferWrapper reads options by position."""
+    values, _, width = _flex_map(data)
+    return [_int32(_flex_read(data, values + i * width, width, _FLEX_INT)) for i in range(count)]
+
+
+def flexbuffer_int(data: bytes, key: str) -> int:
+    """The value of `key` in a FlexBuffer root map as flexbuffers' AsInt32
+    converts it: numbers and bools as stored (floats truncated), a string
+    parsed as a decimal integer, an untyped vector as its length, anything
+    else and a missing key as 0."""
+    for name, element, position, width in _flex_entries(data):
+        if name != key:
+            continue
+        kind, element_width = element >> 2, width
+        if kind in _FLEX_INDIRECT:
+            position = _flex_target(data, position, width)
+            kind, element_width = _FLEX_INDIRECT[kind], 1 << (element & 3)
+        if kind in (_FLEX_INT, _FLEX_UINT, _FLEX_BOOL):
+            return _int32(_flex_read(data, position, element_width,
+                                     _FLEX_UINT if kind == _FLEX_UINT else _FLEX_INT))
+        if kind == _FLEX_FLOAT:
+            value = _flex_read(data, position, element_width, _FLEX_FLOAT)
+            # x86-64 converts a NaN or out-of-range double to INT64_MIN, whose low 32 bits are 0.
+            return _int32(int(value)) if math.isfinite(value) and abs(value) < 2 ** 63 else 0
+        if kind == _FLEX_STRING:
+            start = _flex_target(data, position, width)
+            size = _flex_read(data, start - (1 << (element & 3)), 1 << (element & 3), _FLEX_UINT)
+            text = data[start:start + size].split(b"\0", 1)[0].decode("latin-1")
+            if re.fullmatch(r"[ \t\n\v\f\r]*[+-]?[0-9]+", text) is None:
+                return 0
+            value = int(text)
+            return _int32(value) if -2 ** 63 <= value < 2 ** 63 else 0
+        if kind == _FLEX_VECTOR:
+            start = _flex_target(data, position, width)
+            vector_width = 1 << (element & 3)
+            return _int32(_flex_read(data, start - vector_width, vector_width, _FLEX_UINT))
+        return 0
+    return 0
+
+
+def _int32(value: int) -> int:
+    return (value + 2 ** 31) % 2 ** 32 - 2 ** 31

@@ -27,9 +27,15 @@ from tigris.frontends.tflm import (
     TFLM_TARGETS,
     TflmTarget,
     tflm_arena,
+    tflm_bound,
     tflm_lifetimes,
     tflm_persistent,
+    tflm_planning,
+    tflm_preparing,
+    tflm_scratch_requests,
+    tflm_temps,
     tflm_tensor_bytes,
+    tflm_written_shape,
 )
 
 # CONCATENATION takes at most this many inputs in TFLite Micro.
@@ -38,6 +44,9 @@ MAX_BANDS = 10
 MAX_REGION = 12
 # The TFLM_TARGETS entry export plans for unless told otherwise.
 DEFAULT_TARGET = "arm-none-eabi"
+# The tflite-micro package's interpreter: a 64-bit build with compression whose
+# allocator records its allocations.
+HOST_TARGET = TFLM_TARGETS["lp64"]
 
 _INT8, _INT32 = TENSOR_TYPES.index("INT8"), TENSOR_TYPES.index("INT32")
 _CODES = {name: code for code, name in enumerate(BUILTIN_OPERATORS)}
@@ -51,6 +60,10 @@ _BINARY = ("ADD", "SUB", "MUL", "MAXIMUM", "MINIMUM")
 # Kernels whose scratch tflm_arena does not place; int4 weights fail earlier as an unknown type.
 _UNMODELED_SCRATCH = ("CUSTOM", "MIRROR_PAD", "UNIDIRECTIONAL_SEQUENCE_LSTM", "SVDF",
                        "TRANSPOSE_CONV", "ADD_N")
+# TensorType names past the schema module's, by code.
+_HOST_TYPES = {19: "INT2", 20: "UINT4", 21: "FLOAT8_E4M3FN", 22: "FLOAT8_E5M2"}
+# Subgraph index fields of the operators TFLite Micro plans other subgraphs through.
+_HOST_CALLS = {"IF": 2, "WHILE": 2, "CALL_ONCE": 1}
 # Metadata that holds no tensor index, so it stays valid when tensors are renumbered.
 _METADATA = (b"min_runtime_version", b"CONVERSION_METADATA")
 
@@ -548,10 +561,12 @@ def tflm_tensor_arena(data: bytes) -> int | None:
 
 
 def persistent(model: tw.Model, target: TflmTarget, compression: bool = False,
-               recording: bool = False, referenced: bool = False) -> int | None:
+               recording: bool = False, referenced: bool = False,
+               prepared: bool = False) -> int | None:
     """TFLite Micro's persistent bytes for a single-subgraph model, as
-    tflm_persistent models them; None when it does not model the model. With
-    `referenced`, as the model is once the tensors nothing references are pruned."""
+    tflm_persistent models them, with `prepared` once every kernel prepared;
+    None when it does not model the model. With `referenced`, as the model is
+    once the tensors nothing references are pruned."""
     sg = model.subgraphs[0]
     keep = _kept(model) if referenced else range(len(sg.tensors))
     number = {old: new for new, old in enumerate(keep)}
@@ -574,7 +589,7 @@ def persistent(model: tw.Model, target: TflmTarget, compression: bool = False,
                    "adj_y": bool(_option(op, 1, "b", 0))} if kind == "BATCH_MATMUL" else {}
         operators.append((kind, renumber(op.inputs), renumber(op.outputs), options))
     return tflm_persistent(tensors, operators, renumber(sg.inputs), renumber(sg.outputs), target,
-                           compression, recording)
+                           compression, recording, prepared)
 
 
 def _live(model: tw.Model) -> list[int]:
@@ -625,10 +640,11 @@ def _regions(model: tw.Model, nodes: list):
                 yield a, b
 
 
-def _check_operands(model: tw.Model) -> None:
+def _check_operands(model: tw.Model, sg: tw.Subgraph | None = None) -> None:
     """Raise ValueError for an operator code or a tensor index of an operator
-    or the graph boundary outside its table; the arena model reads them."""
-    sg = model.subgraphs[0]
+    or the graph boundary of `sg`, the first subgraph unless given, outside
+    its table; the arena model reads them."""
+    sg = model.subgraphs[0] if sg is None else sg
     _check_indices("model inputs", "tensor", sg.inputs, len(sg.tensors))
     _check_indices("model outputs", "tensor", sg.outputs, len(sg.tensors))
     for k, op in enumerate(sg.operators):
@@ -637,6 +653,138 @@ def _check_operands(model: tw.Model) -> None:
         _check_indices(f"operator {k}", "tensor", (*op.inputs, *(op.intermediates or ())),
                        len(sg.tensors), -1)
         _check_indices(f"operator {k}", "tensor", op.outputs, len(sg.tensors))
+
+
+def _modeled_arena(model: tw.Model) -> int:
+    """The arena head `arena` plans for a single-subgraph model that
+    `_check_operands` accepts; raises ValueError when the arena model leaves
+    out a tensor type, a kernel's scratch buffers or its persistent
+    allocations."""
+    head = arena(model)
+    if head is None:
+        raise ValueError("a tensor type TFLite Micro's arena model does not know")
+    kinds = [_kind(model, op) for op in model.subgraphs[0].operators]
+    for kind in kinds:
+        if kind in _UNMODELED_SCRATCH:
+            raise ValueError(f"TFLite Micro's scratch buffers for {kind} are not modeled")
+    for kind in kinds:
+        if kind not in TFLM_KERNELS:
+            raise ValueError(f"TFLite Micro's persistent allocations for {kind} are not modeled")
+    return head
+
+
+def _host_kind(model: tw.Model, index: int) -> str:
+    """The name TFLite Micro looks operator code `index` up by: the builtin's,
+    or a custom operator's custom code."""
+    code = model.operator_codes[index]
+    builtin = max(code.builtin_code, code.deprecated_builtin_code)
+    kind = BUILTIN_OPERATORS[builtin] if 0 <= builtin < len(BUILTIN_OPERATORS) else "UNKNOWN"
+    return (code.custom_code or b"").decode(errors="replace") if kind == "CUSTOM" else kind
+
+
+def _host_options(op: tw.Operator, kind: str) -> dict:
+    """The options of `op` that tflm_written_shape, BATCH_MATMUL's persistent
+    allocations, the custom kernels and tflm_bound's subgraph walk read."""
+    if kind in _HOST_CALLS:
+        return {"subgraphs": [_option(op, slot, "i", 0) for slot in range(_HOST_CALLS[kind])]}
+    if kind == "BATCH_MATMUL":
+        return {"adj_x": bool(_option(op, 0, "b", 0)), "adj_y": bool(_option(op, 1, "b", 0))}
+    if kind == "GATHER":
+        return {"axis": _option(op, 0, "i", 0), "batch_dims": _option(op, 1, "i", 0)}
+    if kind in ("DEPTH_TO_SPACE", "SPACE_TO_DEPTH"):
+        return {"block_size": _option(op, 0, "i", 0)}
+    if kind == "L2_POOL_2D":
+        return {name: _option(op, slot, fmt, 0) for slot, (name, fmt) in enumerate(
+            (("padding", "b"), ("stride_w", "i"), ("stride_h", "i"), ("filter_w", "i"),
+             ("filter_h", "i")))}
+    return {"custom": op.custom_options}
+
+
+def _host_tensors(model: tw.Model, sg: tw.Subgraph) -> list:
+    """Each tensor of `sg` as tflm_bound takes it: (storage type, shape,
+    variable, scale count, zero point count, constant)."""
+    tensors = []
+    for t in sg.tensors:
+        q = t.quantization
+        tensors.append((TENSOR_TYPES[t.type] if 0 <= t.type < len(TENSOR_TYPES)
+                        else _HOST_TYPES.get(t.type), t.shape or [], t.is_variable,
+                        len(q.scale or ()) if q else 0, len(q.zero_point or ()) if q else 0,
+                        _is_constant(model, t)))
+    return tensors
+
+
+def _host_metadata(model: tw.Model) -> tuple[list | None, bool]:
+    """The offline planned offset of every tensor of every subgraph, as the
+    OfflineMemoryAllocation metadata holds them, or None; and whether the
+    model has compressed tensors."""
+    names = {name: buffer for name, buffer in model.metadata or ()}
+    offline = None
+    data = model.buffers[names[b"OfflineMemoryAllocation"]] if b"OfflineMemoryAllocation" in (
+        names) and names[b"OfflineMemoryAllocation"] < len(model.buffers) else None
+    if data and len(data) >= 12:
+        count = int.from_bytes(data[8:12], "little")
+        total = sum(len(sg.tensors) for sg in model.subgraphs)
+        if count == total and len(data) >= 12 + 4 * count:
+            offline = list(np.frombuffer(data, "<i4", count, 12))
+    return offline, b"COMPRESSION_METADATA" in names
+
+
+def _host_exact(model: tw.Model) -> int | None:
+    """host_arena's figure where the arena model covers the model, else None."""
+    if len(model.subgraphs) != 1 or _host_metadata(model) != (None, False):
+        return None
+    head = arena(model)
+    sg = model.subgraphs[0]
+    kinds = [_kind(model, op) for op in sg.operators]
+    if head is None or any(kind in _UNMODELED_SCRATCH or kind not in TFLM_KERNELS
+                           for kind in kinds):
+        return None
+    tensors = _host_tensors(model, sg)
+    # Shapes as the kernels that rewrite their output's dims leave them: the
+    # arena model takes the written shape, and resolves only a RESHAPE's -1.
+    shapes = [list(t[1]) for t in tensors]
+    for kind, op in zip(kinds, sg.operators):
+        written = tflm_written_shape(kind, shapes, op.inputs, op.outputs, _host_options(op, kind))
+        if written is not None:
+            if kind != "RESHAPE" and written != shapes[op.outputs[0]]:
+                return None
+            shapes[op.outputs[0]] = written
+    if any(d < 0 for shape in shapes for d in shape):
+        return None
+    temps = max((tflm_temps(kind, tensors, op.inputs, op.outputs, HOST_TARGET)
+                 for kind, op in zip(kinds, sg.operators)), default=0)
+    scratch = tflm_scratch_requests(_tensors(model), [(kind, op.inputs, op.outputs)
+                                                      for kind, op in zip(kinds, sg.operators)])
+    tail = functools.partial(persistent, model, HOST_TARGET, compression=True, recording=True)
+    return max(tail() + head + tflm_planning(len(sg.tensors), scratch, HOST_TARGET),
+               tail(prepared=True) + tflm_preparing(temps, scratch, HOST_TARGET))
+
+
+def host_arena(data: bytes) -> int:
+    """The arena the tflite-micro package's interpreter runs the model in
+    `data` in. Where the arena model covers the model: the head `arena` plans,
+    the tail `persistent` models for that build and `tflm_planning`'s bound
+    of what planning takes on top of the head, or where it is larger the
+    tail as it stands while the kernels prepare and `tflm_preparing`'s bound
+    of what one of them takes past it. Elsewhere `tflm_bound`'s upper bound
+    over every subgraph. Raises ValueError for a file `tw.read` refuses, a
+    model without subgraphs, an index outside its table, custom options a
+    kernel would read past, or scratch buffers TFLite Micro leaves unplanned."""
+    model = tw.read(data)
+    if not model.subgraphs:
+        raise ValueError("the model has no subgraphs")
+    for sg in model.subgraphs:
+        _check_operands(model, sg)
+    exact = _host_exact(model)
+    if exact is not None:
+        return exact
+    offline, compressed = _host_metadata(model)
+    subgraphs = [(_host_tensors(model, sg),
+                  [(kind, op.inputs, op.outputs, _host_options(op, kind)) for op, kind in (
+                      (op, _host_kind(model, op.opcode)) for op in sg.operators)],
+                  sg.inputs, sg.outputs) for sg in model.subgraphs]
+    return tflm_bound(subgraphs, HOST_TARGET, compression=True, recording=True, offline=offline,
+                      compressed=compressed)
 
 
 def _check_references(model: tw.Model) -> None:
@@ -669,17 +817,7 @@ def export(data: bytes, target: str = DEFAULT_TARGET) -> Export:
             if name not in _METADATA:
                 raise ValueError(f"metadata {name.decode(errors='replace')} is not supported")
         _check_operands(model)
-        before = arena(model)
-        if before is None:
-            raise ValueError("a tensor type TFLite Micro's arena model does not know")
-        kinds = [_kind(model, op) for op in model.subgraphs[0].operators]
-        for kind in kinds:
-            if kind in _UNMODELED_SCRATCH:
-                raise ValueError(f"TFLite Micro's scratch buffers for {kind} are not modeled")
-        for kind in kinds:
-            if kind not in TFLM_KERNELS:
-                raise ValueError(f"TFLite Micro's persistent allocations for {kind} are not "
-                                 "modeled")
+        before = _modeled_arena(model)
         _check_references(model)
     except ValueError as exc:
         return Export(None, reason=str(exc), target=target)
@@ -717,7 +855,7 @@ def export(data: bytes, target: str = DEFAULT_TARGET) -> Export:
                                       (origin[a], origin[b]), bands, folded, rewrite.macs))
     result = Export(before, operators_before=operators, macs=total_macs, target=target)
     if best is None or best[0] + best[1] >= before:
-        result.reason = "no rewrite lowers the arena"
+        result.reason = "no smaller arena found"
         return result
     head, growth, candidate, region, bands, folded, macs = best
     candidate = _prune(candidate)

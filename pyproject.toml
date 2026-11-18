@@ -47,7 +47,8 @@ dev = [
 pytorch = [
     "torch==2.15.0+cpu; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
     "onnxscript==0.7.2; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "executorch==1.5.1; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "executorch==1.6.0; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchao==0.18.0; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
     "tosa-tools==2026.5.0; python_version >= '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
@@ -65,7 +66,7 @@ where = ["src"]
 exclude = ["tigris.native"]
 
 [tool.setuptools.package-data]
-tigris = ["schema/*.json", "native/*"]
+tigris = ["schema/*.json", "native/*", "frontends/pte_host_runner.cpp"]
 
 [tool.setuptools_scm]
 version_file = "src/tigris/_version.py"

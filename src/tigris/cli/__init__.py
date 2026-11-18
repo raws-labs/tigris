@@ -124,9 +124,10 @@ def _show_version(ctx, param, value):
 def cli():
     """TiGrIS: Tiled Graph Inference Scheduler
 
-    Fits ONNX and TFLite models into the memory of embedded devices: analyze a
-    model against a budget, compile it into a tiled execution plan, generate
-    the C code that runs it.
+    Fits ONNX, TFLite and PyTorch models into the memory of embedded devices:
+    analyze a model against a budget, compile it into a tiled execution plan,
+    generate the C code that runs it, and rewrite TFLite models and ExecuTorch
+    programs to run in less RAM.
     """
 
 

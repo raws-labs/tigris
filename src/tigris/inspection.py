@@ -10,6 +10,7 @@ import onnx
 from google.protobuf.message import DecodeError
 
 from tigris.frontends import not_a_model, pt2, tflite
+from tigris.frontends.pte_schema import is_pte
 from tigris import SCHEMA_VERSION_INTERFACE_DTYPE, SCHEMA_VERSION_TENSOR_LAYOUT
 from tigris.emitters.binary import defs
 from tigris.emitters.binary.reader import read_binary_plan
@@ -237,6 +238,66 @@ def _plan_requirements(plan: dict) -> dict:
     }
 
 
+def _program(data: bytes) -> dict:
+    """An ExecuTorch program's method forward (or its first method): its
+    instructions, the CMSIS-NN classes it was lowered for, its interface and
+    the RAM it records for Cortex-M."""
+    from tigris.frontends import pte, pte_cortex_m as cm, pte_method as pm
+    from tigris.frontends.pte_host import MethodTensor
+    from tigris.frontends.pte_schema import SCALAR_TYPES
+
+    try:
+        program = pte.read(data, layout=False)
+    except ValueError as exc:
+        raise ValueError(f"Invalid ExecuTorch program: {exc}") from exc
+    plans = program.execution_plan or []
+    plan = next((p for p in plans if p.name == "forward"), plans[0] if plans else None)
+    if plan is None:
+        raise ValueError("Invalid ExecuTorch program: it holds no method")
+    for role, indices in (("input", plan.inputs), ("output", plan.outputs)):
+        for index in indices or ():
+            if not 0 <= index < len(plan.values or []):
+                raise ValueError(f"Invalid ExecuTorch program: the method {role} is value "
+                                 f"{index}, which does not exist")
+
+    def interface(index):
+        value = plan.values[index]
+        if not isinstance(value, pte.Tensor) or value.scalar_type not in SCALAR_TYPES:
+            return {"kind": type(value).__name__.lower()}
+        sizes = tuple(value.sizes or ())
+        spec = MethodTensor(value.scalar_type, sizes, tuple(value.dim_order or range(len(sizes))))
+        return {"kind": "tensor", "dtype": spec.dtype or SCALAR_TYPES[value.scalar_type][0].lower(),
+                "shape": list(sizes), "dim_order": list(spec.dim_order)}
+
+    try:
+        classes = list(cm.infer_class(plan))
+    except ValueError:
+        classes = None
+    try:
+        method = pm.method_allocator_bytes(plan)
+    except ValueError:
+        method = None
+    operators = []
+    for chain in plan.chains or ():
+        for instruction in chain.instructions or ():
+            if isinstance(instruction, pte.KernelCall):
+                if not 0 <= instruction.op_index < len(plan.operators or []):
+                    raise ValueError(f"Invalid ExecuTorch program: a kernel call names operator "
+                                     f"{instruction.op_index}, which does not exist")
+                domain, _, name = (plan.operators[instruction.op_index].name or "").rpartition("::")
+                operators.append({"type": name, "domain": domain})
+    return {
+        "method": plan.name,
+        "instructions": sum(len(chain.instructions or ()) for chain in plan.chains or ()),
+        "cmsis_nn_classes": classes,
+        "inputs": [interface(i) for i in plan.inputs or ()],
+        "outputs": [interface(i) for i in plan.outputs or ()],
+        "memory": {"planned_buffer_bytes": sum(plan.non_const_buffer_sizes or ()),
+                   "method_allocator_bytes": method},
+        "operators": operators,
+    }
+
+
 def inspect_file(path: str | Path) -> dict:
     """Return JSON-safe metadata; never load external ONNX tensor data."""
     data = Path(path).read_bytes()
@@ -248,6 +309,9 @@ def inspect_file(path: str | Path) -> dict:
             raise ValueError(f"Invalid TiGrIS plan: {exc}") from exc
         report.update(format="tgrs", name=plan["model_name"], plan=plan)
         operators = plan["ops"]
+    elif is_pte(data):
+        report.update(format="pte", program=_program(data))
+        operators = report["program"]["operators"]
     elif tflite.is_tflite(data):
         try:
             model = tflite.describe(data)
@@ -279,7 +343,7 @@ def inspect_file(path: str | Path) -> dict:
         operators = graph["operators"]
     if report["format"] == "tgrs":
         report["requirements"] = _plan_requirements(report["plan"])
-    else:
+    elif report["format"] != "pte":
         report["costs"], report["quantization"] = _model_analysis(report)
     report["operator_counts"] = dict(sorted(Counter(
         f"{op['domain']}::{op['type']}" if op.get("domain") else op["type"]

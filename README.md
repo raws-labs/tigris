@@ -22,9 +22,12 @@ macOS x86-64 and ARM64, and Windows x86-64. The Linux wheels use
 `manylinux_2_28`; older glibc, musllinux, Windows ARM, and 32-bit ARM Linux
 install the pure Python wheel instead. A source distribution is also available.
 
-The pure wheel supports inspection, compilation, analysis, code generation, TFLite export, and zoo downloads.
-`run` reports "Bundled host runtime is unavailable" without the native
-library. Neither installation nor execution downloads a runtime separately.
+The pure wheel supports inspection, compilation, analysis, code generation,
+export of TFLite models and ExecuTorch programs, and zoo downloads. Running a
+plan uses the bundled native library; without it `run` reports "Bundled host
+runtime is unavailable". Running a TFLite model uses `tflite-micro`, and
+running an ExecuTorch program builds a host runner once from an ExecuTorch
+checkout, which fetches CMSIS-NN.
 
 On platforms without a native wheel, build the host library from the matching
 [tigris-runtime release](https://github.com/raws-labs/tigris-runtime/releases):
@@ -131,17 +134,21 @@ tigris inspect model.tgrs -v
 tigris inspect model.tgrs --json
 ```
 
-`inspect` detects the format from file contents: ONNX, TFLite, or a compiled
-plan. For a TFLite file it also states whether the model converts, and if not,
-what stops it. It reads declared ONNX inputs,
+`inspect` detects the format from file contents: ONNX, TFLite, an exported
+PyTorch program (`.pt2`), an ExecuTorch program (`.pte`), or a compiled plan.
+For a TFLite file it also states whether the model converts, and if not,
+what stops it; for an ExecuTorch program it shows the interface and the RAM
+the program records. It reads declared ONNX inputs,
 outputs, operators, and initializers, or compiled plan interfaces, stages, tiling,
 quantization, and memory records. `-v` adds details; `--json` emits complete
 metadata with an `inspection_version` field and exact byte counts, without weight
 values. Inspection is offline: it does not compile, execute, infer shapes, or load
 external ONNX tensor data. Recorded plan memory is not measured runtime peak or
 total application RAM. Plan schemas do not imply runtime version requirements.
-Inspection does not validate kernel numerics. `run` checks the portable reference
-path; neither command validates ESP-NN or CMSIS-NN numerics or on-device latency.
+Inspection does not validate kernel numerics. `run` executes portable kernels on
+the host: TiGrIS's reference kernels for a plan, TFLite Micro's reference kernels
+for a TFLite model, CMSIS-NN's portable C kernels for an ExecuTorch program.
+ESP-NN, the DSP and MVE kernel paths and on-device latency run on the target.
 
 ## Run a compiled model
 

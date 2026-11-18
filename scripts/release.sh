@@ -79,7 +79,7 @@ else
     PR="$(gh pr create -R "$REPO" -B develop -H "$BRANCH" -t "$COMMIT_SUBJECT" \
         -b "Prepares the $VERSION release." | grep -oE '[0-9]+$')"
     wait_for_ci "$(git rev-parse HEAD)"
-    gh pr merge "$PR" -R "$REPO" --rebase --delete-branch
+    gh pr merge "$PR" -R "$REPO" --rebase
     SHA="$(gh pr view "$PR" -R "$REPO" --json mergeCommit --jq .mergeCommit.oid)"
 fi
 git -C "$ROOT" branch -D "$BRANCH" >/dev/null 2>&1 || true

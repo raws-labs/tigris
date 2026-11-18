@@ -238,8 +238,7 @@ def test_invalid_files_are_cli_errors(tmp_path, data, message):
 
 
 @pytest.mark.parametrize("data", [b"", b"not a model"])
-@pytest.mark.parametrize("command", [["analyze", "-m", "32K"], ["compile", "-m", "32K"],
-                                     ["run", "--input", "x.bin", "--output", "y.bin"]])
+@pytest.mark.parametrize("command", [["analyze", "-m", "32K"], ["compile", "-m", "32K"]])
 def test_a_file_that_is_no_model_is_a_cli_error(tmp_path, data, command):
     path = tmp_path / "model.onnx"
     path.write_bytes(data)
@@ -249,12 +248,23 @@ def test_a_file_that_is_no_model_is_a_cli_error(tmp_path, data, command):
         "Error: model.onnx is not an ONNX model, a TFLite model, an exported PyTorch program or a plan")
 
 
-def test_run_points_a_model_to_compile(tmp_path):
-    result = CliRunner().invoke(cli, ["run", str(TFLITE / "vww_96_int8.tflite"), "--input", "x.bin",
+@pytest.mark.parametrize("data", [b"", b"not a model"])
+def test_run_names_what_it_runs_for_a_file_that_is_no_model(tmp_path, data):
+    path = tmp_path / "model.onnx"
+    path.write_bytes(data)
+    result = CliRunner().invoke(cli, ["run", str(path), "--input", "x.bin", "--output", "y.bin"])
+    assert result.exit_code == 1
+    assert result.output.splitlines() == [
+        "Error: model.onnx is not a plan, a TFLite model or an ExecuTorch program"]
+
+
+def test_run_points_a_model_to_compile(linear_3op_path, tmp_path):
+    result = CliRunner().invoke(cli, ["run", str(linear_3op_path), "--input", "x.bin",
                                       "--output", str(tmp_path / "y.bin")])
     assert result.exit_code == 1
-    assert result.output.strip().endswith(
-        "Error: not a plan: compile vww_96_int8.tflite with tigris compile first")
+    assert result.output.splitlines() == [
+        f"Error: {linear_3op_path.name} is an ONNX model; compile it with tigris compile and run "
+        f"the plan"]
 
 
 def test_unsupported_schema(tmp_path):

@@ -88,7 +88,44 @@ _FORMATS = {"tgrs": "plan", "onnx": "ONNX", "tflite": "TFLite",
             "pt2": "PyTorch program, exported to ONNX"}
 
 
+def _render_program(program, path: Path):
+    """An ExecuTorch program: its instructions and kernels, its interface, and
+    the RAM it records for Cortex-M."""
+    from tigris.frontends import pte_cortex_m as cm
+
+    summary = ["ExecuTorch program", plural(program["instructions"], "instruction")]
+    if program["cmsis_nn_classes"]:
+        summary.append("CMSIS-NN " + cm.describe(tuple(program["cmsis_nn_classes"])))
+    text.echo(text.bold(path.name) + "   " + ", ".join(summary))
+    rows = []
+    for label, key in (("input", "inputs"), ("output", "outputs")):
+        for index, item in enumerate(program[key]):
+            if item["kind"] != "tensor":
+                rows.append([label, str(index), item["kind"]])
+                continue
+            # The shape in memory order, as a .bin input holds the elements.
+            shape, order = item["shape"], item["dim_order"]
+            if sorted(order) == list(range(len(shape))):
+                shape = [shape[d] for d in order]
+            entry = f"{_shape(shape)} {item['dtype']}"
+            if order != list(range(len(item["shape"]))):
+                entry += ", dim order " + ",".join(str(d) for d in order)
+            rows.append([label, str(index), entry])
+    for line in text.columns(rows):
+        text.echo(line)
+    memory = program["memory"]
+    rows = [["model memory", fmt_bytes(memory["planned_buffer_bytes"]),
+             text.dim("activations and CMSIS-NN scratch")]]
+    if memory["method_allocator_bytes"] is not None:
+        rows.append(["method allocator", fmt_bytes(memory["method_allocator_bytes"]),
+                     text.dim("ExecuTorch's records for the method")])
+    text.section("ExecuTorch RAM on Cortex-M, from the program", rows, "<>")
+
+
 def _render(report, verbose, path: Path):
+    if report["format"] == "pte":
+        _render_program(report["program"], path)
+        return
     is_plan = report["format"] == "tgrs"
     is_tflite = report["format"] == "tflite"
     counts = report["operator_counts"]

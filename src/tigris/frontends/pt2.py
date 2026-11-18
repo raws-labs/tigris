@@ -90,7 +90,7 @@ def executorch_arena(path: str | Path) -> tuple[int | None, str | None]:
     try:
         with _quiet():
             edge = to_edge(program, compile_config=cortex_m_edge_compile_config())
-            # As ExecuTorch's Arm AOT compiler replaces the method with its lowering.
+            # The method is replaced by its Cortex-M lowering.
             edge._edge_programs["forward"] = CortexMPassManager(
                 edge.exported_program(),
                 target_config=CortexMTargetConfig(cpu=CortexM.M7)).transform()
