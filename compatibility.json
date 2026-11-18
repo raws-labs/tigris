@@ -32,6 +32,29 @@
     {
       "status": "supported",
       "compiler": {
+        "tag": "v0.15.0",
+        "commit": "df380fdc56e54cdac44416523e89e55f8eb945b8",
+        "emits_schema": 12
+      },
+      "runtime": {
+        "tag": "v0.15.0",
+        "commit": "65c4d6290a1959c7f956e0b492a8997dd20fda06",
+        "accepts_schemas": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ]
+      }
+    },
+    {
+      "status": "supported",
+      "compiler": {
         "tag": "v0.14.1",
         "commit": "dcc68c6515a3b06a597cff97dc138ba648f9c6dc",
         "emits_schema": 12
