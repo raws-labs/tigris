@@ -172,6 +172,17 @@ def smallest_row(smallest: dict, flash: int) -> list[str] | None:
     return ["smallest budget", fmt_bytes(smallest["budget_bytes"]), text.dim("; ".join(pool + failed))]
 
 
+def ram_total_row(fast: int, slow: int, unscheduled: int) -> list[str]:
+    """The fast plus slow row: the RAM one SRAM holding both arenas needs,
+    flagged when it is not below the unscheduled peak."""
+    total = fast + slow
+    if total < unscheduled:
+        return ["fast + slow", fmt_bytes(total), text.dim("RAM when one SRAM holds both arenas")]
+    return ["fast + slow", text.warn(fmt_bytes(total)),
+            text.dim(f"{fmt_bytes(total - unscheduled)} above unscheduled: "
+                     "on one SRAM this plan saves no RAM")]
+
+
 def _refusal(ag, gate, measured: bytes = b"") -> str | None:
     """The step that stops compile writing a plan for the planned graph `ag`
     with the gate `gate`, as NoPlan names it; None when compile writes one.
@@ -291,12 +302,16 @@ def summary(model: str, ag, findings, budget: int, tflm_arena: int | None,
     if f.largest_tensor_bytes:
         memory.append(["largest tensor", fmt_bytes(f.largest_tensor_bytes),
                        text.dim(f.largest_tensor_shape)])
-    if budget > 0 and f.gate.usable and f.scheduled_peak_bytes > 0 and not f.blocking_stages:
-        memory.append(["this plan", fmt_bytes(f.scheduled_peak_bytes),
-                       text.dim(f"{fmt_bytes(budget - f.scheduled_peak_bytes)} headroom")])
+    planned = budget > 0 and f.gate.usable and f.scheduled_peak_bytes > 0 and not f.blocking_stages
+    # The plan's fast arena: activations plus the decompression buffer of a compressed plan.
+    fast = f.scheduled_peak_bytes + ag.budget.fast_reserve
+    if planned:
+        memory.append(["this plan", fmt_bytes(fast), text.dim(f"{fmt_bytes(budget - fast)} headroom")])
     if f.slow_peak_bytes > 0:
         memory.append(["slow memory", fmt_bytes(f.slow_peak_bytes),
                        text.dim(f"budget {fmt_bytes(ag.budget.slow)}") if ag.budget.slow else ""])
+        if planned:
+            memory.append(ram_total_row(fast, f.slow_peak_bytes, ag.peak_memory_bytes))
     if isinstance(traffic, dict):
         memory.append(["slow traffic", fmt_bytes(traffic["written"] + traffic["read"]),
                        text.dim(f"per inference: {fmt_bytes(traffic['written'])} written, "

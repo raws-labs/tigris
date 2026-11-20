@@ -429,3 +429,38 @@ def test_inspect_lists_five_conversion_reasons_then_counts_the_rest(monkeypatch)
     assert "no, 7 reasons" in result.output
     assert "reason 4" in result.output and "reason 5" not in result.output
     assert "and 2 more; --json lists all" in result.output
+
+
+def test_a_plan_states_its_slow_arena_and_the_one_sram_total(conv_relu_chain_path, tmp_path):
+    from tigris.utils import fmt_bytes
+
+    path = tmp_path / "plan.tgrs"
+    assert CliRunner().invoke(cli, ["compile", str(conv_relu_chain_path), "-m", "8K", "-o", str(path)]).exit_code == 0
+    analyzed = json.loads(CliRunner().invoke(cli, ["analyze", str(conv_relu_chain_path), "-m", "8K", "--json"]).output)
+    needs = inspect_file(path)["requirements"]
+    assert needs["slow_arena_bytes"] == analyzed["slow"]["peak_bytes"] > 0
+    output = CliRunner().invoke(cli, ["inspect", str(path)]).output
+    total = fmt_bytes(needs["fast_arena_bytes"] + needs["slow_arena_bytes"])
+    assert re.search(rf"slow arena +{re.escape(fmt_bytes(needs['slow_arena_bytes']))}$", output, re.M)
+    assert re.search(rf"fast \+ slow +{re.escape(total)} +RAM when one SRAM holds both arenas$", output, re.M)
+    assert CliRunner().invoke(cli, ["compile", str(conv_relu_chain_path), "-m", "64K", "-o", str(path)]).exit_code == 0
+    assert inspect_file(path)["requirements"]["slow_arena_bytes"] == 0
+    untiled = CliRunner().invoke(cli, ["inspect", str(path)]).output
+    assert "slow arena" not in untiled and "fast + slow" not in untiled
+
+
+def test_a_compressed_plan_counts_its_decompression_buffer_in_both_commands(conv_relu_chain_path, tmp_path):
+    from tigris.utils import fmt_bytes
+
+    path = tmp_path / "plan.tgrs"
+    compiled = CliRunner().invoke(cli, ["compile", str(conv_relu_chain_path), "-m", "24K", "-c", "lz4",
+                                        "-o", str(path)])
+    assert compiled.exit_code == 0, compiled.output
+    needs = inspect_file(path)["requirements"]
+    assert needs["decompression_bytes"] > 0
+    fast, total = (fmt_bytes(needs["fast_arena_bytes"]),
+                   fmt_bytes(needs["fast_arena_bytes"] + needs["slow_arena_bytes"]))
+    assert re.search(rf"this plan +{re.escape(fast)} +{re.escape(fmt_bytes(24 * 1024 - needs['fast_arena_bytes']))} headroom$",
+                     compiled.output, re.M)
+    for output in (compiled.output, CliRunner().invoke(cli, ["inspect", str(path)]).output):
+        assert re.search(rf"fast \+ slow +{re.escape(total)} ", output)

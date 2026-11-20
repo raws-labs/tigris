@@ -342,7 +342,11 @@ def inspect_file(path: str | Path) -> dict:
         )
         operators = graph["operators"]
     if report["format"] == "tgrs":
-        report["requirements"] = _plan_requirements(report["plan"])
+        from tigris.analysis.plan_graph import slow_arena_required
+
+        # Derived from the plan as read, before _plan restates its records.
+        slow = slow_arena_required(read_binary_plan(data, decompress_weights=False))
+        report["requirements"] = {**_plan_requirements(report["plan"]), "slow_arena_bytes": slow}
     elif report["format"] != "pte":
         report["costs"], report["quantization"] = _model_analysis(report)
     report["operator_counts"] = dict(sorted(Counter(

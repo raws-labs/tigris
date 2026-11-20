@@ -758,3 +758,24 @@ def test_no_smallest_budget_without_a_slow_budget_leaves_the_row_out():
 
     assert smallest_row({"budget_bytes": None, "below_bytes": None, "slow_budget_bytes": None,
                          "reason": "memory"}, 0) is None
+
+
+def test_fast_plus_slow_is_the_ram_of_one_sram(conv_relu_chain_path):
+    """With slow memory in use, the plan and the slow figure add up to one
+    row, flagged when the total is not below the unscheduled peak."""
+    import json
+    import re
+
+    from tigris.utils import fmt_bytes
+
+    path = str(conv_relu_chain_path)
+    for budget, saves in (("8K", True), ("2K", False)):
+        report = json.loads(CliRunner().invoke(cli, ["analyze", path, "-m", budget, "--json"]).output)
+        total = report["fast"]["scheduled_peak_bytes"] + report["slow"]["peak_bytes"]
+        unscheduled = plan_model(path, (budget,)).peak_memory_bytes
+        assert (total < unscheduled) is saves
+        note = ("RAM when one SRAM holds both arenas" if saves else
+                f"{fmt_bytes(total - unscheduled)} above unscheduled: on one SRAM this plan saves no RAM")
+        output = CliRunner().invoke(cli, ["analyze", path, "-m", budget]).output
+        assert re.search(rf"fast \+ slow +{re.escape(fmt_bytes(total))} +{re.escape(note)}$", output, re.M)
+    assert "fast + slow" not in CliRunner().invoke(cli, ["analyze", path, "-m", "64K"]).output

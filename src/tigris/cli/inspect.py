@@ -7,6 +7,7 @@ import click
 from tigris import TILE_AXIS_HW
 from tigris.cli import cli, text
 from tigris.analysis.plan_graph import fast_activation_bytes
+from tigris.cli.analyze import ram_total_row
 from tigris.emitters.binary.defs import FLAG_XIP, STAGE_FLAG_LINE_BUFFERED
 from tigris.inspection import inspect_file
 from tigris.utils import fmt_bytes, plural
@@ -298,8 +299,11 @@ def _plan_summary(plan, needs):
     if needs["decompression_bytes"]:
         arena_note = (f"{fmt_bytes(fast_activation_bytes(plan))} activations, "
                       f"{fmt_bytes(needs['decompression_bytes'])} decompressed weights")
-    rows = [["fast arena", fmt_bytes(needs["fast_arena_bytes"]), text.dim(arena_note)],
-            ["unscheduled", fmt_bytes(plan["peak"]), ""],
+    rows = [["fast arena", fmt_bytes(needs["fast_arena_bytes"]), text.dim(arena_note)]]
+    if needs["slow_arena_bytes"]:
+        rows += [["slow arena", fmt_bytes(needs["slow_arena_bytes"]), ""],
+                 ram_total_row(needs["fast_arena_bytes"], needs["slow_arena_bytes"], plan["peak"])]
+    rows += [["unscheduled", fmt_bytes(plan["peak"]), ""],
             ["weights", fmt_bytes(weights), text.dim(f"{storage}, {compression}")]]
     if needs["state_bytes"]:
         rows.append(["state", fmt_bytes(needs["state_bytes"]), text.dim("kept between runs")])
