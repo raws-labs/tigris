@@ -133,6 +133,20 @@ def test_a_gather_of_one_index_becomes_a_cut(tmp_path, index, parts):
     assert "Split" in types
     cut = ag.ops[types.index("Split")]
     assert [ag.tensors[name].shape for name in cut.outputs] == parts
+    assert cut.attrs["kernel_shape"] == [0]
+
+
+def test_a_model_with_a_gather_of_one_index_plans(tmp_path):
+    """The cut a Gather becomes carries the axis the tile solver reads."""
+    proj = np.eye(256, dtype=np.float32)
+    path = save_onnx(tmp_path, "gather_plan",
+                     [helper.make_node("MatMul", ["x", "proj"], ["mixed"], name="mix"),
+                      helper.make_node("Gather", ["mixed", "index"], ["y"], axis=1, name="pick")],
+                     [vi("x", [1, 4, 256])], [vi("y", [1, 256])],
+                     init=[numpy_helper.from_array(proj, "proj"),
+                           numpy_helper.from_array(np.array(1, dtype=np.int64), "index")])
+    result = CliRunner().invoke(cli, ["analyze", str(path), "-m", "64K"])
+    assert result.exit_code == 0, result.output
 
 
 def test_a_gather_on_an_axis_something_precedes_is_left_alone(tmp_path):

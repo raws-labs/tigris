@@ -20,23 +20,27 @@ NOTES="$(realpath "$3")"
 REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
 BRANCH="release/$VERSION"
 ROOT="$(git rev-parse --show-toplevel)"
+PYTHON="${PYTHON:-python3}"
+# A relative path has to keep working after the cd into the worktree.
+[[ "$PYTHON" != */* || "$PYTHON" = /* ]] || PYTHON="$PWD/$PYTHON"
 
 # The release commit: the bundled host runtime pinned to runtime vVERSION. The
 # compiler version itself comes from the tag, so nothing else changes.
 prepare() {
-    "${PYTHON:-python3}" scripts/runtime_bundle.py --pin "v$VERSION"
+    "$PYTHON" scripts/runtime_bundle.py --pin "v$VERSION"
 }
 COMMIT_SUBJECT="release: pin the v$VERSION host runtime"
 
-# Waits until every check run on the commit has completed, then requires each
+# Waits until every CI check run on the commit has completed, then requires each
 # to have passed. Runs register over the first minute, so it waits that out.
 wait_for_ci() {
     local sha="$1" runs
     echo "Waiting for CI on $sha"
     sleep 60
     while :; do
+        # Leaves out promote.yml's own check run, which lands on develop's head.
         runs="$(gh api --paginate "repos/$REPO/commits/$sha/check-runs" \
-            --jq '.check_runs[] | [.status, (.conclusion // "")] | @tsv')"
+            --jq '.check_runs[] | select(.name != "promote") | [.status, (.conclusion // "")] | @tsv')"
         if [ -n "$runs" ] && ! grep -qv '^completed' <<<"$runs"; then
             break
         fi
@@ -66,8 +70,9 @@ promote() {
 
 git -C "$ROOT" fetch --quiet origin
 WORKTREE="$(mktemp -d)"
-trap 'git -C "$ROOT" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true' EXIT
 git -C "$ROOT" worktree add --quiet -b "$BRANCH" "$WORKTREE" origin/develop
+# The branch can only be deleted once no worktree has it checked out.
+trap 'git -C "$ROOT" worktree remove --force "$WORKTREE" && git -C "$ROOT" branch --quiet -D "$BRANCH"' EXIT
 cd "$WORKTREE"
 prepare
 if git diff --quiet; then
@@ -75,15 +80,25 @@ if git diff --quiet; then
     SHA="$(git rev-parse origin/develop)"
 else
     git commit --quiet -am "$COMMIT_SUBJECT"
-    git push --quiet -u origin "$BRANCH"
-    PR="$(gh pr create -R "$REPO" -B develop -H "$BRANCH" -t "$COMMIT_SUBJECT" \
+    # A rerun reuses the branch an earlier run pushed when it holds the same
+    # change on the same base; any other remote branch makes the push fail.
+    pushed="$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)"
+    if [ -n "$pushed" ] && [ "$(git rev-parse "$pushed^{tree}" "$pushed^")" \
+        = "$(git rev-parse "HEAD^{tree}" HEAD^)" ]; then
+        git reset --quiet --hard "$pushed"
+    else
+        git push --quiet -u origin "$BRANCH"
+    fi
+    head="$(git rev-parse HEAD)"
+    # -H matches by branch name only, so a fork's pull request can share it.
+    PR="$(gh pr list -R "$REPO" -B develop -H "$BRANCH" --json number,headRefOid,isCrossRepository \
+        --jq "[.[] | select(.headRefOid == \"$head\" and (.isCrossRepository | not))][0].number // empty")"
+    [ -n "$PR" ] || PR="$(gh pr create -R "$REPO" -B develop -H "$BRANCH" -t "$COMMIT_SUBJECT" \
         -b "Prepares the $VERSION release." | grep -oE '[0-9]+$')"
-    wait_for_ci "$(git rev-parse HEAD)"
-    gh pr merge "$PR" -R "$REPO" --rebase
+    wait_for_ci "$head"
+    gh pr merge "$PR" -R "$REPO" --rebase --match-head-commit "$head"
     SHA="$(gh pr view "$PR" -R "$REPO" --json mergeCommit --jq .mergeCommit.oid)"
 fi
-git -C "$ROOT" branch -D "$BRANCH" >/dev/null 2>&1 || true
-
 wait_for_ci "$SHA"
 promote "$SHA" true
 promote "$SHA" false

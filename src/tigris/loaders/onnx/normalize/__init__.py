@@ -86,9 +86,9 @@ def normalize(ag: AnalyzedGraph, subgraph: bool = False) -> AnalyzedGraph:
     ag = _fold_split_into_its_weight(ag)
     ag = _assign_tensor_layouts(ag)
     ag = _align_state_layouts(ag)
+    ag = _gather_one_index_to_split(ag)
     ag = _normalize_concat_axis(ag)
     ag = _mark_untileable_broadcasts(ag)
-    ag = _gather_one_index_to_split(ag)
     ag = _relabel_shape_ops_to_reshape(ag)
     ag = _lower_linear_matmul(ag, transposed)
     # A fold can take the last reader of an operator, as a folded Shape does.

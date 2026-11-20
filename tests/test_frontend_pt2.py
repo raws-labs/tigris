@@ -6,10 +6,12 @@ import os
 import sys
 import zipfile
 
+import numpy as np
 import pytest
 from click.testing import CliRunner
 
 from tigris.cli import cli
+from tigris.emitters.binary.reader import read_binary_plan
 from tigris.frontends import pt2
 from tigris.inspection import inspect_file
 from tigris.utils import fmt_bytes
@@ -159,3 +161,28 @@ def test_inspect_and_run_know_a_program(float_program, tmp_path):
     assert out.output.splitlines() == [
         "Error: net.pt2 is an exported PyTorch program; compile it with tigris compile and run "
         "the plan"]
+
+
+@pytest.mark.usefixtures("require_host_library")
+def test_a_transformer_encoder_layer_runs_tiled(tmp_path):
+    """Attention selects query, key and value from one stacked projection."""
+    torch = _require("torch")
+    _require("onnxscript")
+    from tigris.runtime import Session
+
+    torch.manual_seed(0)
+    layer = torch.nn.TransformerEncoderLayer(d_model=16, nhead=2, dim_feedforward=32,
+                                             batch_first=True).eval()
+    x = torch.randn(1, 8, 16)
+    program = tmp_path / "encoder.pt2"
+    torch.export.save(torch.export.export(layer, (x,)), program)
+    plan = tmp_path / "encoder.tgrs"
+    result = CliRunner().invoke(cli, ["compile", str(program), "-m", "2K", "-o", str(plan)])
+    assert result.exit_code == 0, result.output
+    assert read_binary_plan(plan.read_bytes())["tile_plans"]
+    with Session(plan) as session:
+        (item,) = session.inputs
+        # The runtime stores a sequence length-major.
+        (output,) = session.run({item["name"]: x.numpy().transpose(0, 2, 1).copy()}).values()
+    expected = layer(x).detach().numpy()
+    np.testing.assert_allclose(output.reshape(1, 16, 8).transpose(0, 2, 1), expected, atol=1e-5)

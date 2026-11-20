@@ -20,6 +20,7 @@ from onnx import TensorProto, helper, numpy_helper
 from tigris.cli import cli
 from tigris.cli.export import export_report
 from tigris.frontends import tflite
+from tigris.frontends import tflite_export
 from tigris.frontends import tflite_writer as tw
 from tigris.frontends.flatbuffer import Table
 from tigris.frontends.tflite import Window, window
@@ -773,6 +774,43 @@ def test_a_pad_other_than_same_padding_is_kept():
     x = b.activation([1, 16, 16, 8], 0.04, -5)
     result = export(b.model(x, b.conv(b.pad(x, 2, 0, 1, 1), 0, 3, padding=1, depthwise=True)))
     assert result.data is None and result.folded == 0
+
+
+@pytest.mark.parametrize(("rows", "stride", "top", "bottom"),
+                         [(8, 2, 1, 1), (6, 2, 0, 1), (9, 3, 1, 1), (12, 3, 0, 1)])
+def test_no_band_reads_only_padding_rows(rows, stride, top, bottom, tflite_micro, tmp_path):
+    # A strided 1x1 convolution after a PAD: some output rows read padding rows only.
+    b = _Builder(12)
+    x = b.activation([1, rows, rows, 128], 0.04, -5)
+    data = b.model(x, b.conv(b.pad(x, top, bottom, 1, 1), 32, 1, stride, padding=1))
+    result = export(data)
+    assert result.data is not None and result.bands >= 2, result.reason
+    assert all(d > 0 for t in tw.read(result.data).subgraphs[0].tensors for d in t.shape)
+    model = tmp_path / "padded.tflite"
+    model.write_bytes(data)
+    assert _export_json(model) == export_report(result)
+    rng = np.random.default_rng(9)
+    inputs = [rng.integers(-128, 128, (1, rows, rows, 128), dtype=np.int8) for _ in range(3)]
+    _, _, expected = _tflm(data, inputs, tmp_path, "before")
+    head, _, actual = _tflm(result.data, inputs, tmp_path, "after")
+    assert head == result.arena_after < result.arena_before
+    assert sorted(actual) == sorted(expected) and len(expected) == len(inputs)
+    for key in expected:
+        np.testing.assert_array_equal(actual[key], expected[key])
+
+
+def test_export_never_writes_a_tensor_without_rows(monkeypatch):
+    band_region = tflite_export._band_region
+
+    def emptied(model, *args):
+        rewrite = band_region(model, *args)
+        added = rewrite.model.subgraphs[0].tensors[len(model.subgraphs[0].tensors):]
+        next(t for t in added if len(t.shape) == 4).shape[1] = 0
+        return rewrite
+
+    monkeypatch.setattr(tflite_export, "_band_region", emptied)
+    with pytest.raises(RuntimeError, match="non-positive dimension"):
+        export(_residual())
 
 
 @pytest.mark.parametrize(("kind", "fields", "weights", "expected"), [

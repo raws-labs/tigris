@@ -350,8 +350,9 @@ class _Rewrite:
     macs: int
 
 
-def _band_region(model: tw.Model, nodes: list, a: int, b: int, bands: int) -> _Rewrite:
-    """Operators a..b computed in `bands` row bands."""
+def _band_region(model: tw.Model, nodes: list, a: int, b: int, bands: int) -> _Rewrite | None:
+    """Operators a..b computed in `bands` row bands, or None when a band would
+    read no row of a tensor: its rows all fall in an operator's padding."""
     sg = model.subgraphs[0]
     edit = _Edit(model, sg)
     region = nodes[a:b + 1]
@@ -378,6 +379,8 @@ def _band_region(model: tw.Model, nodes: list, a: int, b: int, bands: int) -> _R
                 have = need.get(index)
                 need[index] = (start, end) if have is None else (min(have[0], start),
                                                                  max(have[1], end))
+        if any(end <= start for start, end, _, _ in uses.values()):
+            return None
         produced, slices = {}, {}
         for k, node in enumerate(region):
             op = sg.operators[a + k]
@@ -848,6 +851,8 @@ def export(data: bytes, target: str = DEFAULT_TARGET) -> Export:
             rows = sg.tensors[nodes[b].output].shape[1]
             for bands in range(2, min(MAX_BANDS, rows) + 1):
                 rewrite = _band_region(base, nodes, a, b, bands)
+                if rewrite is None:
+                    continue
                 growth = persistent(rewrite.model, abi, referenced=True) - tail
                 if _worse(max(_live(rewrite.model)) + growth, best, before):
                     continue
@@ -863,6 +868,11 @@ def export(data: bytes, target: str = DEFAULT_TARGET) -> Export:
     check = tw.read(written)
     if arena(check) != head or persistent(check, abi) - tail != growth:
         raise RuntimeError("the written model's arena differs from the planned one")
+    # The tensors the rewrite added take names the input does not use.
+    names = {t.name for t in model.subgraphs[0].tensors}
+    if any(d < 1 for t in check.subgraphs[0].tensors if t.name not in names
+           for d in t.shape or ()):
+        raise RuntimeError("the written model has a tensor with a non-positive dimension")
     result.arena_after, result.persistent_growth, result.data = head, growth, written
     result.region, result.bands, result.folded, result.extra_macs = region, bands, folded, macs
     result.operators_after = len(candidate.subgraphs[0].operators)
