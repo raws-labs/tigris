@@ -16,7 +16,8 @@ jobs:
 
   test:
     name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +42,8 @@ jobs:
 
   pytorch:
     name: Exported PyTorch programs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,7 +65,8 @@ jobs:
 
   quality-and-package:
     name: Lint, package, CLI, and generated C
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
