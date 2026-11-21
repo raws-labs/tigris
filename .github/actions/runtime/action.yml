@@ -30,7 +30,7 @@ runs:
           echo "The matching runtime release tag must exist" >&2
           exit 1
         fi
-    - uses: ilammy/msvc-dev-cmd@v1
+    - uses: ilammy/msvc-dev-cmd@v1.13.0
       if: inputs.build-host == 'true' && runner.os == 'Windows'
     - name: Build and stage paired host library
       if: inputs.build-host == 'true'

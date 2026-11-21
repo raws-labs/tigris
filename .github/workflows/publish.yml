@@ -14,7 +14,8 @@ jobs:
 
   publish:
     needs: ci
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     environment: pypi
     steps:
       - uses: actions/download-artifact@v4
@@ -22,4 +23,4 @@ jobs:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@v1.14.3

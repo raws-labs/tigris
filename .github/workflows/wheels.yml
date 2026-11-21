@@ -8,10 +8,11 @@ permissions:
 
 jobs:
   matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     outputs:
       builds: ${{ steps.matrix.outputs.builds }}
-      tests: ${{ steps.matrix.outputs.tests }}
+      versions: ${{ steps.matrix.outputs.versions }}
     steps:
       - id: matrix
         env:
@@ -28,17 +29,20 @@ jobs:
           ]
           full = os.environ["FULL_MATRIX"] == "true"
           hosts = hosts if full else hosts[:1]
-          versions = ["3.10", "3.13"] if full else ["3.12"]
+          versions = ["3.10", "3.13"] if full else ["3.13"]
+          assert len(versions) <= 2 and "3.12" not in versions, "tests take at most two interpreters other than the build one"
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("builds=" + json.dumps({"include": hosts}) + "\n")
-              output.write("tests=" + json.dumps({"include": [dict(host, python=v) for host in hosts for v in versions]}) + "\n")
+              output.write("versions=" + json.dumps(versions) + "\n")
 
+  # Build and tests share one job, so each platform acquires one runner.
   build:
     needs: matrix
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix.outputs.builds) }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -67,29 +71,16 @@ jobs:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
           if-no-files-found: error
-
-  test:
-    needs: [matrix, build]
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.matrix.outputs.tests) }}
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: wheel-${{ matrix.platform }}
-          path: dist
-      - name: Install and test outside the checkout
-        shell: bash
-        env:
+          python-version: ${{ fromJSON(needs.matrix.outputs.versions)[0] }}
+      - name: Install and test outside the checkout on Python ${{ fromJSON(needs.matrix.outputs.versions)[0] }}
+        id: test-first
+        env: &wheel-test-env
           TIGRIS_REQUIRE_HOST: "1"
           OMP_NUM_THREADS: "2"
           MKL_NUM_THREADS: "2"
-        run: |
+        run: &wheel-test |
           python -m pip install dist/*.whl pytest onnxruntime
           mkdir -p "$RUNNER_TEMP/wheel-tests/schema_compat" "$RUNNER_TEMP/wheel-tests/fixtures" \
             "$RUNNER_TEMP/wheel-tests/scripts/contract_cases"
@@ -103,9 +94,19 @@ jobs:
           python -c 'import tigris; from pathlib import Path; assert "site-packages" in str(Path(tigris.__file__).resolve())'
           tigris --version
           python -m pytest -q
+      - uses: actions/setup-python@v5
+        id: setup-second
+        if: ${{ !cancelled() && fromJSON(needs.matrix.outputs.versions)[1] && (success() || steps.test-first.outcome == 'failure') }}
+        with:
+          python-version: ${{ fromJSON(needs.matrix.outputs.versions)[1] }}
+      - name: Install and test outside the checkout on Python ${{ fromJSON(needs.matrix.outputs.versions)[1] }}
+        if: ${{ !cancelled() && steps.setup-second.outcome == 'success' }}
+        env: *wheel-test-env
+        run: *wheel-test
 
   pure:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
