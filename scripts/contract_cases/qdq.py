@@ -861,3 +861,93 @@ def _qdq_relu6_ceiling_ties_case() -> ContractCase:
     return ContractCase("int8_relu6_ceiling_ties", model, copy.deepcopy(model), {"input": values},
                         ("Relu6",), mem_budget="64K", exact=True, reference_unoptimized=True)
 
+
+
+def _qdq_row_band_matmul_case() -> ContractCase:
+    """Int8 projections the solver has to band along their rows.
+
+    The vendor FullyConnected kernels take their row count from the output
+    tensor rather than from the band, so a band handed to them would read and
+    write the whole matrix through a band-sized buffer.
+    """
+    rows, width, hidden = 256, 32, 64
+    rng = np.random.default_rng(43)
+    initializers = [
+        numpy_helper.from_array(rng.integers(-8, 9, (width, hidden)).astype(np.float32) * 0.0625, "w1"),
+        numpy_helper.from_array(rng.integers(-8, 9, (hidden, width)).astype(np.float32) * 0.0625, "w2"),
+    ] + _scalars(x=(0.03125, 3), w=(0.0625, 0), h=(0.125, -5), y=(0.25, 7))
+    nodes = [
+        *_qdq("input", "x_s", "x_z", "x"),
+        *_qdq("w1", "w_s", "w_z", "w1_dq"),
+        *_qdq("w2", "w_s", "w_z", "w2_dq"),
+        helper.make_node("MatMul", ["x", "w1_dq"], ["hidden"]),
+        helper.make_node("Relu", ["hidden"], ["act"]),
+        *_qdq("act", "h_s", "h_z", "act_dq"),
+        helper.make_node("MatMul", ["act_dq", "w2_dq"], ["raw"]),
+        *_qdq("raw", "y_s", "y_z", "output"),
+    ]
+    model = _model("int8_row_band_matmul", nodes, [_vi("input", [rows, width])],
+                   [_vi("output", [rows, width])], initializers)
+    data = rng.uniform(-3.0, 3.0, (rows, width)).astype(np.float32)
+    return ContractCase("int8_row_band_matmul", model, copy.deepcopy(model), {"input": data},
+                        ("Gemm", "Gemm"), mem_budget="4K", expect_tiled=True)
+
+
+def _qdq_banded_pool_case(operator: str) -> ContractCase:
+    """An int8 pool in height bands whose windows straddle band edges and the padding."""
+    channels, side = 8, 32
+    stride = 1 if operator == "MaxPool" else 2
+    out_side = (side + 2 - 3) // stride + 1
+    rng = np.random.default_rng(47)
+    model = _qdq_operator_model(
+        f"int8_banded_{operator.lower()}", operator, [1, channels, side, side],
+        [1, channels, out_side, out_side], (0.05, -3), (0.05, -3),
+        kernel_shape=[3, 3], strides=[stride, stride], pads=[1, 1, 1, 1])
+    data = rng.integers(-120, 120, (1, channels, side, side)).astype(np.float32) * 0.05
+    return ContractCase(f"int8_banded_{operator.lower()}", model, copy.deepcopy(model),
+                        {"input": data}, (operator,), mem_budget="4K", expect_tiled=True)
+
+
+def _qdq_banded_dilated_conv_case() -> ContractCase:
+    """An int8 dilated Conv in height bands with per-channel weights.
+
+    A dilation of two widens each band's input window to five rows for a
+    three-row kernel, so a band that took the undilated window reads rows it
+    does not hold.
+    """
+    in_channels, out_channels, side = 4, 8, 32
+    rng = np.random.default_rng(53)
+    weight = rng.integers(-16, 17, (out_channels, in_channels, 3, 3)).astype(np.float32)
+    scales = [0.015625 * (1 + index % 3) for index in range(out_channels)]
+    weight *= np.array(scales, dtype=np.float32).reshape(-1, 1, 1, 1)
+    model = _qdq_operator_model(
+        "int8_banded_dilated_conv", "Conv", [1, in_channels, side, side],
+        [1, out_channels, side, side], (0.05, 2), (0.1, -4), weight,
+        (scales, [0] * out_channels), weight_axis=0,
+        kernel_shape=[3, 3], dilations=[2, 2], pads=[2, 2, 2, 2])
+    data = rng.uniform(-6.0, 6.0, (1, in_channels, side, side)).astype(np.float32)
+    return ContractCase("int8_banded_dilated_conv", model, copy.deepcopy(model), {"input": data},
+                        ("Conv",), mem_budget="4K", expect_tiled=True)
+
+
+def _qdq_banded_binary_case(operator: str) -> ContractCase:
+    """An int8 binary operator in height bands. Mul puts each operand and the
+    output on its own scale; Max and Min require one quantization throughout."""
+    shape = [1, 4, 32, 32]
+    rng = np.random.default_rng(59)
+    nodes = [
+        *_qdq("left", "a_s", "a_z", "a"),
+        *_qdq("right", "b_s", "b_z", "b"),
+        helper.make_node(operator, ["a", "b"], ["raw"]),
+        *_qdq("raw", "y_s", "y_z", "output"),
+    ]
+    scales = (dict(a=(0.03125, -9), b=(0.046875, 11), y=(0.25, -6)) if operator == "Mul"
+              else dict(a=(0.046875, 5), b=(0.046875, 5), y=(0.046875, 5)))
+    model = _model(f"int8_banded_{operator.lower()}", nodes,
+                   [_vi("left", shape), _vi("right", shape)], [_vi("output", shape)],
+                   _scalars(**scales))
+    return ContractCase(
+        f"int8_banded_{operator.lower()}", model, copy.deepcopy(model),
+        {"left": rng.uniform(-4.0, 4.0, shape).astype(np.float32),
+         "right": rng.uniform(-6.0, 6.0, shape).astype(np.float32)},
+        (operator,), mem_budget="4K", expect_tiled=True)

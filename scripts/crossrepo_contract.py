@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
 """Prove a deterministic compiler -> runtime contract against ONNX Runtime.
 
-The gate intentionally uses only the float32 and s8 reference dispatchers.
-Accelerated backends retain their own target-specific parity tests; this checks
-that plans emitted by the compiler execute with the sibling runtime's public
-loader, arena, executor, and raw I/O contract.
+Plans emitted by the compiler execute with the runtime's public loader, arena,
+executor, and raw I/O contract on the float32 and s8 reference dispatchers.
+
+Every run of an int8 plan on s8 is replayed, with the same arguments and
+inputs, on the CMSIS-NN dispatcher and on the ESP-NN dispatcher over both of
+ESP-NN's portable C variants, in runners built with the same tensor alignment
+and linked against the vendors' portable C kernels under AddressSanitizer and
+UndefinedBehaviorSanitizer. Each replay must return the s8 output bytes
+exactly, report the s8 run's activation memory figures with only its vendor
+scratch added to the allocation, size the CMSIS-NN scratch to what its
+vendor calls were given, leave the guard bytes around every arena untouched,
+hand no operator its adapter takes to s8, and report the calls each wrapped
+vendor function received. Cases state the vendor functions their plan must
+call on each dispatcher, or that it calls none, and every wrapped function
+must be called by some case, while preparing or running, unless it is listed
+as unreachable with the reason. Vector and assembly kernels are not covered on
+the host.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import re
 import subprocess
 import tempfile
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Collection, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +54,7 @@ from tigris.emitters.binary.defs import (
     COMPRESS_LZ4,
     FLAG_XIP,
     STAGE_FLAG_LINE_BUFFERED,
+    TENSOR_FLAG_CONSTANT,
     TENSOR_FLAG_LINEAR,
     OP_TYPE_MAP,
 )
@@ -71,6 +88,31 @@ _DTYPE_BY_ONNX_CODE = {
     TensorProto.BOOL: np.dtype("bool"),
 }
 _INT8_LSB_TOLERANCE = 1
+
+
+class _AccelDispatch(NamedTuple):
+    """An accelerated runner target, the --dispatch it runs, and the prefix
+    of the vendor symbols that dispatcher's adapter calls."""
+
+    runner: str
+    dispatch: str
+    prefix: str
+
+
+# Dispatchers an int8 plan also runs on, each to the s8 reference's bytes.
+# The ANSI runner links ESP-NN without CONFIG_NN_OPTIMIZED.
+_ACCEL_DISPATCHES = {
+    "cmsis-nn": _AccelDispatch("tigris_contract_runner_accel", "cmsis-nn", "arm_"),
+    "esp-nn": _AccelDispatch("tigris_contract_runner_accel", "esp-nn", "esp_nn_"),
+    "esp-nn-ansi": _AccelDispatch("tigris_contract_runner_accel_ansi", "esp-nn", "esp_nn_"),
+}
+# Wrapped vendor symbols no plan reaches in the host build, each with the reason.
+_VENDOR_UNREACHABLE = {
+    # Only the MVE build of arm_fully_connected_s8_get_buffer_size asks for a
+    # buffer; the portable C build returns 0, and the adapter computes the
+    # kernel sums into that buffer only when it has one.
+    "arm_vector_sum_s8": "the portable C FullyConnected takes no kernel-sum buffer",
+}
 
 
 def _to_runtime_layout(value: Array) -> Array:
@@ -279,7 +321,7 @@ def _memory_report(case_name: str, runtime_stdout: str) -> _MemoryReport:
 
 
 def _assert_memory_contract(
-    case_name: str, plan: dict, runtime_stdout: str, *, full_budget: bool = False
+    case_name: str, plan: dict, runtime_stdout: str | _MemoryReport, *, full_budget: bool = False
 ) -> None:
     (
         budget,
@@ -289,7 +331,8 @@ def _assert_memory_contract(
         allocated,
         measured_peak,
         slow_peak,
-    ) = _memory_report(case_name, runtime_stdout)
+    ) = (runtime_stdout if isinstance(runtime_stdout, _MemoryReport)
+         else _memory_report(case_name, runtime_stdout))
     scheduled_peak = int(plan["_compiler_scheduled_peak"])
     if budget != plan["budget"]:
         raise AssertionError(
@@ -348,29 +391,28 @@ def _assert_memory_contract(
 
 
 def _assert_runs_in_slow_figure(
-    case_name: str, plan: dict, runner: Path, plan_path: Path, inputs_path: Path,
-    outputs_path: Path, runtime_stdout: str,
+    case: ContractCase, plan: dict, runner: _ContractRunner, plan_path: Path,
+    inputs_path: Path, outputs_path: Path, runtime_stdout: str,
 ) -> None:
     """The runtime's slow peak is the compiler's slow figure, and the plan runs
     in a slow arena of exactly that size, to the same bytes."""
     figure = int(plan["_compiler_slow_peak"])
-    slow_peak = _memory_report(case_name, runtime_stdout).slow_peak
+    slow_peak = _memory_report(case.name, runtime_stdout).slow_peak
     if slow_peak != figure:
         raise AssertionError(
-            f"{case_name}: runtime slow peak {slow_peak} != the compiler's slow "
+            f"{case.name}: runtime slow peak {slow_peak} != the compiler's slow "
             f"requirement {figure}")
     exact = outputs_path.with_name("exact-slow.bin")
-    completed = _run([str(runner), str(plan_path), str(inputs_path), str(exact),
-                      str(plan["_compiler_scheduled_peak"]), f"--slow-arena={figure}"],
-                     f"{case_name} run in the compiler's slow figure")
-    _assert_memory_contract(case_name, plan, completed.stdout)
+    runner.run(case.name, plan, plan_path, inputs_path, exact,
+               [str(plan["_compiler_scheduled_peak"]), f"--slow-arena={figure}"],
+               "run in the compiler's slow figure", routing=case, full_budget=False)
     if exact.read_bytes() != outputs_path.read_bytes():
-        raise AssertionError(f"{case_name}: the run in the compiler's slow figure changed the outputs")
+        raise AssertionError(f"{case.name}: the run in the compiler's slow figure changed the outputs")
 
 
 def _assert_runs_without_slow(
-    case_name: str, plan: dict, runner: Path, plan_path: Path, inputs_path: Path,
-    outputs_path: Path, limit: int,
+    case_name: str, plan: dict, runner: _ContractRunner, plan_path: Path, inputs_path: Path,
+    outputs_path: Path, limit: int, routing: _Routing | None,
 ) -> bool:
     """For a plan that keeps its model inputs and outputs in the fast pool, the
     compiler must state no slow memory, and the runtime must run it without a
@@ -385,15 +427,15 @@ def _assert_runs_without_slow(
             "for a plan that keeps its inputs and outputs in the fast pool")
     expected = outputs_path.read_bytes()
     alone = outputs_path.with_name("no-slow.bin")
-    completed = _run([str(runner), str(plan_path), str(inputs_path), str(alone), str(limit),
-                      "--slow-arena=0"], f"{case_name} run without a slow arena")
-    _assert_memory_contract(case_name, plan, completed.stdout,
-                            full_budget=limit != plan["_compiler_scheduled_peak"])
+    runner.run(case_name, plan, plan_path, inputs_path, alone, [str(limit), "--slow-arena=0"],
+               "run without a slow arena", routing=routing,
+               full_budget=limit != plan["_compiler_scheduled_peak"])
     if alone.read_bytes() != expected:
         raise AssertionError(f"{case_name}: the run without a slow arena changed the outputs")
     copied = outputs_path.with_name("inputs-in-slow.bin")
-    completed = _run([str(runner), str(plan_path), str(inputs_path), str(copied), str(limit),
-                      "--inputs-in-slow"], f"{case_name} run with inputs in slow")
+    completed = runner.run(case_name, plan, plan_path, inputs_path, copied,
+                           [str(limit), "--inputs-in-slow"], "run with inputs in slow",
+                           routing=routing)
     report = _memory_report(case_name, completed.stdout)
     if report.peak > plan["_compiler_scheduled_peak"] + report.reserve or report.slow_peak == 0:
         raise AssertionError(
@@ -404,7 +446,7 @@ def _assert_runs_without_slow(
     return True
 
 
-def _run_peak_fixtures(runners: tuple[Path, ...], work_dir: Path) -> None:
+def _run_peak_fixtures(runners: tuple[_ContractRunner, ...], work_dir: Path) -> None:
     fixtures = Path(__file__).resolve().parents[1] / "tests/fixtures/tflite/ops"
     # concat_rank2 and lstm_unrolled hold reshape groups over a stage input
     # and outputs nothing reads, which the runtime once kept live to the end
@@ -439,36 +481,16 @@ def _run_peak_fixtures(runners: tuple[Path, ...], work_dir: Path) -> None:
                     for runner in runners:
                         for full_budget in (False, True):
                             limit = budget if full_budget else plan["_compiler_scheduled_peak"]
-                            completed = _run(
-                                [str(runner), str(plan_path), str(input_path),
-                                 str(output_path), str(limit)], case_name,
-                            )
-                            _assert_memory_contract(
-                                case_name, plan, completed.stdout, full_budget=full_budget,
-                            )
+                            runner.run(case_name, plan, plan_path, input_path, output_path,
+                                       [str(limit)], f"sample {sample}",
+                                       routing=_ROUTINGS.get(name), full_budget=full_budget)
                             assert output_path.read_bytes() == expected, case_name
                             _assert_runs_without_slow(case_name, plan, runner, plan_path,
-                                                      input_path, output_path, limit)
-                        _assert_refused_below_peak(case_name, plan, runner, plan_path,
-                                                   input_path, output_path)
+                                                      input_path, output_path, limit,
+                                                      _ROUTINGS.get(name))
+                        runner.refuse_below_peak(case_name, plan, plan_path, input_path,
+                                                 output_path)
                 print(f"PASS {case_name}")
-
-
-def _assert_refused_below_peak(
-    case_name: str, plan: dict, runner: Path, plan_path: Path, inputs_path: Path,
-    outputs_path: Path,
-) -> None:
-    """One byte below the plan's scheduled peak, the run is refused before any stage."""
-    limit = plan["scheduled_peak"] - 1
-    completed = subprocess.run(
-        [str(runner), str(plan_path), str(inputs_path), str(outputs_path), str(limit)],
-        text=True, capture_output=True, check=False)
-    if completed.returncode == 0 or (
-            "inference failed: arena too small for the plan after 0 stages"
-            not in completed.stderr):
-        raise AssertionError(
-            f"{case_name}: a fast arena one byte below the scheduled peak was not refused "
-            f"up front (exit {completed.returncode}):\n{completed.stdout}{completed.stderr}")
 
 
 def _build_environment() -> dict[str, str]:
@@ -517,6 +539,485 @@ def _build_runner(
     )
 
 
+def _build_accel_runner(runtime: Path, build_dir: Path, *, alignment: int | None = None) -> Path:
+    """Build the contract runners on the CMSIS-NN and ESP-NN dispatchers and
+    return their build directory.
+
+    The runtime fetches both vendors' sources at the commits it pins and links
+    their portable C kernels, so the host runs the adapters' own code paths.
+    FETCHCONTENT_SOURCE_DIR_CMSIS_NN and FETCHCONTENT_SOURCE_DIR_ESP_NN, when
+    set in the environment, are passed to the configure, which builds from
+    those checkouts without network access once it has checked that each is
+    unmodified at its pinned commit.
+    """
+    sources = [f"-D{name}={os.environ[name]}" for name in
+               ("FETCHCONTENT_SOURCE_DIR_CMSIS_NN", "FETCHCONTENT_SOURCE_DIR_ESP_NN")
+               if os.environ.get(name)]
+    _run(["cmake", "-S", str(runtime), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release",
+          "-DTIGRIS_CONTRACT_ACCEL=ON", *sources,
+          *([f"-DCMAKE_C_FLAGS=-DTIGRIS_TENSOR_ALIGN={alignment}"] if alignment is not None else [])],
+         "accelerated runtime configure")
+    _run(["cmake", "--build", str(build_dir), "--target",
+          *sorted({dispatch.runner for dispatch in _ACCEL_DISPATCHES.values()})],
+         "accelerated contract-runner build", _build_environment())
+    return build_dir
+
+
+def _is_int8_plan(plan: dict) -> bool:
+    """Whether the runtime runs the plan on int8 kernels: some activation is int8."""
+    return any(not tensor["flags"] & TENSOR_FLAG_CONSTANT
+               and tensor["dtype"] == TensorProto.INT8 for tensor in plan["tensors"])
+
+
+def _first_difference(plan: dict, expected: bytes, actual: bytes) -> str:
+    """The first model output element, in stored order, whose bytes differ."""
+    if len(actual) != len(expected):
+        return f"{len(actual)} output bytes, the s8 run wrote {len(expected)}"
+    offset = 0
+    for number, tensor_index in enumerate(plan["model_outputs"]):
+        tensor = plan["tensors"][tensor_index]
+        dtype = _DTYPE_BY_ONNX_CODE[_declared_dtype(tensor)]
+        size = tensor["size_bytes"] // _DTYPE_BY_ONNX_CODE[tensor["dtype"]].itemsize * dtype.itemsize
+        count = size // dtype.itemsize
+        # Compare each element's bytes, so float NaNs and bools compare as stored.
+        mine = np.frombuffer(actual, np.uint8, size, offset).reshape(count, dtype.itemsize)
+        theirs = np.frombuffer(expected, np.uint8, size, offset).reshape(count, dtype.itemsize)
+        differing = np.flatnonzero((mine != theirs).any(axis=1))
+        if differing.size:
+            index = int(differing[0])
+            value = np.frombuffer(actual, dtype, count, offset)[index]
+            wanted = np.frombuffer(expected, dtype, count, offset)[index]
+            return (f"output {number} first differs at element {index} ({value} vs s8 {wanted}), "
+                    f"{differing.size} of {count} elements differ")
+        offset += size
+    return "no element differs"
+
+
+_DISPATCH_REPORT = re.compile(r"^TIGRIS_CONTRACT_DISPATCH name=(\S+) scratch=(\d+)$", re.MULTILINE)
+_VENDOR_REPORT = re.compile(r"^TIGRIS_CONTRACT_VENDOR((?: \w+=\d+)*)$", re.MULTILINE)
+_VENDOR_PREPARE_REPORT = re.compile(r"^TIGRIS_CONTRACT_VENDOR_PREPARE((?: \w+=\d+)*)$",
+                                    re.MULTILINE)
+_FALLBACK_REPORT = re.compile(r"^TIGRIS_CONTRACT_FALLBACK((?: \w+=\d+)*)$", re.MULTILINE)
+_SCRATCH_REPORT = re.compile(
+    r"^TIGRIS_CONTRACT_SCRATCH requested=(\d+) quant_channels=(\d+) tile_routed=(\d+)$",
+    re.MULTILINE)
+# The executor's refusal of a fast arena below the plan's scheduled peak.
+_REFUSED_BELOW_PEAK = "inference failed: arena too small for the plan after 0 stages"
+
+
+class _Routing(NamedTuple):
+    """Vendor calls every run of a plan makes, with the fields of ContractCase:
+    per dispatcher the symbols each run calls at least once, and the
+    dispatchers on which no run calls any vendor function."""
+
+    expect_vendor: Mapping[str, Collection[str]] = {}
+    expect_no_vendor: Collection[str] = ()
+
+
+# The vendor functions each adapter entry point calls in one run, per dispatcher.
+_CONV = {"cmsis-nn": {"arm_convolve_wrapper_s8", "arm_convolve_wrapper_s8_get_buffer_size"},
+         **{name: {f"esp_nn_conv_s8_{variant}", f"esp_nn_get_conv_scratch_size_{variant}",
+                   f"esp_nn_set_conv_scratch_buf_{variant}"}
+            for name, variant in (("esp-nn", "opt"), ("esp-nn-ansi", "ansi"))}}
+_DEPTHWISE = {"cmsis-nn": {"arm_depthwise_conv_wrapper_s8",
+                           "arm_depthwise_conv_wrapper_s8_get_buffer_size"},
+              **{name: {f"esp_nn_depthwise_conv_s8_{variant}",
+                        f"esp_nn_get_depthwise_conv_scratch_size_{variant}"}
+                 for name, variant in (("esp-nn", "opt"), ("esp-nn-ansi", "ansi"))}}
+# Both ESP-NN variants run these kernels from the ANSI C sources.
+_FULLY_CONNECTED = {"cmsis-nn": {"arm_fully_connected_s8", "arm_fully_connected_s8_get_buffer_size"},
+                    **dict.fromkeys(("esp-nn", "esp-nn-ansi"), {"esp_nn_fully_connected_s8_ansi"})}
+_FULLY_CONNECTED_PER_CHANNEL = {
+    "cmsis-nn": {"arm_fully_connected_per_channel_s8", "arm_fully_connected_s8_get_buffer_size"},
+    **dict.fromkeys(("esp-nn", "esp-nn-ansi"), {"esp_nn_fully_connected_per_ch_s8_ansi"})}
+_AVERAGE_POOL = {"cmsis-nn": {"arm_avgpool_s8", "arm_avgpool_s8_get_buffer_size"},
+                 **dict.fromkeys(("esp-nn", "esp-nn-ansi"), {"esp_nn_avg_pool_s8_ansi"})}
+_MUL = {"cmsis-nn": {"arm_elementwise_mul_s8"},
+        **dict.fromkeys(("esp-nn", "esp-nn-ansi"), {"esp_nn_mul_elementwise_s8_ansi"})}
+# ESP-NN has no Max or Min adapter, and the policy sends every binary
+# operator but Mul to s8 there.
+_MAX = {"cmsis-nn": {"arm_maximum_s8"}}
+_MIN = {"cmsis-nn": {"arm_minimum_s8"}}
+
+
+def _calls(*entries: dict[str, set[str]]) -> _Routing:
+    calls: dict[str, frozenset[str]] = {}
+    for entry in entries:
+        for dispatch, symbols in entry.items():
+            calls[dispatch] = calls.get(dispatch, frozenset()) | frozenset(symbols)
+    return _Routing(calls, tuple(name for name in _ACCEL_DISPATCHES if name not in calls))
+
+
+_NO_VENDOR = _Routing({}, tuple(_ACCEL_DISPATCHES))
+
+# Vendor calls of the cases whose plans reach an adapter entry point on a
+# tiled stage, of one untiled case per entry point, and of the cases whose
+# operators the routing policy (tigris_accel_try_s8_ref and
+# tigris_accel_pre_route in the runtime) keeps on s8. Each entry follows from
+# that policy; the gate sets them on the cases by name.
+_ROUTINGS: dict[str, _Routing] = {
+    # Untiled: the policy routes none of these to s8. The fixture's LSTM gates
+    # are FullyConnected layers with per-channel weights, and its same-shape
+    # Mul runs on the Mul adapters.
+    "int8_conv": _calls(_CONV),
+    "int8_depthwise_multiplier_untiled": _calls(_DEPTHWISE),
+    "int8_matmul": _calls(_FULLY_CONNECTED),
+    "lstm_unrolled": _calls(_FULLY_CONNECTED_PER_CHANNEL, _MUL),
+    "int8_averagepool": _calls(_AVERAGE_POOL),
+    "int8_channel_split": _calls(_MUL),
+    "int8_elementwise_max_untiled": _calls(_MAX),
+    "int8_elementwise_min_untiled": _calls(_MIN),
+    # Height tiles: the operator decides as untiled, told that a tile is active.
+    **dict.fromkeys(("int8_banded_mul", "int8_channel_split_bands"), _calls(_MUL)),
+    **dict.fromkeys(("int8_banded_max", "int8_elementwise_max"), _calls(_MAX)),
+    **dict.fromkeys(("int8_banded_min", "int8_elementwise_min"), _calls(_MIN)),
+    "int8_depthwise_multiplier": _calls(_DEPTHWISE),
+    # A height-tiled Conv chained into a 2D-tiled Depthwise.
+    "int8_inferred_kernel_chain": _calls(_CONV, _DEPTHWISE),
+    # 2D tiles and rolled chains: the Conv and Depthwise adapters take the
+    # tile's width and the roll's offsets.
+    **dict.fromkeys(("int8_2d_tiled_conv", "int8_cotiled_concat_2d", "int8_concat_axis2_bands",
+                     "int8_concat_axis3_bands", "int8_add_broadcast_1x4x12x1_second_bands",
+                     "int8_add_broadcast_1x4x12x12_constant_second_bands",
+                     "int8_sub_broadcast_1x4x1x12_first_bands", "int8_linebuffer_conv_chain",
+                     "int8_split_chain", "int8_hardswish", "qdq_conv_inner_float_section_tiled",
+                     "qdq_conv_terminal_float_section_tiled", "int8_add_constant_channels_second",
+                     "int8_sub_constant_scalar_first"), _calls(_CONV)),
+    "int8_strided_depthwise_2d": _calls(_DEPTHWISE),
+    # A global average pool walked by input rows or in channel groups: ESP-NN
+    # sends GlobalAveragePool to s8 always, CMSIS-NN whenever it is tiled.
+    **dict.fromkeys(("int8_tiled_global_reduction", "int8_grouped_global_reduction_0",
+                     "int8_grouped_global_reduction_1"), _NO_VENDOR),
+    # Row bands: no adapter takes a band of a matrix, so every row band runs on s8.
+    "int8_row_band_matmul": _NO_VENDOR,
+    # Tiled pools run on s8 on both dispatchers, and neither has a MaxPool adapter.
+    **dict.fromkeys(("int8_banded_averagepool", "int8_banded_maxpool"), _NO_VENDOR),
+    # ESP-NN encodes unit dilation only; CMSIS-NN runs a dilated Conv untiled only.
+    "int8_banded_dilated_conv": _NO_VENDOR,
+}
+
+
+class _AccelRun(NamedTuple):
+    outputs: bytes
+    # The memory report with the allocation the reference runner makes, once
+    # the vendor scratch above it is accounted for.
+    memory: _MemoryReport
+    calls: dict[str, int]
+    prepare_calls: dict[str, int]
+
+
+def _call_report(where: str, pattern: re.Pattern[str], stdout: str) -> dict[str, int]:
+    """The `name=count` items of the one line `pattern` matches."""
+    reports = pattern.findall(stdout)
+    if len(reports) != 1:
+        raise AssertionError(f"{where}: {len(reports)} lines match {pattern.pattern}, expected one")
+    return {name: int(count) for name, count in (item.split("=") for item in reports[0].split())}
+
+
+def _align16(value: int) -> int:
+    return (value + 15) & ~15
+
+
+class _AccelReplay:
+    """Reruns reference runs of int8 plans on every accelerated dispatcher.
+
+    Each rerun takes the same arguments and inputs, exits 0, touches no guard
+    byte, reports the reference run's memory figures with its vendor scratch
+    on top, returns the reference bytes, hands no operator its adapter takes
+    to s8, and reports the vendor calls it made. A rerun of a plan, inputs
+    and arguments already rerun is compared from the recorded result.
+
+    Reruns execute on a pool of worker threads, on copies of the plan and
+    inputs taken when the reference run is checked; their results are checked
+    in the order of the reference runs, by the thread that calls `replay`,
+    while later cases run, and `finish` checks the rest."""
+
+    def __init__(self, work_dir: Path) -> None:
+        self.work_dir = work_dir / "accel-replay"
+        self.work_dir.mkdir()
+        try:
+            workers = len(os.sched_getaffinity(0))
+        except AttributeError:
+            workers = os.cpu_count() or 1
+        self.pool = ThreadPoolExecutor(max_workers=workers)
+        self.launched = 0
+        self.done: dict[tuple, dict[str, Future[tuple[subprocess.CompletedProcess[str], bytes]]]] = {}
+        self.checked: dict[tuple[tuple, str], _AccelRun] = {}
+        self.pending: deque[tuple] = deque()
+        self.refused: set[tuple] = set()
+        self.runs: Counter[str] = Counter()
+        self.cases: set[str] = set()
+        # Per runner target, the wrapped vendor symbols its report lists.
+        self.wrapped: dict[str, frozenset[str]] = {}
+        # Per dispatcher, the cases whose runs called each vendor symbol,
+        # while preparing or running, and the cases that ran a vendor kernel.
+        self.callers: dict[str, dict[str, set[str]]] = {name: {} for name in _ACCEL_DISPATCHES}
+        self.kernel_cases: dict[str, set[str]] = {name: set() for name in _ACCEL_DISPATCHES}
+
+    @staticmethod
+    def _key(build_dir: Path, plan_path: Path, inputs_path: Path, args: list[str]) -> tuple:
+        return (build_dir, hashlib.sha256(plan_path.read_bytes()).digest(),
+                hashlib.sha256(inputs_path.read_bytes()).digest(), tuple(args))
+
+    def _snapshot(self, path: Path, digest: bytes) -> Path:
+        """A copy of `path` named by its content, which later cases cannot overwrite."""
+        copy = self.work_dir / f"{digest.hex()}{path.suffix}"
+        if not copy.exists():
+            copy.write_bytes(path.read_bytes())
+        return copy
+
+    @staticmethod
+    def _launch(command: list[str], outputs: Path) -> tuple[subprocess.CompletedProcess[str], bytes]:
+        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        return completed, outputs.read_bytes() if outputs.exists() else b""
+
+    def _vendor_calls(self, where: str, name: str, pattern: re.Pattern[str],
+                      stdout: str) -> dict[str, int]:
+        accel = _ACCEL_DISPATCHES[name]
+        calls = _call_report(where, pattern, stdout)
+        wrapped = self.wrapped.setdefault(accel.runner, frozenset(calls))
+        prefixes = tuple({dispatch.prefix for dispatch in _ACCEL_DISPATCHES.values()})
+        foreign = sorted(symbol for symbol in wrapped if not symbol.startswith(prefixes))
+        unknown = sorted(set(_VENDOR_UNREACHABLE) - wrapped)
+        if not wrapped or foreign or unknown:
+            raise AssertionError(f"{where}: wrapped vendor symbols {sorted(wrapped)} name no "
+                                 f"dispatcher {foreign} or miss allowlisted {unknown}")
+        if set(calls) != wrapped:
+            raise AssertionError(f"{where}: vendor call report lists {sorted(calls)}, "
+                                 f"earlier runs {sorted(wrapped)}")
+        stray = sorted(symbol for symbol, count in calls.items()
+                       if count and not symbol.startswith(accel.prefix))
+        if stray:
+            raise AssertionError(f"{where}: called another dispatcher's vendor functions {stray}")
+        return calls
+
+    def _check(self, where: str, name: str, completed: subprocess.CompletedProcess[str],
+               outputs: bytes, reference: _MemoryReport) -> _AccelRun:
+        accel = _ACCEL_DISPATCHES[name]
+        guards = [line for line in completed.stdout.splitlines()
+                  if line.startswith("TIGRIS_CONTRACT_GUARD")]
+        if guards:
+            raise AssertionError(f"{where}: wrote past an arena: {'; '.join(guards)}")
+        if completed.returncode != 0:
+            raise AssertionError(f"{where}: run failed (exit {completed.returncode}):\n"
+                                 f"{completed.stdout}{completed.stderr}")
+        report = _memory_report(where, completed.stdout)
+        dispatch = _DISPATCH_REPORT.search(completed.stdout)
+        if dispatch is None or dispatch.group(1) != accel.dispatch:
+            raise AssertionError(f"{where}: runner reports dispatch "
+                                 f"{dispatch.group(1) if dispatch else None}")
+        # The runner allocates the vendor scratch it reports above the
+        # 16-aligned reference arena, as tigris_cmsis_nn_fast_arena_required does.
+        scratch = int(dispatch.group(2))
+        allocated = _align16(reference.allocated) + scratch if scratch else reference.allocated
+        if report.allocated != allocated:
+            raise AssertionError(
+                f"{where}: allocated arena {report.allocated} != the reference run's "
+                f"{reference.allocated} + vendor scratch {scratch} ({allocated})")
+        # The scratch is the largest buffer a vendor call was given plus the
+        # per-channel quantization a call read from the workspace, each
+        # rounded to 16 bytes as the workspace partitions them. The executor
+        # tiles a stage only when the arena cannot hold it whole, so an
+        # operator the policy sent to s8 for its tile keeps the scratch its
+        # whole-tensor route takes; such a run bounds the scratch from below.
+        measured = _SCRATCH_REPORT.findall(completed.stdout)
+        if len(measured) != 1:
+            raise AssertionError(f"{where}: {len(measured)} scratch reports, expected one")
+        requested, channels, tile_routed = (int(value) for value in measured[0])
+        expected = _align16(requested) + _align16(channels * 8)
+        if scratch < expected or (scratch != expected and not tile_routed):
+            raise AssertionError(
+                f"{where}: vendor scratch {scratch} != the largest buffer a call was given "
+                f"{requested} + quantization for {channels} channels ({expected})")
+        fallbacks = _call_report(where, _FALLBACK_REPORT, completed.stdout)
+        declined = {op: count for op, count in fallbacks.items() if count}
+        if not fallbacks or declined:
+            raise AssertionError(f"{where}: the adapter handed operators it takes to s8 "
+                                 f"{declined or 'or reported no operator types'}")
+        calls = self._vendor_calls(where, name, _VENDOR_REPORT, completed.stdout)
+        prepare_calls = self._vendor_calls(f"{where} preparing", name, _VENDOR_PREPARE_REPORT,
+                                           completed.stdout)
+        return _AccelRun(outputs, report._replace(allocated=reference.allocated),
+                         calls, prepare_calls)
+
+    def _check_routing(self, where: str, name: str, calls: dict[str, int],
+                       routing: _Routing | ContractCase) -> None:
+        wrapped = self.wrapped[_ACCEL_DISPATCHES[name].runner]
+        unknown = sorted(set(routing.expect_vendor) - set(_ACCEL_DISPATCHES)
+                         | set(routing.expect_no_vendor) - set(_ACCEL_DISPATCHES))
+        misnamed = sorted(symbol for dispatch in set(routing.expect_vendor) & {name}
+                          for symbol in routing.expect_vendor[dispatch]
+                          if symbol not in wrapped
+                          or not symbol.startswith(_ACCEL_DISPATCHES[dispatch].prefix))
+        if unknown or misnamed:
+            raise AssertionError(f"{where}: routing names unknown dispatchers {unknown} "
+                                 f"or symbols {misnamed}")
+        called = sorted(symbol for symbol, count in calls.items() if count)
+        missing = sorted(symbol for symbol in routing.expect_vendor.get(name, ())
+                         if not calls[symbol])
+        if missing:
+            raise AssertionError(f"{where}: expected vendor calls {missing} were not made; "
+                                 f"called {called}")
+        if name in routing.expect_no_vendor and called:
+            raise AssertionError(f"{where}: expected no vendor call, called {called}")
+
+    def replay(self, build_dir: Path, case_name: str, plan: dict, plan_path: Path,
+               inputs_path: Path, outputs_path: Path, args: list[str], where: str,
+               reference_stdout: str, routing: _Routing | ContractCase | None,
+               full_budget: bool | None) -> None:
+        """Check the reference run that wrote `outputs_path` on every
+        accelerated dispatcher of the runners in `build_dir`, which have the
+        reference runner's tensor alignment."""
+        expected = outputs_path.read_bytes()
+        reference = _memory_report(where, reference_stdout)
+        key = self._key(build_dir, plan_path, inputs_path, args)
+        runs = self.done.setdefault(key, {})
+        for name, accel in _ACCEL_DISPATCHES.items():
+            if name not in runs:
+                self.launched += 1
+                outputs = self.work_dir / f"{self.launched}-{name}.bin"
+                command = [str(build_dir / accel.runner), str(self._snapshot(plan_path, key[1])),
+                           str(self._snapshot(inputs_path, key[2])), str(outputs), *args,
+                           f"--dispatch={accel.dispatch}"]
+                runs[name] = self.pool.submit(self._launch, command, outputs)
+            self.pending.append((key, name, f"{where} on {name}", case_name, plan, expected,
+                                 reference, routing, full_budget))
+        self._drain(wait=False)
+
+    def _drain(self, *, wait: bool) -> None:
+        """Check finished reruns in the order they were requested; `wait`
+        checks them all."""
+        while self.pending:
+            key, name, label, case_name, plan, expected, reference, routing, full_budget = (
+                self.pending[0])
+            future = self.done[key][name]
+            if not wait and not future.done():
+                return
+            self.pending.popleft()
+            run = self.checked.get((key, name))
+            if run is None:
+                completed, outputs = future.result()
+                run = self._check(label, name, completed, outputs, reference)
+                self.checked[(key, name)] = run
+                self.runs[name] += 1
+            if run.memory != reference:
+                differing = ", ".join(
+                    f"{field} {mine} vs {theirs}" for field, mine, theirs in
+                    zip(_MemoryReport._fields, run.memory, reference) if mine != theirs)
+                raise AssertionError(f"{label}: memory figures differ from the reference "
+                                     f"run: {differing}")
+            if full_budget is not None:
+                _assert_memory_contract(label, plan, run.memory, full_budget=full_budget)
+            if run.outputs != expected:
+                raise AssertionError(f"{label}: outputs differ from the s8 run: "
+                                     f"{_first_difference(plan, expected, run.outputs)}")
+            if routing is not None:
+                self._check_routing(label, name, run.calls, routing)
+            for calls in (run.calls, run.prepare_calls):
+                for symbol, count in calls.items():
+                    if count:
+                        self.callers[name].setdefault(symbol, set()).add(case_name)
+            if any(run.calls.values()):
+                self.kernel_cases[name].add(case_name)
+            self.cases.add(case_name)
+
+    def close(self) -> None:
+        """Stop the reruns not yet started."""
+        self.pool.shutdown(wait=True, cancel_futures=True)
+
+    def refuse(self, build_dir: Path, case_name: str, plan_path: Path, inputs_path: Path,
+               outputs_path: Path, limit: int) -> None:
+        """The run the reference runner refused below the scheduled peak is
+        refused before any stage on every accelerated dispatcher."""
+        key = self._key(build_dir, plan_path, inputs_path, [str(limit)])
+        if key in self.refused:
+            return
+        for name, accel in _ACCEL_DISPATCHES.items():
+            completed = subprocess.run(
+                [str(build_dir / accel.runner), str(plan_path), str(inputs_path),
+                 str(outputs_path), str(limit), f"--dispatch={accel.dispatch}"], text=True,
+                capture_output=True, check=False)
+            # With vendor scratch, a CMSIS-NN arena whose 16-aligned core falls
+            # short is refused at preparation, which precedes the first stage.
+            refused = _REFUSED_BELOW_PEAK in completed.stderr or (
+                accel.dispatch == "cmsis-nn" and "CMSIS-NN preparation failed" in completed.stderr)
+            if completed.returncode == 0 or not refused or "TIGRIS_CONTRACT_" in completed.stdout:
+                raise AssertionError(
+                    f"{case_name} on {name}: a fast arena one byte below the scheduled peak "
+                    f"was not refused up front (exit {completed.returncode}):\n"
+                    f"{completed.stdout}{completed.stderr}")
+        self.refused.add(key)
+
+    def finish(self) -> None:
+        """Every wrapped vendor symbol was called by some case on its
+        dispatcher, unless it is listed as unreachable."""
+        self._drain(wait=True)
+        if not self.runs or not self.wrapped:
+            raise AssertionError("no int8 plan ran on the accelerated dispatchers")
+        print(f"PASS accelerated_dispatch_parity cases={len(self.cases)} " + " ".join(
+            f"{name}={self.runs[name]}" for name in _ACCEL_DISPATCHES))
+        symbols, cases = [], []
+        for name, accel in _ACCEL_DISPATCHES.items():
+            wrapped = sorted(symbol for symbol in self.wrapped[accel.runner]
+                             if symbol.startswith(accel.prefix))
+            callers = self.callers[name]
+            missing = [symbol for symbol in wrapped
+                       if symbol not in callers and symbol not in _VENDOR_UNREACHABLE]
+            stale = {symbol: sorted(callers[symbol]) for symbol in _VENDOR_UNREACHABLE
+                     if symbol in callers}
+            if missing or stale:
+                raise AssertionError(
+                    f"{name}: no case calls {missing}; listed as unreachable but called: {stale}")
+            symbols.append(f"{name}={len(callers)}/{len(wrapped)}")
+            cases.append(f"{name}={len(self.kernel_cases[name])}")
+        print(f"PASS accelerated_dispatch_routing {' '.join(symbols)} symbols "
+              f"(unreachable: {', '.join(sorted(_VENDOR_UNREACHABLE))}), "
+              f"cases reaching a vendor function while running {' '.join(cases)}, "
+              f"no adapter fallback")
+
+
+class _ContractRunner(NamedTuple):
+    """A contract runner on the reference dispatchers. Every run of an int8
+    plan through it is replayed on the accelerated dispatchers of the runners
+    in the build directory `accel`, built with the same tensor alignment."""
+
+    path: Path
+    accel: Path
+    replay: _AccelReplay
+
+    def run(self, case_name: str, plan: dict, plan_path: Path, inputs_path: Path,
+            outputs_path: Path, args: list[str], label: str, *,
+            routing: _Routing | ContractCase | None = None,
+            full_budget: bool | None = None) -> subprocess.CompletedProcess[str]:
+        """Run the plan; `full_budget` set checks the memory contract of every run.
+
+        `routing` holds the vendor calls of the case's own plan; a plan the
+        gate derives from it passes none."""
+        where = f"{case_name} {label}"
+        completed = _run([str(self.path), str(plan_path), str(inputs_path), str(outputs_path),
+                          *args], where)
+        if full_budget is not None:
+            _assert_memory_contract(case_name, plan, completed.stdout, full_budget=full_budget)
+        if _is_int8_plan(plan):
+            self.replay.replay(self.accel, case_name, plan, plan_path, inputs_path, outputs_path, args,
+                               where, completed.stdout, routing, full_budget)
+        return completed
+
+    def refuse_below_peak(self, case_name: str, plan: dict, plan_path: Path,
+                          inputs_path: Path, outputs_path: Path) -> None:
+        """One byte below the plan's scheduled peak, the run is refused before any stage."""
+        limit = plan["scheduled_peak"] - 1
+        completed = subprocess.run(
+            [str(self.path), str(plan_path), str(inputs_path), str(outputs_path), str(limit)],
+            text=True, capture_output=True, check=False)
+        if completed.returncode == 0 or _REFUSED_BELOW_PEAK not in completed.stderr:
+            raise AssertionError(
+                f"{case_name}: a fast arena one byte below the scheduled peak was not refused "
+                f"up front (exit {completed.returncode}):\n{completed.stdout}{completed.stderr}")
+        if _is_int8_plan(plan):
+            self.replay.refuse(self.accel, case_name, plan_path, inputs_path, outputs_path, limit)
+
+
 _ROWS_REPORT = re.compile(
     r"^TIGRIS_CONTRACT_ROWS kernel_rows=(\d+) chain_tiles=(\d+) "
     r"chain_tile_h=(\d+) interior_clamps=(\d+)$",
@@ -560,7 +1061,7 @@ def _prepare_case(case: ContractCase, work_dir: Path) -> tuple[Path, dict, list[
 
 
 def _run_metric_case(
-    case: ContractCase, rows_runner: Path, work_dir: Path
+    case: ContractCase, rows_runner: _ContractRunner, work_dir: Path
 ) -> None:
     """Prove the line-buffered roll matches ORT and computes fewer kernel rows.
 
@@ -577,13 +1078,10 @@ def _run_metric_case(
 
     def _execute(extra_args: list[str], label: str) -> dict[str, int]:
         outputs_path = case_dir / f"outputs_{label}.bin"
-        completed = _run(
-            [str(rows_runner), str(plan_path), str(inputs_path), str(outputs_path), limit]
-            + extra_args,
-            f"{case.name} rows-runner ({label})",
-        )
-        if label == "linebuffered":
-            _assert_memory_contract(case.name, plan, completed.stdout)
+        completed = rows_runner.run(
+            case.name, plan, plan_path, inputs_path, outputs_path, [limit, *extra_args],
+            f"rows-runner ({label})", routing=case,
+            full_budget=False if label == "linebuffered" else None)
         actual_outputs = _decode_outputs(
             plan, outputs_path.read_bytes(), reference_outputs
         )
@@ -642,7 +1140,7 @@ def _reference_session(case: ContractCase, path: Path) -> ort.InferenceSession:
 
 
 def _section_reference_outputs(
-    case: ContractCase, runner: Path, case_dir: Path, plan: dict,
+    case: ContractCase, runner: _ContractRunner, case_dir: Path, plan: dict,
     primary: bytes, reference_outputs: list[Array],
 ) -> list[Array]:
     """Check section entry codes and evaluate float outputs on those same codes."""
@@ -677,8 +1175,8 @@ def _section_reference_outputs(
     expected = _reference_session(case, oracle_path).run(None, case.inputs)
     variant_inputs, variant_outputs = case_dir / "entries-inputs.bin", case_dir / "entries-outputs.bin"
     variant_inputs.write_bytes(_pack_inputs(variant_plan, case.inputs))
-    _run([str(runner), str(variant_plan_path), str(variant_inputs), str(variant_outputs)],
-         f"{case.name} section entry execution")
+    runner.run(case.name, variant_plan, variant_plan_path, variant_inputs, variant_outputs, [],
+               "section entry execution")
     raw = variant_outputs.read_bytes()
     assert raw[:len(primary)] == primary, f"{case.name}: adding entry outputs changed original outputs"
     actual = _decode_outputs(variant_plan, raw, expected)
@@ -719,31 +1217,30 @@ def _section_reference_outputs(
     return outputs
 
 
-def _run_case(case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Path) -> Path:
+def _run_case(
+    case: ContractCase, runner: _ContractRunner, work_dir: Path, roomy_runner: _ContractRunner
+) -> Path:
     case_dir, plan, reference_outputs = _prepare_case(case, work_dir)
     compile_path, plan_path = case_dir / "compile.onnx", case_dir / "model.tgrs"
     inputs_path, outputs_path = case_dir / "inputs.bin", case_dir / "outputs.bin"
-    completed = _run(
-        [
-            str(runner),
-            str(plan_path),
-            str(inputs_path),
-            str(outputs_path),
-            str(plan["_compiler_scheduled_peak"]),
-            # Run with exactly the workspace generated code would reserve.
-            "--workspace-limits=" + ",".join(
-                str(value) for value in executor_workspace_limits(plan)),
-        ],
-        f"{case.name} runtime execution",
-    )
-    _assert_memory_contract(case.name, plan, completed.stdout)
+    run_args = [
+        str(plan["_compiler_scheduled_peak"]),
+        # Run with exactly the workspace generated code would reserve.
+        "--workspace-limits=" + ",".join(
+            str(value) for value in executor_workspace_limits(plan)),
+    ]
+    accelerated = _is_int8_plan(plan)
+    if (case.expect_vendor or case.expect_no_vendor) and not accelerated:
+        raise AssertionError(f"{case.name}: states vendor calls for a plan that is not int8")
+    completed = runner.run(case.name, plan, plan_path, inputs_path, outputs_path, run_args,
+                           "runtime execution", routing=case, full_budget=False)
     without_slow = _assert_runs_without_slow(
         case.name, plan, runner, plan_path, inputs_path, outputs_path,
-        plan["_compiler_scheduled_peak"])
+        plan["_compiler_scheduled_peak"], case)
     if case.expect_inputs_in_fast and not without_slow:
         raise AssertionError(f"{case.name}: the plan does not read its inputs in place")
     if case.exact_slow:
-        _assert_runs_in_slow_figure(case.name, plan, runner, plan_path, inputs_path,
+        _assert_runs_in_slow_figure(case, plan, runner, plan_path, inputs_path,
                                     outputs_path, completed.stdout)
     actual_outputs = _decode_outputs(
         plan, outputs_path.read_bytes(), reference_outputs
@@ -755,11 +1252,8 @@ def _run_case(case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Pa
     )
     # Extra caller capacity must not change the scheduled memory bound.
     for full_runner in (runner, roomy_runner):
-        completed = _run(
-            [str(full_runner), str(plan_path), str(inputs_path), str(outputs_path)],
-            f"{case.name} full-budget execution",
-        )
-        _assert_memory_contract(case.name, plan, completed.stdout, full_budget=True)
+        full_runner.run(case.name, plan, plan_path, inputs_path, outputs_path, [],
+                        "full-budget execution", routing=case, full_budget=True)
         _assert_output_parity(
             _decode_outputs(plan, outputs_path.read_bytes(), reference_outputs),
             reference_outputs, _output_scales(plan),
@@ -778,8 +1272,8 @@ def _run_case(case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Pa
         assert not any(tile["tileable"] for tile in untiled["tile_plans"])
         assert untiled["version"] == SCHEMA_VERSION
         untiled_outputs = case_dir / "untiled.bin"
-        _run([str(runner), str(untiled_path), str(inputs_path), str(untiled_outputs),
-              str(untiled["_compiler_scheduled_peak"])], f"{case.name} untiled execution")
+        runner.run(case.name, untiled, untiled_path, inputs_path, untiled_outputs,
+                   [str(untiled["_compiler_scheduled_peak"])], "untiled execution")
         assert outputs_path.read_bytes() == untiled_outputs.read_bytes()
     if case.exact_uncompressed:
         plain_path = case_dir / "uncompressed.tgrs"
@@ -787,11 +1281,12 @@ def _run_case(case: ContractCase, runner: Path, work_dir: Path, roomy_runner: Pa
                               slow_budget=case.slow_budget, compression=None, xip=case.xip,
                               force_one_op_stages=case.force_one_op_stages, int8_io=case.int8_io)
         plain_outputs = case_dir / "uncompressed.bin"
-        _run([str(runner), str(plain_path), str(inputs_path), str(plain_outputs),
-              str(plain["_compiler_scheduled_peak"])], f"{case.name} uncompressed execution")
+        runner.run(case.name, plain, plain_path, inputs_path, plain_outputs,
+                   [str(plain["_compiler_scheduled_peak"])], "uncompressed execution")
         if outputs_path.read_bytes() != plain_outputs.read_bytes():
             raise AssertionError(f"{case.name}: outputs differ from the uncompressed plan")
-    print(f"PASS {case.name} memory-contract" + (" no-slow" if without_slow else ""))
+    print(f"PASS {case.name} memory-contract" + (" no-slow" if without_slow else "")
+          + (" accelerated" if accelerated else ""))
     return plan_path
 
 
@@ -1162,6 +1657,9 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         *[elementwise._elementwise_case(kind, quantized=True) for kind in (
             "Abs", "Rsqrt", "SquaredDifference", "Max", "Min", "Div",
         )],
+        *[replace(elementwise._elementwise_case(kind, quantized=True),
+                  name=f"int8_elementwise_{kind.lower()}_untiled", mem_budget="64K",
+                  expect_tiled=False) for kind in ("Max", "Min")],
         elementwise._constant_add_case(),
         elementwise._add_relu_fusion_case(),
         elementwise._residual_case(),
@@ -1205,6 +1703,8 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         movement._standalone_pad_case(quantized=True),
         convolution._depthwise_multiplier_case(quantized=False),
         convolution._depthwise_multiplier_case(quantized=True),
+        replace(convolution._depthwise_multiplier_case(quantized=True),
+                name="int8_depthwise_multiplier_untiled", mem_budget="64K", expect_tiled=False),
         movement._inner_axis_concat_case(axis=2, quantized=False),
         movement._inner_axis_concat_case(axis=2, quantized=True),
         movement._inner_axis_concat_case(axis=3, quantized=False),
@@ -1333,6 +1833,10 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         matmul._matmul_case(),
         matmul._gemm_no_transpose_case(),
         qdq._qdq_matmul_case(),
+        qdq._qdq_row_band_matmul_case(),
+        *[qdq._qdq_banded_pool_case(kind) for kind in ("AveragePool", "MaxPool")],
+        qdq._qdq_banded_dilated_conv_case(),
+        *[qdq._qdq_banded_binary_case(kind) for kind in ("Mul", "Max", "Min")],
         qdq._quint8_activation_case(),
         qdq._qdq_input_ties_case(),
         qdq._qdq_quantize_ties_case(),
@@ -1420,6 +1924,11 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
                                                       tiled=True), exact_untiled=True,
                          tiled_operators=(kind,))
                  for q in (False, True) for kind in ("Gather", "GatherND", "DynamicUpdateSlice"))
+    unrouted = set(_ROUTINGS) - {case.name for case in cases} - {"lstm_unrolled"}
+    if unrouted:
+        raise AssertionError(f"vendor routing stated for cases the gate does not run: {sorted(unrouted)}")
+    cases = [replace(case, **_ROUTINGS[case.name]._asdict()) if case.name in _ROUTINGS else case
+             for case in cases]
     covered_operators = {
         operator for case in cases for operator in case.expected_operators
     }
@@ -1435,21 +1944,40 @@ def _run_gate(runtime: Path, work_dir: Path) -> None:
         f"{len(covered_operators)}/{len(supported_operators)}"
     )
 
-    runner, rows_runner = _build_runner(runtime, work_dir / "runtime-build")
-    runner_a16, _ = _build_runner(runtime, work_dir / "runtime-build-a16", alignment=16)
-    os.environ["TIGRIS_HOST_LIBRARY"] = str(_build_host_library(runtime, work_dir / "host-build"))
-    _run_peak_fixtures((runner, runner_a16), work_dir)
-    first_plan: Path | None = None
-    for case in cases:
-        if case.recompute_metric:
-            _run_metric_case(case, rows_runner, work_dir)
-        else:
-            plan_path = _run_case(case, runner, work_dir, runner_a16)
-            if first_plan is None:
-                first_plan = plan_path
-    assert first_plan is not None, "gate needs at least one non-metric case"
+    # The builds are independent, so they run at once.
+    with ThreadPoolExecutor(max_workers=5) as builds:
+        default_build = builds.submit(_build_runner, runtime, work_dir / "runtime-build")
+        a16_build = builds.submit(_build_runner, runtime, work_dir / "runtime-build-a16",
+                                  alignment=16)
+        host_build = builds.submit(_build_host_library, runtime, work_dir / "host-build")
+        accel_build = builds.submit(_build_accel_runner, runtime,
+                                    work_dir / "runtime-build-accel")
+        accel_a16_build = builds.submit(_build_accel_runner, runtime,
+                                        work_dir / "runtime-build-accel-a16", alignment=16)
+    default_path, rows_path = default_build.result()
+    a16_path, _ = a16_build.result()
+    os.environ["TIGRIS_HOST_LIBRARY"] = str(host_build.result())
+    accel_path, accel_a16_path = accel_build.result(), accel_a16_build.result()
+    replay = _AccelReplay(work_dir)
+    try:
+        runner, rows_runner, runner_a16 = (
+            _ContractRunner(path, accel, replay) for path, accel in
+            ((default_path, accel_path), (rows_path, accel_path), (a16_path, accel_a16_path)))
+        _run_peak_fixtures((runner, runner_a16), work_dir)
+        first_plan: Path | None = None
+        for case in cases:
+            if case.recompute_metric:
+                _run_metric_case(case, rows_runner, work_dir)
+            else:
+                plan_path = _run_case(case, runner, work_dir, runner_a16)
+                if first_plan is None:
+                    first_plan = plan_path
+        assert first_plan is not None, "gate needs at least one non-metric case"
+        replay.finish()
+    finally:
+        replay.close()
     _assert_compile_rejected(work_dir)
-    _assert_runtime_rejects_incompatible_plan(runner, first_plan, work_dir)
+    _assert_runtime_rejects_incompatible_plan(runner.path, first_plan, work_dir)
 
 
 def main() -> None:
