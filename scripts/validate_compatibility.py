@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 from pathlib import Path
 
 from tigris import SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
@@ -14,9 +15,27 @@ from tigris import SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _TAG_RE = re.compile(r"v\d+\.\d+\.\d+")
 _RUNTIME_SCHEMA_RE = re.compile(
-    r"^#define\s+TIGRIS_SCHEMA_VERSION(?:_V\d+)?\s+(\d+)\s*$",
+    r"^#define\s+(TIGRIS_SCHEMA_VERSION\w*)\s+(\w+)\s*$",
     re.MULTILINE,
 )
+_COMPILER_SCHEMA_RE = re.compile(r"^SCHEMA_VERSION\s*=\s*(\d+)\s*$", re.MULTILINE)
+
+
+def runtime_schemas(header: str) -> list[int]:
+    """TIGRIS_SCHEMA_VERSION_MIN through TIGRIS_SCHEMA_VERSION of a runtime
+    header, following macro aliases."""
+    defines = dict(_RUNTIME_SCHEMA_RE.findall(header))
+
+    def resolve(name: str) -> int:
+        for _ in range(len(defines)):
+            if name.isdigit():
+                break
+            name = defines[name]
+        return int(name)
+
+    return list(
+        range(resolve("TIGRIS_SCHEMA_VERSION_MIN"), resolve("TIGRIS_SCHEMA_VERSION") + 1)
+    )
 
 
 def _positive_schema_list(value: object, label: str, errors: list[str]) -> list[int]:
@@ -171,25 +190,88 @@ def validate(root: Path, runtime: Path | None = None) -> list[str]:
     if runtime is not None:
         header = runtime / "include" / "tigris.h"
         try:
-            runtime_schemas = sorted(
-                {int(value) for value in _RUNTIME_SCHEMA_RE.findall(header.read_text())}
-            )
-        except OSError as exc:
-            errors.append(f"cannot read runtime schema header: {exc}")
+            header_schemas = runtime_schemas(header.read_text())
+        except (OSError, KeyError, ValueError) as exc:
+            errors.append(f"cannot read runtime schema range: {exc!r}")
         else:
-            if runtime_schemas != accepted:
+            if header_schemas != accepted:
                 errors.append(
                     "runtime header accepts schemas "
-                    f"{runtime_schemas}, manifest declares {accepted}"
+                    f"{header_schemas}, manifest declares {accepted}"
                 )
     return errors
 
 
-def main() -> int:
+def _git(repo: Path, *args: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def record(root: Path, runtime: Path, version: str, status: str) -> int:
+    """Add the release entry for compiler and runtime tag vVERSION, newest first.
+    Both sides are read at their tags, so the runtime checkout only needs the tag."""
+    tag = f"v{version}"
+    manifest = root / "compatibility.json"
+    original = manifest.read_text()
+    document = json.loads(original)
+    if any(
+        (release.get("compiler") or {}).get("tag") == tag
+        and (release.get("runtime") or {}).get("tag") == tag
+        for release in document["releases"]
+    ):
+        print(f"compatibility.json already records {tag}.")
+        return 0
+    commits = {}
+    for name, repo in (("compiler", root), ("runtime", runtime)):
+        commit = _git(repo, "rev-parse", "--verify", "--quiet", f"{tag}^{{commit}}")
+        if commit is None:
+            print(f"ERROR: {name} checkout {repo} has no tag {tag}")
+            return 1
+        commits[name] = commit.strip()
+    emitted = _COMPILER_SCHEMA_RE.search(
+        _git(root, "show", f"{tag}:src/tigris/__init__.py") or ""
+    )
+    try:
+        accepted = runtime_schemas(_git(runtime, "show", f"{tag}:include/tigris.h") or "")
+    except (KeyError, ValueError) as exc:
+        print(f"ERROR: cannot read the runtime schema range at {tag}: {exc!r}")
+        return 1
+    if emitted is None:
+        print(f"ERROR: cannot read the compiler SCHEMA_VERSION at {tag}")
+        return 1
+    document["releases"].insert(0, {
+        "status": status,
+        "compiler": {"tag": tag, "commit": commits["compiler"], "emits_schema": int(emitted[1])},
+        "runtime": {"tag": tag, "commit": commits["runtime"], "accepts_schemas": accepted},
+    })
+    manifest.write_text(json.dumps(document, indent=2) + "\n")
+    errors = validate(root)
+    if errors:
+        manifest.write_text(original)
+        for error in errors:
+            print(f"ERROR: {error}")
+        return 1
+    print(f"Recorded {tag} in compatibility.json.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--runtime", type=Path)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--record", metavar="X.Y.Z", help="add the release entry for the vX.Y.Z tags"
+    )
+    parser.add_argument("--status", choices=("supported", "retired"), default="supported")
+    args = parser.parse_args(argv)
+    if args.record is not None:
+        if not re.fullmatch(r"\d+\.\d+\.\d+", args.record):
+            parser.error("--record takes a version X.Y.Z")
+        if args.runtime is None:
+            parser.error("--record needs --runtime")
+        return record(args.root.resolve(), args.runtime.resolve(), args.record, args.status)
     errors = validate(args.root.resolve(), args.runtime.resolve() if args.runtime else None)
     if errors:
         for error in errors:

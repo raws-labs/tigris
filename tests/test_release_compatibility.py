@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from tigris import SCHEMA_VERSION
+from tigris import SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from scripts.generate_capability_matrix import encoded_matrix
 from scripts.generate_schema_package import encoded_package
-from scripts.validate_compatibility import validate
+from scripts.validate_compatibility import main as compatibility_main, validate
 from scripts.validate_runtime_capabilities import validate as validate_capabilities
 
 
@@ -261,3 +261,58 @@ def test_release_manifest_rejects_a_compiler_schema_no_runtime_accepts(tmp_path)
         "no supported runtime release accepts compiler schema" in error
         for error in errors
     )
+
+
+def _tagged_repo(path, files, tag):
+    for relative, content in files.items():
+        (path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (path / relative).write_bytes(content)
+    git = ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "release"], check=True)
+    subprocess.run([*git, "tag", tag], check=True)
+    return subprocess.run(
+        [*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_record_adds_the_release_pair_once(tmp_path):
+    relatives = (
+        "compatibility.json",
+        "src/tigris/__init__.py",
+        "src/tigris/emitters/binary/defs.py",
+        f"src/tigris/{SCHEMA_ARTIFACT}",
+    )
+    compiler, runtime = tmp_path / "compiler", tmp_path / "runtime"
+    compiler_commit = _tagged_repo(
+        compiler, {name: (ROOT / name).read_bytes() for name in relatives}, "v99.0.0"
+    )
+    low, high = SUPPORTED_SCHEMA_VERSIONS[0], SUPPORTED_SCHEMA_VERSIONS[-1]
+    header = (
+        f"#define TIGRIS_SCHEMA_VERSION_V{high} {high}\n"
+        f"#define TIGRIS_SCHEMA_VERSION TIGRIS_SCHEMA_VERSION_V{high}\n"
+        f"#define TIGRIS_SCHEMA_VERSION_MIN {low}\n"
+    )
+    runtime_commit = _tagged_repo(
+        runtime, {"include/tigris.h": header.encode()}, "v99.0.0"
+    )
+    args = ["--root", str(compiler), "--runtime", str(runtime), "--record"]
+
+    assert compatibility_main([*args, "99.0.0"]) == 0
+    document = json.loads((compiler / "compatibility.json").read_text())
+    assert document["releases"] == [{
+        "status": "supported",
+        "compiler": {"tag": "v99.0.0", "commit": compiler_commit, "emits_schema": SCHEMA_VERSION},
+        "runtime": {
+            "tag": "v99.0.0",
+            "commit": runtime_commit,
+            "accepts_schemas": list(SUPPORTED_SCHEMA_VERSIONS),
+        },
+    }] + _document()["releases"]
+    recorded = (compiler / "compatibility.json").read_text()
+    assert recorded == json.dumps(document, indent=2) + "\n"
+
+    assert compatibility_main([*args, "99.0.0"]) == 0
+    assert compatibility_main([*args, "99.0.1"]) == 1
+    assert (compiler / "compatibility.json").read_text() == recorded

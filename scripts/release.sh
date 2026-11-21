@@ -34,7 +34,7 @@ COMMIT_SUBJECT="release: pin the v$VERSION host runtime"
 # Waits until every CI check run on the commit has completed, then requires each
 # to have passed. Runs register over the first minute, so it waits that out.
 wait_for_ci() {
-    local sha="$1" runs
+    local sha="$1" runs deadline=$((SECONDS + 3600))
     echo "Waiting for CI on $sha"
     sleep 60
     while :; do
@@ -44,6 +44,7 @@ wait_for_ci() {
         if [ -n "$runs" ] && ! grep -qv '^completed' <<<"$runs"; then
             break
         fi
+        [ "$SECONDS" -lt "$deadline" ] || { echo "CI on $sha did not complete within 60 min" >&2; exit 1; }
         sleep 30
     done
     if grep -qvE $'^completed\t(success|skipped|neutral)$' <<<"$runs"; then
@@ -53,17 +54,19 @@ wait_for_ci() {
 }
 
 promote() {
-    local sha="$1" dry_run="$2" started run_id
-    started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local sha="$1" dry_run="$2" last run_id deadline=$((SECONDS + 300))
+    # The dispatched run is the first one with a larger id; the local clock plays no part.
+    last="$(gh run list -R "$REPO" -w promote.yml -L 1 --json databaseId --jq '.[0].databaseId // 0')"
     gh workflow run promote.yml -R "$REPO" --ref develop \
         -f sha="$sha" -f version="$VERSION" -f dry_run="$dry_run"
     run_id=""
     while [ -z "$run_id" ]; do
+        [ "$SECONDS" -lt "$deadline" ] || { echo "the dispatched promote run did not appear" >&2; exit 1; }
         sleep 5
-        run_id="$(gh run list -R "$REPO" -w promote.yml -L 5 --json databaseId,createdAt \
-            --jq "[.[] | select(.createdAt >= \"$started\")][0].databaseId // empty")"
+        run_id="$(gh run list -R "$REPO" -w promote.yml -L 5 --json databaseId \
+            --jq "[.[] | select(.databaseId > $last)] | min_by(.databaseId) | .databaseId // empty")"
     done
-    gh run watch "$run_id" -R "$REPO" --exit-status >/dev/null \
+    timeout 3600 gh run watch "$run_id" -R "$REPO" --exit-status >/dev/null \
         || { echo "promote (dry_run=$dry_run) failed: run $run_id" >&2; exit 1; }
     echo "promote (dry_run=$dry_run) passed: run $run_id"
 }
