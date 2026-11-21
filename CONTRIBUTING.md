@@ -82,15 +82,19 @@ ship in a patch release.
    first pair this is `v0.11.0`; `v0.10.2` has no host archives.
 3. Pin `runtime-host.json` to that tag and its per-platform archive hashes.
    Review the downloaded manifests and run the wheel tests.
-4. Move the Cortex-M board support's runtime pin to that release. The
-   compiler's promote checks that the pinned runtime accepts the plan schema
-   the compiler emits, and the runtime's promote checks that every zoo artifact
-   declaring the release compatible has a schema the loader accepts.
+4. Move the Cortex-M board support's runtime pin to that release when the
+   pinned runtime does not accept the plan schema the compiler emits. The
+   compiler's promote refuses that combination, and the runtime's promote checks
+   that every zoo artifact declaring the release compatible has a schema the
+   loader accepts.
 5. Promote the compiler's tested `develop` commit through "Promote to main"
    (`.github/workflows/promote.yml`), with a dry run first. Then create the GitHub
    release `vX.Y.Z` with its tag on that commit. Its tag and setuptools-scm
    version must agree with the runtime pin; release-wheel builds enforce this
    equality.
+6. Record the pair in `compatibility.json` through a pull request against
+   `develop`. `python scripts/validate_compatibility.py --runtime RUNTIME_SOURCE
+   --record X.Y.Z` adds the entry from both `vX.Y.Z` tags and validates it.
 
 `scripts/release.sh X.Y.Z --notes NOTES.md` in each repository runs its steps up to
 a draft GitHub release: it lands the version change (runtime) or the runtime pin
