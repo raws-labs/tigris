@@ -2,11 +2,13 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/tigris-ml)](https://pypi.org/project/tigris-ml/)
-[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/getting-started/quickstart/)
+[![Docs](https://img.shields.io/badge/docs-tigris--ml.dev-green)](https://tigris-ml.dev/getting-started/what-is-tigris/)
 
 **Tiled Graph Inference Scheduler.** An ahead-of-time compiler that tiles ML models to fit embedded devices with hard memory budgets.
 
-Give it an ONNX or a TFLite model and a memory budget. It partitions the compute graph into stages, tiles spatial operations, and emits a flat binary plan that the [tigris-runtime](https://github.com/raws-labs/tigris-runtime) executes with zero dynamic allocation.
+Give it a model and a memory budget: ONNX, TFLite, or a PyTorch program saved with `torch.export` (`.pt2`). It partitions the compute graph into stages, tiles spatial operations, and emits a flat binary plan that the [tigris-runtime](https://github.com/raws-labs/tigris-runtime) executes with zero dynamic allocation.
+
+If you already deploy TFLite Micro or ExecuTorch, `tigris export` rewrites the int8 `.tflite` file or the Cortex-M `.pte` program in row bands instead, so the runtime you ship runs it in less RAM with the same outputs.
 
 ## The problem
 
@@ -196,6 +198,7 @@ See [Contributing](CONTRIBUTING.md) for native-library staging and wheel builds.
 ## Further reading
 
 - [Getting started](https://tigris-ml.dev/getting-started/quickstart/): installation, first compile, deploying to ESP32
+- [What is TiGrIS](https://tigris-ml.dev/getting-started/what-is-tigris/): what the compiler does and where its result runs
 - [Core compatibility data](compatibility.json): exact compiler/runtime releases and plan schemas
 - [Introducing TiGrIS](https://tigris-ml.dev/blog/introducing-tigris): design, benchmarks, how tiling works
 - [CLI reference](https://tigris-ml.dev/toolchain/analyze/): every flag, every subcommand
