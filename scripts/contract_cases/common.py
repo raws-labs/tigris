@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import onnx
@@ -55,6 +56,11 @@ class ContractCase:
     int8_io: bool = False
     # Outputs another interpreter recorded for these inputs, compared in place of ONNX Runtime's.
     recorded_outputs: tuple[Array, ...] = ()
+    # Vendor functions every accelerated run of the plan calls, per dispatcher
+    # ("cmsis-nn", "esp-nn", "esp-nn-ansi"), and the dispatchers on which it
+    # calls none.
+    expect_vendor: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    expect_no_vendor: tuple[str, ...] = ()
 
 
 def _model(
